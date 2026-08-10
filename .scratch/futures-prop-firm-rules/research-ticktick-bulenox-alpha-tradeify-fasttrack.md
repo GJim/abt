@@ -133,6 +133,14 @@
 
 > **Tradeify 資料衝突／警示：** 同一主站的 Select funded 動態表隨 Tradovate、WealthCharts、Rithmic/TradeSea broker column 改變部分 DLL／EOD DD 表項，且首頁另有「No consistency once funded」總述。故上述只逐列轉載，不把它們合併為通用規則；需在選定 broker／checkout 內取得當前官方規則。
 
+### BrowserOS 重新查核（2026-08-10，官方 Help Center）
+
+先前一般瀏覽器被 Cloudflare 擋住；改用 BrowserOS 後，已可直接讀到官方 Help Center，以下以較新的／較具體的官方文章補正：
+
+- **Select Evaluation 的 40% 定義已明示：** 任一單日 profit 不得超過「從首日到通過為止的總 profit」之 40%。`最大單日 profit ÷ 總 profit ≤ 40%`。佣金不計入 profit。它只適用於 **Select 的 evaluation**；通過後不論選 Flex 或 Daily，Select funded 不再有 consistency rule。此規則不會因當天賺太多而直接 breach；交易者可以繼續累積較小的盈利日，直到符合 40%。官方也明示 Select 最少 **3 個 trading days**。|[Rules: Consistency Rule](https://help.tradeify.co/en/articles/10468320-rules-consistency-rule)（2026-06-19）; [Select Evaluation Accounts](https://help.tradeify.co/en/articles/12853921-select-evaluation-accounts)（2026-04-02）|
+- **Select 50K 官方範例：** Day 1–3 各 +$1,050，合計 +$3,150；任一日占 $1,050 ÷ $3,150 = 33%，因此低於 40% 並且超過 $3,000 target。|[Select Evaluation Accounts](https://help.tradeify.co/en/articles/12853921-select-evaluation-accounts)|
+- **Select 出金的補正：** 通過後才選擇且不可變更。Flex：每 5 個 winning days、上限為當期 profit 的 50%（25/50/100/150K: $1,250/$3,000/$4,000/$5,000）、無 DLL。Daily：符合 buffer 後每日 eligible，cap $600/$1,000/$1,500/$2,500，DLL $500/$1,000/$1,250/$1,750，buffer $1,100/$2,100/$2,600/$3,600。官方此文也稱 Select funded 無月費、無 activation fee。|[Select Evaluation Accounts](https://help.tradeify.co/en/articles/12853921-select-evaluation-accounts)|
+
 ---
 
 ## 5. Fast Track Trading
