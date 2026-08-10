@@ -1,0 +1,6 @@
+# Local Hermes state and generated skill metadata
+.hermes/
+skills-lock.json
+
+# Raw browser/source captures are reproducibility aids, not publishable research.
+.scratch/futures-prop-firm-rules/sources/
