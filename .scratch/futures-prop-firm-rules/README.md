@@ -68,6 +68,10 @@
 - [ ] KYC、稅表、付款服務商、銀行資料姓名要求，以及**居住地／國籍**的開戶與出金可用性。
 - [ ] 自動化、copy trading、跨帳戶、反向倉／對沖、重大新聞交易是否允許；對擬採策略要求 compliance 書面確認。
 
-## 5. 範圍界線與更新方式
+## 5. 延伸研究
+
+- [自建量化 Nasdaq 期貨 Prop Firm：官方規則比較與嚴格候選名單](../quant-futures-prop-comparison/README.md) — 使用 TradingPilot Futures 作候選池、以官方規則重新驗證；含自動化、NQ/MNQ、費用、時限與 payout 篩選。
+
+## 6. 範圍界線與更新方式
 
 「每個 prop firm」沒有可驗證的全球封閉名單；本研究因此明示為上述 13 家的**首輪研究 universe**，而非聲稱涵蓋所有世界各地業者。後續要納入新業者時，必須先找到其官方 NQ/MNQ permitted-products 證據；若未能明示，維持「未載明／待書面確認」，不由 CME 交易所級別資訊推論。
