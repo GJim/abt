@@ -1,0 +1,8 @@
+[project]
+name = "abt"
+version = "0.0.0"
+description = "Cross-platform MT5 hedge controller experiments"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "MetaTrader5==5.0.6090",
+]
