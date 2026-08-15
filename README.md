@@ -74,6 +74,8 @@ uv run abt account
 uv run abt terminal
 uv run abt symbols
 uv run abt symbol EURUSD
+uv run abt symbol-select SOLUSDC
+uv run abt symbol-hide SOLUSDC
 uv run abt tick EURUSD
 uv run abt positions
 uv run abt orders
@@ -101,8 +103,11 @@ the declared source offset. Write-result expiration epochs are explicitly
 labelled as market-data-clock fields even when the surrounding result uses the
 trade-record family.
 
-The first release intentionally does not change Market Watch visibility:
-enable symbols in MT5 before querying their ticks or depth.
+`symbol-select SYMBOL` explicitly adds a broker symbol to the selected
+terminal's Market Watch, allowing it to receive quotes; `symbol-hide SYMBOL`
+removes it. These commands intentionally change terminal state and verify the
+resulting visibility. MT5 can reject hiding a symbol that is in use by a chart
+or another terminal feature.
 
 `order-check` is an advanced broker-side validation endpoint. It never sends
 the request as an order.

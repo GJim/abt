@@ -66,6 +66,10 @@ def build_parser() -> argparse.ArgumentParser:
     symbols.add_argument("--all", action="store_true", help="Include symbols not in Market Watch.")
     symbol = subparsers.add_parser("symbol")
     symbol.add_argument("symbol")
+    symbol_select = subparsers.add_parser("symbol-select", help="Add a symbol to Market Watch.")
+    symbol_select.add_argument("symbol")
+    symbol_hide = subparsers.add_parser("symbol-hide", help="Remove a symbol from Market Watch.")
+    symbol_hide.add_argument("symbol")
     tick = subparsers.add_parser("tick")
     tick.add_argument("symbol")
     positions = subparsers.add_parser("positions")
@@ -392,6 +396,15 @@ def _read_command(args: argparse.Namespace, api: object) -> Any:
         ]
     if args.command == "symbol":
         return _required(api.symbol_info(args.symbol), f"Unknown symbol {args.symbol!r}", api)
+    if args.command in {"symbol-select", "symbol-hide"}:
+        visible = args.command == "symbol-select"
+        action = "add to" if visible else "remove from"
+        if not api.symbol_select(args.symbol, visible):
+            raise SessionError(f"Unable to {action} Market Watch: {api.last_error()}")
+        symbol = _required(api.symbol_info(args.symbol), f"Unknown symbol {args.symbol!r}", api)
+        if symbol.visible != visible:
+            raise SessionError(f"MT5 did not {action} Market Watch for {args.symbol!r}.")
+        return {"symbol": symbol.name, "visible": symbol.visible}
     if args.command == "tick":
         return _required(api.symbol_info_tick(args.symbol), f"No tick for {args.symbol!r}", api)
     if args.command == "positions":

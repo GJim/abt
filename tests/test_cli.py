@@ -20,6 +20,7 @@ from abt.cli import (
     dispatch,
     _duration,
     _history_window,
+    _read_command,
     _rates,
     _required_user_timezone,
     _timestamp,
@@ -29,6 +30,7 @@ from abt.cli import (
     build_parser,
 )
 from abt.config import CalibrationSample, Config, ConfigError, Context, TimeCalibration, TimeCalibrationFamily, load, save
+from abt.mt5 import SessionError
 from abt.output import render
 
 
@@ -209,6 +211,40 @@ class ParsingAndOutputTests(unittest.TestCase):
         )
         self.assertEqual(parsed.symbol, "EURUSD")
         self.assertEqual(parsed.count, 10)
+
+    def test_symbol_select_and_hide_change_market_watch_visibility(self) -> None:
+        class MarketWatchApi:
+            def __init__(self) -> None:
+                self.visible = False
+                self.calls: list[tuple[str, bool]] = []
+
+            def symbol_select(self, symbol: str, visible: bool) -> bool:
+                self.calls.append((symbol, visible))
+                self.visible = visible
+                return True
+
+            def symbol_info(self, symbol: str) -> SimpleNamespace:
+                return SimpleNamespace(name=symbol, visible=self.visible)
+
+            def last_error(self) -> tuple[int, str]:
+                return (0, "ok")
+
+        api = MarketWatchApi()
+        selected = _read_command(build_parser().parse_args(["symbol-select", "SOLUSDC"]), api)
+        hidden = _read_command(build_parser().parse_args(["symbol-hide", "SOLUSDC"]), api)
+
+        self.assertEqual(selected, {"symbol": "SOLUSDC", "visible": True})
+        self.assertEqual(hidden, {"symbol": "SOLUSDC", "visible": False})
+        self.assertEqual(api.calls, [("SOLUSDC", True), ("SOLUSDC", False)])
+
+    def test_symbol_select_reports_mt5_failure(self) -> None:
+        api = SimpleNamespace(
+            symbol_select=lambda symbol, visible: False,
+            last_error=lambda: (-1, "unavailable"),
+        )
+
+        with self.assertRaisesRegex(SessionError, "Unable to add to Market Watch"):
+            _read_command(build_parser().parse_args(["symbol-select", "SOLUSDC"]), api)
 
     def test_market_data_queries_send_user_time_in_the_calibrated_broker_clock(self) -> None:
         captured: list[tuple[object, ...]] = []
