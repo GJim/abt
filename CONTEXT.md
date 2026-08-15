@@ -4,6 +4,45 @@
 
 ## Language
 
+**人工測試 CLI**:
+直接連線至單一已登入 MT5 terminal 的獨立命令列工具，用於人工驗證 MT5 API 行為及交易；可操作模擬或實盤帳戶，不屬於主控台或帳戶工作者，不得承載配對反向避險的生產決策。
+
+**測試 CLI 工作階段**:
+人工測試 CLI 以具名稱的帳戶設定選定並登入 MT5 terminal 後建立的附著狀態；帳戶識別與授權狀態以 `account_info` 即時回傳的登入狀態為唯一權威。
+
+**測試 CLI 帳戶設定**:
+人工測試 CLI 管理的具名稱 MT5 連線設定，至少識別 terminal、登入帳號與伺服器；設定檔置於 CLI 執行檔所在目錄。多個設定可共用同一 terminal，選定設定時 CLI 重新登入該 terminal；帳戶設定本身不等同於 broker 的實際登入狀態。同一 terminal 的操作必須序列化。
+
+**測試 CLI 憑證**:
+人工測試 CLI 在互動登入成功後，將 MT5 密碼存於目前 Windows 使用者的 Windows Credential Manager；帳戶設定只保存其具名稱參照，不得保存明文密碼。
+
+**測試 CLI terminal 生命週期**:
+人工測試 CLI 選定 context 後可啟動其專屬 terminal 並登入。工作階段斷開只關閉 API 連線；停止 terminal 與登出 broker 帳戶是彼此獨立且需明確確認的操作。
+
+**測試 CLI context 切換**:
+多個測試 CLI context 共用 terminal 時，切換前若原帳戶仍有持倉或掛單，CLI 顯示其數量；互動模式要求確認，`--yes` 可略過。切換不會平倉或撤單。
+
+**測試 CLI 寫入確認**:
+人工測試 CLI 的交易、撤單、修改、平倉與 smoke test 等 broker 寫入操作，在互動模式只預覽交易參數並要求使用者回答 yes/no；一次性命令以 `--yes` 確認。
+
+**相對保護價格**:
+人工測試 CLI 以百分比、points 或 pips 表示的停損／停利距離，且可與絕對價格互斥選用。市價單預設依送單前可執行報價直接計算並附帶保護價格；只有明確指定時才以實際成交價為基準，在成交後設定保護。
+
+**測試 CLI context 驗證**:
+人工測試 CLI 每次操作前必須驗證 terminal 的實際登入帳戶與選定 context 的 login/server 一致；不一致時拒絕讀寫，直到重新登入或明確更新 context。
+
+**測試 CLI 時間語意**:
+每個測試 CLI context 保存使用者 IANA 時區；建立時必須明確設定且可後續變更。互動輸入以使用者時區表示，未帶 offset 的 datetime 以該時區解讀，帶 offset 的 ISO-8601 優先；DST 歧義必須拒絕。表格時間以使用者時區的 `YYYY-MM-DD HH:mm:ss` 顯示，JSON 保留 epoch、補充 UTC ISO-8601 欄位及該命令即時觀測的時間來源 metadata。市場資料 offset 依跨日 rotation 與 tick drift 偵測校準。交易寫入成功後，CLI 以該次動作前後可信 UTC 的中點與 broker record 秒級時間計算 trade-record 整秒 offset，保存樣本 ticket、來源、校準 UTC 及誤差；查回失敗不得覆寫舊值。交易紀錄呈現依序使用未過期 offset、過期 offset、UTC；offset 在使用者本地跨日後過期。`context time-status` 必須顯示各 API family 的校準、過期與回退狀態。broker 指定到期以該目標商品可取得的最新 tick server epoch 計算。相對到期時間必須保證不早於指定 duration，broker 正規化後若仍提早則取消掛單並回報失敗。
+
+**測試 CLI read-only 面**:
+人工測試 CLI 第一版提供交易工作流資料、訂單計算與檢查、市場深度與 broker 狀態的查詢命令；不包含 MetaTrader5 的資料庫、圖表或 global variables 等低層 API，也不改變 terminal 的 Market Watch 商品選取狀態。
+
+**測試 CLI 寫入面**:
+人工測試 CLI 以具型別命令支援 market、limit、stop、stop-limit、cancel、modify、close 與 close-by，並提供須明確標示的原生 JSON 請求進階入口；掛單涵蓋 buy/sell limit、buy/sell stop 與 buy/sell stop-limit；所有寫入均遵守相同的確認與 broker 預先檢查。填單模式只支援 FOK、IOC 與 RETURN，不支援 BOC。magic number 與 comment 預設留空，僅在使用者明確傳入時寫入；明確傳入的 comment 超出 broker 上限時拒絕，不得截斷。
+
+**測試 CLI 持倉模型**:
+人工測試 CLI 同時支援 netting 與 hedging 帳戶；依帳戶保證金模式決定持倉操作語意，close-by 只適用於 hedging。平倉預設全數，只有明確指定 volume 時才部分平倉；hedging 以 position ticket 定位，netting 以 symbol 定位唯一持倉。
+
 **配對反向避險**:
 同一交易意圖在兩個平台上建立的相反方向訂單所組成的關係；兩筆訂單共享開倉、調整與平倉的生命週期。
 _Avoid_: 反向訂單

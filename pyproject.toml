@@ -4,5 +4,17 @@ version = "0.0.0"
 description = "Cross-platform MT5 hedge controller experiments"
 requires-python = ">=3.13,<3.14"
 dependencies = [
+    "keyring>=25.7.0",
     "MetaTrader5==5.0.6090",
+    "tzdata>=2026.3",
 ]
+
+[project.scripts]
+abt = "abt.cli:main"
+
+[build-system]
+requires = ["setuptools>=80"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["abt"]

@@ -2,6 +2,15 @@
 .hermes/
 skills-lock.json
 .venv/
+abt.egg-info/
+abt.toml
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+build/
+dist/
 
 # Raw browser/source captures are reproducibility aids, not publishable research.
 .scratch/futures-prop-firm-rules/sources/
