@@ -1,0 +1,27 @@
+:root {
+  --accent: #5b35c9;
+  --bg: #f8f8fb;
+  --border: #d8d8e2;
+  --card: #ffffff;
+  --shadow: 0 0.75rem 2rem rgb(30 20 70 / 12%);
+  --text: #504e5d;
+  --text-h: #1c1a25;
+  color: var(--text);
+  font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+  line-height: 1.5;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  background: var(--bg);
+  margin: 0;
+}
+
+h1 {
+  color: var(--text-h);
+  font-size: 2rem;
+  margin: 0.25rem 0 0.75rem;
+}

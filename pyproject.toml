@@ -4,17 +4,25 @@ version = "0.0.0"
 description = "Cross-platform MT5 hedge controller experiments"
 requires-python = ">=3.13,<3.14"
 dependencies = [
+    "argon2-cffi>=25.1.0",
+    "cryptography>=50.0.0",
+    "duckdb>=1.5.5",
+    "fastapi>=0.141.1",
+    "httpx>=0.28.1",
     "keyring>=25.7.0",
     "MetaTrader5==5.0.6090",
+    "pytz>=2026.3.post1",
     "tzdata>=2026.3",
+    "uvicorn[standard]>=0.52.3",
 ]
 
 [project.scripts]
 abt = "abt.cli:main"
+abt-console = "abt.controlplane.console:main"
 
 [build-system]
 requires = ["setuptools>=80"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["abt"]
+packages = ["abt", "abt.controlplane", "abt.worker"]
