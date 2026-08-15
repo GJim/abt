@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Callable
 
 from fastapi import Cookie, FastAPI, Header, HTTPException, Request, Response, status
 from fastapi.staticfiles import StaticFiles
@@ -37,6 +37,7 @@ def create_app(
     *,
     trusted_proxy_ips: frozenset[str] = frozenset(),
     spa_directory: Path | None = None,
+    secret_control_healthy: Callable[[], bool] = lambda: True,
 ) -> FastAPI:
     ledger = ControlLedger(ledger_path)
 
@@ -47,6 +48,12 @@ def create_app(
 
     app = FastAPI(title="abt control plane", version="0.1.0", lifespan=lifespan)
     app.state.ledger = ledger
+
+    @app.get("/health")
+    def health() -> dict[str, str]:
+        if not secret_control_healthy():
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Secret control plane is unavailable.")
+        return {"status": "ok"}
 
     @app.post("/api/admin/login")
     def login(request: Request, response: Response, body: LoginRequest) -> dict[str, str]:

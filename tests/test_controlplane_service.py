@@ -123,3 +123,17 @@ class ControlPlaneServiceTests(unittest.TestCase):
             self.assertIn("Management access", response.text)
         finally:
             client.close()
+
+    def test_health_requires_the_secret_control_plane(self) -> None:
+        healthy_client = TestClient(
+            create_app(Path(self._directory.name) / "healthy.duckdb", secret_control_healthy=lambda: True)
+        )
+        unhealthy_client = TestClient(
+            create_app(Path(self._directory.name) / "unhealthy.duckdb", secret_control_healthy=lambda: False)
+        )
+        try:
+            self.assertEqual({"status": "ok"}, healthy_client.get("/health").json())
+            self.assertEqual(503, unhealthy_client.get("/health").status_code)
+        finally:
+            healthy_client.close()
+            unhealthy_client.close()

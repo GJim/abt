@@ -1,0 +1,86 @@
+services:
+  controller:
+    build:
+      context: ..
+      dockerfile: deploy/controller.Dockerfile
+    environment:
+      ABT_LEDGER_PATH: /var/lib/abt/ledger.duckdb
+      ABT_SPA_DIRECTORY: /opt/abt/web
+      ABT_TRUSTED_PROXY_IPS: 172.30.0.2
+      ABT_OPENBAO_HEALTH_URL: http://openbao:8200/v1/abt/data/health
+      ABT_OPENBAO_HEALTH_TOKEN: ${ABT_OPENBAO_HEALTH_TOKEN:?Set ABT_OPENBAO_HEALTH_TOKEN}
+    depends_on:
+      - openbao
+    volumes:
+      - controller_ledger:/var/lib/abt
+    healthcheck:
+      test: ["CMD", "python", "-c", "from urllib.request import urlopen; urlopen('http://localhost:8000/health', timeout=2)"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+    networks:
+      - ingress
+      - secrets
+
+  openbao:
+    build:
+      context: ..
+      dockerfile: deploy/openbao.Dockerfile
+    command: server -config=/etc/openbao/openbao.hcl
+    environment:
+      BAO_ADDR: http://127.0.0.1:8200
+      BAO_HSM_PIN: ${OPENBAO_PKCS11_PIN:?Set OPENBAO_PKCS11_PIN}
+    healthcheck:
+      test: ["CMD-SHELL", "bao status >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    volumes:
+      - ./openbao.hcl:/etc/openbao/openbao.hcl:ro
+      - openbao_raft:/var/lib/openbao
+      - softhsm_tokens:/var/lib/softhsm/tokens
+    networks:
+      - secrets
+      - hsm
+      - plugin-registry
+
+  softhsm:
+    build:
+      context: ..
+      dockerfile: deploy/softhsm.Dockerfile
+    volumes:
+      - softhsm_tokens:/var/lib/softhsm/tokens
+    environment:
+      SOFTHSM_TOKEN_LABEL: abt-openbao
+      SOFTHSM_SO_PIN: ${SOFTHSM_SO_PIN:?Set SOFTHSM_SO_PIN}
+      SOFTHSM_USER_PIN: ${OPENBAO_PKCS11_PIN:?Set OPENBAO_PKCS11_PIN}
+    networks:
+      - hsm
+
+  cloudflared:
+    image: cloudflare/cloudflared:2025.2.1
+    command: tunnel --no-autoupdate run
+    depends_on:
+      - controller
+    volumes:
+      - cloudflared_credentials:/etc/cloudflared
+    networks:
+      ingress:
+        ipv4_address: 172.30.0.2
+
+networks:
+  ingress:
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+  secrets:
+    internal: true
+  hsm:
+    internal: true
+  plugin-registry: {}
+
+volumes:
+  controller_ledger:
+  openbao_raft:
+  softhsm_tokens:
+  cloudflared_credentials:

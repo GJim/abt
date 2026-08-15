@@ -10,7 +10,7 @@ dependencies = [
     "fastapi>=0.141.1",
     "httpx>=0.28.1",
     "keyring>=25.7.0",
-    "MetaTrader5==5.0.6090",
+    "MetaTrader5==5.0.6090 ; sys_platform == 'win32'",
     "pytz>=2026.3.post1",
     "tzdata>=2026.3",
     "uvicorn[standard]>=0.52.3",
