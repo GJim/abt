@@ -53,7 +53,8 @@ After the controller health endpoint reports `{"status":"ok"}`, create the
 one-time administrator credentials on the console host:
 
 ```bash
-docker compose --env-file deploy/.env -f deploy/docker-compose.yml exec controller abt-console create-admin
+docker compose --env-file deploy/.env -f deploy/docker-compose.yml exec controller \
+  abt-console create-admin
 ```
 
 Store the generated credentials in a password manager; the password is not

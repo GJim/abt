@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import secrets
 import string
 from pathlib import Path
@@ -15,7 +16,7 @@ _PASSWORD_ALPHABET = string.ascii_letters + string.digits + "!@#$"
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="abt-console")
-    parser.add_argument("--ledger", type=Path, required=True)
+    parser.add_argument("--ledger", type=Path, default=Path(os.environ.get("ABT_LEDGER_PATH", "ledger.duckdb")))
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("create-admin")
     reset = commands.add_parser("reset-password")

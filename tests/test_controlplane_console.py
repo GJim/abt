@@ -6,12 +6,23 @@ import unittest
 from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
+from unittest.mock import patch
 
 from abt.controlplane.console import main
 from abt.controlplane.ledger import ControlLedger
 
 
 class ControlPlaneConsoleTests(unittest.TestCase):
+    def test_create_admin_uses_the_configured_default_ledger(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            ledger_path = Path(directory) / "ledger.duckdb"
+            output = StringIO()
+            with patch.dict("os.environ", {"ABT_LEDGER_PATH": str(ledger_path)}), redirect_stdout(output):
+                self.assertEqual(0, main(["create-admin"]))
+
+            self.assertTrue(ledger_path.exists())
+            self.assertIn("username=", output.getvalue())
+
     def test_create_admin_generates_login_credentials_once(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             ledger_path = Path(directory) / "ledger.duckdb"
