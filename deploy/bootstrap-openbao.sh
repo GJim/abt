@@ -68,7 +68,7 @@ import sys
 values = json.load(sys.stdin)
 for index, key in enumerate(values["recovery_keys_b64"], 1):
     print(f"Recovery Key {index}: {key}")
-print(f"\nInitial Root Token: {values['root_token']}")
+print("\nInitial Root Token: {}".format(values["root_token"]))
 ' <"${init_file}" >&2
 
 bao() {
