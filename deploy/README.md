@@ -42,20 +42,19 @@ sudo ./deploy/bootstrap-openbao.sh
 
 The script waits for SoftHSM to create the `abt-root` seal key, initializes
 only an uninitialized OpenBao instance, creates the required KV-v2/Transit
-mounts and least-privilege policies, and writes health/controller tokens to
-`deploy/.env`. It prints recovery keys and the initial root token once; store
-them offline and never add them to `.env`, Git, or shell history. It refuses
-to run against initialized OpenBao state.
+mounts and least-privilege policies, writes health/controller tokens to
+`deploy/.env`, creates the one-time administrator before the controller owns
+the DuckDB ledger, and starts the controller. It prints recovery keys, the
+initial root token, and administrator credentials once; store them offline
+and never add them to `.env`, Git, or shell history. It refuses to run against
+initialized OpenBao state.
 
 ## First administrator
 
-After the controller health endpoint reports `{"status":"ok"}`, create the
-one-time administrator credentials on the console host:
-
-```bash
-docker compose --env-file deploy/.env -f deploy/docker-compose.yml exec controller \
-  abt-console create-admin
-```
+`bootstrap-openbao.sh` creates the one-time administrator before the
+controller starts and prints its credentials once. Do not run `abt-console`
+against an active controller ledger: DuckDB has a single-writer boundary and
+the controller holds its lock.
 
 Store the generated credentials in a password manager; the password is not
 shown again.

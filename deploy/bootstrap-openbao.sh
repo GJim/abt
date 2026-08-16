@@ -126,4 +126,7 @@ os.chmod(path, 0o600)
 PYTHON
 
 unset root_token health_token controller_token
-printf '\nBootstrap complete. Start the full stack with:\n  docker compose --env-file deploy/.env -f deploy/docker-compose.yml up -d --build\n'
+printf '\nCreating the one-time administrator credentials:\n\n'
+"${compose[@]}" run --rm --no-deps controller abt-console create-admin
+"${compose[@]}" up -d --build controller
+printf '\nBootstrap complete. Configure ABT_CLOUDFLARE_TUNNEL_TOKEN in %s, then start cloudflared:\n  docker compose --env-file %s -f deploy/docker-compose.yml up -d cloudflared\n' "${env_file}" "${env_file}"
