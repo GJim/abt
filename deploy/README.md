@@ -5,6 +5,18 @@ Cloudflare Tunnel is the sole ingress to the controller. The controller accepts
 `CF-Connecting-IP` only from the fixed `cloudflared` container address
 `172.30.0.2`; do not attach another service to the ingress network.
 
+Create a remotely managed Cloudflare Tunnel and configure its public hostname
+to route to `http://controller:8000`. Store its rotated tunnel token only in
+the root-readable `deploy/.env`:
+
+```dotenv
+ABT_CLOUDFLARE_TUNNEL_TOKEN=<rotated-token>
+```
+
+Compose supplies it as `TUNNEL_TOKEN` to cloudflared. Never put the token in a
+Compose command, Git, terminal history, or support transcript; rotate it
+immediately if exposed.
+
 Set `OPENBAO_PKCS11_PIN` and `SOFTHSM_SO_PIN` in the host environment before
 running `docker compose up`. They initialize and unlock the SoftHSM token; keep
 them out of source control and shell history. The controller reports unhealthy
@@ -46,7 +58,6 @@ Persistent volumes have separate ownership and backup boundaries:
 | `controller_ledger` | controller | DuckDB control-plane ledger |
 | `openbao_raft` | OpenBao | encrypted OpenBao Raft data |
 | `softhsm_tokens` | SoftHSM/OpenBao | PKCS#11 token material |
-| `cloudflared_credentials` | cloudflared | Tunnel credentials |
 | `controller_backups` | controller | 24 local complete restore sets |
 
 Back up each volume as a distinct encrypted artifact. A restore must restore

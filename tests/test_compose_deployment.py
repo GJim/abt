@@ -34,18 +34,22 @@ class ComposeDeploymentTests(unittest.TestCase):
             services["controller"]["healthcheck"]["test"],
         )
         self.assertNotIn("ABT_OPENBAO_HEALTH_URL", services["cloudflared"].get("environment", {}))
+        self.assertEqual(
+            "${ABT_CLOUDFLARE_TUNNEL_TOKEN:?Set ABT_CLOUDFLARE_TUNNEL_TOKEN}",
+            services["cloudflared"]["environment"]["TUNNEL_TOKEN"],
+        )
 
     def test_sensitive_state_uses_distinct_persistent_volumes(self) -> None:
         volumes = self.compose["volumes"]
         self.assertEqual(
-            {"controller_ledger", "openbao_raft", "softhsm_tokens", "cloudflared_credentials", "controller_backups"},
+            {"controller_ledger", "openbao_raft", "softhsm_tokens", "controller_backups"},
             set(volumes),
         )
         services = self.compose["services"]
         self.assertIn("controller_ledger:/var/lib/abt", services["controller"]["volumes"])
         self.assertIn("openbao_raft:/var/lib/openbao", services["openbao"]["volumes"])
         self.assertIn("softhsm_tokens:/var/lib/softhsm/tokens", services["openbao"]["volumes"])
-        self.assertIn("cloudflared_credentials:/etc/cloudflared", services["cloudflared"]["volumes"])
+        self.assertNotIn("volumes", services["cloudflared"])
         self.assertIn("controller_backups:/var/backups/abt", services["controller"]["volumes"])
         self.assertIn("openbao_raft:/backup-source/openbao-raft:ro", services["controller"]["volumes"])
         self.assertIn("softhsm_tokens:/backup-source/softhsm-tokens:ro", services["controller"]["volumes"])
@@ -53,7 +57,7 @@ class ComposeDeploymentTests(unittest.TestCase):
         self.assertIn("controller_ledger", deployment_guide)
         self.assertIn("openbao_raft", deployment_guide)
         self.assertIn("softhsm_tokens", deployment_guide)
-        self.assertIn("cloudflared_credentials", deployment_guide)
+        self.assertIn("ABT_CLOUDFLARE_TUNNEL_TOKEN", deployment_guide)
 
     def test_openbao_auto_unseal_plugin_is_version_and_digest_pinned(self) -> None:
         self.assertEqual(
