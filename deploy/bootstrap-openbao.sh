@@ -3,7 +3,7 @@ set -euo pipefail
 
 readonly deploy_directory="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly compose_file="${deploy_directory}/docker-compose.yml"
-readonly env_file="${deploy_directory}/.env"
+readonly env_file="${ABT_ENV_FILE:-${deploy_directory}/.env}"
 readonly init_file="$(mktemp)"
 
 cleanup() {
@@ -34,7 +34,21 @@ if ! "${compose[@]}" exec -T softhsm sh -c \
   exit 1
 fi
 
-status="$("${compose[@]}" exec -T openbao bao status -format=json || true)"
+status=""
+for _ in {1..30}; do
+  candidate="$("${compose[@]}" exec -T openbao bao status -format=json 2>/dev/null || true)"
+  if python3 -c 'import json, sys; json.load(sys.stdin)' <<<"${candidate}" >/dev/null 2>&1; then
+    status="${candidate}"
+    break
+  fi
+  sleep 2
+done
+
+if [[ -z "${status}" ]]; then
+  printf 'OpenBao API did not become ready; inspect its logs before retrying.\n' >&2
+  exit 1
+fi
+
 initialized="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["initialized"])' <<<"${status}")"
 if [[ "${initialized}" != "False" ]]; then
   printf 'OpenBao is already initialized; refusing to replace existing credentials.\n' >&2
