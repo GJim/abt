@@ -25,10 +25,6 @@ class AuthenticationError(LedgerError):
     """Raised when an administrator cannot be authenticated."""
 
 
-class IpLockedError(AuthenticationError):
-    """Raised when the source IP has exhausted its login attempts."""
-
-
 @dataclass(frozen=True)
 class AdminSession:
     token: str
@@ -111,17 +107,9 @@ class ControlLedger:
             self._connection.execute("DELETE FROM admin_sessions WHERE username = ?", [username])
             self._event("admin_password_reset", {"username": username})
 
-    def authenticate_admin(self, username: str, password: str, source_ip: str) -> AdminSession:
+    def authenticate_admin(self, username: str, password: str) -> AdminSession:
         now = _utc_now()
         with self._transaction():
-            lock = self._connection.execute(
-                "SELECT 1 FROM ip_locks WHERE source_ip = ?",
-                [source_ip],
-            ).fetchone()
-            if lock is not None:
-                self._event("admin_login_rejected_locked_ip", {"username": username, "source_ip": source_ip})
-                raise IpLockedError("This IP address is locked.")
-
             row = self._connection.execute(
                 "SELECT password_hash FROM admins WHERE username = ?",
                 [username],
@@ -133,21 +121,9 @@ class ControlLedger:
                 except (InvalidHashError, VerifyMismatchError):
                     verified = False
             if not verified:
-                attempts = self._record_login_failure(source_ip, now)
-                self._event(
-                    "admin_login_failed",
-                    {"username": username, "source_ip": source_ip, "attempts": attempts},
-                )
-                if attempts >= 3:
-                    self._connection.execute(
-                        "INSERT INTO ip_locks (source_ip, locked_at) VALUES (?, ?)",
-                        [source_ip, now],
-                    )
-                    self._event("admin_ip_locked", {"source_ip": source_ip})
-                    raise IpLockedError("This IP address is locked.")
+                self._event("admin_login_failed", {"username": username})
                 raise AuthenticationError("Invalid administrator credentials.")
 
-            self._connection.execute("DELETE FROM login_failures WHERE source_ip = ?", [source_ip])
             token = secrets.token_urlsafe(32)
             csrf_token = secrets.token_urlsafe(32)
             expires_at = now + timedelta(hours=8)
@@ -158,14 +134,8 @@ class ControlLedger:
                 """,
                 [_hash(token), username, _hash(csrf_token), now, now, expires_at],
             )
-            self._event("admin_login_succeeded", {"username": username, "source_ip": source_ip})
+            self._event("admin_login_succeeded", {"username": username})
             return AdminSession(token, csrf_token, expires_at)
-
-    def unlock_ip(self, source_ip: str) -> None:
-        with self._transaction():
-            self._connection.execute("DELETE FROM ip_locks WHERE source_ip = ?", [source_ip])
-            self._connection.execute("DELETE FROM login_failures WHERE source_ip = ?", [source_ip])
-            self._event("admin_ip_unlocked", {"source_ip": source_ip})
 
     def logout_admin(self, token: str) -> None:
         with self._transaction():
@@ -210,7 +180,6 @@ class ControlLedger:
         server: str,
         pairing_code: str,
         public_key_pem: str,
-        source_ip: str,
         account_info: dict[str, object],
         terminal_info: dict[str, object],
         password_secret_ref: str,
@@ -242,7 +211,7 @@ class ControlLedger:
                     server,
                     pairing_code,
                     public_key_pem,
-                    source_ip,
+                    "not-collected",
                     json.dumps(account_info, sort_keys=True),
                     json.dumps(terminal_info, sort_keys=True),
                     password_secret_ref,
@@ -252,7 +221,7 @@ class ControlLedger:
             )
             self._event(
                 "worker_enrollment_requested",
-                {"enrollment_id": enrollment.enrollment_id, "login": login, "server": server, "source_ip": source_ip},
+                {"enrollment_id": enrollment.enrollment_id, "login": login, "server": server},
             )
         return enrollment
 
@@ -280,28 +249,6 @@ class ControlLedger:
         ).fetchone()
         if consumed is None:
             raise LedgerError("Enrollment challenge is invalid, expired, or already used.")
-
-    def record_registration_attempt(self, source_ip: str) -> None:
-        now = _utc_now()
-        with self._transaction():
-            self._connection.execute(
-                "DELETE FROM registration_attempts WHERE attempted_at < ?",
-                [now - timedelta(hours=1)],
-            )
-            recent = self._connection.execute(
-                "SELECT count(*) FROM registration_attempts WHERE source_ip = ? AND attempted_at >= ?",
-                [source_ip, now - timedelta(minutes=15)],
-            ).fetchone()[0]
-            hourly = self._connection.execute(
-                "SELECT count(*) FROM registration_attempts WHERE source_ip = ?",
-                [source_ip],
-            ).fetchone()[0]
-            if recent >= 3 or hourly >= 10:
-                raise LedgerError("Worker registration rate limit exceeded.")
-            self._connection.execute(
-                "INSERT INTO registration_attempts (source_ip, attempted_at) VALUES (?, ?)",
-                [source_ip, now],
-            )
 
     def approve_enrollment(
         self,
@@ -633,7 +580,7 @@ class ControlLedger:
         with self._transaction():
             rows = self._connection.execute(
                 """
-                SELECT enrollment_id, login, server, pairing_code, source_ip, account_info, terminal_info, created_at, expires_at
+                SELECT enrollment_id, login, server, pairing_code, account_info, terminal_info, created_at, expires_at
                 FROM enrollments WHERE status = 'pending' ORDER BY created_at
                 """
             ).fetchall()
@@ -643,11 +590,10 @@ class ControlLedger:
                     "login": row[1],
                     "server": row[2],
                     "pairing_code": row[3],
-                    "source_ip": row[4],
-                    "account_info": json.loads(row[5]),
-                    "terminal_info": json.loads(row[6]),
-                    "created_at": row[7],
-                    "expires_at": row[8],
+                    "account_info": json.loads(row[4]),
+                    "terminal_info": json.loads(row[5]),
+                    "created_at": row[6],
+                    "expires_at": row[7],
                 }
                 for row in rows
             ]
@@ -661,21 +607,6 @@ class ControlLedger:
             {"event_id": row[0], "event_type": row[1], "payload": json.loads(row[2]), "occurred_at": row[3]}
             for row in rows
         ]
-
-    def _record_login_failure(self, source_ip: str, now: datetime) -> int:
-        row = self._connection.execute(
-            "SELECT attempts FROM login_failures WHERE source_ip = ?",
-            [source_ip],
-        ).fetchone()
-        attempts = 1 if row is None else row[0] + 1
-        self._connection.execute(
-            """
-            INSERT INTO login_failures (source_ip, attempts, updated_at) VALUES (?, ?, ?)
-            ON CONFLICT (source_ip) DO UPDATE SET attempts = excluded.attempts, updated_at = excluded.updated_at
-            """,
-            [source_ip, attempts, now],
-        )
-        return attempts
 
     def _event(self, event_type: str, payload: dict[str, Any]) -> None:
         self._connection.execute(

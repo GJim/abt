@@ -93,8 +93,8 @@ class TwoWorkerReleaseExerciseTests(unittest.TestCase):
             )
             with TestClient(app, base_url="https://console.example") as client:
                 app.state.ledger.create_admin("ABCDEF", "A-secure-admin-password!")
-                first_key, first_enrollment = self._enroll(client, 123456, "198.51.100.10")
-                second_key, second_enrollment = self._enroll(client, 654321, "203.0.113.20")
+                first_key, first_enrollment = self._enroll(client, 123456)
+                second_key, second_enrollment = self._enroll(client, 654321)
                 login = client.post(
                     "/api/admin/login", json={"username": "ABCDEF", "password": "A-secure-admin-password!"}
                 )
@@ -126,7 +126,7 @@ class TwoWorkerReleaseExerciseTests(unittest.TestCase):
                 self.assertEqual("revoked", workers[first_worker]["connectivity"])
                 self.assertEqual("connected", workers[second_worker]["connectivity"])
 
-    def _enroll(self, client: TestClient, login: int, source_ip: str) -> tuple[ec.EllipticCurvePrivateKey, str]:
+    def _enroll(self, client: TestClient, login: int) -> tuple[ec.EllipticCurvePrivateKey, str]:
         private_key = ec.generate_private_key(ec.SECP256R1())
         public_key = private_key.public_key().public_bytes(
             serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
@@ -141,7 +141,6 @@ class TwoWorkerReleaseExerciseTests(unittest.TestCase):
         )
         response = client.post(
             "/api/enrollments",
-            headers={"CF-Connecting-IP": source_ip},
             json={
                 "login": login, "server": "Broker-Demo", "pairing_code": "12345678", "account_info": account,
                 "terminal_info": terminal, "mt5_password": password, "enrollment_challenge": challenge,

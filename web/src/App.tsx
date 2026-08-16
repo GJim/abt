@@ -19,7 +19,6 @@ type Enrollment = {
   login: number
   server: string
   pairing_code: string
-  source_ip: string
   created_at: string
   expires_at: string
   account_info: EnrollmentEvidence
@@ -204,7 +203,6 @@ function App() {
                         <div><dt>Login</dt><dd>{enrollment.login}</dd></div>
                         <div><dt>Server</dt><dd>{enrollment.server}</dd></div>
                         <div><dt>Pairing code</dt><dd>{enrollment.pairing_code}</dd></div>
-                        <div><dt>Source IP</dt><dd>{enrollment.source_ip}</dd></div>
                         <div><dt>Created</dt><dd><time dateTime={enrollment.created_at}>{enrollment.created_at}</time></dd></div>
                         <div><dt>Expires</dt><dd><time dateTime={enrollment.expires_at}>{enrollment.expires_at}</time></dd></div>
                       </dl>

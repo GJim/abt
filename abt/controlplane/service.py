@@ -8,13 +8,13 @@ import secrets
 from typing import Annotated, Callable, cast
 from uuid import uuid4
 
-from fastapi import Cookie, FastAPI, Header, HTTPException, Request, Response, WebSocket, WebSocketDisconnect, status
+from fastapi import Cookie, FastAPI, Header, HTTPException, Response, WebSocket, WebSocketDisconnect, status
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
 from .backup import BackupManager
 from .crypto import ProofError, parse_device_certificate, verify_enrollment_proof, verify_worker_proof
-from .ledger import AuthenticationError, ControlLedger, IpLockedError, LedgerError
+from .ledger import AuthenticationError, ControlLedger, LedgerError
 from .secrets import DeviceCertificateIssuer, DeviceCertificateVerifier, SecretStore, SecretStoreError
 
 _LOGGER = logging.getLogger(__name__)
@@ -47,7 +47,6 @@ class EnrollmentRequest(BaseModel):
 def create_app(
     ledger_path: Path,
     *,
-    trusted_proxy_ips: frozenset[str] = frozenset(),
     spa_directory: Path | None = None,
     secret_control_healthy: Callable[[], bool] = lambda: True,
     secret_store: SecretStore | None = None,
@@ -100,11 +99,9 @@ def create_app(
         return {"status": "ok"}
 
     @app.post("/api/admin/login")
-    def login(request: Request, response: Response, body: LoginRequest) -> dict[str, str]:
+    def login(response: Response, body: LoginRequest) -> dict[str, str]:
         try:
-            session = ledger.authenticate_admin(body.username, body.password, _source_ip(request, trusted_proxy_ips))
-        except IpLockedError as error:
-            raise HTTPException(status_code=status.HTTP_423_LOCKED, detail=str(error)) from error
+            session = ledger.authenticate_admin(body.username, body.password)
         except AuthenticationError as error:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(error)) from error
         response.set_cookie(
@@ -118,10 +115,8 @@ def create_app(
         return {"csrf_token": session.csrf_token, "expires_at": session.expires_at.isoformat()}
 
     @app.post("/api/enrollments", status_code=status.HTTP_201_CREATED)
-    def create_enrollment(request: Request, body: EnrollmentRequest) -> dict[str, str]:
-        source_ip = _source_ip(request, trusted_proxy_ips)
+    def create_enrollment(body: EnrollmentRequest) -> dict[str, str]:
         try:
-            ledger.record_registration_attempt(source_ip)
             verify_enrollment_proof(
                 body.public_key_pem,
                 body.proof_signature,
@@ -143,7 +138,6 @@ def create_app(
                     server=body.server,
                     pairing_code=body.pairing_code,
                     public_key_pem=body.public_key_pem,
-                    source_ip=source_ip,
                     account_info=body.account_info,
                     terminal_info=body.terminal_info,
                     password_secret_ref=secret_ref,
@@ -156,12 +150,7 @@ def create_app(
         except ProofError as error:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(error)) from error
         except LedgerError as error:
-            status_code = (
-                status.HTTP_429_TOO_MANY_REQUESTS
-                if str(error) == "Worker registration rate limit exceeded."
-                else status.HTTP_409_CONFLICT
-            )
-            raise HTTPException(status_code=status_code, detail=str(error)) from error
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
         except SecretStoreError as error:
             raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(error)) from error
 
@@ -447,15 +436,6 @@ def _delete_expired_pending_secrets(ledger: ControlLedger, secret_store: SecretS
     for secret_ref in ledger.expire_pending_enrollments():
         secret_store.delete_password(secret_ref)
         ledger.mark_pending_password_deleted(secret_ref)
-
-
-def _source_ip(request: Request, trusted_proxy_ips: frozenset[str]) -> str:
-    cloudflare_ip = request.headers.get("cf-connecting-ip")
-    if cloudflare_ip and request.client is not None and request.client.host in trusted_proxy_ips:
-        return cloudflare_ip
-    if request.client is None:
-        return "unknown"
-    return request.client.host
 
 
 def _require_admin(

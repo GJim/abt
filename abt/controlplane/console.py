@@ -21,8 +21,6 @@ def build_parser() -> argparse.ArgumentParser:
     commands.add_parser("create-admin")
     reset = commands.add_parser("reset-password")
     reset.add_argument("username", type=_username)
-    unlock = commands.add_parser("unlock-ip")
-    unlock.add_argument("source_ip")
     backup = commands.add_parser("backup")
     backup.add_argument("--backup-directory", type=Path, required=True)
     backup.add_argument("--openbao-raft", type=Path, required=True)
@@ -50,8 +48,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             ledger.reset_admin_password(args.username, password)
             print(f"username={args.username}")
             print(f"password={password}")
-        elif args.command == "unlock-ip":
-            ledger.unlock_ip(args.source_ip)
         elif args.command == "backup":
             backup_set = BackupManager(
                 ledger, args.backup_directory, args.openbao_raft, args.softhsm_tokens

@@ -188,7 +188,7 @@ class ControlPlaneServiceTests(unittest.TestCase):
         self.assertEqual(204, logout_response.status_code)
         self.assertEqual(401, self.client.get("/api/admin/events").status_code)
 
-    def test_untrusted_client_cannot_choose_its_ip_lock_key(self) -> None:
+    def test_login_does_not_apply_an_ip_lock_to_proxied_requests(self) -> None:
         for source_ip in ("198.51.100.1", "198.51.100.2"):
             response = self.client.post(
                 "/api/admin/login",
@@ -201,7 +201,7 @@ class ControlPlaneServiceTests(unittest.TestCase):
             headers={"CF-Connecting-IP": "198.51.100.3"},
             json={"username": "ABCDEF", "password": "wrong-password-is-long-enough"},
         )
-        self.assertEqual(423, response.status_code)
+        self.assertEqual(401, response.status_code)
 
     def test_controller_can_serve_the_same_origin_spa(self) -> None:
         web_directory = Path(self._directory.name) / "web"
@@ -414,7 +414,7 @@ class ControlPlaneServiceTests(unittest.TestCase):
         self.assertEqual({"balance": 1000}, workers[0]["latest_snapshot"]["account"])
         self.assertEqual(["volume_changed", "modified"], [delta["change"] for delta in workers[0]["deltas"]])
 
-    def test_enrollment_rate_limit_rejects_the_fourth_attempt_in_fifteen_minutes(self) -> None:
+    def test_enrollment_does_not_apply_a_client_ip_rate_limit(self) -> None:
         private_key = ec.generate_private_key(ec.SECP256R1())
         public_key_pem = private_key.public_key().public_bytes(
             serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
@@ -426,10 +426,7 @@ class ControlPlaneServiceTests(unittest.TestCase):
                 201,
                 self._enrollment_response(private_key, public_key_pem, account_info, terminal_info).status_code,
             )
-        self.assertEqual(
-            429,
-            self._enrollment_response(private_key, public_key_pem, account_info, terminal_info).status_code,
-        )
+        self.assertEqual(201, self._enrollment_response(private_key, public_key_pem, account_info, terminal_info).status_code)
 
     def test_rejection_deletes_the_pending_password_secret(self) -> None:
         enrollment_id = self._create_pending_enrollment()

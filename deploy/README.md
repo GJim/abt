@@ -2,8 +2,9 @@
 
 Start this topology only on the console host. Docker publishes no service ports:
 Cloudflare Tunnel is the sole ingress to the controller. The controller accepts
-`CF-Connecting-IP` only from the fixed `cloudflared` container address
-`172.30.0.2`; do not attach another service to the ingress network.
+requests only through the fixed `cloudflared` container address `172.30.0.2`;
+do not attach another service to the ingress network. The controller does not
+trust or store client-IP forwarding headers.
 
 Create a remotely managed Cloudflare Tunnel and configure its public hostname
 to route to `http://controller:8000`. Store its rotated tunnel token only in

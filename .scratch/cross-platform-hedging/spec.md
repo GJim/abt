@@ -24,9 +24,9 @@ Status: ready-for-agent
 10. As a platform operator, I want hosts without a supported CNG/TPM/PKCS#11 keystore rejected as workers, so that software key-file fallback does not silently weaken the model.
 11. As a worker, I want my initial password handoff and actual MT5 evidence bound to my hardware public key, so that another host cannot replay my registration.
 12. As a worker, I want to submit actual MT5 `account_info`, `terminal_info`, my P-256 public key and an eight-digit pairing code during registration, and display the same evidence locally, so that the management site and operator have evidence to review.
-13. As a 主控台管理員, I want to compare a worker’s pairing code, observed source and actual broker account before approval, so that I approve the intended host and account.
+13. As a 主控台管理員, I want to compare a worker’s pairing code and actual broker account before approval, so that I approve the intended host and account.
 14. As a 主控台管理員, I want pending worker registrations to expire after 15 minutes and rejected registrations to stay rejected, so that stale approvals cannot be reused.
-15. As a public service operator, I want worker registration rate-limited per Cloudflare client IP, so that pending-registration storage cannot be exhausted by unauthenticated traffic.
+15. As a public service operator, I want ingress-level protection against registration abuse without trusting or storing forwarded client IP addresses, so that pending-registration storage cannot be exhausted by unauthenticated traffic.
 16. As a 主控台管理員, I want one active 帳戶工作者 per MT5 login/server pair, so that two workers never control or observe the same transaction account concurrently.
 17. As a worker, I want to receive an approved 裝置憑證 only after my public key and actual account have been reviewed, so that the WSS service can identify me as a specific worker.
 18. As a worker, I want to prove possession of my ECDSA P-256 hardware key during WSS connection and rotation, so that a public certificate alone cannot authenticate a host.
@@ -85,8 +85,8 @@ Status: ready-for-agent
 
 - The highest testing seam is the observable console REST/WSS contract plus a real native-worker adapter. Tests must assert user-visible authorization, state transitions, events, reconciliation and absence of broker writes, not DuckDB SQL layout or private methods.
 - Existing tests use Python `unittest`; new control-plane tests follow this style and use temporary isolated storage and API test clients.
-- Unit tests cover ledger transactions, generated administrator credentials, Argon2id/session expiry, CSRF enforcement, IP lock/unlock, one-account/one-active-worker enforcement, enrollment expiry/rejection, certificate/rotation validation and immutable event creation.
-- API contract tests cover signed P-256 registration, local-only administrative recovery paths, approval/rejection, WSS authentication, credential mediation authorization and rate-limit responses.
+- Unit tests cover ledger transactions, generated administrator credentials, Argon2id/session expiry, CSRF enforcement, one-account/one-active-worker enforcement, enrollment expiry/rejection, certificate/rotation validation and immutable event creation.
+- API contract tests cover signed P-256 registration, approval/rejection, WSS authentication, and credential mediation authorization.
 - Worker-adapter contract tests run the same high-level enrollment and reconciliation scenarios against CNG and TPM/PKCS#11 implementations where the platform supports them; unsupported keystores must fail closed.
 - Reconciliation tests assert one-minute poll scheduling, ten-minute full snapshots, cursor continuity over reconnect and immediate deltas only for order/position lifecycle changes.
 - Failure tests simulate terminal loss, MT5 API error, account mismatch, WSS loss, credential revocation and external broker change. They assert bounded retries, alerts, frozen/needs-human states and no broker write invocation.

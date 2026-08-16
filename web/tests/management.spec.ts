@@ -48,6 +48,7 @@ test('administrator can sign in and view audit events', async ({ page }) => {
 test('administrator can review and approve a pending worker registration', async ({ page }) => {
   let enrollmentRequests = 0
 
+  await page.setViewportSize({ width: 900, height: 800 })
   await page.route('**/api/admin/login', async (route) => {
     await route.fulfill({
       contentType: 'application/json',
@@ -77,7 +78,6 @@ test('administrator can review and approve a pending worker registration', async
             login: 12345678,
             server: 'Broker-Demo',
             pairing_code: '87654321',
-            source_ip: '192.0.2.40',
             created_at: '2026-08-15T00:00:00Z',
             expires_at: '2026-08-15T00:15:00Z',
             account_info: {
@@ -108,11 +108,22 @@ test('administrator can review and approve a pending worker registration', async
   await expect(page.getByText('12345678')).toBeVisible()
   await expect(page.getByText('Broker-Demo')).toBeVisible()
   await expect(page.getByText('87654321')).toBeVisible()
-  await expect(page.getByText('192.0.2.40')).toBeVisible()
   await expect(page.getByRole('region', { name: 'Account information for 12345678 on Broker-Demo' })
     .getByText('"currency": "USD"')).toBeVisible()
   await expect(page.getByRole('region', { name: 'Terminal information for 12345678 on Broker-Demo' })
     .getByText('"platform": "MetaTrader 5"')).toBeVisible()
+  const enrollment = page.getByRole('listitem').filter({ hasText: '12345678' })
+  const metadata = enrollment.locator('dl')
+  const evidence = enrollment.locator('.enrollment-evidence')
+  const actions = enrollment.locator('.enrollment-actions')
+  const metadataBox = await metadata.boundingBox()
+  const evidenceBox = await evidence.boundingBox()
+  const actionsBox = await actions.boundingBox()
+  expect(metadataBox).not.toBeNull()
+  expect(evidenceBox).not.toBeNull()
+  expect(actionsBox).not.toBeNull()
+  expect(evidenceBox!.y).toBeGreaterThan(metadataBox!.y + metadataBox!.height)
+  expect(actionsBox!.y).toBeGreaterThan(evidenceBox!.y + evidenceBox!.height)
   await page.getByRole('button', { name: 'Approve registration for 12345678 on Broker-Demo' }).click()
 
   await expect(page.getByText('No worker registrations are awaiting review.')).toBeVisible()

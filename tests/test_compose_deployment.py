@@ -23,7 +23,7 @@ class ComposeDeploymentTests(unittest.TestCase):
         self.assertEqual({"hsm"}, set(services["softhsm"]["networks"]))
         self.assertEqual({"openbao"}, {name for name, service in services.items() if "plugin-registry" in service["networks"]})
         self.assertEqual("172.30.0.2", services["cloudflared"]["networks"]["ingress"]["ipv4_address"])
-        self.assertEqual("172.30.0.2", services["controller"]["environment"]["ABT_TRUSTED_PROXY_IPS"])
+        self.assertNotIn("ABT_TRUSTED_PROXY_IPS", services["controller"]["environment"])
         self.assertEqual("http://openbao:8200/v1/abt/data/health", services["controller"]["environment"]["ABT_OPENBAO_HEALTH_URL"])
         self.assertEqual(
             "${ABT_OPENBAO_HEALTH_TOKEN:?Set ABT_OPENBAO_HEALTH_TOKEN}",

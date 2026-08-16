@@ -35,7 +35,7 @@ class ControlPlaneConsoleTests(unittest.TestCase):
             assert match is not None
             ledger = ControlLedger(ledger_path)
             try:
-                session = ledger.authenticate_admin(match.group(1), match.group(2), "203.0.113.10")
+                session = ledger.authenticate_admin(match.group(1), match.group(2))
                 self.assertTrue(session.token)
             finally:
                 ledger.close()

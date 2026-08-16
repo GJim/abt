@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from abt.controlplane.ledger import AuthenticationError, ControlLedger, IpLockedError, LedgerError
+from abt.controlplane.ledger import AuthenticationError, ControlLedger, LedgerError
 
 
 class ControlLedgerTests(unittest.TestCase):
@@ -16,19 +16,14 @@ class ControlLedgerTests(unittest.TestCase):
         self.ledger.close()
         self._directory.cleanup()
 
-    def test_locks_an_ip_after_three_failed_logins_until_cli_unlock(self) -> None:
+    def test_repeated_failed_logins_do_not_lock_an_ip(self) -> None:
         self.ledger.create_admin("ABCDEF", "long-admin-password")
 
-        for _ in range(2):
+        for _ in range(3):
             with self.assertRaises(AuthenticationError):
-                self.ledger.authenticate_admin("ABCDEF", "wrong", "203.0.113.10")
-        with self.assertRaises(IpLockedError):
-            self.ledger.authenticate_admin("ABCDEF", "wrong", "203.0.113.10")
-        with self.assertRaises(IpLockedError):
-            self.ledger.authenticate_admin("ABCDEF", "long-admin-password", "203.0.113.10")
+                self.ledger.authenticate_admin("ABCDEF", "wrong")
 
-        self.ledger.unlock_ip("203.0.113.10")
-        session = self.ledger.authenticate_admin("ABCDEF", "long-admin-password", "203.0.113.10")
+        session = self.ledger.authenticate_admin("ABCDEF", "long-admin-password")
         self.assertEqual("ABCDEF", self.ledger.validate_session(session.token, session.csrf_token, require_csrf=True))
 
     def test_approved_enrollment_exclusively_binds_an_mt5_account(self) -> None:
@@ -38,7 +33,6 @@ class ControlLedgerTests(unittest.TestCase):
             server="Broker-Demo",
             pairing_code="12345678",
             public_key_pem="public-key-one",
-            source_ip="203.0.113.11",
             account_info={"login": 123456},
             terminal_info={"name": "MetaTrader 5"},
             password_secret_ref="abt/data/mt5/pending/one",
@@ -55,7 +49,6 @@ class ControlLedgerTests(unittest.TestCase):
             server="Broker-Demo",
             pairing_code="87654321",
             public_key_pem="public-key-two",
-            source_ip="203.0.113.12",
             account_info={"login": 123456},
             terminal_info={"name": "MetaTrader 5"},
             password_secret_ref="abt/data/mt5/pending/two",
@@ -73,7 +66,6 @@ class ControlLedgerTests(unittest.TestCase):
             server="Broker-Demo",
             pairing_code="12345678",
             public_key_pem="public-key",
-            source_ip="203.0.113.11",
             account_info={"login": 123456},
             terminal_info={"name": "MetaTrader 5"},
             password_secret_ref="abt/data/mt5/pending/rejected",
