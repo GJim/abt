@@ -18,6 +18,7 @@ class ComposeDeploymentTests(unittest.TestCase):
         self.assertEqual(["controller"], services["cloudflared"]["depends_on"])
         self.assertEqual({"ingress"}, set(services["cloudflared"]["networks"]))
         self.assertEqual({"ingress", "secrets"}, set(services["controller"]["networks"]))
+        self.assertEqual("172.30.0.3", services["controller"]["networks"]["ingress"]["ipv4_address"])
         self.assertEqual({"secrets", "hsm", "plugin-registry"}, set(services["openbao"]["networks"]))
         self.assertEqual({"hsm"}, set(services["softhsm"]["networks"]))
         self.assertEqual({"openbao"}, {name for name, service in services.items() if "plugin-registry" in service["networks"]})
