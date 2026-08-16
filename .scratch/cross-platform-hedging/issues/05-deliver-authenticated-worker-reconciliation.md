@@ -8,6 +8,8 @@
 
 - [x] The worker and 主控台 establish WSS through P-256 device-certificate challenge-response; invalid, expired or mismatched identities cannot create a session.
 - [x] The worker requests only its bound MT5 password over the authenticated WSS session; the 主控台 mediates the internal OpenBao read and the worker keeps the result only in memory.
-- [x] The worker polls MT5 every minute, emits a full account snapshot every ten minutes and sends cursor-based deltas only for order/position lifecycle or volume changes.
+- [x] The worker polls MT5 every minute, emits a full account snapshot every ten minutes and sends cursor-based order/position deltas for lifecycle, volume, and relevant modifications.
 - [x] The management UI displays worker connectivity, terminal/account health, latest snapshots and lifecycle deltas.
 - [x] Contract tests demonstrate the behavior through the public REST/WSS and native-worker seams while proving no broker write method is invoked.
+
+Certificate rotation is outside this ticket's acceptance criteria.

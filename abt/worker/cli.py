@@ -82,6 +82,12 @@ class MetaTrader5Adapter:
     def terminal_info(self) -> object:
         return self._mt5.terminal_info()
 
+    def orders_get(self) -> object:
+        return self._mt5.orders_get()
+
+    def positions_get(self) -> object:
+        return self._mt5.positions_get()
+
     def shutdown(self) -> None:
         self._mt5.shutdown()
 

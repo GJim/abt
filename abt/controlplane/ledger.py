@@ -380,14 +380,15 @@ class ControlLedger:
     ) -> None:
         with self._transaction():
             self._require_reconciliation_cursor(worker_id, cursor)
+            snapshot_id = str(uuid4())
             self._connection.execute(
                 """
                 INSERT INTO reconciliation_snapshots
-                    (worker_id, cursor, observed_at, account, terminal, orders, positions, received_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    (worker_id, snapshot_id, cursor, observed_at, account, terminal, orders, positions, received_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
-                    worker_id, cursor, observed_at, json.dumps(account, sort_keys=True), json.dumps(terminal, sort_keys=True),
+                    worker_id, snapshot_id, cursor, observed_at, json.dumps(account, sort_keys=True), json.dumps(terminal, sort_keys=True),
                     json.dumps(orders, sort_keys=True), json.dumps(positions, sort_keys=True), _utc_now(),
                 ],
             )
@@ -435,7 +436,7 @@ class ControlLedger:
             for worker_id, login, server, last_seen_at in workers:
                 snapshot = self._connection.execute(
                     """
-                    SELECT cursor, observed_at, account, terminal, orders, positions
+                    SELECT snapshot_id, cursor, observed_at, account, terminal, orders, positions
                     FROM reconciliation_snapshots WHERE worker_id = ? ORDER BY received_at DESC LIMIT 1
                     """,
                     [worker_id],
@@ -454,8 +455,9 @@ class ControlLedger:
                         "server": server,
                         "connectivity": "connected" if last_seen_at and now - last_seen_at <= timedelta(minutes=5) else "stale",
                         "latest_snapshot": None if snapshot is None else {
-                            "cursor": snapshot[0], "observed_at": snapshot[1], "account": json.loads(snapshot[2]),
-                            "terminal": json.loads(snapshot[3]), "orders": json.loads(snapshot[4]), "positions": json.loads(snapshot[5]),
+                            "snapshot_id": snapshot[0], "cursor": snapshot[1], "observed_at": snapshot[2],
+                            "account": json.loads(snapshot[3]), "terminal": json.loads(snapshot[4]),
+                            "orders": json.loads(snapshot[5]), "positions": json.loads(snapshot[6]),
                         },
                         "deltas": [
                             {"cursor": row[0], "observed_at": row[1], "entity": row[2], "ticket": row[3],
@@ -465,6 +467,11 @@ class ControlLedger:
                     }
                 )
         return result
+
+    def reconciliation_cursor(self, worker_id: str) -> int:
+        with self._lock:
+            self.active_worker(worker_id)
+            return self._current_cursor(worker_id)
 
     def _require_reconciliation_cursor(self, worker_id: str, cursor: int) -> None:
         if cursor != self._current_cursor(worker_id):
@@ -664,6 +671,7 @@ class ControlLedger:
                 );
                 CREATE TABLE IF NOT EXISTS reconciliation_snapshots (
                     worker_id VARCHAR NOT NULL,
+                    snapshot_id VARCHAR NOT NULL,
                     cursor BIGINT NOT NULL,
                     observed_at VARCHAR NOT NULL,
                     account JSON NOT NULL,
@@ -671,7 +679,7 @@ class ControlLedger:
                     orders JSON NOT NULL,
                     positions JSON NOT NULL,
                     received_at TIMESTAMPTZ NOT NULL,
-                    PRIMARY KEY (worker_id, cursor)
+                    PRIMARY KEY (worker_id, snapshot_id)
                 );
                 CREATE TABLE IF NOT EXISTS reconciliation_deltas (
                     worker_id VARCHAR NOT NULL,
@@ -697,6 +705,42 @@ class ControlLedger:
                 "ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS password_secret_deleted_at TIMESTAMPTZ"
             )
             self._connection.execute("ALTER TABLE workers ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ")
+            self._migrate_reconciliation_snapshots()
+
+    def _migrate_reconciliation_snapshots(self) -> None:
+        columns = {
+            row[1]
+            for row in self._connection.execute("PRAGMA table_info('reconciliation_snapshots')").fetchall()
+        }
+        if "snapshot_id" in columns:
+            return
+        self._connection.execute("ALTER TABLE reconciliation_snapshots RENAME TO reconciliation_snapshots_legacy")
+        self._connection.execute(
+            """
+            CREATE TABLE reconciliation_snapshots (
+                worker_id VARCHAR NOT NULL,
+                snapshot_id VARCHAR NOT NULL,
+                cursor BIGINT NOT NULL,
+                observed_at VARCHAR NOT NULL,
+                account JSON NOT NULL,
+                terminal JSON NOT NULL,
+                orders JSON NOT NULL,
+                positions JSON NOT NULL,
+                received_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY (worker_id, snapshot_id)
+            )
+            """
+        )
+        self._connection.execute(
+            """
+            INSERT INTO reconciliation_snapshots
+                (worker_id, snapshot_id, cursor, observed_at, account, terminal, orders, positions, received_at)
+            SELECT worker_id, worker_id || ':' || CAST(cursor AS VARCHAR), cursor, observed_at, account, terminal,
+                   orders, positions, received_at
+            FROM reconciliation_snapshots_legacy
+            """
+        )
+        self._connection.execute("DROP TABLE reconciliation_snapshots_legacy")
 
     def _transaction(self):
         return _Transaction(self._lock, self._connection)

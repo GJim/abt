@@ -35,7 +35,7 @@ class ReadOnlyMT5:
 
 
 class WorkerReconciliationTests(unittest.TestCase):
-    def test_emits_ten_minute_snapshot_and_only_lifecycle_or_volume_deltas(self) -> None:
+    def test_emits_ten_minute_snapshots_and_relevant_deltas(self) -> None:
         mt5 = ReadOnlyMT5()
         emitted: list[dict[str, object]] = []
         adapter = MT5ReconciliationAdapter(mt5, emit=emitted.append)
@@ -56,6 +56,37 @@ class WorkerReconciliationTests(unittest.TestCase):
         self.assertEqual(2, emitted[-1]["cursor"])
         self.assertEqual(["account_info", "terminal_info", "orders_get", "positions_get"] * 4, mt5.calls)
         self.assertEqual(0, mt5.broker_write_calls)
+
+    def test_emits_modified_deltas_but_ignores_price_and_floating_profit(self) -> None:
+        mt5 = ReadOnlyMT5()
+        emitted: list[dict[str, object]] = []
+        adapter = MT5ReconciliationAdapter(mt5, emit=emitted.append)
+        started = datetime(2026, 8, 16, tzinfo=UTC)
+
+        adapter.poll(started)
+        mt5.orders[0]["price_current"] = 2.5
+        mt5.positions[0]["profit"] = 4.0
+        adapter.poll(started + timedelta(minutes=1))
+        mt5.orders[0]["type"] = "sell_limit"
+        mt5.positions[0]["tp"] = 1.5
+        adapter.poll(started + timedelta(minutes=2))
+
+        self.assertEqual(["snapshot", "delta", "delta"], [event["type"] for event in emitted])
+        self.assertEqual(["modified", "modified"], [event["change"] for event in emitted[1:]])
+        self.assertEqual(0, mt5.broker_write_calls)
+
+    def test_resumes_delta_cursor_with_a_full_baseline_snapshot(self) -> None:
+        mt5 = ReadOnlyMT5()
+        emitted: list[dict[str, object]] = []
+        adapter = MT5ReconciliationAdapter(mt5, emit=emitted.append, initial_cursor=7)
+        started = datetime(2026, 8, 16, tzinfo=UTC)
+
+        adapter.poll(started)
+        mt5.positions[0]["volume"] = 1.0
+        adapter.poll(started + timedelta(minutes=1))
+
+        self.assertEqual([7, 8], [event["cursor"] for event in emitted])
+        self.assertEqual(["snapshot", "delta"], [event["type"] for event in emitted])
 
     def test_schedules_each_read_only_poll_one_minute_apart(self) -> None:
         mt5 = ReadOnlyMT5()
@@ -101,6 +132,7 @@ class WorkerReconciliationTests(unittest.TestCase):
 class MemoryOnlySession:
     def __init__(self, emitted: list[dict[str, object]]) -> None:
         self._emitted = emitted
+        self.reconciliation_cursor = 0
 
     def request_password(self) -> str:
         return "memory-only"

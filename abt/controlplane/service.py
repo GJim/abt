@@ -318,7 +318,9 @@ def create_app(
                 nonce=nonce,
             )
             ledger.record_worker_session(worker.worker_id)
-            await websocket.send_json({"type": "authenticated", "worker_id": worker.worker_id})
+            await websocket.send_json(
+                {"type": "authenticated", "worker_id": worker.worker_id, "cursor": ledger.reconciliation_cursor(worker.worker_id)}
+            )
             while True:
                 request = await websocket.receive_json()
                 if not isinstance(request, dict):
@@ -421,7 +423,7 @@ def _record_delta(ledger: ControlLedger, worker_id: str, message: dict[str, obje
     if not all(isinstance(message[field], str) and message[field] for field in ("observed_at", "entity", "ticket", "change")):
         raise ValueError("Invalid worker message.")
     if message["entity"] not in {"order", "position"} or message["change"] not in {
-        "created", "state_changed", "volume_changed", "closed"
+        "created", "state_changed", "volume_changed", "modified", "closed"
     }:
         raise ValueError("Invalid worker message.")
     if not isinstance(message["record"], dict):

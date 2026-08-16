@@ -339,7 +339,9 @@ class ControlPlaneServiceTests(unittest.TestCase):
                 ec.ECDSA(hashes.SHA256()),
             )
             websocket.send_json({"signature": base64.b64encode(proof).decode("ascii")})
-            self.assertEqual({"type": "authenticated", "worker_id": worker_id}, websocket.receive_json())
+            self.assertEqual(
+                {"type": "authenticated", "worker_id": worker_id, "cursor": 0}, websocket.receive_json()
+            )
             websocket.send_json({"type": "password_request"})
             self.assertEqual(
                 {"type": "password", "password": "worker-memory-only-password"},
@@ -377,15 +379,40 @@ class ControlPlaneServiceTests(unittest.TestCase):
                                  "account": {"balance": 1000}, "terminal": {"connected": True},
                                  "orders": [], "positions": []})
             self.assertEqual({"type": "accepted", "cursor": 0}, websocket.receive_json())
+            first_snapshot_id = self.client.get("/api/admin/workers").json()[0]["latest_snapshot"]["snapshot_id"]
+            websocket.send_json({"type": "snapshot", "cursor": 0, "observed_at": "2026-08-16T00:10:00+00:00",
+                                 "account": {"balance": 1000}, "terminal": {"connected": True},
+                                 "orders": [], "positions": []})
+            self.assertEqual({"type": "accepted", "cursor": 0}, websocket.receive_json())
+            second_snapshot_id = self.client.get("/api/admin/workers").json()[0]["latest_snapshot"]["snapshot_id"]
+            self.assertNotEqual(first_snapshot_id, second_snapshot_id)
             websocket.send_json({"type": "delta", "cursor": 1, "observed_at": "2026-08-16T00:01:00+00:00",
                                  "entity": "position", "ticket": "51", "change": "volume_changed",
                                  "record": {"ticket": 51, "volume": 1.0}})
             self.assertEqual({"type": "accepted", "cursor": 1}, websocket.receive_json())
 
+        with self.client.websocket_connect("/api/worker/session") as websocket:
+            websocket.send_json({"worker_id": worker_id, "certificate": certificate})
+            challenge = websocket.receive_json()
+            signature = private_key.sign(
+                worker_proof_payload(purpose="worker_session", worker_id=worker_id, nonce=challenge["nonce"]),
+                ec.ECDSA(hashes.SHA256()),
+            )
+            websocket.send_json({"signature": base64.b64encode(signature).decode("ascii")})
+            self.assertEqual({"type": "authenticated", "worker_id": worker_id, "cursor": 1}, websocket.receive_json())
+            websocket.send_json({"type": "snapshot", "cursor": 1, "observed_at": "2026-08-16T00:20:00+00:00",
+                                 "account": {"balance": 1000}, "terminal": {"connected": True},
+                                 "orders": [], "positions": []})
+            self.assertEqual({"type": "accepted", "cursor": 1}, websocket.receive_json())
+            websocket.send_json({"type": "delta", "cursor": 2, "observed_at": "2026-08-16T00:21:00+00:00",
+                                 "entity": "position", "ticket": "51", "change": "modified",
+                                 "record": {"ticket": 51, "volume": 1.0, "tp": 1.5}})
+            self.assertEqual({"type": "accepted", "cursor": 2}, websocket.receive_json())
+
         workers = self.client.get("/api/admin/workers").json()
         self.assertEqual("connected", workers[0]["connectivity"])
         self.assertEqual({"balance": 1000}, workers[0]["latest_snapshot"]["account"])
-        self.assertEqual("volume_changed", workers[0]["deltas"][0]["change"])
+        self.assertEqual(["volume_changed", "modified"], [delta["change"] for delta in workers[0]["deltas"]])
 
     def test_enrollment_rate_limit_rejects_the_fourth_attempt_in_fifteen_minutes(self) -> None:
         private_key = ec.generate_private_key(ec.SECP256R1())

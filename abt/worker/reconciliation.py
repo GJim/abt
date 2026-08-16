@@ -21,6 +21,8 @@ class ReadOnlyMT5(Protocol):
 
 
 class AuthenticatedReconciliationSession(Protocol):
+    reconciliation_cursor: int
+
     def request_password(self) -> str: ...
 
     def send_reconciliation(self, message: dict[str, object]) -> None: ...
@@ -29,10 +31,14 @@ class AuthenticatedReconciliationSession(Protocol):
 class MT5ReconciliationAdapter:
     """Poll one MT5 terminal without exposing a broker-write operation."""
 
-    def __init__(self, mt5: ReadOnlyMT5, *, emit: Callable[[dict[str, object]], None]) -> None:
+    def __init__(
+        self, mt5: ReadOnlyMT5, *, emit: Callable[[dict[str, object]], None], initial_cursor: int = 0
+    ) -> None:
+        if isinstance(initial_cursor, bool) or not isinstance(initial_cursor, int) or initial_cursor < 0:
+            raise ValueError("The initial reconciliation cursor must be a non-negative integer.")
         self._mt5 = mt5
         self._emit = emit
-        self._cursor = 0
+        self._cursor = initial_cursor
         self._last_snapshot_at: datetime | None = None
         self._orders: dict[str, dict[str, object]] = {}
         self._positions: dict[str, dict[str, object]] = {}
@@ -108,7 +114,9 @@ def reconcile_authenticated_worker(
         initialized = True
         if not login_mt5(login, password=password, server=server):
             raise WorkerEnrollmentError("The local MT5 login was not accepted.")
-        MT5ReconciliationAdapter(mt5, emit=session.send_reconciliation).run_forever(now=now, sleep=sleep)
+        MT5ReconciliationAdapter(
+            mt5, emit=session.send_reconciliation, initial_cursor=getattr(session, "reconciliation_cursor", 0)
+        ).run_forever(now=now, sleep=sleep)
     finally:
         password = ""
         if initialized:
@@ -153,6 +161,8 @@ def _changes(
             changes.append({"entity": entity, "ticket": ticket, "change": "state_changed", "record": record})
         elif _volume(old) != _volume(record):
             changes.append({"entity": entity, "ticket": ticket, "change": "volume_changed", "record": record})
+        elif _relevant_fields(entity, old) != _relevant_fields(entity, record):
+            changes.append({"entity": entity, "ticket": ticket, "change": "modified", "record": record})
     for ticket, record in previous.items():
         if ticket not in current:
             changes.append({"entity": entity, "ticket": ticket, "change": "closed", "record": record})
@@ -161,3 +171,29 @@ def _changes(
 
 def _volume(record: dict[str, object]) -> object:
     return record.get("volume_current", record.get("volume"))
+
+
+_RELEVANT_FIELDS = {
+    "order": frozenset(
+        {
+            "comment",
+            "external_id",
+            "magic",
+            "price_stoplimit",
+            "position_by_id",
+            "position_id",
+            "sl",
+            "symbol",
+            "time_expiration",
+            "tp",
+            "type",
+            "type_filling",
+            "type_time",
+        }
+    ),
+    "position": frozenset({"comment", "external_id", "identifier", "magic", "sl", "symbol", "tp", "type"}),
+}
+
+
+def _relevant_fields(entity: str, record: dict[str, object]) -> dict[str, object]:
+    return {field: record.get(field) for field in _RELEVANT_FIELDS[entity]}

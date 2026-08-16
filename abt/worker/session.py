@@ -22,6 +22,7 @@ class AuthenticatedWorkerSession:
     """A proved WSS channel for one approved 帳戶工作者."""
 
     socket: WorkerWebSocket
+    reconciliation_cursor: int
 
     def __enter__(self) -> Self:
         return self
@@ -73,9 +74,15 @@ def open_authenticated_worker_session(
         challenge = _message(socket)
         _send_proof(socket, key_store, challenge, "worker_session", worker_id)
         authenticated = _message(socket)
-        if authenticated != {"type": "authenticated", "worker_id": worker_id}:
+        cursor = authenticated.get("cursor") if isinstance(authenticated, dict) else None
+        if (
+            not isinstance(cursor, int)
+            or isinstance(cursor, bool)
+            or cursor < 0
+            or authenticated != {"type": "authenticated", "worker_id": worker_id, "cursor": cursor}
+        ):
             raise WorkerEnrollmentError("The controller returned an invalid worker response.")
     except BaseException as error:
         socket.__exit__(type(error), error, error.__traceback__)
         raise
-    return AuthenticatedWorkerSession(socket)
+    return AuthenticatedWorkerSession(socket, reconciliation_cursor=cursor)
