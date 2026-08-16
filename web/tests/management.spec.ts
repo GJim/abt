@@ -29,6 +29,9 @@ test('administrator can sign in and view audit events', async ({ page }) => {
       body: JSON.stringify([]),
     })
   })
+  await page.route('**/api/admin/workers', async (route) => {
+    await route.fulfill({ contentType: 'application/json', body: JSON.stringify([]) })
+  })
 
   await page.goto('http://127.0.0.1:4173/')
   await page.getByLabel('Administrator account').fill('ABCDEF')
@@ -86,6 +89,9 @@ test('administrator can review and approve a pending worker registration', async
         : []),
     })
   })
+  await page.route('**/api/admin/workers', async (route) => {
+    await route.fulfill({ contentType: 'application/json', body: JSON.stringify([]) })
+  })
 
   await page.goto('http://127.0.0.1:4173/')
   await page.getByLabel('Administrator account').fill('ABCDEF')
@@ -106,4 +112,47 @@ test('administrator can review and approve a pending worker registration', async
   await expect(page.getByText('No worker registrations are awaiting review.')).toBeVisible()
   await expect(page.getByText('worker_enrollment_approved')).toBeVisible()
   expect(enrollmentRequests).toBe(2)
+})
+
+test('administrator can view connected worker health and reconciliation', async ({ page }) => {
+  await page.route('**/api/admin/login', async (route) => {
+    await route.fulfill({ contentType: 'application/json', body: JSON.stringify({ csrf_token: 'csrf-token' }) })
+  })
+  await page.route('**/api/admin/events', async (route) => {
+    await route.fulfill({ contentType: 'application/json', body: JSON.stringify([]) })
+  })
+  await page.route('**/api/admin/enrollments', async (route) => {
+    await route.fulfill({ contentType: 'application/json', body: JSON.stringify([]) })
+  })
+  await page.route('**/api/admin/workers', async (route) => {
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify([{
+        worker_id: 'worker-1',
+        login: 123456,
+        server: 'Broker-Demo',
+        connectivity: 'connected',
+        latest_snapshot: {
+          cursor: 1,
+          observed_at: '2026-08-16T00:00:00Z',
+          account: { balance: 1000 },
+          terminal: { connected: true },
+          orders: [],
+          positions: [],
+        },
+        deltas: [{ cursor: 2, observed_at: '2026-08-16T00:01:00Z', entity: 'position', ticket: '51',
+          change: 'volume_changed', record: { volume: 1 } }],
+      }]),
+    })
+  })
+
+  await page.goto('http://127.0.0.1:4173/')
+  await page.getByLabel('Administrator account').fill('ABCDEF')
+  await page.getByLabel('Password').fill('A-secure-admin-password!')
+  await page.getByRole('button', { name: 'Sign in' }).click()
+
+  await expect(page.getByRole('heading', { name: 'Account workers' })).toBeVisible()
+  await expect(page.getByText('connected', { exact: true })).toBeVisible()
+  await expect(page.getByText('volume_changed')).toBeVisible()
+  await expect(page.getByText('"balance": 1000')).toBeVisible()
 })

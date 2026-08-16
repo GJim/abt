@@ -11,6 +11,7 @@ from abt.controlplane.crypto import enrollment_payload
 from abt.worker.cli import HTTPEnrollmentTransport, main
 from abt.worker.credentials import retrieve_mt5_password
 from abt.worker.enrollment import WorkerEnrollmentError, register_worker
+from abt.worker.session import open_authenticated_worker_session
 
 
 class FakeMT5:
@@ -296,6 +297,42 @@ class WorkerCredentialTests(unittest.TestCase):
                 key_store=FakeKeyStore(),
                 connect=lambda _: FakeWebSocket([]),
             )
+
+    def test_authenticated_session_uses_one_wss_channel_for_password_and_reconciliation(self) -> None:
+        key_store = FakeKeyStore()
+        certificate_socket = FakeWebSocket(
+            [
+                {"purpose": "certificate_delivery", "worker_id": "worker-123", "nonce": "certificate-nonce"},
+                {"worker_id": "worker-123", "certificate": "certificate"},
+            ]
+        )
+        session_socket = FakeWebSocket(
+            [
+                {"purpose": "worker_session", "worker_id": "worker-123", "nonce": "session-nonce"},
+                {"type": "authenticated", "worker_id": "worker-123"},
+                {"type": "password", "password": "memory-only-password"},
+                {"type": "accepted", "cursor": 0},
+            ]
+        )
+        urls: list[str] = []
+
+        with open_authenticated_worker_session(
+            controller_url="https://controller.example",
+            enrollment_id="enrollment-123",
+            key_store=key_store,
+            connect=lambda url: _connect(url, urls, certificate_socket, session_socket),
+        ) as session:
+            self.assertEqual("memory-only-password", session.request_password())
+            session.send_reconciliation(
+                {"type": "snapshot", "cursor": 0, "observed_at": "2026-08-16T00:00:00+00:00",
+                 "account": {}, "terminal": {}, "orders": [], "positions": []}
+            )
+
+        self.assertEqual(
+            ["wss://controller.example/api/worker/certificate", "wss://controller.example/api/worker/session"], urls
+        )
+        self.assertEqual(2, len(key_store.signed_payloads))
+        self.assertNotIn("memory-only-password", "".join(certificate_socket.sent + session_socket.sent))
 
 
 class FakeWebSocket:

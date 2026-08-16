@@ -368,6 +368,120 @@ class ControlLedger:
             raise LedgerError("Worker is not active.")
         return ActiveWorker(*row)
 
+    def record_snapshot(
+        self,
+        worker_id: str,
+        cursor: int,
+        observed_at: str,
+        account: dict[str, object],
+        terminal: dict[str, object],
+        orders: list[object],
+        positions: list[object],
+    ) -> None:
+        with self._transaction():
+            self._require_reconciliation_cursor(worker_id, cursor)
+            self._connection.execute(
+                """
+                INSERT INTO reconciliation_snapshots
+                    (worker_id, cursor, observed_at, account, terminal, orders, positions, received_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    worker_id, cursor, observed_at, json.dumps(account, sort_keys=True), json.dumps(terminal, sort_keys=True),
+                    json.dumps(orders, sort_keys=True), json.dumps(positions, sort_keys=True), _utc_now(),
+                ],
+            )
+            self._connection.execute("UPDATE workers SET last_seen_at = ? WHERE worker_id = ?", [_utc_now(), worker_id])
+            self._event("worker_reconciliation_snapshot", {"worker_id": worker_id, "cursor": cursor})
+
+    def record_worker_session(self, worker_id: str) -> None:
+        with self._transaction():
+            active = self._connection.execute(
+                "SELECT 1 FROM workers WHERE worker_id = ? AND status = 'active'", [worker_id]
+            ).fetchone()
+            if active is None:
+                raise LedgerError("Worker is not active.")
+            self._connection.execute("UPDATE workers SET last_seen_at = ? WHERE worker_id = ?", [_utc_now(), worker_id])
+            self._event("worker_session_authenticated", {"worker_id": worker_id})
+
+    def record_delta(
+        self, worker_id: str, cursor: int, observed_at: str, entity: str, ticket: str, change: str, record: dict[str, object]
+    ) -> None:
+        with self._transaction():
+            expected = self._current_cursor(worker_id) + 1
+            if cursor != expected:
+                raise LedgerError("Worker reconciliation cursor is not continuous.")
+            self._connection.execute(
+                """
+                INSERT INTO reconciliation_deltas
+                    (worker_id, cursor, observed_at, entity, ticket, change, record, received_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [worker_id, cursor, observed_at, entity, ticket, change, json.dumps(record, sort_keys=True), _utc_now()],
+            )
+            self._connection.execute("UPDATE workers SET last_seen_at = ? WHERE worker_id = ?", [_utc_now(), worker_id])
+            self._event(
+                "worker_reconciliation_delta",
+                {"worker_id": worker_id, "cursor": cursor, "entity": entity, "ticket": ticket, "change": change},
+            )
+
+    def worker_reconciliation(self) -> list[dict[str, Any]]:
+        now = _utc_now()
+        with self._lock:
+            workers = self._connection.execute(
+                "SELECT worker_id, login, server, last_seen_at FROM workers WHERE status = 'active' ORDER BY approved_at"
+            ).fetchall()
+            result = []
+            for worker_id, login, server, last_seen_at in workers:
+                snapshot = self._connection.execute(
+                    """
+                    SELECT cursor, observed_at, account, terminal, orders, positions
+                    FROM reconciliation_snapshots WHERE worker_id = ? ORDER BY received_at DESC LIMIT 1
+                    """,
+                    [worker_id],
+                ).fetchone()
+                deltas = self._connection.execute(
+                    """
+                    SELECT cursor, observed_at, entity, ticket, change, record
+                    FROM reconciliation_deltas WHERE worker_id = ? ORDER BY cursor DESC LIMIT 50
+                    """,
+                    [worker_id],
+                ).fetchall()
+                result.append(
+                    {
+                        "worker_id": worker_id,
+                        "login": login,
+                        "server": server,
+                        "connectivity": "connected" if last_seen_at and now - last_seen_at <= timedelta(minutes=5) else "stale",
+                        "latest_snapshot": None if snapshot is None else {
+                            "cursor": snapshot[0], "observed_at": snapshot[1], "account": json.loads(snapshot[2]),
+                            "terminal": json.loads(snapshot[3]), "orders": json.loads(snapshot[4]), "positions": json.loads(snapshot[5]),
+                        },
+                        "deltas": [
+                            {"cursor": row[0], "observed_at": row[1], "entity": row[2], "ticket": row[3],
+                             "change": row[4], "record": json.loads(row[5])}
+                            for row in reversed(deltas)
+                        ],
+                    }
+                )
+        return result
+
+    def _require_reconciliation_cursor(self, worker_id: str, cursor: int) -> None:
+        if cursor != self._current_cursor(worker_id):
+            raise LedgerError("Worker reconciliation cursor is not continuous.")
+
+    def _current_cursor(self, worker_id: str) -> int:
+        row = self._connection.execute(
+            """
+            SELECT greatest(
+                coalesce((SELECT max(cursor) FROM reconciliation_snapshots WHERE worker_id = ?), 0),
+                coalesce((SELECT max(cursor) FROM reconciliation_deltas WHERE worker_id = ?), 0)
+            )
+            """,
+            [worker_id, worker_id],
+        ).fetchone()
+        return int(row[0])
+
     def reject_enrollment(self, enrollment_id: str, rejected_by: str) -> str:
         with self._transaction():
             row = self._connection.execute(
@@ -545,7 +659,30 @@ class ControlLedger:
                     server VARCHAR NOT NULL,
                     certificate VARCHAR NOT NULL,
                     status VARCHAR NOT NULL,
-                    approved_at TIMESTAMPTZ NOT NULL
+                    approved_at TIMESTAMPTZ NOT NULL,
+                    last_seen_at TIMESTAMPTZ
+                );
+                CREATE TABLE IF NOT EXISTS reconciliation_snapshots (
+                    worker_id VARCHAR NOT NULL,
+                    cursor BIGINT NOT NULL,
+                    observed_at VARCHAR NOT NULL,
+                    account JSON NOT NULL,
+                    terminal JSON NOT NULL,
+                    orders JSON NOT NULL,
+                    positions JSON NOT NULL,
+                    received_at TIMESTAMPTZ NOT NULL,
+                    PRIMARY KEY (worker_id, cursor)
+                );
+                CREATE TABLE IF NOT EXISTS reconciliation_deltas (
+                    worker_id VARCHAR NOT NULL,
+                    cursor BIGINT NOT NULL,
+                    observed_at VARCHAR NOT NULL,
+                    entity VARCHAR NOT NULL,
+                    ticket VARCHAR NOT NULL,
+                    change VARCHAR NOT NULL,
+                    record JSON NOT NULL,
+                    received_at TIMESTAMPTZ NOT NULL,
+                    PRIMARY KEY (worker_id, cursor)
                 );
                 CREATE SEQUENCE IF NOT EXISTS events_sequence START 1;
                 CREATE TABLE IF NOT EXISTS events (
@@ -559,6 +696,7 @@ class ControlLedger:
             self._connection.execute(
                 "ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS password_secret_deleted_at TIMESTAMPTZ"
             )
+            self._connection.execute("ALTER TABLE workers ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ")
 
     def _transaction(self):
         return _Transaction(self._lock, self._connection)

@@ -93,13 +93,42 @@ li {
 }
 
 .enrollment-list,
-.audit-events {
+.audit-events,
+.worker-list,
+.worker-deltas {
   margin: 0;
 }
 
 .enrollment {
   align-items: start;
   gap: 1rem;
+}
+
+.worker {
+  align-items: start;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.worker dl {
+  display: flex;
+  gap: 2rem;
+  margin: 0;
+}
+
+.worker dl > div {
+  display: grid;
+  gap: 0.15rem;
+}
+
+.worker h3 {
+  font-size: 0.9rem;
+  margin: 0 0 0.5rem;
+}
+
+.worker-deltas li {
+  gap: 0.5rem;
+  justify-content: start;
 }
 
 .enrollment dl {

@@ -28,30 +28,59 @@ type Enrollment = {
 
 type EnrollmentAction = 'approve' | 'reject'
 
+type ReconciliationDelta = {
+  cursor: number
+  observed_at: string
+  entity: string
+  ticket: string
+  change: string
+  record: Record<string, unknown>
+}
+
+type AccountWorker = {
+  worker_id: string
+  login: number
+  server: string
+  connectivity: string
+  latest_snapshot: {
+    cursor: number
+    observed_at: string
+    account: EnrollmentEvidence
+    terminal: EnrollmentEvidence
+    orders: EnrollmentEvidence[]
+    positions: EnrollmentEvidence[]
+  } | null
+  deltas: ReconciliationDelta[]
+}
+
 function App() {
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
   const [csrfToken, setCsrfToken] = useState<string | null>(null)
   const [events, setEvents] = useState<AuditEvent[]>([])
   const [enrollments, setEnrollments] = useState<Enrollment[]>([])
+  const [workers, setWorkers] = useState<AccountWorker[]>([])
   const [processingEnrollmentId, setProcessingEnrollmentId] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
 
   async function refreshManagementData() {
-    const [eventsResponse, enrollmentsResponse] = await Promise.all([
+    const [eventsResponse, enrollmentsResponse, workersResponse] = await Promise.all([
       fetch('/api/admin/events', { credentials: 'same-origin' }),
       fetch('/api/admin/enrollments', { credentials: 'same-origin' }),
+      fetch('/api/admin/workers', { credentials: 'same-origin' }),
     ])
-    if (!eventsResponse.ok || !enrollmentsResponse.ok) {
+    if (!eventsResponse.ok || !enrollmentsResponse.ok || !workersResponse.ok) {
       throw new Error('Management data could not be loaded.')
     }
 
-    const [eventPayload, enrollmentPayload] = await Promise.all([
+    const [eventPayload, enrollmentPayload, workerPayload] = await Promise.all([
       eventsResponse.json() as Promise<AuditEvent[]>,
       enrollmentsResponse.json() as Promise<Enrollment[]>,
+      workersResponse.json() as Promise<AccountWorker[]>,
     ])
     setEvents(eventPayload)
     setEnrollments(enrollmentPayload)
+    setWorkers(workerPayload)
   }
 
   async function submitLogin(event: FormEvent<HTMLFormElement>) {
@@ -163,6 +192,48 @@ function App() {
                     </li>
                   )
                 })}
+              </ul>
+            )}
+          </section>
+          <section aria-labelledby="account-workers-heading">
+            <h2 id="account-workers-heading">Account workers</h2>
+            {workers.length === 0 ? (
+              <p>No approved account workers have reported yet.</p>
+            ) : (
+              <ul className="worker-list" aria-label="Account workers">
+                {workers.map((worker) => (
+                  <li key={worker.worker_id} className="worker">
+                    <dl>
+                      <div><dt>Account</dt><dd>{worker.login} on {worker.server}</dd></div>
+                      <div><dt>Connectivity</dt><dd>{worker.connectivity}</dd></div>
+                    </dl>
+                    {worker.latest_snapshot && (
+                      <section aria-label={`Latest snapshot for ${worker.login} on ${worker.server}`}>
+                        <h3>Latest snapshot</h3>
+                        <time dateTime={worker.latest_snapshot.observed_at}>{worker.latest_snapshot.observed_at}</time>
+                        <pre>{JSON.stringify({
+                          account: worker.latest_snapshot.account,
+                          terminal: worker.latest_snapshot.terminal,
+                          orders: worker.latest_snapshot.orders,
+                          positions: worker.latest_snapshot.positions,
+                        }, null, 2)}</pre>
+                      </section>
+                    )}
+                    <section aria-label={`Lifecycle deltas for ${worker.login} on ${worker.server}`}>
+                      <h3>Lifecycle deltas</h3>
+                      {worker.deltas.length === 0 ? <p>No lifecycle or volume changes reported.</p> : (
+                        <ul className="worker-deltas">
+                          {worker.deltas.map((delta) => (
+                            <li key={delta.cursor}>
+                              <strong>{delta.change}</strong> {delta.entity} {delta.ticket}
+                              <time dateTime={delta.observed_at}>{delta.observed_at}</time>
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                    </section>
+                  </li>
+                ))}
               </ul>
             )}
           </section>

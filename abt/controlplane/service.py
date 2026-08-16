@@ -167,6 +167,13 @@ def create_app(
         _require_admin(ledger, abt_admin_session)
         return ledger.events()
 
+    @app.get("/api/admin/workers")
+    def list_workers(
+        abt_admin_session: Annotated[str | None, Cookie()] = None,
+    ) -> list[dict[str, object]]:
+        _require_admin(ledger, abt_admin_session)
+        return ledger.worker_reconciliation()
+
     @app.post("/api/admin/logout", status_code=status.HTTP_204_NO_CONTENT)
     def logout(
         abt_admin_session: Annotated[str | None, Cookie()] = None,
@@ -281,6 +288,57 @@ def create_app(
         except (LedgerError, ProofError, SecretStoreError, ValueError, WebSocketDisconnect):
             await _reject_worker(websocket)
 
+    @app.websocket("/api/worker/session")
+    async def worker_session(websocket: WebSocket) -> None:
+        await websocket.accept()
+        try:
+            request = await _worker_message(websocket, {"worker_id", "certificate"})
+            worker = ledger.active_worker(_required_text(request, "worker_id"))
+            certificate = _required_text(request, "certificate")
+            claims = parse_device_certificate(certificate)
+            if certificate_verifier is None:
+                raise ProofError("The device certificate verifier is unavailable.")
+            certificate_verifier.verify(certificate)
+            if (
+                certificate != worker.certificate
+                or claims["worker_id"] != worker.worker_id
+                or claims["login"] != worker.login
+                or claims["server"] != worker.server
+                or claims["public_key_pem"] != worker.public_key_pem
+            ):
+                raise ProofError("The device certificate does not match this worker.")
+            nonce = secrets.token_urlsafe(32)
+            await websocket.send_json({"purpose": "worker_session", "worker_id": worker.worker_id, "nonce": nonce})
+            proof = await _worker_message(websocket, {"signature"})
+            verify_worker_proof(
+                worker.public_key_pem,
+                _required_text(proof, "signature"),
+                purpose="worker_session",
+                worker_id=worker.worker_id,
+                nonce=nonce,
+            )
+            ledger.record_worker_session(worker.worker_id)
+            await websocket.send_json({"type": "authenticated", "worker_id": worker.worker_id})
+            while True:
+                request = await websocket.receive_json()
+                if not isinstance(request, dict):
+                    raise ValueError("Invalid worker message.")
+                message_type = request.get("type")
+                if message_type == "password_request" and set(request) == {"type"} and secret_store is not None:
+                    await websocket.send_json(
+                        {"type": "password", "password": secret_store.read_password(worker.password_secret_ref)}
+                    )
+                elif message_type == "snapshot":
+                    _record_snapshot(ledger, worker.worker_id, request)
+                    await websocket.send_json({"type": "accepted", "cursor": request["cursor"]})
+                elif message_type == "delta":
+                    _record_delta(ledger, worker.worker_id, request)
+                    await websocket.send_json({"type": "accepted", "cursor": request["cursor"]})
+                else:
+                    raise ValueError("Invalid worker message.")
+        except (LedgerError, ProofError, SecretStoreError, ValueError, WebSocketDisconnect):
+            await _reject_worker(websocket)
+
     if spa_directory is not None:
         app.mount("/", StaticFiles(directory=spa_directory, html=True), name="management-spa")
 
@@ -340,6 +398,38 @@ def _required_text(message: dict[str, object], field: str) -> str:
     if not isinstance(value, str) or not value:
         raise ValueError("Invalid worker message.")
     return value
+
+
+def _record_snapshot(ledger: ControlLedger, worker_id: str, message: dict[str, object]) -> None:
+    required = {"type", "cursor", "observed_at", "account", "terminal", "orders", "positions"}
+    if set(message) != required or not isinstance(message["cursor"], int) or isinstance(message["cursor"], bool):
+        raise ValueError("Invalid worker message.")
+    if not isinstance(message["observed_at"], str) or not isinstance(message["account"], dict) or not isinstance(message["terminal"], dict):
+        raise ValueError("Invalid worker message.")
+    if not isinstance(message["orders"], list) or not isinstance(message["positions"], list):
+        raise ValueError("Invalid worker message.")
+    ledger.record_snapshot(
+        worker_id, message["cursor"], message["observed_at"], message["account"], message["terminal"],
+        message["orders"], message["positions"],
+    )
+
+
+def _record_delta(ledger: ControlLedger, worker_id: str, message: dict[str, object]) -> None:
+    required = {"type", "cursor", "observed_at", "entity", "ticket", "change", "record"}
+    if set(message) != required or not isinstance(message["cursor"], int) or isinstance(message["cursor"], bool):
+        raise ValueError("Invalid worker message.")
+    if not all(isinstance(message[field], str) and message[field] for field in ("observed_at", "entity", "ticket", "change")):
+        raise ValueError("Invalid worker message.")
+    if message["entity"] not in {"order", "position"} or message["change"] not in {
+        "created", "state_changed", "volume_changed", "closed"
+    }:
+        raise ValueError("Invalid worker message.")
+    if not isinstance(message["record"], dict):
+        raise ValueError("Invalid worker message.")
+    ledger.record_delta(
+        worker_id, message["cursor"], message["observed_at"], message["entity"], message["ticket"],
+        message["change"], message["record"],
+    )
 
 
 async def _reject_worker(websocket: WebSocket) -> None:

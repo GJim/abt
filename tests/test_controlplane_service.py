@@ -312,6 +312,81 @@ class ControlPlaneServiceTests(unittest.TestCase):
                 websocket.receive_json()
         self.assertEqual(1008, getattr(error.exception, "code", None))
 
+    def test_authenticated_worker_session_returns_only_its_bound_password(self) -> None:
+        private_key = ec.generate_private_key(ec.SECP256R1())
+        public_key_pem = private_key.public_key().public_bytes(
+            serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
+        ).decode("utf-8")
+        enrollment = self._enrollment_response(
+            private_key, public_key_pem, {"login": 123456, "server": "Broker-Demo"}, {"name": "MetaTrader 5"}
+        )
+        login = self.client.post(
+            "/api/admin/login", json={"username": "ABCDEF", "password": "A-secure-admin-password!"}
+        )
+        worker_id = self.client.post(
+            f"/api/admin/enrollments/{enrollment.json()['enrollment_id']}/approve",
+            headers={"X-CSRF-Token": login.json()["csrf_token"]},
+        ).json()["worker_id"]
+
+        with self.client.websocket_connect("/api/worker/session") as websocket:
+            certificate = self.app.state.ledger.active_worker(worker_id).certificate
+            websocket.send_json({"worker_id": worker_id, "certificate": certificate})
+            challenge = websocket.receive_json()
+            proof = private_key.sign(
+                worker_proof_payload(
+                    purpose="worker_session", worker_id=worker_id, nonce=challenge["nonce"]
+                ),
+                ec.ECDSA(hashes.SHA256()),
+            )
+            websocket.send_json({"signature": base64.b64encode(proof).decode("ascii")})
+            self.assertEqual({"type": "authenticated", "worker_id": worker_id}, websocket.receive_json())
+            websocket.send_json({"type": "password_request"})
+            self.assertEqual(
+                {"type": "password", "password": "worker-memory-only-password"},
+                websocket.receive_json(),
+            )
+        self.assertEqual("connected", self.client.get("/api/admin/workers").json()[0]["connectivity"])
+
+    def test_management_api_shows_authenticated_worker_health_snapshots_and_deltas(self) -> None:
+        private_key = ec.generate_private_key(ec.SECP256R1())
+        public_key_pem = private_key.public_key().public_bytes(
+            serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
+        ).decode("utf-8")
+        enrollment = self._enrollment_response(
+            private_key, public_key_pem, {"login": 123456, "server": "Broker-Demo"}, {"name": "MetaTrader 5"}
+        )
+        login = self.client.post(
+            "/api/admin/login", json={"username": "ABCDEF", "password": "A-secure-admin-password!"}
+        )
+        worker_id = self.client.post(
+            f"/api/admin/enrollments/{enrollment.json()['enrollment_id']}/approve",
+            headers={"X-CSRF-Token": login.json()["csrf_token"]},
+        ).json()["worker_id"]
+        certificate = self.app.state.ledger.active_worker(worker_id).certificate
+
+        with self.client.websocket_connect("/api/worker/session") as websocket:
+            websocket.send_json({"worker_id": worker_id, "certificate": certificate})
+            challenge = websocket.receive_json()
+            signature = private_key.sign(
+                worker_proof_payload(purpose="worker_session", worker_id=worker_id, nonce=challenge["nonce"]),
+                ec.ECDSA(hashes.SHA256()),
+            )
+            websocket.send_json({"signature": base64.b64encode(signature).decode("ascii")})
+            websocket.receive_json()
+            websocket.send_json({"type": "snapshot", "cursor": 0, "observed_at": "2026-08-16T00:00:00+00:00",
+                                 "account": {"balance": 1000}, "terminal": {"connected": True},
+                                 "orders": [], "positions": []})
+            self.assertEqual({"type": "accepted", "cursor": 0}, websocket.receive_json())
+            websocket.send_json({"type": "delta", "cursor": 1, "observed_at": "2026-08-16T00:01:00+00:00",
+                                 "entity": "position", "ticket": "51", "change": "volume_changed",
+                                 "record": {"ticket": 51, "volume": 1.0}})
+            self.assertEqual({"type": "accepted", "cursor": 1}, websocket.receive_json())
+
+        workers = self.client.get("/api/admin/workers").json()
+        self.assertEqual("connected", workers[0]["connectivity"])
+        self.assertEqual({"balance": 1000}, workers[0]["latest_snapshot"]["account"])
+        self.assertEqual("volume_changed", workers[0]["deltas"][0]["change"])
+
     def test_enrollment_rate_limit_rejects_the_fourth_attempt_in_fifteen_minutes(self) -> None:
         private_key = ec.generate_private_key(ec.SECP256R1())
         public_key_pem = private_key.public_key().public_bytes(

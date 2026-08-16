@@ -10,6 +10,8 @@ import httpx
 
 from .enrollment import EnrollmentTransport, MT5Client, WorkerEnrollmentError, register_worker
 from .keystore import HardwareKeyStore, WindowsCNGKeyStore
+from .reconciliation import reconcile_authenticated_worker
+from .session import open_authenticated_worker_session
 
 
 class HTTPEnrollmentTransport:
@@ -104,13 +106,26 @@ def main(
 
     parser = _parser()
     arguments = parser.parse_args(argv)
-    if arguments.command != "enroll":
+    if arguments.command not in {"enroll", "reconcile"}:
         parser.error("a command is required")
     try:
         mt5 = mt5_factory()
-        transport = transport_factory()
+        key_store = key_store_factory(arguments.key_name)
         try:
-            key_store = key_store_factory(arguments.key_name)
+            if arguments.command == "reconcile":
+                with open_authenticated_worker_session(
+                    controller_url=arguments.controller_url,
+                    enrollment_id=arguments.enrollment_id,
+                    key_store=key_store,
+                ) as session:
+                    reconcile_authenticated_worker(
+                        mt5=mt5,
+                        session=session,
+                        login=arguments.login,
+                        server=arguments.server,
+                    )
+                return 0
+            transport = transport_factory()
             try:
                 result = register_worker(
                     controller_url=arguments.controller_url,
@@ -122,9 +137,9 @@ def main(
                     password_prompt=password_prompt,
                 )
             finally:
-                _close(key_store)
+                _close(transport)
         finally:
-            _close(transport)
+            _close(key_store)
     except Exception:
         print("Worker registration failed.", file=error_output)
         return 1
@@ -141,6 +156,16 @@ def _parser() -> argparse.ArgumentParser:
     enroll.add_argument("--login", required=True, type=_positive_login, help="MT5 account login")
     enroll.add_argument("--server", required=True, help="MT5 server")
     enroll.add_argument(
+        "--key-name",
+        default="abt-worker-device-key",
+        help="persistent Windows CNG key name",
+    )
+    reconcile = commands.add_parser("reconcile", help="run read-only MT5 reconciliation for an approved worker")
+    reconcile.add_argument("--controller-url", required=True, help="HTTPS controller origin")
+    reconcile.add_argument("--enrollment-id", required=True, help="approved worker enrollment ID")
+    reconcile.add_argument("--login", required=True, type=_positive_login, help="bound MT5 account login")
+    reconcile.add_argument("--server", required=True, help="bound MT5 server")
+    reconcile.add_argument(
         "--key-name",
         default="abt-worker-device-key",
         help="persistent Windows CNG key name",
