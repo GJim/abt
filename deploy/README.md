@@ -19,6 +19,22 @@ certificates through the configured Transit key; it must not be the OpenBao
 root token or the health token. Pending registration credentials are deleted
 when the registration is rejected or expires.
 
+## First-time OpenBao bootstrap
+
+Create `deploy/.env` with high-entropy `OPENBAO_PKCS11_PIN` and
+`SOFTHSM_SO_PIN`, then run:
+
+```bash
+sudo ./deploy/bootstrap-openbao.sh
+```
+
+The script waits for SoftHSM to create the `abt-root` seal key, initializes
+only an uninitialized OpenBao instance, creates the required KV-v2/Transit
+mounts and least-privilege policies, and writes health/controller tokens to
+`deploy/.env`. It prints recovery keys and the initial root token once; store
+them offline and never add them to `.env`, Git, or shell history. It refuses
+to run against initialized OpenBao state.
+
 OpenBao alone joins the `plugin-registry` network so it can fetch the pinned
 PKCS#11 plugin from GHCR; it has no published host port. The controller and
 SoftHSM remain isolated from that egress network.
