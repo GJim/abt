@@ -83,7 +83,7 @@ bao() {
 bao secrets enable -path=abt kv-v2
 bao kv put abt/health status=ok
 bao secrets enable transit
-bao write -f transit/keys/abt-device-certificates
+bao write transit/keys/abt-device-certificates type=ecdsa-p256
 
 printf 'path "abt/data/health" {\n  capabilities = ["read"]\n}\n' |
   bao policy write abt-health -

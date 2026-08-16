@@ -52,6 +52,10 @@ initial root token, and administrator credentials once; store them offline and
 never add them to `.env`, Git, or shell history. It refuses to run against
 initialized OpenBao state.
 
+The `abt-device-certificates` Transit key is an `ecdsa-p256` signing key. Do
+not create it with the default AES Transit type: AES keys cannot issue or
+verify worker device certificates.
+
 ## First administrator
 
 `bootstrap-openbao.sh` creates the one-time administrator before the
