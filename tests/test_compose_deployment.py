@@ -83,3 +83,9 @@ class ComposeDeploymentTests(unittest.TestCase):
         dockerfile = (Path(__file__).parents[1] / "deploy" / "controller.Dockerfile").read_text(encoding="utf-8")
         self.assertIn('ENV PATH="/opt/abt/.venv/bin:${PATH}"', dockerfile)
         self.assertIn('"--workers", "1"', dockerfile)
+
+    def test_bootstrap_requires_and_starts_managed_tunnel(self) -> None:
+        bootstrap = (Path(__file__).parents[1] / "deploy" / "bootstrap-openbao.sh").read_text(encoding="utf-8")
+        self.assertIn("ABT_CLOUDFLARE_TUNNEL_TOKEN", bootstrap)
+        self.assertIn('"${compose[@]}" up -d --build controller cloudflared', bootstrap)
+        self.assertIn('"${compose[@]}" ps --status running --services | grep -Fxq cloudflared', bootstrap)

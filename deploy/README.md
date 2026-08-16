@@ -34,7 +34,7 @@ when the registration is rejected or expires.
 ## First-time OpenBao bootstrap
 
 Create `deploy/.env` with high-entropy `OPENBAO_PKCS11_PIN` and
-`SOFTHSM_SO_PIN`, then run:
+`SOFTHSM_SO_PIN`, plus the rotated `ABT_CLOUDFLARE_TUNNEL_TOKEN`, then run:
 
 ```bash
 sudo ./deploy/bootstrap-openbao.sh
@@ -44,9 +44,11 @@ The script waits for SoftHSM to create the `abt-root` seal key, initializes
 only an uninitialized OpenBao instance, creates the required KV-v2/Transit
 mounts and least-privilege policies, writes health/controller tokens to
 `deploy/.env`, creates the one-time administrator before the controller owns
-the DuckDB ledger, and starts the controller. It prints recovery keys, the
-initial root token, and administrator credentials once; store them offline
-and never add them to `.env`, Git, or shell history. It refuses to run against
+the DuckDB ledger, and starts both the controller and cloudflared. It refuses
+to begin unless the Cloudflare tunnel token is already configured, so a
+successful run leaves the public ingress running. It prints recovery keys, the
+initial root token, and administrator credentials once; store them offline and
+never add them to `.env`, Git, or shell history. It refuses to run against
 initialized OpenBao state.
 
 ## First administrator

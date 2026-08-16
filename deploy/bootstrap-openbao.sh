@@ -12,7 +12,12 @@ cleanup() {
 trap cleanup EXIT
 
 if [[ ! -f "${env_file}" ]]; then
-  printf 'Create %s with OPENBAO_PKCS11_PIN and SOFTHSM_SO_PIN first.\n' "${env_file}" >&2
+  printf 'Create %s with OPENBAO_PKCS11_PIN, SOFTHSM_SO_PIN, and ABT_CLOUDFLARE_TUNNEL_TOKEN first.\n' "${env_file}" >&2
+  exit 1
+fi
+
+if ! grep -Eq '^ABT_CLOUDFLARE_TUNNEL_TOKEN=[^[:space:]#].*$' "${env_file}"; then
+  printf 'Set ABT_CLOUDFLARE_TUNNEL_TOKEN in %s before bootstrapping.\n' "${env_file}" >&2
   exit 1
 fi
 
@@ -128,5 +133,11 @@ PYTHON
 unset root_token health_token controller_token
 printf '\nCreating the one-time administrator credentials:\n\n'
 "${compose[@]}" run --rm --no-deps controller abt-console create-admin
-"${compose[@]}" up -d --build controller
-printf '\nBootstrap complete. Configure ABT_CLOUDFLARE_TUNNEL_TOKEN in %s, then start cloudflared:\n  docker compose --env-file %s -f deploy/docker-compose.yml up -d cloudflared\n' "${env_file}" "${env_file}"
+"${compose[@]}" up -d --build controller cloudflared
+
+if ! "${compose[@]}" ps --status running --services | grep -Fxq cloudflared; then
+  printf 'cloudflared did not remain running; inspect its logs before using the deployment.\n' >&2
+  exit 1
+fi
+
+printf '\nBootstrap complete. Controller and cloudflared are running.\n'
