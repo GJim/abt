@@ -32,6 +32,9 @@ test('administrator can sign in and view audit events', async ({ page }) => {
   await page.route('**/api/admin/workers', async (route) => {
     await route.fulfill({ contentType: 'application/json', body: JSON.stringify([]) })
   })
+  await page.route('**/api/admin/alerts', async (route) => {
+    await route.fulfill({ contentType: 'application/json', body: JSON.stringify([]) })
+  })
 
   await page.goto('http://127.0.0.1:4173/')
   await page.getByLabel('Administrator account').fill('ABCDEF')
@@ -92,6 +95,9 @@ test('administrator can review and approve a pending worker registration', async
   await page.route('**/api/admin/workers', async (route) => {
     await route.fulfill({ contentType: 'application/json', body: JSON.stringify([]) })
   })
+  await page.route('**/api/admin/alerts', async (route) => {
+    await route.fulfill({ contentType: 'application/json', body: JSON.stringify([]) })
+  })
 
   await page.goto('http://127.0.0.1:4173/')
   await page.getByLabel('Administrator account').fill('ABCDEF')
@@ -145,6 +151,19 @@ test('administrator can view connected worker health and reconciliation', async 
       }]),
     })
   })
+  await page.route('**/api/admin/alerts', async (route) => {
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify([{
+        alert_id: 1,
+        worker_id: 'worker-1',
+        priority: 'high',
+        alert_type: 'external_broker_change',
+        reason: 'unattributed_broker_change',
+        occurred_at: '2026-08-16T00:01:00Z',
+      }]),
+    })
+  })
 
   await page.goto('http://127.0.0.1:4173/')
   await page.getByLabel('Administrator account').fill('ABCDEF')
@@ -155,4 +174,5 @@ test('administrator can view connected worker health and reconciliation', async 
   await expect(page.getByText('connected', { exact: true })).toBeVisible()
   await expect(page.getByText('volume_changed')).toBeVisible()
   await expect(page.getByText('"balance": 1000')).toBeVisible()
+  await expect(page.getByText('high: external_broker_change')).toBeVisible()
 })

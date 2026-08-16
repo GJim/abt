@@ -493,6 +493,61 @@ class ControlPlaneServiceTests(unittest.TestCase):
         self.assertNotIn(secret_ref, retrying_store.passwords)
         self.assertEqual([], self.app.state.ledger.expire_pending_enrollments())
 
+    def test_unattributed_broker_delta_alerts_needs_human_and_revocation_blocks_wss(self) -> None:
+        private_key = ec.generate_private_key(ec.SECP256R1())
+        public_key_pem = private_key.public_key().public_bytes(
+            serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
+        ).decode("utf-8")
+        enrollment = self._enrollment_response(
+            private_key, public_key_pem, {"login": 123456, "server": "Broker-Demo"}, {"name": "MetaTrader 5"}
+        )
+        login = self.client.post(
+            "/api/admin/login", json={"username": "ABCDEF", "password": "A-secure-admin-password!"}
+        )
+        worker_id = self.client.post(
+            f"/api/admin/enrollments/{enrollment.json()['enrollment_id']}/approve",
+            headers={"X-CSRF-Token": login.json()["csrf_token"]},
+        ).json()["worker_id"]
+        certificate = self.app.state.ledger.active_worker(worker_id).certificate
+
+        with self.client.websocket_connect("/api/worker/session") as websocket:
+            websocket.send_json({"worker_id": worker_id, "certificate": certificate})
+            challenge = websocket.receive_json()
+            signature = private_key.sign(
+                worker_proof_payload(purpose="worker_session", worker_id=worker_id, nonce=challenge["nonce"]),
+                ec.ECDSA(hashes.SHA256()),
+            )
+            websocket.send_json({"signature": base64.b64encode(signature).decode("ascii")})
+            websocket.receive_json()
+            websocket.send_json(
+                {"type": "delta", "cursor": 1, "observed_at": "2026-08-16T00:01:00+00:00",
+                 "entity": "position", "ticket": "51", "change": "created", "record": {"ticket": 51, "volume": 1}}
+            )
+            self.assertEqual({"type": "accepted", "cursor": 1}, websocket.receive_json())
+            worker = self.client.get("/api/admin/workers").json()[0]
+            self.assertEqual("needs_human", worker["safety_state"])
+            alerts = self.client.get("/api/admin/alerts").json()
+            self.assertEqual(("high", "external_broker_change"), (alerts[-1]["priority"], alerts[-1]["alert_type"]))
+            self.assertEqual(
+                204,
+                self.client.post(
+                    f"/api/admin/workers/{worker_id}/revoke", headers={"X-CSRF-Token": login.json()["csrf_token"]}
+                ).status_code,
+            )
+            with self.assertRaises(Exception) as closed:
+                websocket.receive_json()
+            self.assertEqual(1008, getattr(closed.exception, "code", None))
+
+        self.assertEqual("revoked", self.client.get("/api/admin/workers").json()[0]["connectivity"])
+        self.assertIn("worker_certificate_revoked", [
+            event["event_type"] for event in self.client.get("/api/admin/events").json()
+        ])
+        with self.client.websocket_connect("/api/worker/session") as websocket:
+            websocket.send_json({"worker_id": worker_id, "certificate": certificate})
+            with self.assertRaises(Exception) as error:
+                websocket.receive_json()
+        self.assertEqual(1008, getattr(error.exception, "code", None))
+
     def _create_pending_enrollment(self) -> str:
         private_key = ec.generate_private_key(ec.SECP256R1())
         public_key_pem = private_key.public_key().public_bytes(

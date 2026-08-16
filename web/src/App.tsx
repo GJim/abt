@@ -42,6 +42,7 @@ type AccountWorker = {
   login: number
   server: string
   connectivity: string
+  safety_state: string
   latest_snapshot: {
     cursor: number
     observed_at: string
@@ -53,6 +54,15 @@ type AccountWorker = {
   deltas: ReconciliationDelta[]
 }
 
+type WorkerAlert = {
+  alert_id: number
+  worker_id: string
+  priority: string
+  alert_type: string
+  reason: string
+  occurred_at: string
+}
+
 function App() {
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
@@ -60,27 +70,51 @@ function App() {
   const [events, setEvents] = useState<AuditEvent[]>([])
   const [enrollments, setEnrollments] = useState<Enrollment[]>([])
   const [workers, setWorkers] = useState<AccountWorker[]>([])
+  const [alerts, setAlerts] = useState<WorkerAlert[]>([])
   const [processingEnrollmentId, setProcessingEnrollmentId] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
 
   async function refreshManagementData() {
-    const [eventsResponse, enrollmentsResponse, workersResponse] = await Promise.all([
+    const [eventsResponse, enrollmentsResponse, workersResponse, alertsResponse] = await Promise.all([
       fetch('/api/admin/events', { credentials: 'same-origin' }),
       fetch('/api/admin/enrollments', { credentials: 'same-origin' }),
       fetch('/api/admin/workers', { credentials: 'same-origin' }),
+      fetch('/api/admin/alerts', { credentials: 'same-origin' }),
     ])
-    if (!eventsResponse.ok || !enrollmentsResponse.ok || !workersResponse.ok) {
+    if (!eventsResponse.ok || !enrollmentsResponse.ok || !workersResponse.ok || !alertsResponse.ok) {
       throw new Error('Management data could not be loaded.')
     }
 
-    const [eventPayload, enrollmentPayload, workerPayload] = await Promise.all([
+    const [eventPayload, enrollmentPayload, workerPayload, alertPayload] = await Promise.all([
       eventsResponse.json() as Promise<AuditEvent[]>,
       enrollmentsResponse.json() as Promise<Enrollment[]>,
       workersResponse.json() as Promise<AccountWorker[]>,
+      alertsResponse.json() as Promise<WorkerAlert[]>,
     ])
     setEvents(eventPayload)
     setEnrollments(enrollmentPayload)
     setWorkers(workerPayload)
+    setAlerts(alertPayload)
+  }
+
+  async function revokeWorker(workerId: string) {
+    if (!csrfToken) {
+      return
+    }
+    setError(null)
+    try {
+      const response = await fetch(`/api/admin/workers/${workerId}/revoke`, {
+        method: 'POST',
+        headers: { 'X-CSRF-Token': csrfToken },
+        credentials: 'same-origin',
+      })
+      if (!response.ok) {
+        throw new Error('Certificate revocation failed.')
+      }
+      await refreshManagementData()
+    } catch {
+      setError('Could not revoke this worker certificate. Please try again.')
+    }
   }
 
   async function submitLogin(event: FormEvent<HTMLFormElement>) {
@@ -140,6 +174,20 @@ function App() {
             <p>Your management session is active.</p>
           </header>
           {error && <p className="error" role="alert">{error}</p>}
+          <section aria-labelledby="worker-alerts-heading">
+            <h2 id="worker-alerts-heading">Worker alerts</h2>
+            {alerts.length === 0 ? <p>No worker alerts.</p> : (
+              <ul className="worker-alerts" aria-label="Worker alerts">
+                {alerts.map((alert) => (
+                  <li key={alert.alert_id}>
+                    <strong>{alert.priority}: {alert.alert_type}</strong>
+                    <span>{alert.reason}</span>
+                    <time dateTime={alert.occurred_at}>{alert.occurred_at}</time>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </section>
           <section aria-labelledby="pending-enrollments-heading">
             <h2 id="pending-enrollments-heading">Pending worker registrations</h2>
             {enrollments.length === 0 ? (
@@ -206,7 +254,18 @@ function App() {
                     <dl>
                       <div><dt>Account</dt><dd>{worker.login} on {worker.server}</dd></div>
                       <div><dt>Connectivity</dt><dd>{worker.connectivity}</dd></div>
+                      <div><dt>Safety state</dt><dd>{worker.safety_state}</dd></div>
                     </dl>
+                    {worker.connectivity !== 'revoked' && (
+                      <button
+                        aria-label={`Revoke certificate for ${worker.login} on ${worker.server}`}
+                        className="reject-button"
+                        onClick={() => void revokeWorker(worker.worker_id)}
+                        type="button"
+                      >
+                        Revoke certificate
+                      </button>
+                    )}
                     {worker.latest_snapshot && (
                       <section aria-label={`Latest snapshot for ${worker.login} on ${worker.server}`}>
                         <h3>Latest snapshot</h3>

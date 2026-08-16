@@ -28,6 +28,68 @@ class AuthenticatedReconciliationSession(Protocol):
     def send_reconciliation(self, message: dict[str, object]) -> None: ...
 
 
+class WorkerSafetySession(Protocol):
+    def heartbeat(self) -> bool: ...
+
+    def send_safety_state(self, state: str, reason: str) -> None: ...
+
+
+class WorkerSafetyAdapter:
+    """Maintain the native worker's read-only lost-link safety state."""
+
+    def __init__(self, session: WorkerSafetySession, *, lost_link_after: timedelta = timedelta(minutes=5)) -> None:
+        self._session = session
+        self._lost_link_after = lost_link_after
+        self._last_controller_signal: datetime | None = None
+        self.state = "connected"
+
+    def heartbeat(self, observed_at: datetime) -> bool:
+        """Exchange the required 30-second heartbeat and report safe state transitions."""
+
+        if self._last_controller_signal is None:
+            self._last_controller_signal = observed_at
+        try:
+            received = self._session.heartbeat()
+        except WorkerEnrollmentError:
+            received = False
+        if received:
+            self._last_controller_signal = observed_at
+            if self.state != "connected":
+                self.state = "connected"
+                self._session.send_safety_state("connected", "controller_signal_recovered")
+            return True
+        if observed_at - self._last_controller_signal >= self._lost_link_after and self.state != "lost_link_safety":
+            self.state = "lost_link_safety"
+            self._session.send_safety_state("lost_link_safety", "five_minute_missed_heartbeat")
+        return False
+
+    def run_with_retries(
+        self, operation: Callable[[], None], *, sleep: Callable[[float], None] = _sleep
+    ) -> None:
+        """Retry terminal/API failures at most three times before escalating to a human."""
+
+        for attempt in range(3):
+            try:
+                operation()
+                return
+            except AccountMismatchError:
+                self._needs_human("account_mismatch")
+                raise
+            except WorkerEnrollmentError:
+                if attempt == 2:
+                    self._needs_human("terminal_or_api_failure")
+                    raise
+                sleep(float(2 ** attempt))
+
+    def _needs_human(self, reason: str) -> None:
+        self.state = "needs_human"
+        self._session.send_safety_state("needs_human", reason)
+
+
+class AccountMismatchError(WorkerEnrollmentError):
+    """The terminal is logged into an account other than the worker's binding."""
+
+
 class MT5ReconciliationAdapter:
     """Poll one MT5 terminal without exposing a broker-write operation."""
 
@@ -85,12 +147,19 @@ class MT5ReconciliationAdapter:
         *,
         now: Callable[[], datetime] = lambda: datetime.now(UTC),
         sleep: Callable[[float], None] = _sleep,
+        heartbeat: Callable[[], bool] | None = None,
     ) -> None:
-        """Run the required one-minute read-only polling cadence."""
+        """Run the required one-minute read-only polling cadence and 30-second heartbeats."""
 
         while True:
             self.poll(now())
-            sleep(60)
+            if heartbeat is None:
+                sleep(60)
+            else:
+                heartbeat()
+                sleep(30)
+                heartbeat()
+                sleep(30)
 
 
 def reconcile_authenticated_worker(
@@ -114,15 +183,44 @@ def reconcile_authenticated_worker(
         initialized = True
         if not login_mt5(login, password=password, server=server):
             raise WorkerEnrollmentError("The local MT5 login was not accepted.")
+        account = _evidence(mt5.account_info(), "account")
+        if account.get("login") != login or account.get("server") != server:
+            raise AccountMismatchError("The local MT5 account does not match the approved worker binding.")
+        safety: WorkerSafetyAdapter | None = None
+        if callable(getattr(session, "heartbeat", None)) and callable(getattr(session, "send_safety_state", None)):
+            safety = WorkerSafetyAdapter(session)  # type: ignore[arg-type]
         MT5ReconciliationAdapter(
             mt5, emit=session.send_reconciliation, initial_cursor=getattr(session, "reconciliation_cursor", 0)
-        ).run_forever(now=now, sleep=sleep)
+        ).run_forever(
+            now=now,
+            sleep=sleep,
+            heartbeat=None if safety is None else lambda: safety.heartbeat(now()),
+        )
     finally:
         password = ""
         if initialized:
             shutdown = getattr(mt5, "shutdown", None)
             if callable(shutdown):
                 shutdown()
+
+
+def reconcile_with_safety(
+    *,
+    mt5: ReadOnlyMT5,
+    session: AuthenticatedReconciliationSession & WorkerSafetySession,
+    login: int,
+    server: str,
+    now: Callable[[], datetime] = lambda: datetime.now(UTC),
+    sleep: Callable[[float], None] = _sleep,
+) -> None:
+    """Run reconciliation with bounded terminal/API recovery and human escalation."""
+
+    WorkerSafetyAdapter(session).run_with_retries(
+        lambda: reconcile_authenticated_worker(
+            mt5=mt5, session=session, login=login, server=server, now=now, sleep=sleep
+        ),
+        sleep=sleep,
+    )
 
 
 def _evidence(value: object, kind: str) -> dict[str, object]:

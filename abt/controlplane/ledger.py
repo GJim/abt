@@ -405,6 +405,42 @@ class ControlLedger:
             self._connection.execute("UPDATE workers SET last_seen_at = ? WHERE worker_id = ?", [_utc_now(), worker_id])
             self._event("worker_session_authenticated", {"worker_id": worker_id})
 
+    def record_worker_heartbeat(self, worker_id: str) -> None:
+        with self._transaction():
+            self.active_worker(worker_id)
+            self._connection.execute("UPDATE workers SET last_seen_at = ? WHERE worker_id = ?", [_utc_now(), worker_id])
+            self._event("worker_heartbeat_received", {"worker_id": worker_id})
+
+    def record_worker_safety_state(self, worker_id: str, state: str, reason: str) -> None:
+        if state not in {"connected", "lost_link_safety", "needs_human"}:
+            raise LedgerError("Worker safety state is invalid.")
+        with self._transaction():
+            self.active_worker(worker_id)
+            self._connection.execute(
+                "UPDATE workers SET safety_state = ?, last_seen_at = ? WHERE worker_id = ?",
+                [state, _utc_now(), worker_id],
+            )
+            self._event("worker_safety_state_changed", {"worker_id": worker_id, "state": state, "reason": reason})
+            if state in {"lost_link_safety", "needs_human"}:
+                self._alert(worker_id, "high", state, reason)
+
+    def revoke_worker(self, worker_id: str, revoked_by: str) -> None:
+        with self._transaction():
+            active = self._connection.execute(
+                "SELECT 1 FROM workers WHERE worker_id = ? AND status = 'active'", [worker_id]
+            ).fetchone()
+            if active is None:
+                raise LedgerError("Worker is not active.")
+            self._connection.execute(
+                """
+                UPDATE workers SET status = 'revoked', safety_state = 'revoked', revoked_at = ?
+                WHERE worker_id = ? AND status = 'active'
+                """,
+                [_utc_now(), worker_id],
+            )
+            self._event("worker_certificate_revoked", {"worker_id": worker_id, "revoked_by": revoked_by})
+            self._alert(worker_id, "high", "certificate_revoked", "administrator_revocation")
+
     def record_delta(
         self, worker_id: str, cursor: int, observed_at: str, entity: str, ticket: str, change: str, record: dict[str, object]
     ) -> None:
@@ -425,15 +461,24 @@ class ControlLedger:
                 "worker_reconciliation_delta",
                 {"worker_id": worker_id, "cursor": cursor, "entity": entity, "ticket": ticket, "change": change},
             )
+            if not isinstance(record.get("control_plane_command_id"), str) or not record["control_plane_command_id"]:
+                self._connection.execute(
+                    "UPDATE workers SET safety_state = 'needs_human' WHERE worker_id = ?", [worker_id]
+                )
+                self._event(
+                    "external_broker_change",
+                    {"worker_id": worker_id, "cursor": cursor, "entity": entity, "ticket": ticket, "change": change},
+                )
+                self._alert(worker_id, "high", "external_broker_change", "unattributed_broker_change")
 
     def worker_reconciliation(self) -> list[dict[str, Any]]:
         now = _utc_now()
         with self._lock:
             workers = self._connection.execute(
-                "SELECT worker_id, login, server, last_seen_at FROM workers WHERE status = 'active' ORDER BY approved_at"
+                "SELECT worker_id, login, server, status, safety_state, last_seen_at FROM workers ORDER BY approved_at"
             ).fetchall()
             result = []
-            for worker_id, login, server, last_seen_at in workers:
+            for worker_id, login, server, status, safety_state, last_seen_at in workers:
                 snapshot = self._connection.execute(
                     """
                     SELECT snapshot_id, cursor, observed_at, account, terminal, orders, positions
@@ -453,7 +498,11 @@ class ControlLedger:
                         "worker_id": worker_id,
                         "login": login,
                         "server": server,
-                        "connectivity": "connected" if last_seen_at and now - last_seen_at <= timedelta(minutes=5) else "stale",
+                        "connectivity": (
+                            "revoked" if status == "revoked"
+                            else "connected" if last_seen_at and now - last_seen_at <= timedelta(minutes=5) else "stale"
+                        ),
+                        "safety_state": safety_state,
                         "latest_snapshot": None if snapshot is None else {
                             "snapshot_id": snapshot[0], "cursor": snapshot[1], "observed_at": snapshot[2],
                             "account": json.loads(snapshot[3]), "terminal": json.loads(snapshot[4]),
@@ -467,6 +516,17 @@ class ControlLedger:
                     }
                 )
         return result
+
+    def alerts(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT alert_id, worker_id, priority, alert_type, reason, occurred_at FROM alerts ORDER BY alert_id"
+            ).fetchall()
+        return [
+            {"alert_id": row[0], "worker_id": row[1], "priority": row[2], "alert_type": row[3],
+             "reason": row[4], "occurred_at": row[5]}
+            for row in rows
+        ]
 
     def reconciliation_cursor(self, worker_id: str) -> int:
         with self._lock:
@@ -606,6 +666,12 @@ class ControlLedger:
             [event_type, json.dumps(payload, sort_keys=True), _utc_now()],
         )
 
+    def _alert(self, worker_id: str, priority: str, alert_type: str, reason: str) -> None:
+        self._connection.execute(
+            "INSERT INTO alerts (worker_id, priority, alert_type, reason, occurred_at) VALUES (?, ?, ?, ?, ?)",
+            [worker_id, priority, alert_type, reason, _utc_now()],
+        )
+
     def _initialize(self) -> None:
         with self._lock:
             self._connection.execute(
@@ -667,7 +733,9 @@ class ControlLedger:
                     certificate VARCHAR NOT NULL,
                     status VARCHAR NOT NULL,
                     approved_at TIMESTAMPTZ NOT NULL,
-                    last_seen_at TIMESTAMPTZ
+                    last_seen_at TIMESTAMPTZ,
+                    safety_state VARCHAR NOT NULL DEFAULT 'connected',
+                    revoked_at TIMESTAMPTZ
                 );
                 CREATE TABLE IF NOT EXISTS reconciliation_snapshots (
                     worker_id VARCHAR NOT NULL,
@@ -699,12 +767,24 @@ class ControlLedger:
                     payload JSON NOT NULL,
                     occurred_at TIMESTAMPTZ NOT NULL
                 );
+                CREATE SEQUENCE IF NOT EXISTS alerts_sequence START 1;
+                CREATE TABLE IF NOT EXISTS alerts (
+                    alert_id BIGINT PRIMARY KEY DEFAULT nextval('alerts_sequence'),
+                    worker_id VARCHAR NOT NULL,
+                    priority VARCHAR NOT NULL,
+                    alert_type VARCHAR NOT NULL,
+                    reason VARCHAR NOT NULL,
+                    occurred_at TIMESTAMPTZ NOT NULL
+                );
                 """
             )
             self._connection.execute(
                 "ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS password_secret_deleted_at TIMESTAMPTZ"
             )
             self._connection.execute("ALTER TABLE workers ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ")
+            self._connection.execute("ALTER TABLE workers ADD COLUMN IF NOT EXISTS safety_state VARCHAR DEFAULT 'connected'")
+            self._connection.execute("ALTER TABLE workers ADD COLUMN IF NOT EXISTS revoked_at TIMESTAMPTZ")
+            self._connection.execute("UPDATE workers SET safety_state = 'connected' WHERE safety_state IS NULL")
             self._migrate_reconciliation_snapshots()
 
     def _migrate_reconciliation_snapshots(self) -> None:

@@ -43,6 +43,17 @@ class AuthenticatedWorkerSession:
         if response.get("type") != "accepted" or response.get("cursor") != message.get("cursor"):
             raise WorkerEnrollmentError("The controller rejected worker reconciliation.")
 
+    def heartbeat(self) -> bool:
+        _send(self.socket, {"type": "heartbeat"})
+        response = _message(self.socket)
+        return response == {"type": "heartbeat_ack"}
+
+    def send_safety_state(self, state: str, reason: str) -> None:
+        _send(self.socket, {"type": "safety_state", "state": state, "reason": reason})
+        response = _message(self.socket)
+        if response != {"type": "accepted", "state": state}:
+            raise WorkerEnrollmentError("The controller rejected the worker safety state.")
+
 
 def open_authenticated_worker_session(
     *,

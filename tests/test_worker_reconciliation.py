@@ -3,7 +3,13 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 import unittest
 
-from abt.worker.reconciliation import MT5ReconciliationAdapter, reconcile_authenticated_worker
+from abt.worker.enrollment import WorkerEnrollmentError
+from abt.worker.reconciliation import (
+    AccountMismatchError,
+    MT5ReconciliationAdapter,
+    WorkerSafetyAdapter,
+    reconcile_authenticated_worker,
+)
 
 
 class ReadOnlyMT5:
@@ -35,6 +41,45 @@ class ReadOnlyMT5:
 
 
 class WorkerReconciliationTests(unittest.TestCase):
+    def test_enters_read_only_lost_link_safety_after_five_missed_minutes_and_recovers(self) -> None:
+        session = SafetySession([False, False, False, True])
+        adapter = WorkerSafetyAdapter(session)
+        started = datetime(2026, 8, 16, tzinfo=UTC)
+
+        self.assertFalse(adapter.heartbeat(started))
+        self.assertFalse(adapter.heartbeat(started + timedelta(seconds=30)))
+        self.assertEqual("connected", adapter.state)
+        self.assertFalse(adapter.heartbeat(started + timedelta(minutes=5)))
+        self.assertEqual("lost_link_safety", adapter.state)
+        self.assertTrue(adapter.heartbeat(started + timedelta(minutes=5, seconds=30)))
+
+        self.assertEqual("connected", adapter.state)
+        self.assertEqual(["lost_link_safety", "connected"], session.states)
+
+    def test_stops_terminal_retries_after_three_failures_and_escalates_account_mismatch_immediately(self) -> None:
+        session = SafetySession([])
+        adapter = WorkerSafetyAdapter(session)
+        attempts = 0
+        waits: list[float] = []
+
+        def terminal_failure() -> None:
+            nonlocal attempts
+            attempts += 1
+            raise WorkerEnrollmentError("terminal unavailable")
+
+        with self.assertRaises(WorkerEnrollmentError):
+            adapter.run_with_retries(terminal_failure, sleep=waits.append)
+        self.assertEqual((3, [1.0, 2.0], ["needs_human"]), (attempts, waits, session.states))
+
+        mismatch_attempts = 0
+        with self.assertRaises(AccountMismatchError):
+            def account_mismatch() -> None:
+                nonlocal mismatch_attempts
+                mismatch_attempts += 1
+                raise AccountMismatchError("unexpected account")
+            adapter.run_with_retries(account_mismatch, sleep=waits.append)
+        self.assertEqual(1, mismatch_attempts)
+
     def test_emits_ten_minute_snapshots_and_relevant_deltas(self) -> None:
         mt5 = ReadOnlyMT5()
         emitted: list[dict[str, object]] = []
@@ -124,7 +169,9 @@ class WorkerReconciliationTests(unittest.TestCase):
                 sleep=lambda _: (_ for _ in ()).throw(StopIteration),
             )
 
-        self.assertEqual(["account_info", "terminal_info", "orders_get", "positions_get", "shutdown"], mt5.calls)
+        self.assertEqual(
+            ["account_info", "account_info", "terminal_info", "orders_get", "positions_get", "shutdown"], mt5.calls
+        )
         self.assertEqual("snapshot", emitted[0]["type"])
         self.assertEqual(0, mt5.broker_write_calls)
 
@@ -139,3 +186,15 @@ class MemoryOnlySession:
 
     def send_reconciliation(self, message: dict[str, object]) -> None:
         self._emitted.append(message)
+
+
+class SafetySession:
+    def __init__(self, heartbeats: list[bool]) -> None:
+        self._heartbeats = iter(heartbeats)
+        self.states: list[str] = []
+
+    def heartbeat(self) -> bool:
+        return next(self._heartbeats)
+
+    def send_safety_state(self, state: str, reason: str) -> None:
+        self.states.append(state)

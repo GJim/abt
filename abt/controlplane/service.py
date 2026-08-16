@@ -69,6 +69,7 @@ def create_app(
 
     app = FastAPI(title="abt control plane", version="0.1.0", lifespan=lifespan)
     app.state.ledger = ledger
+    worker_connections: dict[str, set[WebSocket]] = {}
 
     @app.get("/health")
     def health() -> dict[str, str]:
@@ -173,6 +174,31 @@ def create_app(
     ) -> list[dict[str, object]]:
         _require_admin(ledger, abt_admin_session)
         return ledger.worker_reconciliation()
+
+    @app.get("/api/admin/alerts")
+    def list_alerts(
+        abt_admin_session: Annotated[str | None, Cookie()] = None,
+    ) -> list[dict[str, object]]:
+        _require_admin(ledger, abt_admin_session)
+        return ledger.alerts()
+
+    @app.post("/api/admin/workers/{worker_id}/revoke", status_code=status.HTTP_204_NO_CONTENT)
+    async def revoke_worker(
+        worker_id: str,
+        abt_admin_session: Annotated[str | None, Cookie()] = None,
+        x_csrf_token: Annotated[str | None, Header()] = None,
+    ) -> Response:
+        username = _require_admin(ledger, abt_admin_session, x_csrf_token, require_csrf=True)
+        try:
+            ledger.revoke_worker(worker_id, username)
+        except LedgerError as error:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
+        connections = tuple(worker_connections.pop(worker_id, set()))
+        await asyncio.gather(
+            *(connection.close(code=status.WS_1008_POLICY_VIOLATION) for connection in connections),
+            return_exceptions=True,
+        )
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     @app.post("/api/admin/logout", status_code=status.HTTP_204_NO_CONTENT)
     def logout(
@@ -318,6 +344,7 @@ def create_app(
                 nonce=nonce,
             )
             ledger.record_worker_session(worker.worker_id)
+            worker_connections.setdefault(worker.worker_id, set()).add(websocket)
             await websocket.send_json(
                 {"type": "authenticated", "worker_id": worker.worker_id, "cursor": ledger.reconciliation_cursor(worker.worker_id)}
             )
@@ -330,6 +357,18 @@ def create_app(
                     await websocket.send_json(
                         {"type": "password", "password": secret_store.read_password(worker.password_secret_ref)}
                     )
+                elif message_type == "heartbeat" and set(request) == {"type"}:
+                    ledger.record_worker_heartbeat(worker.worker_id)
+                    await websocket.send_json({"type": "heartbeat_ack"})
+                elif (
+                    message_type == "safety_state"
+                    and set(request) == {"type", "state", "reason"}
+                    and isinstance(request.get("state"), str)
+                    and isinstance(request.get("reason"), str)
+                    and request["reason"]
+                ):
+                    ledger.record_worker_safety_state(worker.worker_id, request["state"], request["reason"])
+                    await websocket.send_json({"type": "accepted", "state": request["state"]})
                 elif message_type == "snapshot":
                     _record_snapshot(ledger, worker.worker_id, request)
                     await websocket.send_json({"type": "accepted", "cursor": request["cursor"]})
@@ -340,6 +379,12 @@ def create_app(
                     raise ValueError("Invalid worker message.")
         except (LedgerError, ProofError, SecretStoreError, ValueError, WebSocketDisconnect):
             await _reject_worker(websocket)
+        finally:
+            connections = worker_connections.get(worker.worker_id) if "worker" in locals() else None
+            if connections is not None:
+                connections.discard(websocket)
+                if not connections:
+                    worker_connections.pop(worker.worker_id, None)
 
     if spa_directory is not None:
         app.mount("/", StaticFiles(directory=spa_directory, html=True), name="management-spa")

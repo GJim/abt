@@ -10,7 +10,7 @@ import httpx
 
 from .enrollment import EnrollmentTransport, MT5Client, WorkerEnrollmentError, register_worker
 from .keystore import HardwareKeyStore, WindowsCNGKeyStore
-from .reconciliation import reconcile_authenticated_worker
+from .reconciliation import reconcile_with_safety
 from .session import open_authenticated_worker_session
 
 
@@ -124,7 +124,7 @@ def main(
                     enrollment_id=arguments.enrollment_id,
                     key_store=key_store,
                 ) as session:
-                    reconcile_authenticated_worker(
+                    reconcile_with_safety(
                         mt5=mt5,
                         session=session,
                         login=arguments.login,
