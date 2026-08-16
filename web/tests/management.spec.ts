@@ -23,6 +23,12 @@ test('administrator can sign in and view audit events', async ({ page }) => {
       ]),
     })
   })
+  await page.route('**/api/admin/enrollments', async (route) => {
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify([]),
+    })
+  })
 
   await page.goto('http://127.0.0.1:4173/')
   await page.getByLabel('Administrator account').fill('ABCDEF')
@@ -31,4 +37,73 @@ test('administrator can sign in and view audit events', async ({ page }) => {
 
   await expect(page.getByRole('heading', { name: 'Audit events' })).toBeVisible()
   await expect(page.getByText('admin_login_succeeded')).toBeVisible()
+})
+
+test('administrator can review and approve a pending worker registration', async ({ page }) => {
+  let enrollmentRequests = 0
+
+  await page.route('**/api/admin/login', async (route) => {
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({ csrf_token: 'csrf-token' }),
+    })
+  })
+  await page.route('**/api/admin/events', async (route) => {
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify([
+        { event_id: 1, event_type: 'worker_enrollment_approved', payload: {}, occurred_at: '2026-08-15T00:00:00Z' },
+      ]),
+    })
+  })
+  await page.route('**/api/admin/enrollments/enrollment-1/approve', async (route) => {
+    expect(route.request().method()).toBe('POST')
+    expect(route.request().headers()['x-csrf-token']).toBe('csrf-token')
+    await route.fulfill({ status: 200 })
+  })
+  await page.route('**/api/admin/enrollments', async (route) => {
+    enrollmentRequests += 1
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify(enrollmentRequests === 1
+        ? [{
+            enrollment_id: 'enrollment-1',
+            login: 12345678,
+            server: 'Broker-Demo',
+            pairing_code: '87654321',
+            source_ip: '192.0.2.40',
+            created_at: '2026-08-15T00:00:00Z',
+            expires_at: '2026-08-15T00:15:00Z',
+            account_info: {
+              currency: 'USD',
+              leverage: 100,
+            },
+            terminal_info: {
+              platform: 'MetaTrader 5',
+              version: '5.0.0',
+            },
+          }]
+        : []),
+    })
+  })
+
+  await page.goto('http://127.0.0.1:4173/')
+  await page.getByLabel('Administrator account').fill('ABCDEF')
+  await page.getByLabel('Password').fill('A-secure-admin-password!')
+  await page.getByRole('button', { name: 'Sign in' }).click()
+
+  await expect(page.getByRole('heading', { name: 'Pending worker registrations' })).toBeVisible()
+  await expect(page.getByText('12345678')).toBeVisible()
+  await expect(page.getByText('Broker-Demo')).toBeVisible()
+  await expect(page.getByText('87654321')).toBeVisible()
+  await expect(page.getByText('192.0.2.40')).toBeVisible()
+  await expect(page.getByRole('region', { name: 'Account information for 12345678 on Broker-Demo' })
+    .getByText('"currency": "USD"')).toBeVisible()
+  await expect(page.getByRole('region', { name: 'Terminal information for 12345678 on Broker-Demo' })
+    .getByText('"platform": "MetaTrader 5"')).toBeVisible()
+  await page.getByRole('button', { name: 'Approve registration for 12345678 on Broker-Demo' }).click()
+
+  await expect(page.getByText('No worker registrations are awaiting review.')).toBeVisible()
+  await expect(page.getByText('worker_enrollment_approved')).toBeVisible()
+  expect(enrollmentRequests).toBe(2)
 })

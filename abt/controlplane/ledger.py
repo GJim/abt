@@ -7,7 +7,7 @@ import threading
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from uuid import uuid4
 
 import duckdb
@@ -43,6 +43,16 @@ class Enrollment:
     public_key_pem: str
     expires_at: datetime
     status: str
+
+
+@dataclass(frozen=True)
+class ActiveWorker:
+    worker_id: str
+    login: int
+    server: str
+    certificate: str
+    public_key_pem: str
+    password_secret_ref: str
 
 
 class ControlLedger:
@@ -184,6 +194,9 @@ class ControlLedger:
         pairing_code: str,
         public_key_pem: str,
         source_ip: str,
+        account_info: dict[str, object],
+        terminal_info: dict[str, object],
+        password_secret_ref: str,
     ) -> Enrollment:
         now = _utc_now()
         expires_at = now + timedelta(minutes=15)
@@ -200,9 +213,9 @@ class ControlLedger:
             self._connection.execute(
                 """
                 INSERT INTO enrollments (
-                    enrollment_id, login, server, pairing_code, public_key_pem, source_ip,
+                    enrollment_id, login, server, pairing_code, public_key_pem, source_ip, account_info, terminal_info, password_secret_ref,
                     status, created_at, expires_at
-                ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
                 """,
                 [
                     enrollment.enrollment_id,
@@ -211,6 +224,9 @@ class ControlLedger:
                     pairing_code,
                     public_key_pem,
                     source_ip,
+                    json.dumps(account_info, sort_keys=True),
+                    json.dumps(terminal_info, sort_keys=True),
+                    password_secret_ref,
                     now,
                     expires_at,
                 ],
@@ -221,19 +237,46 @@ class ControlLedger:
             )
         return enrollment
 
-    def approve_enrollment(self, enrollment_id: str, approved_by: str) -> str:
+    def record_registration_attempt(self, source_ip: str) -> None:
+        now = _utc_now()
+        with self._transaction():
+            self._connection.execute(
+                "DELETE FROM registration_attempts WHERE attempted_at < ?",
+                [now - timedelta(hours=1)],
+            )
+            recent = self._connection.execute(
+                "SELECT count(*) FROM registration_attempts WHERE source_ip = ? AND attempted_at >= ?",
+                [source_ip, now - timedelta(minutes=15)],
+            ).fetchone()[0]
+            hourly = self._connection.execute(
+                "SELECT count(*) FROM registration_attempts WHERE source_ip = ?",
+                [source_ip],
+            ).fetchone()[0]
+            if recent >= 3 or hourly >= 10:
+                raise LedgerError("Worker registration rate limit exceeded.")
+            self._connection.execute(
+                "INSERT INTO registration_attempts (source_ip, attempted_at) VALUES (?, ?)",
+                [source_ip, now],
+            )
+
+    def approve_enrollment(
+        self,
+        enrollment_id: str,
+        approved_by: str,
+        issue_certificate: Callable[[str, int, str, str], str],
+    ) -> str:
         now = _utc_now()
         with self._transaction():
             row = self._connection.execute(
                 """
-                SELECT login, server, status, expires_at
+                SELECT login, server, public_key_pem, status, expires_at
                 FROM enrollments WHERE enrollment_id = ?
                 """,
                 [enrollment_id],
             ).fetchone()
             if row is None:
                 raise LedgerError("Enrollment does not exist.")
-            login, server, status, expires_at = row
+            login, server, public_key_pem, status, expires_at = row
             if status != "pending" or now >= expires_at:
                 raise LedgerError("Enrollment is no longer pending.")
             active = self._connection.execute(
@@ -243,12 +286,13 @@ class ControlLedger:
             if active is not None:
                 raise LedgerError("This MT5 account already has an active worker.")
             worker_id = str(uuid4())
+            certificate = issue_certificate(worker_id, login, server, public_key_pem)
             self._connection.execute(
                 """
-                INSERT INTO workers (worker_id, enrollment_id, login, server, status, approved_at)
-                VALUES (?, ?, ?, ?, 'active', ?)
+                INSERT INTO workers (worker_id, enrollment_id, login, server, certificate, status, approved_at)
+                VALUES (?, ?, ?, ?, ?, 'active', ?)
                 """,
-                [worker_id, enrollment_id, login, server, now],
+                [worker_id, enrollment_id, login, server, certificate, now],
             )
             self._connection.execute(
                 "UPDATE enrollments SET status = 'approved', approved_by = ?, approved_at = ? WHERE enrollment_id = ?",
@@ -259,6 +303,43 @@ class ControlLedger:
                 {"enrollment_id": enrollment_id, "worker_id": worker_id, "approved_by": approved_by},
             )
             return worker_id
+
+    def enrollment_password_secret_ref(self, enrollment_id: str) -> str:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT password_secret_ref FROM enrollments WHERE enrollment_id = ? AND status = 'pending'",
+                [enrollment_id],
+            ).fetchone()
+        if row is None:
+            raise LedgerError("Enrollment is no longer pending.")
+        return row[0]
+
+    def active_worker_for_enrollment(self, enrollment_id: str) -> ActiveWorker:
+        return self._active_worker(
+            """
+            SELECT w.worker_id, w.login, w.server, w.certificate, e.public_key_pem, e.password_secret_ref
+            FROM workers w JOIN enrollments e ON e.enrollment_id = w.enrollment_id
+            WHERE w.enrollment_id = ? AND w.status = 'active'
+            """,
+            [enrollment_id],
+        )
+
+    def active_worker(self, worker_id: str) -> ActiveWorker:
+        return self._active_worker(
+            """
+            SELECT w.worker_id, w.login, w.server, w.certificate, e.public_key_pem, e.password_secret_ref
+            FROM workers w JOIN enrollments e ON e.enrollment_id = w.enrollment_id
+            WHERE w.worker_id = ? AND w.status = 'active'
+            """,
+            [worker_id],
+        )
+
+    def _active_worker(self, query: str, parameters: list[str]) -> ActiveWorker:
+        with self._lock:
+            row = self._connection.execute(query, parameters).fetchone()
+        if row is None:
+            raise LedgerError("Worker is not active.")
+        return ActiveWorker(*row)
 
     def reject_enrollment(self, enrollment_id: str, rejected_by: str) -> None:
         with self._transaction():
@@ -274,16 +355,42 @@ class ControlLedger:
             )
             self._event("worker_enrollment_rejected", {"enrollment_id": enrollment_id, "rejected_by": rejected_by})
 
-    def pending_enrollments(self) -> list[dict[str, Any]]:
+    def expire_pending_enrollments(self) -> list[str]:
         now = _utc_now()
         with self._transaction():
+            rows = self._connection.execute(
+                """
+                SELECT enrollment_id, password_secret_ref
+                FROM enrollments
+                WHERE (status = 'pending' AND expires_at <= ?)
+                   OR (status = 'expired' AND password_secret_deleted_at IS NULL)
+                """,
+                [now],
+            ).fetchall()
             self._connection.execute(
                 "UPDATE enrollments SET status = 'expired' WHERE status = 'pending' AND expires_at <= ?",
                 [now],
             )
+            for enrollment_id, _ in rows:
+                self._event("worker_enrollment_expired", {"enrollment_id": enrollment_id})
+            return [row[1] for row in rows]
+
+    def mark_expired_password_deleted(self, password_secret_ref: str) -> None:
+        with self._transaction():
+            self._connection.execute(
+                """
+                UPDATE enrollments
+                SET password_secret_deleted_at = ?
+                WHERE status = 'expired' AND password_secret_ref = ?
+                """,
+                [_utc_now(), password_secret_ref],
+            )
+
+    def pending_enrollments(self) -> list[dict[str, Any]]:
+        with self._transaction():
             rows = self._connection.execute(
                 """
-                SELECT enrollment_id, login, server, pairing_code, source_ip, created_at, expires_at
+                SELECT enrollment_id, login, server, pairing_code, source_ip, account_info, terminal_info, created_at, expires_at
                 FROM enrollments WHERE status = 'pending' ORDER BY created_at
                 """
             ).fetchall()
@@ -294,8 +401,10 @@ class ControlLedger:
                     "server": row[2],
                     "pairing_code": row[3],
                     "source_ip": row[4],
-                    "created_at": row[5],
-                    "expires_at": row[6],
+                    "account_info": json.loads(row[5]),
+                    "terminal_info": json.loads(row[6]),
+                    "created_at": row[7],
+                    "expires_at": row[8],
                 }
                 for row in rows
             ]
@@ -364,17 +473,26 @@ class ControlLedger:
                     pairing_code VARCHAR NOT NULL,
                     public_key_pem VARCHAR NOT NULL,
                     source_ip VARCHAR NOT NULL,
+                    account_info JSON NOT NULL,
+                    terminal_info JSON NOT NULL,
+                    password_secret_ref VARCHAR NOT NULL,
                     status VARCHAR NOT NULL,
                     created_at TIMESTAMPTZ NOT NULL,
                     expires_at TIMESTAMPTZ NOT NULL,
                     approved_by VARCHAR,
-                    approved_at TIMESTAMPTZ
+                    approved_at TIMESTAMPTZ,
+                    password_secret_deleted_at TIMESTAMPTZ
+                );
+                CREATE TABLE IF NOT EXISTS registration_attempts (
+                    source_ip VARCHAR NOT NULL,
+                    attempted_at TIMESTAMPTZ NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS workers (
                     worker_id VARCHAR PRIMARY KEY,
                     enrollment_id VARCHAR UNIQUE NOT NULL,
                     login BIGINT NOT NULL,
                     server VARCHAR NOT NULL,
+                    certificate VARCHAR NOT NULL,
                     status VARCHAR NOT NULL,
                     approved_at TIMESTAMPTZ NOT NULL
                 );
@@ -386,6 +504,9 @@ class ControlLedger:
                     occurred_at TIMESTAMPTZ NOT NULL
                 );
                 """
+            )
+            self._connection.execute(
+                "ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS password_secret_deleted_at TIMESTAMPTZ"
             )
 
     def _transaction(self):

@@ -16,14 +16,14 @@ Status: ready-for-agent
 2. As a 主控台管理員, I want all login failures from the same Cloudflare client IP to lock after three failures, so that repeated password guessing is stopped until local intervention.
 3. As a 主控台管理員, I want to unlock a blocked IP only from the console host CLI, so that the public management site has no account-recovery path.
 4. As a 主控台管理員, I want management sessions to be HttpOnly, Secure, SameSite and CSRF-protected, so that browser tokens are not exposed to JavaScript or cross-site requests.
-5. As a 主控台管理員, I want to create an account bootstrap grant locally, so that a new worker can obtain an MT5 password without it being stored on the worker.
-6. As a worker operator, I want to configure a native worker with its terminal path and one-time bootstrap grant, so that it can sign in to its assigned MT5 account without Docker or local password persistence.
+5. As a worker operator, I want to interactively enter the MT5 password during initial native-worker registration, so that it is not placed in a worker file or environment variable.
+6. As a 主控台管理員, I want the console to store the initial password in OpenBao only after the worker proves a successful local MT5 login, so that the console remains the sole credential authority.
 7. As a worker operator, I want the worker to use a non-exportable hardware/OS device key, so that its identity cannot be copied to another machine.
 8. As a Windows worker operator, I want the worker to use CNG for its device key, so that it follows the platform-native hardware/OS key boundary.
 9. As a Linux worker operator, I want the worker to use TPM 2.0/PKCS#11 for its device key, so that a future non-Windows worker has an equivalent trust boundary.
 10. As a platform operator, I want hosts without a supported CNG/TPM/PKCS#11 keystore rejected as workers, so that software key-file fallback does not silently weaken the model.
-11. As a worker, I want a bootstrap grant to be one-time and bound to my hardware public key and expected MT5 account, so that a leaked grant cannot be replayed by another host.
-12. As a worker, I want to submit actual MT5 `account_info`, my P-256 public key and an eight-digit pairing code during registration, so that the management site has evidence to review.
+11. As a worker, I want my initial password handoff and actual MT5 evidence bound to my hardware public key, so that another host cannot replay my registration.
+12. As a worker, I want to submit actual MT5 `account_info`, `terminal_info`, my P-256 public key and an eight-digit pairing code during registration, and display the same evidence locally, so that the management site and operator have evidence to review.
 13. As a 主控台管理員, I want to compare a worker’s pairing code, observed source and actual broker account before approval, so that I approve the intended host and account.
 14. As a 主控台管理員, I want pending worker registrations to expire after 15 minutes and rejected registrations to stay rejected, so that stale approvals cannot be reused.
 15. As a public service operator, I want worker registration rate-limited per Cloudflare client IP, so that pending-registration storage cannot be exhausted by unauthenticated traffic.
@@ -69,11 +69,11 @@ Status: ready-for-agent
 - A successful administrator login rotates a server-side session. Sessions expire after 30 minutes of inactivity or eight hours absolute lifetime. Password reset invalidates every session for that administrator.
 - Failed login attempts are tracked by the trusted Cloudflare client IP. Three failures permanently lock that IP until the console-host CLI unlocks it.
 - Worker enrollment accepts only a valid ECDSA P-256 proof over canonical login/server/pairing-code data. The worker public key is P-256 and must be backed by CNG on Windows or TPM 2.0/PKCS#11 on Linux; no software-key fallback is permitted.
-- A **帳戶 bootstrap grant** is created from the console-host CLI. It binds the expected login/server, the hardware public key and a secret stored in OpenBao. It is single-use and returns the MT5 password only to worker memory.
+- During initial registration, the worker operator enters the MT5 password interactively. After successful local MT5 login, the native worker sends the password as a non-displayed, non-echoed request field alongside actual account/terminal evidence and a hardware-key proof through Cloudflare TLS. The controller immediately stores the password in OpenBao, never logs it, and deletes the pending secret when registration expires or is rejected.
 - Approval uses the worker’s real MT5 `account_info`, pairing code and observed source. Approval creates the only active worker binding for a login/server pair. Replacing a worker requires revoking or disabling the old binding.
 - An approved worker obtains an **裝置憑證** and uses challenge-response over WSS. Device certificates rotate every 30 days with a new hardware-backed key pair.
 - OpenBao stores the controller signing material, device PKI and MT5 credentials. SoftHSM plus a version-locked PKCS#11 KMS plugin supplies auto-unseal. The startup health check must verify unseal and least-privilege secret access.
-- Workers never connect to OpenBao. An authenticated worker uses WSS to request its own MT5 credential; the controller verifies worker/account binding and mediates the OpenBao read. The password remains memory-only and trusts Cloudflare’s TLS proxy boundary.
+- Workers never connect to OpenBao. An approved authenticated worker uses WSS for every MT5 login to request its own credential; the controller verifies worker/account binding and mediates the OpenBao read. The password remains memory-only and trusts Cloudflare’s TLS proxy boundary.
 - WSS heartbeats run every 30 seconds. A worker enters the existing five-minute lost-link safety state after no valid controller signal. In this slice it records/alerts only because no positions are ever created.
 - Workers poll MT5 every minute, emit exposure-lifecycle deltas immediately and full snapshots every 10 minutes. Terminal/API recovery uses bounded backoff and stops after three failures or an account mismatch.
 - External changes produce immutable events, high-priority alerts and a worker state requiring human attention. For later paired trading they also freeze affected pairs.

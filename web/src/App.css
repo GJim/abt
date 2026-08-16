@@ -17,6 +17,18 @@
   width: 100%;
 }
 
+.management-content {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 0.75rem;
+  box-shadow: var(--shadow);
+  display: grid;
+  gap: 1.5rem;
+  max-width: 60rem;
+  padding: 2.5rem;
+  width: 100%;
+}
+
 .eyebrow {
   color: var(--accent);
   font-size: 0.8rem;
@@ -80,7 +92,102 @@ li {
   padding: 0.75rem 0;
 }
 
+.enrollment-list,
+.audit-events {
+  margin: 0;
+}
+
+.enrollment {
+  align-items: start;
+  gap: 1rem;
+}
+
+.enrollment dl {
+  display: grid;
+  flex: 1;
+  gap: 0.5rem;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin: 0;
+}
+
+.enrollment dl > div {
+  display: grid;
+  gap: 0.15rem;
+}
+
+dt {
+  color: var(--text);
+  font-size: 0.8rem;
+  font-weight: 700;
+}
+
+dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.enrollment-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.enrollment-evidence {
+  display: grid;
+  flex-basis: 100%;
+  gap: 1rem;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.enrollment-evidence h3 {
+  font-size: 0.9rem;
+  margin: 0 0 0.5rem;
+}
+
+pre {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 0.4rem;
+  margin: 0;
+  overflow-x: auto;
+  padding: 0.75rem;
+  white-space: pre-wrap;
+}
+
+.reject-button {
+  background: #b42318;
+}
+
+button:disabled {
+  cursor: wait;
+  opacity: 0.7;
+}
+
 time {
   color: var(--text);
   font-size: 0.85rem;
+}
+
+@media (max-width: 40rem) {
+  .management {
+    padding: 1rem;
+  }
+
+  .management-content,
+  .login-card {
+    padding: 1.5rem;
+  }
+
+  .enrollment {
+    flex-direction: column;
+  }
+
+  .enrollment dl {
+    grid-template-columns: 1fr;
+    width: 100%;
+  }
+
+  .enrollment-evidence {
+    grid-template-columns: 1fr;
+  }
 }

@@ -1,22 +1,79 @@
 from __future__ import annotations
 
 import base64
+from datetime import UTC, datetime, timedelta
+import json
 import tempfile
 import unittest
 from pathlib import Path
 
+from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from fastapi.testclient import TestClient
 
-from abt.controlplane.crypto import enrollment_payload
-from abt.controlplane.service import create_app
+from abt.controlplane.crypto import ProofError, device_certificate_payload, enrollment_payload, worker_proof_payload
+from abt.controlplane.secrets import SecretStore, SecretStoreError
+from abt.controlplane.service import _delete_expired_pending_secrets, create_app
+
+
+class MemorySecretStore:
+    def __init__(self) -> None:
+        self.passwords: dict[str, str] = {}
+
+    def write_password(self, reference: str, password: str) -> None:
+        self.passwords[reference] = password
+
+    def read_password(self, reference: str) -> str:
+        return self.passwords[reference]
+
+    def delete_password(self, reference: str) -> None:
+        del self.passwords[reference]
+
+
+class MemoryCertificateIssuer:
+    def __init__(self) -> None:
+        self._key = ec.generate_private_key(ec.SECP256R1())
+
+    def issue(self, *, worker_id: str, login: int, server: str, public_key_pem: str) -> str:
+        issued_at = datetime.now(UTC)
+        payload = device_certificate_payload(
+            worker_id=worker_id,
+            login=login,
+            server=server,
+            public_key_pem=public_key_pem,
+            issued_at=issued_at,
+            expires_at=issued_at + timedelta(days=1),
+        )
+        return json.dumps(
+            {
+                "payload": base64.b64encode(payload).decode("ascii"),
+                "signature": base64.b64encode(self._key.sign(payload, ec.ECDSA(hashes.SHA256()))).decode("ascii"),
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+
+    def verify(self, certificate: str) -> None:
+        try:
+            envelope = json.loads(certificate)
+            payload = base64.b64decode(envelope["payload"], validate=True)
+            signature = base64.b64decode(envelope["signature"], validate=True)
+            self._key.public_key().verify(signature, payload, ec.ECDSA(hashes.SHA256()))
+        except (InvalidSignature, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            raise ProofError("The device certificate signature is invalid.") from error
 
 
 class ControlPlaneServiceTests(unittest.TestCase):
     def setUp(self) -> None:
         self._directory = tempfile.TemporaryDirectory()
-        self.app = create_app(Path(self._directory.name) / "ledger.duckdb")
+        self.secret_store = MemorySecretStore()
+        self.certificate_issuer = MemoryCertificateIssuer()
+        self.app = create_app(
+            Path(self._directory.name) / "ledger.duckdb",
+            secret_store=self.secret_store,
+            certificate_issuer=self.certificate_issuer,
+        )
         self.client = TestClient(self.app, base_url="https://testserver")
         self.app.state.ledger.create_admin("ABCDEF", "A-secure-admin-password!")
 
@@ -30,8 +87,10 @@ class ControlPlaneServiceTests(unittest.TestCase):
             serialization.Encoding.PEM,
             serialization.PublicFormat.SubjectPublicKeyInfo,
         ).decode("utf-8")
+        account_info = {"login": 123456, "server": "Broker-Demo", "trade_mode": 0}
+        terminal_info = {"build": 5000, "company": "MetaQuotes", "name": "MetaTrader 5"}
         signature = private_key.sign(
-            enrollment_payload(123456, "Broker-Demo", "12345678"),
+            enrollment_payload(123456, "Broker-Demo", "12345678", account_info, terminal_info),
             ec.ECDSA(hashes.SHA256()),
         )
         enrollment_response = self.client.post(
@@ -41,11 +100,15 @@ class ControlPlaneServiceTests(unittest.TestCase):
                 "login": 123456,
                 "server": "Broker-Demo",
                 "pairing_code": "12345678",
+                "account_info": account_info,
+                "terminal_info": terminal_info,
+                "mt5_password": "worker-memory-only-password",
                 "public_key_pem": public_key_pem,
                 "proof_signature": base64.b64encode(signature).decode("ascii"),
             },
         )
         self.assertEqual(201, enrollment_response.status_code)
+        self.assertNotIn("worker-memory-only-password", enrollment_response.text)
 
         login_response = self.client.post(
             "/api/admin/login",
@@ -137,3 +200,184 @@ class ControlPlaneServiceTests(unittest.TestCase):
         finally:
             healthy_client.close()
             unhealthy_client.close()
+
+    def test_worker_receives_certificate_then_its_own_password_over_proved_websockets(self) -> None:
+        private_key = ec.generate_private_key(ec.SECP256R1())
+        public_key_pem = private_key.public_key().public_bytes(
+            serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
+        ).decode("utf-8")
+        account_info = {"login": 123456, "server": "Broker-Demo"}
+        terminal_info = {"name": "MetaTrader 5"}
+        enrollment_signature = private_key.sign(
+            enrollment_payload(123456, "Broker-Demo", "12345678", account_info, terminal_info),
+            ec.ECDSA(hashes.SHA256()),
+        )
+        enrollment = self.client.post(
+            "/api/enrollments",
+            json={
+                "login": 123456,
+                "server": "Broker-Demo",
+                "pairing_code": "12345678",
+                "account_info": account_info,
+                "terminal_info": terminal_info,
+                "mt5_password": "worker-memory-only-password",
+                "public_key_pem": public_key_pem,
+                "proof_signature": base64.b64encode(enrollment_signature).decode("ascii"),
+            },
+        )
+        login = self.client.post(
+            "/api/admin/login",
+            json={"username": "ABCDEF", "password": "A-secure-admin-password!"},
+        )
+        approval = self.client.post(
+            f"/api/admin/enrollments/{enrollment.json()['enrollment_id']}/approve",
+            headers={"X-CSRF-Token": login.json()["csrf_token"]},
+        )
+        worker_id = approval.json()["worker_id"]
+
+        with self.client.websocket_connect("/api/worker/certificate") as websocket:
+            websocket.send_json({"enrollment_id": enrollment.json()["enrollment_id"]})
+            challenge = websocket.receive_json()
+            self.assertEqual("certificate_delivery", challenge["purpose"])
+            proof = private_key.sign(
+                worker_proof_payload(
+                    purpose=challenge["purpose"], worker_id=challenge["worker_id"], nonce=challenge["nonce"]
+                ),
+                ec.ECDSA(hashes.SHA256()),
+            )
+            websocket.send_json({"signature": base64.b64encode(proof).decode("ascii")})
+            delivered = websocket.receive_json()
+        self.assertEqual(worker_id, delivered["worker_id"])
+
+        with self.client.websocket_connect("/api/worker/credentials") as websocket:
+            websocket.send_json({"worker_id": worker_id, "certificate": delivered["certificate"]})
+            challenge = websocket.receive_json()
+            self.assertEqual("password_request", challenge["purpose"])
+            proof = private_key.sign(
+                worker_proof_payload(
+                    purpose=challenge["purpose"], worker_id=challenge["worker_id"], nonce=challenge["nonce"]
+                ),
+                ec.ECDSA(hashes.SHA256()),
+            )
+            websocket.send_json({"signature": base64.b64encode(proof).decode("ascii")})
+            self.assertEqual({"password": "worker-memory-only-password"}, websocket.receive_json())
+
+        tampered_certificate = delivered["certificate"][:-1] + (
+            "A" if delivered["certificate"][-1] != "A" else "B"
+        )
+        with self.client.websocket_connect("/api/worker/credentials") as websocket:
+            websocket.send_json({"worker_id": worker_id, "certificate": tampered_certificate})
+            with self.assertRaises(Exception) as error:
+                websocket.receive_json()
+        self.assertEqual(1008, getattr(error.exception, "code", None))
+
+    def test_worker_password_request_rejects_an_invalid_certificate(self) -> None:
+        with self.client.websocket_connect("/api/worker/credentials") as websocket:
+            websocket.send_json({"worker_id": "not-a-worker", "certificate": "not-a-certificate"})
+            with self.assertRaises(Exception) as error:
+                websocket.receive_json()
+        self.assertEqual(1008, getattr(error.exception, "code", None))
+
+    def test_enrollment_rate_limit_rejects_the_fourth_attempt_in_fifteen_minutes(self) -> None:
+        private_key = ec.generate_private_key(ec.SECP256R1())
+        public_key_pem = private_key.public_key().public_bytes(
+            serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
+        ).decode("utf-8")
+        account_info = {"login": 123456, "server": "Broker-Demo"}
+        terminal_info = {"name": "MetaTrader 5"}
+        signature = base64.b64encode(
+            private_key.sign(
+                enrollment_payload(123456, "Broker-Demo", "12345678", account_info, terminal_info),
+                ec.ECDSA(hashes.SHA256()),
+            )
+        ).decode("ascii")
+        payload = {
+            "login": 123456,
+            "server": "Broker-Demo",
+            "pairing_code": "12345678",
+            "account_info": account_info,
+            "terminal_info": terminal_info,
+            "mt5_password": "worker-memory-only-password",
+            "public_key_pem": public_key_pem,
+            "proof_signature": signature,
+        }
+
+        for _ in range(3):
+            self.assertEqual(
+                201,
+                self.client.post("/api/enrollments", headers={"CF-Connecting-IP": "203.0.113.11"}, json=payload).status_code,
+            )
+        self.assertEqual(
+            429,
+            self.client.post("/api/enrollments", headers={"CF-Connecting-IP": "203.0.113.11"}, json=payload).status_code,
+        )
+
+    def test_rejection_deletes_the_pending_password_secret(self) -> None:
+        enrollment_id = self._create_pending_enrollment()
+        secret_ref = self.app.state.ledger.enrollment_password_secret_ref(enrollment_id)
+        login = self.client.post(
+            "/api/admin/login", json={"username": "ABCDEF", "password": "A-secure-admin-password!"}
+        )
+
+        response = self.client.post(
+            f"/api/admin/enrollments/{enrollment_id}/reject",
+            headers={"X-CSRF-Token": login.json()["csrf_token"]},
+        )
+
+        self.assertEqual(204, response.status_code)
+        self.assertNotIn(secret_ref, self.secret_store.passwords)
+
+    def test_expired_password_secret_deletion_retries_after_a_failure(self) -> None:
+        enrollment_id = self._create_pending_enrollment()
+        secret_ref = self.app.state.ledger.enrollment_password_secret_ref(enrollment_id)
+        self.app.state.ledger._connection.execute(
+            "UPDATE enrollments SET expires_at = ? WHERE enrollment_id = ?",
+            [datetime.now(UTC) - timedelta(seconds=1), enrollment_id],
+        )
+
+        class FailOnceSecretStore(MemorySecretStore):
+            def __init__(self, passwords: dict[str, str]) -> None:
+                super().__init__()
+                self.passwords = passwords
+                self.failed = False
+
+            def delete_password(self, reference: str) -> None:
+                if not self.failed:
+                    self.failed = True
+                    raise SecretStoreError("OpenBao is unavailable.")
+                super().delete_password(reference)
+
+        retrying_store = FailOnceSecretStore(self.secret_store.passwords)
+        with self.assertRaises(SecretStoreError):
+            _delete_expired_pending_secrets(self.app.state.ledger, retrying_store)
+        _delete_expired_pending_secrets(self.app.state.ledger, retrying_store)
+
+        self.assertNotIn(secret_ref, retrying_store.passwords)
+        self.assertEqual([], self.app.state.ledger.expire_pending_enrollments())
+
+    def _create_pending_enrollment(self) -> str:
+        private_key = ec.generate_private_key(ec.SECP256R1())
+        public_key_pem = private_key.public_key().public_bytes(
+            serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
+        ).decode("utf-8")
+        account_info = {"login": 123456, "server": "Broker-Demo"}
+        terminal_info = {"name": "MetaTrader 5"}
+        signature = private_key.sign(
+            enrollment_payload(123456, "Broker-Demo", "12345678", account_info, terminal_info),
+            ec.ECDSA(hashes.SHA256()),
+        )
+        response = self.client.post(
+            "/api/enrollments",
+            json={
+                "login": 123456,
+                "server": "Broker-Demo",
+                "pairing_code": "12345678",
+                "account_info": account_info,
+                "terminal_info": terminal_info,
+                "mt5_password": "worker-memory-only-password",
+                "public_key_pem": public_key_pem,
+                "proof_signature": base64.b64encode(signature).decode("ascii"),
+            },
+        )
+        self.assertEqual(201, response.status_code)
+        return response.json()["enrollment_id"]

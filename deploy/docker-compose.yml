@@ -9,6 +9,8 @@ services:
       ABT_TRUSTED_PROXY_IPS: 172.30.0.2
       ABT_OPENBAO_HEALTH_URL: http://openbao:8200/v1/abt/data/health
       ABT_OPENBAO_HEALTH_TOKEN: ${ABT_OPENBAO_HEALTH_TOKEN:?Set ABT_OPENBAO_HEALTH_TOKEN}
+      ABT_OPENBAO_URL: http://openbao:8200
+      ABT_OPENBAO_CONTROLLER_TOKEN: ${ABT_OPENBAO_CONTROLLER_TOKEN:?Set ABT_OPENBAO_CONTROLLER_TOKEN}
     depends_on:
       - openbao
     volumes:

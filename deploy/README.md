@@ -13,6 +13,12 @@ token only after initializing OpenBao: create the `abt` KV-v2 mount, write the
 health sentinel, grant a policy limited to `read` on `abt/data/health`, then
 set the resulting token in the host environment before starting the controller.
 
+Set `ABT_OPENBAO_CONTROLLER_TOKEN` to a separate controller policy token. It
+may create, read and delete only MT5 credential secrets and sign device
+certificates through the configured Transit key; it must not be the OpenBao
+root token or the health token. Pending registration credentials are deleted
+when the registration is rejected or expires.
+
 OpenBao alone joins the `plugin-registry` network so it can fetch the pinned
 PKCS#11 plugin from GHCR; it has no published host port. The controller and
 SoftHSM remain isolated from that egress network.

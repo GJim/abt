@@ -1,13 +1,17 @@
 # 04 — Deliver approved worker enrollment
 
-**What to build:** Let an operator securely enroll one native Windows 帳戶工作者 for one MT5 account: create a one-time 帳戶 bootstrap grant locally, submit a signed hardware-key registration from the worker, review it in the management UI, and approve or reject it with a unique active account binding.
+**What to build:** Let an operator securely enroll one native Windows 帳戶工作者 for one MT5 account: the worker interactively enters its MT5 password, proves a successful local login with account/terminal evidence, submits a signed registration, and the administrator reviews and approves or rejects it with a unique active account binding.
 
 **Blocked by:** 02 — Deliver auditable management access; 03 — Deliver sealed console runtime.
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] A console-host bootstrap grant stores the MT5 password in OpenBao, binds expected login/server and the worker public key, is single-use, and never persists the password on the worker.
-- [ ] A native Windows worker uses CNG-backed ECDSA P-256 proof to submit actual MT5 account information, an eight-digit pairing code and a registration request.
-- [ ] Pending registration is rate-limited, expires after 15 minutes, and cannot be reactivated after rejection.
-- [ ] The management UI lets an authenticated 主控台管理員 compare evidence, approve or reject the request, and records the decision immutably.
-- [ ] Approval issues an auditable 裝置憑證 and rejects any second active worker binding for the same MT5 login/server.
+- [x] A worker interactively enters the MT5 password, successfully obtains actual account/terminal evidence, then sends the password and a CNG-backed ECDSA P-256 signed registration through Cloudflare TLS; the console immediately stores the password in OpenBao and the worker never persists it.
+- [x] A native Windows worker displays the registration ID, pairing code, actual account/terminal evidence and observed-request context needed for the operator's out-of-band comparison; it never displays, echoes or logs the password it pushes to the console.
+- [x] Pending registration is rate-limited per Cloudflare client IP, expires after 15 minutes, cannot be reactivated after rejection, and deletes its pending OpenBao password secret when rejected or expired.
+- [x] The management UI lets an authenticated 主控台管理員 compare evidence, approve or reject the request, and records the decision immutably.
+- [x] Approval issues an auditable 裝置憑證 and rejects any second active worker binding for the same MT5 login/server; thereafter the worker requests its memory-only password through authenticated WSS for every MT5 login.
+
+## Answer
+
+Implemented and validated native CNG-backed enrollment, OpenBao-mediated pending and active credentials, evidence review, rate limits, expiry cleanup retries, immutable approval decisions, and per-login proved WSS password mediation.

@@ -17,6 +17,7 @@ dependencies = [
     { name = "pytz" },
     { name = "tzdata" },
     { name = "uvicorn", extra = ["standard"] },
+    { name = "websockets" },
 ]
 
 [package.metadata]
@@ -31,6 +32,7 @@ requires-dist = [
     { name = "pytz", specifier = ">=2026.3.post1" },
     { name = "tzdata", specifier = ">=2026.3" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.52.3" },
+    { name = "websockets", specifier = ">=16.0" },
 ]
 
 [[package]]

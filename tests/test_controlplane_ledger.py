@@ -38,8 +38,13 @@ class ControlLedgerTests(unittest.TestCase):
             pairing_code="12345678",
             public_key_pem="public-key-one",
             source_ip="203.0.113.11",
+            account_info={"login": 123456},
+            terminal_info={"name": "MetaTrader 5"},
+            password_secret_ref="abt/data/mt5/pending/one",
         )
-        worker_id = self.ledger.approve_enrollment(first.enrollment_id, "ABCDEF")
+        worker_id = self.ledger.approve_enrollment(
+            first.enrollment_id, "ABCDEF", lambda worker_id, *_: f"certificate:{worker_id}"
+        )
         self.assertTrue(worker_id)
 
         second = self.ledger.create_enrollment(
@@ -48,9 +53,14 @@ class ControlLedgerTests(unittest.TestCase):
             pairing_code="87654321",
             public_key_pem="public-key-two",
             source_ip="203.0.113.12",
+            account_info={"login": 123456},
+            terminal_info={"name": "MetaTrader 5"},
+            password_secret_ref="abt/data/mt5/pending/two",
         )
         with self.assertRaisesRegex(LedgerError, "active worker"):
-            self.ledger.approve_enrollment(second.enrollment_id, "ABCDEF")
+            self.ledger.approve_enrollment(
+                second.enrollment_id, "ABCDEF", lambda worker_id, *_: f"certificate:{worker_id}"
+            )
 
     def test_rejected_enrollment_cannot_be_reactivated(self) -> None:
         enrollment = self.ledger.create_enrollment(
@@ -59,7 +69,12 @@ class ControlLedgerTests(unittest.TestCase):
             pairing_code="12345678",
             public_key_pem="public-key",
             source_ip="203.0.113.11",
+            account_info={"login": 123456},
+            terminal_info={"name": "MetaTrader 5"},
+            password_secret_ref="abt/data/mt5/pending/rejected",
         )
         self.ledger.reject_enrollment(enrollment.enrollment_id, "ABCDEF")
         with self.assertRaisesRegex(LedgerError, "no longer pending"):
-            self.ledger.approve_enrollment(enrollment.enrollment_id, "ABCDEF")
+            self.ledger.approve_enrollment(
+                enrollment.enrollment_id, "ABCDEF", lambda worker_id, *_: f"certificate:{worker_id}"
+            )

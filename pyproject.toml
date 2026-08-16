@@ -14,11 +14,13 @@ dependencies = [
     "pytz>=2026.3.post1",
     "tzdata>=2026.3",
     "uvicorn[standard]>=0.52.3",
+    "websockets>=16.0",
 ]
 
 [project.scripts]
 abt = "abt.cli:main"
 abt-console = "abt.controlplane.console:main"
+abt-worker = "abt.worker.cli:main"
 
 [build-system]
 requires = ["setuptools>=80"]

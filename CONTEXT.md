@@ -96,10 +96,13 @@ _Avoid_: 反向訂單
 尚未授權的工作者在已登入 MT5 後，以其新生成公鑰簽署並透過 REST 提交 `account_info`、配對碼與連線來源資訊的程序。主控台依 Cloudflare client IP 限制每 15 分鐘 3 次、每小時 10 次註冊，超額回 `429`；不配置 Cloudflare edge rate rule。待批准註冊在 15 分鐘後失效，拒絕後不得重新啟用；工作者必須重新註冊。管理員批准後，工作者以私鑰 challenge-response 輪詢領取裝置憑證；取得憑證前不得建立常態 WSS 通道。
 
 **帳戶 bootstrap grant**:
-主控台本機 CLI 為尚未批准 worker 建立的一次性高熵兌換碼，綁定預期 MT5 login/server、worker 硬體 public key 與 OpenBao 中的 MT5 password。worker 只能以該硬體私鑰使用 grant 一次，將 password 取至記憶體登入 MT5 並開始註冊；grant 使用後立即失效，password 不得持久保存在 worker。
+已廢止的初始 worker password 交付方式。新的工作者註冊不使用 bootstrap grant。
+
+**初始憑證交付**:
+尚未批准的帳戶工作者在本機互動輸入 MT5 password、成功登入並取得帳戶與 terminal evidence 後，經 Cloudflare TLS 將 password 與簽署的註冊請求交給主控台。password 是不顯示、不回顯的傳送欄位；主控台立即將其寫入 OpenBao，註冊被拒絕或逾期時刪除該 secret，且 worker 不得持久保存或記錄 password。
 
 **MT5 憑證代理**:
-已批准工作者在已驗證 WSS 工作階段中請求其綁定帳戶的 MT5 password；主控台驗證 worker/account 綁定後由內部 OpenBao 讀取並只在該工作階段回覆。工作者只可在記憶體保存 password，OpenBao 不得公開給工作者網路；password 下發信任 Cloudflare 的 TLS proxy，不另加應用層加密。
+已批准工作者在每次需要登入 MT5 時，於已驗證 WSS 工作階段中請求其綁定帳戶的 MT5 password；主控台驗證 worker/account binding 後由內部 OpenBao 讀取並只在該工作階段回覆。工作者只可在記憶體保存 password，OpenBao 不得公開給工作者網路；password 下發信任 Cloudflare 的 TLS proxy，不另加應用層加密。
 
 **工作者配對碼**:
 工作者以已登入 MT5 的 `account_info` 註冊時在本機等待批准畫面顯示並提交至主控台的短期 8 位數人工比對碼；管理員必須將其與待批准申請的觀測來源、實際 broker 帳戶資訊比對後才可簽發裝置憑證。它只證明人工配對，不得作為帳戶身分或網路來源的唯一證據。
