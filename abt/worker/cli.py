@@ -36,6 +36,23 @@ class HTTPEnrollmentTransport:
             raise WorkerEnrollmentError("The controller returned an invalid enrollment response.")
         return body
 
+    def enrollment_challenge(self, controller_url: str) -> Mapping[str, object]:
+        endpoint = _enrollment_challenge_endpoint(controller_url)
+        try:
+            response = self._client.get(endpoint, follow_redirects=False)
+            if response.status_code != 200:
+                raise httpx.HTTPStatusError(
+                    "Unexpected enrollment challenge response status.",
+                    request=response.request,
+                    response=response,
+                )
+            body = response.json()
+        except (httpx.HTTPError, ValueError) as error:
+            raise WorkerEnrollmentError("The controller enrollment challenge request failed.") from error
+        if not isinstance(body, Mapping):
+            raise WorkerEnrollmentError("The controller returned an invalid enrollment challenge.")
+        return body
+
     def close(self) -> None:
         if self._owns_client:
             self._client.close()
@@ -142,6 +159,14 @@ def _positive_login(value: str) -> int:
 
 
 def _enrollment_endpoint(controller_url: str) -> str:
+    return _controller_endpoint(controller_url, "/api/enrollments")
+
+
+def _enrollment_challenge_endpoint(controller_url: str) -> str:
+    return _controller_endpoint(controller_url, "/api/enrollment-challenge")
+
+
+def _controller_endpoint(controller_url: str, path: str) -> str:
     try:
         url = httpx.URL(controller_url)
     except (TypeError, httpx.InvalidURL) as error:
@@ -156,7 +181,7 @@ def _enrollment_endpoint(controller_url: str) -> str:
         or url.fragment
     ):
         raise WorkerEnrollmentError("The controller URL must be an HTTPS origin.")
-    return str(url.copy_with(path="/api/enrollments"))
+    return str(url.copy_with(path=path))
 
 
 def _close(value: object) -> None:

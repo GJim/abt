@@ -197,6 +197,7 @@ class ControlLedger:
         account_info: dict[str, object],
         terminal_info: dict[str, object],
         password_secret_ref: str,
+        enrollment_challenge: str,
     ) -> Enrollment:
         now = _utc_now()
         expires_at = now + timedelta(minutes=15)
@@ -210,6 +211,7 @@ class ControlLedger:
             status="pending",
         )
         with self._transaction():
+            self._consume_enrollment_challenge(enrollment_challenge, now)
             self._connection.execute(
                 """
                 INSERT INTO enrollments (
@@ -236,6 +238,31 @@ class ControlLedger:
                 {"enrollment_id": enrollment.enrollment_id, "login": login, "server": server, "source_ip": source_ip},
             )
         return enrollment
+
+    def issue_enrollment_challenge(self) -> tuple[str, datetime]:
+        challenge = secrets.token_urlsafe(32)
+        now = _utc_now()
+        expires_at = now + timedelta(minutes=2)
+        with self._transaction():
+            self._connection.execute("DELETE FROM enrollment_challenges WHERE expires_at <= ?", [now])
+            self._connection.execute(
+                "INSERT INTO enrollment_challenges (challenge_hash, issued_at, expires_at) VALUES (?, ?, ?)",
+                [_hash(challenge), now, expires_at],
+            )
+        return challenge, expires_at
+
+    def _consume_enrollment_challenge(self, challenge: str, now: datetime) -> None:
+        consumed = self._connection.execute(
+            """
+            UPDATE enrollment_challenges
+            SET consumed_at = ?
+            WHERE challenge_hash = ? AND consumed_at IS NULL AND expires_at > ?
+            RETURNING challenge_hash
+            """,
+            [now, _hash(challenge), now],
+        ).fetchone()
+        if consumed is None:
+            raise LedgerError("Enrollment challenge is invalid, expired, or already used.")
 
     def record_registration_attempt(self, source_ip: str) -> None:
         now = _utc_now()
@@ -341,19 +368,24 @@ class ControlLedger:
             raise LedgerError("Worker is not active.")
         return ActiveWorker(*row)
 
-    def reject_enrollment(self, enrollment_id: str, rejected_by: str) -> None:
+    def reject_enrollment(self, enrollment_id: str, rejected_by: str) -> str:
         with self._transaction():
             row = self._connection.execute(
-                "SELECT status FROM enrollments WHERE enrollment_id = ?",
+                "SELECT status, password_secret_ref FROM enrollments WHERE enrollment_id = ?",
                 [enrollment_id],
             ).fetchone()
-            if row is None or row[0] != "pending":
+            if row is None:
+                raise LedgerError("Enrollment is no longer pending.")
+            if row[0] == "rejected":
+                return row[1]
+            if row[0] != "pending":
                 raise LedgerError("Enrollment is no longer pending.")
             self._connection.execute(
                 "UPDATE enrollments SET status = 'rejected', approved_by = ?, approved_at = ? WHERE enrollment_id = ?",
                 [rejected_by, _utc_now(), enrollment_id],
             )
             self._event("worker_enrollment_rejected", {"enrollment_id": enrollment_id, "rejected_by": rejected_by})
+            return row[1]
 
     def expire_pending_enrollments(self) -> list[str]:
         now = _utc_now()
@@ -374,6 +406,19 @@ class ControlLedger:
             for enrollment_id, _ in rows:
                 self._event("worker_enrollment_expired", {"enrollment_id": enrollment_id})
             return [row[1] for row in rows]
+
+    def mark_pending_password_deleted(self, password_secret_ref: str) -> None:
+        with self._transaction():
+            self._connection.execute(
+                """
+                UPDATE enrollments
+                SET password_secret_deleted_at = ?
+                WHERE status IN ('expired', 'rejected')
+                  AND password_secret_ref = ?
+                  AND password_secret_deleted_at IS NULL
+                """,
+                [_utc_now(), password_secret_ref],
+            )
 
     def mark_expired_password_deleted(self, password_secret_ref: str) -> None:
         with self._transaction():
@@ -486,6 +531,12 @@ class ControlLedger:
                 CREATE TABLE IF NOT EXISTS registration_attempts (
                     source_ip VARCHAR NOT NULL,
                     attempted_at TIMESTAMPTZ NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS enrollment_challenges (
+                    challenge_hash VARCHAR PRIMARY KEY,
+                    issued_at TIMESTAMPTZ NOT NULL,
+                    expires_at TIMESTAMPTZ NOT NULL,
+                    consumed_at TIMESTAMPTZ
                 );
                 CREATE TABLE IF NOT EXISTS workers (
                     worker_id VARCHAR PRIMARY KEY,

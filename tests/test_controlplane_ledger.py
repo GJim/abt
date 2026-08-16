@@ -32,6 +32,7 @@ class ControlLedgerTests(unittest.TestCase):
         self.assertEqual("ABCDEF", self.ledger.validate_session(session.token, session.csrf_token, require_csrf=True))
 
     def test_approved_enrollment_exclusively_binds_an_mt5_account(self) -> None:
+        first_challenge, _ = self.ledger.issue_enrollment_challenge()
         first = self.ledger.create_enrollment(
             login=123456,
             server="Broker-Demo",
@@ -41,12 +42,14 @@ class ControlLedgerTests(unittest.TestCase):
             account_info={"login": 123456},
             terminal_info={"name": "MetaTrader 5"},
             password_secret_ref="abt/data/mt5/pending/one",
+            enrollment_challenge=first_challenge,
         )
         worker_id = self.ledger.approve_enrollment(
             first.enrollment_id, "ABCDEF", lambda worker_id, *_: f"certificate:{worker_id}"
         )
         self.assertTrue(worker_id)
 
+        second_challenge, _ = self.ledger.issue_enrollment_challenge()
         second = self.ledger.create_enrollment(
             login=123456,
             server="Broker-Demo",
@@ -56,6 +59,7 @@ class ControlLedgerTests(unittest.TestCase):
             account_info={"login": 123456},
             terminal_info={"name": "MetaTrader 5"},
             password_secret_ref="abt/data/mt5/pending/two",
+            enrollment_challenge=second_challenge,
         )
         with self.assertRaisesRegex(LedgerError, "active worker"):
             self.ledger.approve_enrollment(
@@ -63,6 +67,7 @@ class ControlLedgerTests(unittest.TestCase):
             )
 
     def test_rejected_enrollment_cannot_be_reactivated(self) -> None:
+        challenge, _ = self.ledger.issue_enrollment_challenge()
         enrollment = self.ledger.create_enrollment(
             login=123456,
             server="Broker-Demo",
@@ -72,6 +77,7 @@ class ControlLedgerTests(unittest.TestCase):
             account_info={"login": 123456},
             terminal_info={"name": "MetaTrader 5"},
             password_secret_ref="abt/data/mt5/pending/rejected",
+            enrollment_challenge=challenge,
         )
         self.ledger.reject_enrollment(enrollment.enrollment_id, "ABCDEF")
         with self.assertRaisesRegex(LedgerError, "no longer pending"):

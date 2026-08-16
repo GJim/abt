@@ -33,6 +33,8 @@ class MT5Client(Protocol):
 class EnrollmentTransport(Protocol):
     """A TLS transport for submitting a signed enrollment request."""
 
+    def enrollment_challenge(self, controller_url: str) -> Mapping[str, object]: ...
+
     def enroll(self, controller_url: str, request: dict[str, object]) -> Mapping[str, object]: ...
 
 
@@ -99,6 +101,7 @@ def register_worker(
         pairing_code = pairing_code_factory()
         if not isinstance(pairing_code, str) or not pairing_code.isascii() or not pairing_code.isdigit() or len(pairing_code) != 8:
             raise WorkerEnrollmentError("Unable to generate a valid pairing code.")
+        challenge = _required_response_text(transport.enrollment_challenge(controller_url), "challenge")
 
         signed_payload = enrollment_payload(
             login,
@@ -106,6 +109,8 @@ def register_worker(
             pairing_code,
             account_info,
             terminal_info,
+            password,
+            challenge,
         )
         signature = key_store.sign(signed_payload)
         if not isinstance(signature, bytes):
@@ -121,6 +126,7 @@ def register_worker(
             "account_info": account_info,
             "terminal_info": terminal_info,
             "mt5_password": password,
+            "enrollment_challenge": challenge,
             "public_key_pem": public_key_pem,
             "proof_signature": b64encode(signature).decode("ascii"),
         }

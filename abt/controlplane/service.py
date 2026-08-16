@@ -31,6 +31,7 @@ class EnrollmentRequest(BaseModel):
     account_info: dict[str, object]
     terminal_info: dict[str, object]
     mt5_password: str = Field(min_length=1)
+    enrollment_challenge: str = Field(min_length=1, max_length=256)
     public_key_pem: str = Field(min_length=1)
     proof_signature: str = Field(min_length=1)
 
@@ -106,6 +107,8 @@ def create_app(
                 pairing_code=body.pairing_code,
                 account_info=body.account_info,
                 terminal_info=body.terminal_info,
+                mt5_password=body.mt5_password,
+                enrollment_challenge=body.enrollment_challenge,
             )
             if secret_store is None:
                 raise SecretStoreError("The MT5 credential mediator is unavailable.")
@@ -121,6 +124,7 @@ def create_app(
                     account_info=body.account_info,
                     terminal_info=body.terminal_info,
                     password_secret_ref=secret_ref,
+                    enrollment_challenge=body.enrollment_challenge,
                 )
             except LedgerError:
                 secret_store.delete_password(secret_ref)
@@ -137,6 +141,11 @@ def create_app(
             raise HTTPException(status_code=status_code, detail=str(error)) from error
         except SecretStoreError as error:
             raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(error)) from error
+
+    @app.get("/api/enrollment-challenge")
+    def enrollment_challenge() -> dict[str, str]:
+        challenge, expires_at = ledger.issue_enrollment_challenge()
+        return {"challenge": challenge, "expires_at": expires_at.isoformat()}
 
     @app.get("/api/admin/enrollments")
     def list_enrollments(
@@ -205,8 +214,9 @@ def create_app(
         try:
             if secret_store is None:
                 raise SecretStoreError("The MT5 credential mediator is unavailable.")
-            secret_store.delete_password(ledger.enrollment_password_secret_ref(enrollment_id))
-            ledger.reject_enrollment(enrollment_id, username)
+            secret_ref = ledger.reject_enrollment(enrollment_id, username)
+            secret_store.delete_password(secret_ref)
+            ledger.mark_pending_password_deleted(secret_ref)
         except (LedgerError, SecretStoreError) as error:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
         return Response(status_code=status.HTTP_204_NO_CONTENT)
@@ -291,7 +301,7 @@ async def _expire_pending_secrets(ledger: ControlLedger, secret_store: SecretSto
 def _delete_expired_pending_secrets(ledger: ControlLedger, secret_store: SecretStore) -> None:
     for secret_ref in ledger.expire_pending_enrollments():
         secret_store.delete_password(secret_ref)
-        ledger.mark_expired_password_deleted(secret_ref)
+        ledger.mark_pending_password_deleted(secret_ref)
 
 
 def _source_ip(request: Request, trusted_proxy_ips: frozenset[str]) -> str:

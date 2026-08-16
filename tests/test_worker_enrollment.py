@@ -59,6 +59,10 @@ class FakeTransport:
         self.request: dict[str, object] | None = None
         self.closed = False
 
+    def enrollment_challenge(self, controller_url: str) -> dict[str, object]:
+        self.controller_url = controller_url
+        return {"challenge": "controller-one-time-challenge"}
+
     def enroll(self, controller_url: str, request: dict[str, object]) -> dict[str, object]:
         self.controller_url = controller_url
         self.request = dict(request)
@@ -98,6 +102,8 @@ class WorkerEnrollmentTests(unittest.TestCase):
                 "01234567",
                 {"login": 123456, "server": "Broker-Demo", "trade_mode": 0},
                 {"build": 5000, "company": "MetaQuotes", "name": "MetaTrader 5"},
+                password,
+                "controller-one-time-challenge",
             ),
             key_store.signed_payload,
         )
@@ -201,11 +207,25 @@ class FailingTransport:
     def __init__(self, password: str) -> None:
         self._password = password
 
+    def enrollment_challenge(self, controller_url: str) -> dict[str, object]:
+        return {"challenge": "controller-one-time-challenge"}
+
     def enroll(self, controller_url: str, request: dict[str, object]) -> dict[str, object]:
         raise RuntimeError(self._password)
 
 
 class HTTPEnrollmentTransportTests(unittest.TestCase):
+    def test_gets_the_enrollment_challenge_only_from_the_tls_endpoint(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            self.assertEqual("https://controller.example/api/enrollment-challenge", str(request.url))
+            return httpx.Response(200, json={"challenge": "one-time"}, request=request)
+
+        transport = HTTPEnrollmentTransport(httpx.Client(transport=httpx.MockTransport(handler)))
+        try:
+            self.assertEqual("one-time", transport.enrollment_challenge("https://controller.example")["challenge"])
+        finally:
+            transport.close()
+
     def test_posts_only_to_the_tls_enrollment_endpoint(self) -> None:
         captured: dict[str, object] = {}
 

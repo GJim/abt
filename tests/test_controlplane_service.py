@@ -20,6 +20,7 @@ from abt.controlplane.service import _delete_expired_pending_secrets, create_app
 class MemorySecretStore:
     def __init__(self) -> None:
         self.passwords: dict[str, str] = {}
+        self.fail_next_delete = False
 
     def write_password(self, reference: str, password: str) -> None:
         self.passwords[reference] = password
@@ -28,6 +29,9 @@ class MemorySecretStore:
         return self.passwords[reference]
 
     def delete_password(self, reference: str) -> None:
+        if self.fail_next_delete:
+            self.fail_next_delete = False
+            raise SecretStoreError("OpenBao is unavailable.")
         del self.passwords[reference]
 
 
@@ -89,8 +93,10 @@ class ControlPlaneServiceTests(unittest.TestCase):
         ).decode("utf-8")
         account_info = {"login": 123456, "server": "Broker-Demo", "trade_mode": 0}
         terminal_info = {"build": 5000, "company": "MetaQuotes", "name": "MetaTrader 5"}
+        password = "worker-memory-only-password"
+        challenge = self._enrollment_challenge()
         signature = private_key.sign(
-            enrollment_payload(123456, "Broker-Demo", "12345678", account_info, terminal_info),
+            enrollment_payload(123456, "Broker-Demo", "12345678", account_info, terminal_info, password, challenge),
             ec.ECDSA(hashes.SHA256()),
         )
         enrollment_response = self.client.post(
@@ -102,7 +108,8 @@ class ControlPlaneServiceTests(unittest.TestCase):
                 "pairing_code": "12345678",
                 "account_info": account_info,
                 "terminal_info": terminal_info,
-                "mt5_password": "worker-memory-only-password",
+                "mt5_password": password,
+                "enrollment_challenge": challenge,
                 "public_key_pem": public_key_pem,
                 "proof_signature": base64.b64encode(signature).decode("ascii"),
             },
@@ -140,6 +147,30 @@ class ControlPlaneServiceTests(unittest.TestCase):
             },
         )
         self.assertEqual(422, response.status_code)
+
+    def test_enrollment_challenge_rejects_replay_and_password_substitution(self) -> None:
+        private_key = ec.generate_private_key(ec.SECP256R1())
+        public_key_pem = private_key.public_key().public_bytes(
+            serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
+        ).decode("utf-8")
+        account_info = {"login": 123456, "server": "Broker-Demo"}
+        terminal_info = {"name": "MetaTrader 5"}
+        password = "worker-memory-only-password"
+        challenge = self._enrollment_challenge()
+        signature = private_key.sign(
+            enrollment_payload(123456, "Broker-Demo", "12345678", account_info, terminal_info, password, challenge),
+            ec.ECDSA(hashes.SHA256()),
+        )
+        request = {
+            "login": 123456, "server": "Broker-Demo", "pairing_code": "12345678",
+            "account_info": account_info, "terminal_info": terminal_info, "mt5_password": password,
+            "enrollment_challenge": challenge, "public_key_pem": public_key_pem,
+            "proof_signature": base64.b64encode(signature).decode("ascii"),
+        }
+        substituted = dict(request, mt5_password="substituted-password")
+        self.assertEqual(422, self.client.post("/api/enrollments", json=substituted).status_code)
+        self.assertEqual(201, self.client.post("/api/enrollments", json=request).status_code)
+        self.assertEqual(409, self.client.post("/api/enrollments", json=request).status_code)
 
     def test_administrator_can_view_audit_events_then_logout(self) -> None:
         login_response = self.client.post(
@@ -208,8 +239,10 @@ class ControlPlaneServiceTests(unittest.TestCase):
         ).decode("utf-8")
         account_info = {"login": 123456, "server": "Broker-Demo"}
         terminal_info = {"name": "MetaTrader 5"}
+        password = "worker-memory-only-password"
+        challenge = self._enrollment_challenge()
         enrollment_signature = private_key.sign(
-            enrollment_payload(123456, "Broker-Demo", "12345678", account_info, terminal_info),
+            enrollment_payload(123456, "Broker-Demo", "12345678", account_info, terminal_info, password, challenge),
             ec.ECDSA(hashes.SHA256()),
         )
         enrollment = self.client.post(
@@ -220,7 +253,8 @@ class ControlPlaneServiceTests(unittest.TestCase):
                 "pairing_code": "12345678",
                 "account_info": account_info,
                 "terminal_info": terminal_info,
-                "mt5_password": "worker-memory-only-password",
+                "mt5_password": password,
+                "enrollment_challenge": challenge,
                 "public_key_pem": public_key_pem,
                 "proof_signature": base64.b64encode(enrollment_signature).decode("ascii"),
             },
@@ -285,31 +319,14 @@ class ControlPlaneServiceTests(unittest.TestCase):
         ).decode("utf-8")
         account_info = {"login": 123456, "server": "Broker-Demo"}
         terminal_info = {"name": "MetaTrader 5"}
-        signature = base64.b64encode(
-            private_key.sign(
-                enrollment_payload(123456, "Broker-Demo", "12345678", account_info, terminal_info),
-                ec.ECDSA(hashes.SHA256()),
-            )
-        ).decode("ascii")
-        payload = {
-            "login": 123456,
-            "server": "Broker-Demo",
-            "pairing_code": "12345678",
-            "account_info": account_info,
-            "terminal_info": terminal_info,
-            "mt5_password": "worker-memory-only-password",
-            "public_key_pem": public_key_pem,
-            "proof_signature": signature,
-        }
-
         for _ in range(3):
             self.assertEqual(
                 201,
-                self.client.post("/api/enrollments", headers={"CF-Connecting-IP": "203.0.113.11"}, json=payload).status_code,
+                self._enrollment_response(private_key, public_key_pem, account_info, terminal_info).status_code,
             )
         self.assertEqual(
             429,
-            self.client.post("/api/enrollments", headers={"CF-Connecting-IP": "203.0.113.11"}, json=payload).status_code,
+            self._enrollment_response(private_key, public_key_pem, account_info, terminal_info).status_code,
         )
 
     def test_rejection_deletes_the_pending_password_secret(self) -> None:
@@ -325,6 +342,25 @@ class ControlPlaneServiceTests(unittest.TestCase):
         )
 
         self.assertEqual(204, response.status_code)
+        self.assertNotIn(secret_ref, self.secret_store.passwords)
+
+    def test_rejection_commits_before_cleanup_failure_and_retries_safely(self) -> None:
+        enrollment_id = self._create_pending_enrollment()
+        secret_ref = self.app.state.ledger.enrollment_password_secret_ref(enrollment_id)
+        login = self.client.post(
+            "/api/admin/login", json={"username": "ABCDEF", "password": "A-secure-admin-password!"}
+        )
+        headers = {"X-CSRF-Token": login.json()["csrf_token"]}
+        self.secret_store.fail_next_delete = True
+
+        self.assertEqual(409, self.client.post(f"/api/admin/enrollments/{enrollment_id}/reject", headers=headers).status_code)
+        self.assertIn(secret_ref, self.secret_store.passwords)
+        self.assertEqual(
+            409,
+            self.client.post(f"/api/admin/enrollments/{enrollment_id}/approve", headers=headers).status_code,
+        )
+
+        self.assertEqual(204, self.client.post(f"/api/admin/enrollments/{enrollment_id}/reject", headers=headers).status_code)
         self.assertNotIn(secret_ref, self.secret_store.passwords)
 
     def test_expired_password_secret_deletion_retries_after_a_failure(self) -> None:
@@ -362,22 +398,31 @@ class ControlPlaneServiceTests(unittest.TestCase):
         ).decode("utf-8")
         account_info = {"login": 123456, "server": "Broker-Demo"}
         terminal_info = {"name": "MetaTrader 5"}
+        response = self._enrollment_response(private_key, public_key_pem, account_info, terminal_info)
+        self.assertEqual(201, response.status_code)
+        return response.json()["enrollment_id"]
+
+    def _enrollment_challenge(self) -> str:
+        response = self.client.get("/api/enrollment-challenge")
+        self.assertEqual(200, response.status_code)
+        return response.json()["challenge"]
+
+    def _enrollment_response(
+        self, private_key: ec.EllipticCurvePrivateKey, public_key_pem: str, account_info: dict[str, object],
+        terminal_info: dict[str, object], password: str = "worker-memory-only-password"
+    ):
+        challenge = self._enrollment_challenge()
         signature = private_key.sign(
-            enrollment_payload(123456, "Broker-Demo", "12345678", account_info, terminal_info),
+            enrollment_payload(123456, "Broker-Demo", "12345678", account_info, terminal_info, password, challenge),
             ec.ECDSA(hashes.SHA256()),
         )
-        response = self.client.post(
+        return self.client.post(
             "/api/enrollments",
+            headers={"CF-Connecting-IP": "203.0.113.11"},
             json={
-                "login": 123456,
-                "server": "Broker-Demo",
-                "pairing_code": "12345678",
-                "account_info": account_info,
-                "terminal_info": terminal_info,
-                "mt5_password": "worker-memory-only-password",
-                "public_key_pem": public_key_pem,
+                "login": 123456, "server": "Broker-Demo", "pairing_code": "12345678",
+                "account_info": account_info, "terminal_info": terminal_info, "mt5_password": password,
+                "enrollment_challenge": challenge, "public_key_pem": public_key_pem,
                 "proof_signature": base64.b64encode(signature).decode("ascii"),
             },
         )
-        self.assertEqual(201, response.status_code)
-        return response.json()["enrollment_id"]
