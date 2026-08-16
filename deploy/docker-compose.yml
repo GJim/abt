@@ -38,6 +38,9 @@ services:
     environment:
       BAO_ADDR: http://127.0.0.1:8200
       BAO_HSM_PIN: ${OPENBAO_PKCS11_PIN:?Set OPENBAO_PKCS11_PIN}
+    depends_on:
+      softhsm:
+        condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "bao status >/dev/null 2>&1"]
       interval: 10s
@@ -62,6 +65,15 @@ services:
       SOFTHSM_TOKEN_LABEL: abt-openbao
       SOFTHSM_SO_PIN: ${SOFTHSM_SO_PIN:?Set SOFTHSM_SO_PIN}
       SOFTHSM_USER_PIN: ${OPENBAO_PKCS11_PIN:?Set OPENBAO_PKCS11_PIN}
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          'pkcs11-tool --module /usr/lib/softhsm/libsofthsm2.so --login --pin "$$SOFTHSM_USER_PIN" --list-objects --type secrkey | grep -Fq "label:      abt-root"',
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 12
     networks:
       - hsm
 
