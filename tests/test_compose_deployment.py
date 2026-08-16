@@ -81,4 +81,5 @@ class ComposeDeploymentTests(unittest.TestCase):
 
     def test_controller_uses_exactly_one_asgi_worker(self) -> None:
         dockerfile = (Path(__file__).parents[1] / "deploy" / "controller.Dockerfile").read_text(encoding="utf-8")
+        self.assertIn('ENV PATH="/opt/abt/.venv/bin:${PATH}"', dockerfile)
         self.assertIn('"--workers", "1"', dockerfile)

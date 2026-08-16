@@ -11,6 +11,7 @@ FROM python:3.13-slim
 WORKDIR /opt/abt
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
+ENV PATH="/opt/abt/.venv/bin:${PATH}"
 
 COPY pyproject.toml uv.lock ./
 COPY abt/ ./abt/

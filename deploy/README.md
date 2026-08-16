@@ -47,6 +47,18 @@ mounts and least-privilege policies, and writes health/controller tokens to
 them offline and never add them to `.env`, Git, or shell history. It refuses
 to run against initialized OpenBao state.
 
+## First administrator
+
+After the controller health endpoint reports `{"status":"ok"}`, create the
+one-time administrator credentials on the console host:
+
+```bash
+docker compose --env-file deploy/.env -f deploy/docker-compose.yml exec controller abt-console create-admin
+```
+
+Store the generated credentials in a password manager; the password is not
+shown again.
+
 OpenBao alone joins the `plugin-registry` network so it can fetch the pinned
 PKCS#11 plugin from GHCR; it has no published host port. The controller and
 SoftHSM remain isolated from that egress network.
