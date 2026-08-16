@@ -6,6 +6,7 @@ import string
 from pathlib import Path
 from typing import Sequence
 
+from .backup import BackupError, BackupManager
 from .ledger import ControlLedger, LedgerError
 
 
@@ -21,6 +22,14 @@ def build_parser() -> argparse.ArgumentParser:
     reset.add_argument("username", type=_username)
     unlock = commands.add_parser("unlock-ip")
     unlock.add_argument("source_ip")
+    backup = commands.add_parser("backup")
+    backup.add_argument("--backup-directory", type=Path, required=True)
+    backup.add_argument("--openbao-raft", type=Path, required=True)
+    backup.add_argument("--softhsm-tokens", type=Path, required=True)
+    backup.add_argument("--reason", default="manual")
+    verify = commands.add_parser("verify-restore-set")
+    verify.add_argument("--backup-directory", type=Path, required=True)
+    verify.add_argument("backup_set", type=Path)
     return parser
 
 
@@ -42,8 +51,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"password={password}")
         elif args.command == "unlock-ip":
             ledger.unlock_ip(args.source_ip)
+        elif args.command == "backup":
+            backup_set = BackupManager(
+                ledger, args.backup_directory, args.openbao_raft, args.softhsm_tokens
+            ).create(args.reason)
+            print(f"backup_set={backup_set}")
+        elif args.command == "verify-restore-set":
+            BackupManager(ledger, args.backup_directory, Path("."), Path(".")).verify_restore_set(args.backup_set)
+            print(f"restore_set={args.backup_set}")
         return 0
-    except LedgerError as error:
+    except (BackupError, LedgerError) as error:
         parser.error(str(error))
     finally:
         ledger.close()

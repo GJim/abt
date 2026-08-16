@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import secrets
+import shutil
+import tarfile
 import threading
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -67,6 +69,21 @@ class ControlLedger:
     def close(self) -> None:
         with self._lock:
             self._connection.close()
+
+    def snapshot(self, destination: Path) -> None:
+        """Export a consistent DuckDB snapshot while this process owns the ledger."""
+
+        with self._lock:
+            export_directory = destination.with_name(f"{destination.name}.export")
+            shutil.rmtree(export_directory, ignore_errors=True)
+            try:
+                escaped = str(export_directory).replace("'", "''")
+                self._connection.execute(f"EXPORT DATABASE '{escaped}'")
+                with tarfile.open(destination, "w:gz") as archive:
+                    for path in sorted(export_directory.rglob("*")):
+                        archive.add(path, arcname=path.relative_to(export_directory), recursive=False)
+            finally:
+                shutil.rmtree(export_directory, ignore_errors=True)
 
     def create_admin(self, username: str, password: str) -> None:
         password_hash = self._passwords.hash(password)

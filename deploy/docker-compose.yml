@@ -11,10 +11,16 @@ services:
       ABT_OPENBAO_HEALTH_TOKEN: ${ABT_OPENBAO_HEALTH_TOKEN:?Set ABT_OPENBAO_HEALTH_TOKEN}
       ABT_OPENBAO_URL: http://openbao:8200
       ABT_OPENBAO_CONTROLLER_TOKEN: ${ABT_OPENBAO_CONTROLLER_TOKEN:?Set ABT_OPENBAO_CONTROLLER_TOKEN}
+      ABT_BACKUP_DIRECTORY: /var/backups/abt
+      ABT_OPENBAO_RAFT_DIRECTORY: /backup-source/openbao-raft
+      ABT_SOFTHSM_TOKENS_DIRECTORY: /backup-source/softhsm-tokens
     depends_on:
       - openbao
     volumes:
       - controller_ledger:/var/lib/abt
+      - controller_backups:/var/backups/abt
+      - openbao_raft:/backup-source/openbao-raft:ro
+      - softhsm_tokens:/backup-source/softhsm-tokens:ro
     healthcheck:
       test: ["CMD", "python", "-c", "from urllib.request import urlopen; urlopen('http://localhost:8000/health', timeout=2)"]
       interval: 10s
@@ -86,3 +92,4 @@ volumes:
   openbao_raft:
   softhsm_tokens:
   cloudflared_credentials:
+  controller_backups:

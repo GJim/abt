@@ -35,11 +35,19 @@ def _openbao_certificate_issuer() -> OpenBaoDeviceCertificateIssuer | None:
     return OpenBaoDeviceCertificateIssuer(os.environ.get("ABT_OPENBAO_URL", "http://openbao:8200"), token)
 
 
+_ledger_path = Path(os.environ.get("ABT_LEDGER_PATH", "/var/lib/abt/ledger.duckdb"))
 app = create_app(
-    Path(os.environ.get("ABT_LEDGER_PATH", "/var/lib/abt/ledger.duckdb")),
+    _ledger_path,
     trusted_proxy_ips=frozenset(filter(None, os.environ.get("ABT_TRUSTED_PROXY_IPS", "").split(","))),
     spa_directory=Path(os.environ["ABT_SPA_DIRECTORY"]) if "ABT_SPA_DIRECTORY" in os.environ else None,
     secret_control_healthy=_openbao_is_healthy,
     secret_store=_openbao_secret_store(),
     certificate_issuer=_openbao_certificate_issuer(),
+    backup_directory=Path(os.environ["ABT_BACKUP_DIRECTORY"]) if "ABT_BACKUP_DIRECTORY" in os.environ else None,
+    openbao_raft_directory=(
+        Path(os.environ["ABT_OPENBAO_RAFT_DIRECTORY"]) if "ABT_OPENBAO_RAFT_DIRECTORY" in os.environ else None
+    ),
+    softhsm_tokens_directory=(
+        Path(os.environ["ABT_SOFTHSM_TOKENS_DIRECTORY"]) if "ABT_SOFTHSM_TOKENS_DIRECTORY" in os.environ else None
+    ),
 )

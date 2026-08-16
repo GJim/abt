@@ -38,7 +38,7 @@ class ComposeDeploymentTests(unittest.TestCase):
     def test_sensitive_state_uses_distinct_persistent_volumes(self) -> None:
         volumes = self.compose["volumes"]
         self.assertEqual(
-            {"controller_ledger", "openbao_raft", "softhsm_tokens", "cloudflared_credentials"},
+            {"controller_ledger", "openbao_raft", "softhsm_tokens", "cloudflared_credentials", "controller_backups"},
             set(volumes),
         )
         services = self.compose["services"]
@@ -46,6 +46,9 @@ class ComposeDeploymentTests(unittest.TestCase):
         self.assertIn("openbao_raft:/var/lib/openbao", services["openbao"]["volumes"])
         self.assertIn("softhsm_tokens:/var/lib/softhsm/tokens", services["openbao"]["volumes"])
         self.assertIn("cloudflared_credentials:/etc/cloudflared", services["cloudflared"]["volumes"])
+        self.assertIn("controller_backups:/var/backups/abt", services["controller"]["volumes"])
+        self.assertIn("openbao_raft:/backup-source/openbao-raft:ro", services["controller"]["volumes"])
+        self.assertIn("softhsm_tokens:/backup-source/softhsm-tokens:ro", services["controller"]["volumes"])
         deployment_guide = (Path(__file__).parents[1] / "deploy" / "README.md").read_text(encoding="utf-8")
         self.assertIn("controller_ledger", deployment_guide)
         self.assertIn("openbao_raft", deployment_guide)

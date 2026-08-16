@@ -12,6 +12,7 @@ from fastapi import Cookie, FastAPI, Header, HTTPException, Request, Response, W
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
+from .backup import BackupManager
 from .crypto import ProofError, parse_device_certificate, verify_enrollment_proof, verify_worker_proof
 from .ledger import AuthenticationError, ControlLedger, IpLockedError, LedgerError
 from .secrets import DeviceCertificateIssuer, DeviceCertificateVerifier, SecretStore, SecretStoreError
@@ -52,19 +53,40 @@ def create_app(
     secret_store: SecretStore | None = None,
     certificate_issuer: DeviceCertificateIssuer | None = None,
     certificate_verifier: DeviceCertificateVerifier | None = None,
+    backup_manager: BackupManager | None = None,
+    backup_directory: Path | None = None,
+    openbao_raft_directory: Path | None = None,
+    softhsm_tokens_directory: Path | None = None,
 ) -> FastAPI:
     ledger = ControlLedger(ledger_path)
+    backup_paths = (backup_directory, openbao_raft_directory, softhsm_tokens_directory)
+    if backup_manager is None and all(backup_paths):
+        backup_manager = BackupManager(
+            ledger,
+            backup_directory,
+            openbao_raft_directory,
+            softhsm_tokens_directory,
+        )
+    elif any(backup_paths):
+        raise ValueError("All control-plane backup directories must be configured together.")
     if certificate_verifier is None and certificate_issuer is not None and callable(getattr(certificate_issuer, "verify", None)):
         certificate_verifier = cast(DeviceCertificateVerifier, certificate_issuer)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         cleanup_task = asyncio.create_task(_expire_pending_secrets(ledger, secret_store))
+        backup_task = (
+            asyncio.create_task(_create_hourly_backups(backup_manager)) if backup_manager is not None else None
+        )
         try:
             yield
         finally:
             cleanup_task.cancel()
-            await asyncio.gather(cleanup_task, return_exceptions=True)
+            tasks = [cleanup_task]
+            if backup_task is not None:
+                backup_task.cancel()
+                tasks.append(backup_task)
+            await asyncio.gather(*tasks, return_exceptions=True)
             ledger.close()
 
     app = FastAPI(title="abt control plane", version="0.1.0", lifespan=lifespan)
@@ -191,6 +213,7 @@ def create_app(
         username = _require_admin(ledger, abt_admin_session, x_csrf_token, require_csrf=True)
         try:
             ledger.revoke_worker(worker_id, username)
+            _create_pki_backup(backup_manager)
         except LedgerError as error:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
         connections = tuple(worker_connections.pop(worker_id, set()))
@@ -222,7 +245,7 @@ def create_app(
         try:
             if certificate_issuer is None:
                 raise SecretStoreError("The device certificate issuer is unavailable.")
-            return {
+            result = {
                 "worker_id": ledger.approve_enrollment(
                     enrollment_id,
                     username,
@@ -234,6 +257,8 @@ def create_app(
                     ),
                 )
             }
+            _create_pki_backup(backup_manager)
+            return result
         except (LedgerError, SecretStoreError) as error:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
 
@@ -401,6 +426,21 @@ async def _expire_pending_secrets(ledger: ControlLedger, secret_store: SecretSto
             _delete_expired_pending_secrets(ledger, secret_store)
         except SecretStoreError:
             _LOGGER.exception("Failed to delete expired pending worker credential.")
+
+
+async def _create_hourly_backups(backup_manager: BackupManager) -> None:
+    while True:
+        await asyncio.sleep(60 * 60)
+        try:
+            backup_manager.create("hourly")
+        except Exception:
+            _LOGGER.exception("Failed to create hourly control-plane backup.")
+
+
+def _create_pki_backup(backup_manager: BackupManager | None) -> None:
+    if backup_manager is None:
+        return
+    backup_manager.create("pki-change")
 
 
 def _delete_expired_pending_secrets(ledger: ControlLedger, secret_store: SecretStore) -> None:
