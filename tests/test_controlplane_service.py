@@ -38,8 +38,12 @@ class MemorySecretStore:
 class MemoryCertificateIssuer:
     def __init__(self) -> None:
         self._key = ec.generate_private_key(ec.SECP256R1())
+        self.fail_next_issue = False
 
     def issue(self, *, worker_id: str, login: int, server: str, public_key_pem: str) -> str:
+        if self.fail_next_issue:
+            self.fail_next_issue = False
+            raise SecretStoreError("OpenBao device certificate signing failed (HTTP 403).")
         issued_at = datetime.now(UTC)
         payload = device_certificate_payload(
             worker_id=worker_id,
@@ -187,6 +191,41 @@ class ControlPlaneServiceTests(unittest.TestCase):
         logout_response = self.client.post("/api/admin/logout", headers={"X-CSRF-Token": csrf_token})
         self.assertEqual(204, logout_response.status_code)
         self.assertEqual(401, self.client.get("/api/admin/events").status_code)
+
+    def test_admin_session_resumes_with_a_rotated_csrf_token(self) -> None:
+        login_response = self.client.post(
+            "/api/admin/login",
+            json={"username": "ABCDEF", "password": "A-secure-admin-password!"},
+        )
+        original_csrf = login_response.json()["csrf_token"]
+
+        resume_response = self.client.get("/api/admin/session")
+
+        self.assertEqual(200, resume_response.status_code)
+        resumed_csrf = resume_response.json()["csrf_token"]
+        self.assertNotEqual(original_csrf, resumed_csrf)
+        self.assertEqual(
+            204,
+            self.client.post("/api/admin/logout", headers={"X-CSRF-Token": resumed_csrf}).status_code,
+        )
+
+    def test_approval_logs_a_sanitized_openbao_signing_failure(self) -> None:
+        enrollment_id = self._create_pending_enrollment()
+        login = self.client.post(
+            "/api/admin/login",
+            json={"username": "ABCDEF", "password": "A-secure-admin-password!"},
+        )
+        self.certificate_issuer.fail_next_issue = True
+
+        with self.assertLogs("abt.controlplane.service", level="WARNING") as logs:
+            response = self.client.post(
+                f"/api/admin/enrollments/{enrollment_id}/approve",
+                headers={"X-CSRF-Token": login.json()["csrf_token"]},
+            )
+
+        self.assertEqual(409, response.status_code)
+        self.assertEqual("OpenBao device certificate signing failed (HTTP 403).", response.json()["detail"])
+        self.assertIn(enrollment_id, "\n".join(logs.output))
 
     def test_login_does_not_apply_an_ip_lock_to_proxied_requests(self) -> None:
         for source_ip in ("198.51.100.1", "198.51.100.2"):

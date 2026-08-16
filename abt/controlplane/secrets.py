@@ -88,8 +88,14 @@ class OpenBaoDeviceCertificateIssuer:
             )
             response.raise_for_status()
             signature = response.json()["data"]["signature"]
+        except httpx.HTTPStatusError as error:
+            raise SecretStoreError(
+                f"OpenBao device certificate signing failed (HTTP {error.response.status_code})."
+            ) from error
+        except httpx.TimeoutException as error:
+            raise SecretStoreError("OpenBao device certificate signing timed out.") from error
         except (httpx.HTTPError, KeyError, TypeError, ValueError) as error:
-            raise SecretStoreError("OpenBao device certificate signing failed.") from error
+            raise SecretStoreError("OpenBao device certificate signing transport failed.") from error
         return json.dumps(
             {
                 "payload": base64.b64encode(payload).decode("ascii"),

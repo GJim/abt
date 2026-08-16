@@ -114,6 +114,15 @@ def create_app(
         )
         return {"csrf_token": session.csrf_token, "expires_at": session.expires_at.isoformat()}
 
+    @app.get("/api/admin/session")
+    def resume_session(abt_admin_session: Annotated[str | None, Cookie()] = None) -> dict[str, str]:
+        if abt_admin_session is None:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Administrator login is required.")
+        try:
+            return {"csrf_token": ledger.resume_admin_session(abt_admin_session)}
+        except AuthenticationError as error:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(error)) from error
+
     @app.post("/api/enrollments", status_code=status.HTTP_201_CREATED)
     def create_enrollment(body: EnrollmentRequest) -> dict[str, str]:
         try:
@@ -249,6 +258,7 @@ def create_app(
             _create_pki_backup(backup_manager)
             return result
         except (LedgerError, SecretStoreError) as error:
+            _LOGGER.warning("Worker enrollment approval failed for %s: %s", enrollment_id, error)
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
 
     @app.post("/api/admin/enrollments/{enrollment_id}/reject", status_code=status.HTTP_204_NO_CONTENT)

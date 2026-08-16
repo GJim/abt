@@ -8,6 +8,28 @@ test('administrator can reach the management login', async ({ page }) => {
   await expect(page.getByLabel('Password')).toBeVisible()
 })
 
+test('administrator resumes a cookie-backed session after refresh', async ({ page }) => {
+  await page.route('**/api/admin/session', async (route) => {
+    await route.fulfill({ contentType: 'application/json', body: JSON.stringify({ csrf_token: 'resumed-csrf-token' }) })
+  })
+  await page.route('**/api/admin/events', async (route) => {
+    await route.fulfill({ contentType: 'application/json', body: JSON.stringify([]) })
+  })
+  await page.route('**/api/admin/enrollments', async (route) => {
+    await route.fulfill({ contentType: 'application/json', body: JSON.stringify([]) })
+  })
+  await page.route('**/api/admin/workers', async (route) => {
+    await route.fulfill({ contentType: 'application/json', body: JSON.stringify([]) })
+  })
+  await page.route('**/api/admin/alerts', async (route) => {
+    await route.fulfill({ contentType: 'application/json', body: JSON.stringify([]) })
+  })
+
+  await page.goto('http://127.0.0.1:4173/')
+
+  await expect(page.getByRole('heading', { name: 'Audit events' })).toBeVisible()
+})
+
 test('administrator can sign in and view audit events', async ({ page }) => {
   await page.route('**/api/admin/login', async (route) => {
     await route.fulfill({

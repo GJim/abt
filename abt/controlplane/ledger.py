@@ -173,6 +173,16 @@ class ControlLedger:
             )
             return username
 
+    def resume_admin_session(self, token: str) -> str:
+        self.validate_session(token)
+        csrf_token = secrets.token_urlsafe(32)
+        with self._transaction():
+            self._connection.execute(
+                "UPDATE admin_sessions SET csrf_hash = ? WHERE token_hash = ?",
+                [_hash(csrf_token), _hash(token)],
+            )
+        return csrf_token
+
     def create_enrollment(
         self,
         *,

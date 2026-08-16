@@ -16,6 +16,7 @@ class ComposeDeploymentTests(unittest.TestCase):
         self.assertEqual({"controller", "openbao", "softhsm", "cloudflared"}, set(services))
         self.assertTrue(all("ports" not in service for service in services.values()))
         self.assertEqual(["controller"], services["cloudflared"]["depends_on"])
+        self.assertEqual("cloudflare/cloudflared:latest", services["cloudflared"]["image"])
         self.assertEqual({"ingress"}, set(services["cloudflared"]["networks"]))
         self.assertEqual({"ingress", "secrets"}, set(services["controller"]["networks"]))
         self.assertEqual("172.30.0.3", services["controller"]["networks"]["ingress"]["ipv4_address"])

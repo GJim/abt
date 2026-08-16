@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import type { FormEvent } from 'react'
 import './App.css'
 
@@ -96,6 +96,24 @@ function App() {
     setAlerts(alertPayload)
   }
 
+  useEffect(() => {
+    async function resumeSession() {
+      try {
+        const response = await fetch('/api/admin/session', { credentials: 'same-origin' })
+        if (!response.ok) {
+          return
+        }
+        const payload = (await response.json()) as LoginResponse
+        setCsrfToken(payload.csrf_token)
+        await refreshManagementData()
+      } catch {
+        setError('Your session could not be restored. Please sign in again.')
+      }
+    }
+
+    void resumeSession()
+  }, [])
+
   async function revokeWorker(workerId: string) {
     if (!csrfToken) {
       return
@@ -153,11 +171,13 @@ function App() {
         credentials: 'same-origin',
       })
       if (!response.ok) {
-        throw new Error('Enrollment review failed.')
+        const payload = await response.json() as { detail?: unknown }
+        throw new Error(typeof payload.detail === 'string' ? payload.detail : 'Enrollment review failed.')
       }
       await refreshManagementData()
-    } catch {
-      setError(`Could not ${action} this worker registration. Please try again.`)
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : 'Enrollment review failed.'
+      setError(`Could not ${action} this worker registration: ${detail}`)
     } finally {
       setProcessingEnrollmentId(null)
     }
