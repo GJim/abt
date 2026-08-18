@@ -999,6 +999,14 @@ async def _request_market_data_with_retry(
             )
         except (asyncio.TimeoutError, LedgerError, ValueError) as error:
             last_error = error
+            _LOGGER.warning(
+                "Market-data analysis %s failed at %s (%s), attempt %s/2: %r",
+                analysis_id,
+                stage,
+                timeframe,
+                attempt + 1,
+                error,
+            )
             if attempt == 1:
                 break
             record_retry(str(error))

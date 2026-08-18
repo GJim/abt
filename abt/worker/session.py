@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import deque
 from datetime import timedelta
 import json
+import logging
 from math import floor
 from statistics import median
 from collections.abc import Callable
@@ -24,6 +25,9 @@ from .credentials import (
     _worker_endpoint,
 )
 from .enrollment import WorkerEnrollmentError
+
+
+_LOGGER = logging.getLogger(__name__)
 from .keystore import HardwareKeyStore
 
 
@@ -188,8 +192,34 @@ def collect_market_data_evidence(
         "timeframe": timeframe,
         "period_start_utc": period_start_utc,
         "period_end_utc": period_end_utc,
-        "symbols": [_market_data_symbol_evidence(mt5, symbol, timeframe, start, end) for symbol in symbols],
+        "symbols": [_market_data_symbol_evidence_with_retry(mt5, symbol, timeframe, start, end) for symbol in symbols],
     }
+
+
+def _market_data_symbol_evidence_with_retry(
+    mt5: MarketDataReadOnlyMT5,
+    symbol: str,
+    timeframe: str,
+    start: datetime,
+    end: datetime,
+) -> dict[str, object]:
+    last_error: WorkerEnrollmentError | None = None
+    for attempt in range(1, 4):
+        try:
+            return _market_data_symbol_evidence(mt5, symbol, timeframe, start, end)
+        except WorkerEnrollmentError as error:
+            last_error = error
+            _LOGGER.debug(
+                "Market-data evidence failed for symbol %s, timeframe %s, attempt %s/3: %s",
+                symbol,
+                timeframe,
+                attempt,
+                error,
+            )
+    assert last_error is not None
+    raise WorkerEnrollmentError(
+        f"Unable to collect {timeframe} market-data evidence for {symbol} after 3 attempts: {last_error}"
+    ) from last_error
 
 
 def _symbol_specification(symbol: object) -> dict[str, object]:
