@@ -26,6 +26,7 @@ from .ledger import AuthenticationError, ControlLedger, LedgerError
 from .secrets import DeviceCertificateIssuer, DeviceCertificateVerifier, SecretStore, SecretStoreError
 
 _LOGGER = logging.getLogger(__name__)
+_MARKET_DATA_REQUEST_TIMEOUT_SECONDS = 30
 
 
 class LoginRequest(BaseModel):
@@ -984,14 +985,14 @@ async def _request_market_data_with_retry(
                     first_connection,
                     analysis_id=analysis_id,
                     stage=stage,
-                    timeout=5,
+                    timeout=_MARKET_DATA_REQUEST_TIMEOUT_SECONDS,
                     message=_market_data_request(analysis_id, stage, timeframe, first_symbols, analysis_period, policy),
                 ),
                 _request_worker_analysis(
                     second_connection,
                     analysis_id=analysis_id,
                     stage=stage,
-                    timeout=5,
+                    timeout=_MARKET_DATA_REQUEST_TIMEOUT_SECONDS,
                     message=_market_data_request(analysis_id, stage, timeframe, second_symbols, analysis_period, policy),
                 ),
             )
@@ -1011,9 +1012,17 @@ async def _request_market_data_with_retry(
             )
             if attempt == 1:
                 break
-            record_retry(str(error))
+            record_retry(_market_data_request_error_reason(error))
     assert last_error is not None
+    if isinstance(last_error, asyncio.TimeoutError):
+        raise LedgerError(_market_data_request_error_reason(last_error)) from last_error
     raise last_error
+
+
+def _market_data_request_error_reason(error: asyncio.TimeoutError | LedgerError | ValueError) -> str:
+    if isinstance(error, asyncio.TimeoutError):
+        return f"Worker did not respond within {_MARKET_DATA_REQUEST_TIMEOUT_SECONDS} seconds."
+    return str(error)
 
 
 async def _request_worker_analysis(

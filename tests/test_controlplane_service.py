@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
@@ -24,11 +25,13 @@ from websockets.exceptions import ConnectionClosed
 from websockets.sync.client import connect as websocket_connect
 
 from abt.controlplane.crypto import ProofError, device_certificate_payload, enrollment_payload, worker_proof_payload
+from abt.controlplane.ledger import LedgerError
 from abt.controlplane.secrets import SecretStore, SecretStoreError
 from abt.controlplane.service import (
     _analyze_product_catalogs,
     _delete_expired_pending_secrets,
     _market_data_statistics,
+    _request_market_data_with_retry,
     _shared_supported_filling_modes,
     _validated_market_data_response,
     _validated_product_catalog_response,
@@ -77,6 +80,37 @@ class MarketDataAlignmentTests(unittest.TestCase):
 
         self.assertEqual(3, statistics["aligned_bar_count"])
         self.assertEqual(1.0, statistics["coverage_ratio"])
+
+
+class MarketDataRequestTests(unittest.IsolatedAsyncioTestCase):
+    async def test_uses_full_batch_timeout_and_records_a_nonempty_timeout_reason(self) -> None:
+        timeouts: list[int] = []
+        retries: list[str] = []
+
+        async def worker_timeout(*_: object, **kwargs: object) -> dict[str, object]:
+            timeouts.append(int(kwargs["timeout"]))
+            raise asyncio.TimeoutError
+
+        with patch("abt.controlplane.service._request_worker_analysis", side_effect=worker_timeout):
+            with self.assertRaisesRegex(LedgerError, "did not respond within 30 seconds"):
+                await _request_market_data_with_retry(
+                    "analysis-123",
+                    first_connection=object(),  # type: ignore[arg-type]
+                    second_connection=object(),  # type: ignore[arg-type]
+                    first_symbols=["EURUSD"],
+                    second_symbols=["EURUSDC"],
+                    analysis_period={
+                        "started_at_utc": "2026-08-10T00:00:00Z",
+                        "ended_at_utc": "2026-08-17T00:00:00Z",
+                    },
+                    policy={},
+                    stage="m1_verification",
+                    timeframe="M1",
+                    record_retry=retries.append,
+                )
+
+        self.assertEqual([30, 30, 30, 30], timeouts)
+        self.assertEqual(["Worker did not respond within 30 seconds."], retries)
 
 
 class MemoryCertificateIssuer:
@@ -1099,17 +1133,18 @@ class ControlPlaneServiceTests(unittest.TestCase):
                 kwargs={
                     "request_key": "second",
                     "ready_event": second_ready,
-                    "market_data_responses": [
-                        {
+                    "market_data_by_stage": {
+                        "m15_screening": {
                             "EURUSD": [
                                 {"time": 1000, "close": 1.1012},
                                 {"time": 1900, "close": 1.1024},
                                 {"time": 2800, "close": 1.1032},
                             ]
                         },
-                        None,
-                        None,
-                    ],
+                    },
+                    "market_data_error_by_stage": {
+                        "m1_verification": "EURUSD M1 evidence is unavailable.",
+                    },
                 },
             )
             first_responder.start()
@@ -2343,6 +2378,7 @@ class _LiveCatalogAnalysisHarness:
         market_data_by_stage: dict[str, dict[str, list[dict[str, object]]]] | None = None,
         market_data_responses: list[dict[str, list[dict[str, object]]] | None] | None = None,
         market_data_error: str | None = None,
+        market_data_error_by_stage: dict[str, str] | None = None,
         ready_event: threading.Event | None = None,
     ) -> None:
         with websocket_connect(f"ws://127.0.0.1:{self.port}/api/worker/session") as websocket:
@@ -2372,19 +2408,21 @@ class _LiveCatalogAnalysisHarness:
                         market_data_by_symbol is None
                         and market_data_by_stage is None
                         and market_data_error is None
+                        and market_data_error_by_stage is None
                         and not pending_market_data
                     ):
                         return
                     continue
                 if stage in {"m15_screening", "m1_verification"}:
-                    if market_data_error is not None:
+                    error = market_data_error if market_data_error_by_stage is None else market_data_error_by_stage.get(stage)
+                    if error is not None:
                         websocket.send(json.dumps({
                             "type": "product_catalog_analysis_error",
                             "analysis_id": request["analysis_id"],
                             "request_id": request["request_id"],
                             "stage": stage,
                             "timeframe": request["timeframe"],
-                            "reason": market_data_error,
+                            "reason": error,
                         }))
                         continue
                     response_payload = (
