@@ -204,6 +204,33 @@ class WorkerEnrollmentTests(unittest.TestCase):
         self.assertEqual(1, exit_code)
         self.assertNotIn(password, errors.getvalue())
 
+    def test_cli_verbose_mode_reports_safe_registration_diagnostics(self) -> None:
+        password = "never-display-this-password"
+        errors = io.StringIO()
+
+        exit_code = main(
+            [
+                "enroll",
+                "-v",
+                "--controller-url",
+                "https://controller.example",
+                "--login",
+                "123456",
+                "--server",
+                "Broker-Demo",
+            ],
+            mt5_factory=FakeMT5,
+            transport_factory=lambda: FailingTransport(password),
+            key_store_factory=lambda _: FakeKeyStore(),
+            password_prompt=lambda _: password,
+            error_output=errors,
+        )
+
+        self.assertEqual(1, exit_code)
+        self.assertIn("Worker registration failed.", errors.getvalue())
+        self.assertIn("RuntimeError", errors.getvalue())
+        self.assertNotIn(password, errors.getvalue())
+
     def test_analysis_helper_accepts_m1_verification_requests(self) -> None:
         session = AuthenticatedWorkerSession(
             socket=FakeWebSocket(
@@ -303,6 +330,16 @@ class HTTPEnrollmentTransportTests(unittest.TestCase):
         try:
             with self.assertRaisesRegex(WorkerEnrollmentError, "HTTPS origin"):
                 transport.enroll("http://controller.example", {})
+        finally:
+            transport.close()
+
+    def test_includes_safe_http_status_in_enrollment_failure(self) -> None:
+        transport = HTTPEnrollmentTransport(
+            httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(422, request=request)))
+        )
+        try:
+            with self.assertRaisesRegex(WorkerEnrollmentError, "HTTP 422"):
+                transport.enroll("https://controller.example", {})
         finally:
             transport.close()
 

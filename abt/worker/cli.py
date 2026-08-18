@@ -26,12 +26,10 @@ class HTTPEnrollmentTransport:
         try:
             response = self._client.post(endpoint, json=request, follow_redirects=False)
             if response.status_code != 201:
-                raise httpx.HTTPStatusError(
-                    "Unexpected enrollment response status.",
-                    request=response.request,
-                    response=response,
-                )
+                raise WorkerEnrollmentError(f"The controller enrollment request returned HTTP {response.status_code}.")
             body = response.json()
+        except WorkerEnrollmentError:
+            raise
         except (httpx.HTTPError, ValueError) as error:
             raise WorkerEnrollmentError("The controller enrollment request failed.") from error
         if not isinstance(body, Mapping):
@@ -43,12 +41,10 @@ class HTTPEnrollmentTransport:
         try:
             response = self._client.get(endpoint, follow_redirects=False)
             if response.status_code != 200:
-                raise httpx.HTTPStatusError(
-                    "Unexpected enrollment challenge response status.",
-                    request=response.request,
-                    response=response,
-                )
+                raise WorkerEnrollmentError(f"The controller enrollment challenge request returned HTTP {response.status_code}.")
             body = response.json()
+        except WorkerEnrollmentError:
+            raise
         except (httpx.HTTPError, ValueError) as error:
             raise WorkerEnrollmentError("The controller enrollment challenge request failed.") from error
         if not isinstance(body, Mapping):
@@ -146,8 +142,10 @@ def main(
                 _close(transport)
         finally:
             _close(key_store)
-    except Exception:
+    except Exception as error:
         print("Worker registration failed.", file=error_output)
+        if arguments.verbose:
+            _print_diagnostic(error, error_output)
         return 1
 
     print(result.display(), file=output)
@@ -156,8 +154,10 @@ def main(
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="abt-worker")
+    parser.add_argument("-v", "--verbose", action="store_true", help="show safe failure diagnostics")
     commands = parser.add_subparsers(dest="command")
     enroll = commands.add_parser("enroll", help="enroll this Windows MT5 worker")
+    enroll.add_argument("-v", "--verbose", action="store_true", default=argparse.SUPPRESS, help="show safe failure diagnostics")
     enroll.add_argument("--controller-url", required=True, help="HTTPS controller origin")
     enroll.add_argument("--login", required=True, type=_positive_login, help="MT5 account login")
     enroll.add_argument("--server", required=True, help="MT5 server")
@@ -167,6 +167,9 @@ def _parser() -> argparse.ArgumentParser:
         help="persistent Windows CNG key name",
     )
     reconcile = commands.add_parser("reconcile", help="run read-only MT5 reconciliation for an approved worker")
+    reconcile.add_argument(
+        "-v", "--verbose", action="store_true", default=argparse.SUPPRESS, help="show safe failure diagnostics"
+    )
     reconcile.add_argument("--controller-url", required=True, help="HTTPS controller origin")
     reconcile.add_argument("--enrollment-id", required=True, help="approved worker enrollment ID")
     reconcile.add_argument("--login", required=True, type=_positive_login, help="bound MT5 account login")
@@ -219,3 +222,10 @@ def _close(value: object) -> None:
     close = getattr(value, "close", None)
     if callable(close):
         close()
+
+
+def _print_diagnostic(error: Exception, output: TextIO) -> None:
+    if isinstance(error, WorkerEnrollmentError):
+        print(f"Diagnostic: {error}", file=output)
+    else:
+        print(f"Diagnostic: {type(error).__name__}", file=output)
