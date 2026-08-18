@@ -419,15 +419,18 @@ def open_authenticated_worker_session(
         from websockets.sync.client import connect as websocket_connect
 
         connect = websocket_connect
-    with connect(_worker_endpoint(controller_url, "/api/worker/certificate")) as certificate_socket:
-        _send(certificate_socket, {"enrollment_id": enrollment_id})
-        challenge = _message(certificate_socket)
-        worker_id = _required_text(challenge, "worker_id")
-        _send_proof(certificate_socket, key_store, challenge, "certificate_delivery", worker_id)
-        delivery = _message(certificate_socket)
-        if _required_text(delivery, "worker_id") != worker_id:
-            raise WorkerEnrollmentError("The controller returned an invalid device certificate.")
-        certificate = _required_text(delivery, "certificate")
+    try:
+        with connect(_worker_endpoint(controller_url, "/api/worker/certificate")) as certificate_socket:
+            _send(certificate_socket, {"enrollment_id": enrollment_id})
+            challenge = _message(certificate_socket)
+            worker_id = _required_text(challenge, "worker_id")
+            _send_proof(certificate_socket, key_store, challenge, "certificate_delivery", worker_id)
+            delivery = _message(certificate_socket)
+            if _required_text(delivery, "worker_id") != worker_id:
+                raise WorkerEnrollmentError("The controller returned an invalid device certificate.")
+            certificate = _required_text(delivery, "certificate")
+    except Exception as error:
+        _raise_closed_connection(error, "certificate delivery")
 
     socket = connect(_worker_endpoint(controller_url, "/api/worker/session"))
     try:
@@ -446,5 +449,13 @@ def open_authenticated_worker_session(
             raise WorkerEnrollmentError("The controller returned an invalid worker response.")
     except BaseException as error:
         socket.__exit__(type(error), error, error.__traceback__)
+        if isinstance(error, Exception):
+            _raise_closed_connection(error, "authenticated worker session")
         raise
     return AuthenticatedWorkerSession(socket, reconciliation_cursor=cursor)
+
+
+def _raise_closed_connection(error: Exception, phase: str) -> None:
+    if isinstance(getattr(getattr(error, "rcvd", None), "code", None), int):
+        raise WorkerEnrollmentError(f"The controller closed the {phase} WebSocket.") from error
+    raise error

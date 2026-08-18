@@ -227,7 +227,10 @@ def _close(value: object) -> None:
 def _print_diagnostic(error: Exception, output: TextIO) -> None:
     if isinstance(error, WorkerEnrollmentError):
         print(f"Diagnostic: {error}", file=output)
-        return
+        cause = error.__cause__
+        if not isinstance(cause, Exception):
+            return
+        error = cause
     received_close = getattr(error, "rcvd", None)
     sent_close = getattr(error, "sent", None)
     received_code = getattr(received_close, "code", None)

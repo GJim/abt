@@ -736,7 +736,8 @@ def create_app(
                 nonce=nonce,
             )
             await websocket.send_json({"worker_id": worker.worker_id, "certificate": worker.certificate})
-        except WebSocketDisconnect:
+        except WebSocketDisconnect as error:
+            _LOGGER.info("Worker certificate delivery disconnected with code %s.", error.code)
             await _reject_worker(websocket)
         except (LedgerError, ProofError, ValueError) as error:
             _LOGGER.warning("Worker certificate delivery failed: %s", error)
@@ -776,7 +777,8 @@ def create_app(
             if secret_store is None:
                 raise SecretStoreError("The MT5 credential mediator is unavailable.")
             await websocket.send_json({"password": secret_store.read_password(worker.password_secret_ref)})
-        except WebSocketDisconnect:
+        except WebSocketDisconnect as error:
+            _LOGGER.info("Worker password mediation disconnected with code %s.", error.code)
             await _reject_worker(websocket)
         except (LedgerError, ProofError, SecretStoreError, ValueError) as error:
             _LOGGER.warning("Worker password mediation failed: %s", error)
@@ -850,7 +852,8 @@ def create_app(
                     _record_product_catalog_analysis_response(connection, request)
                 else:
                     raise ValueError("Invalid worker message.")
-        except WebSocketDisconnect:
+        except WebSocketDisconnect as error:
+            _LOGGER.info("Worker session disconnected with code %s.", error.code)
             await _reject_worker(websocket)
         except (LedgerError, ProofError, SecretStoreError, ValueError) as error:
             _LOGGER.warning("Worker session authentication or request failed: %s", error)

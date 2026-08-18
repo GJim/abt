@@ -11,7 +11,7 @@ from websockets.exceptions import ConnectionClosedError
 from websockets.frames import Close
 
 from abt.controlplane.crypto import enrollment_payload
-from abt.worker.cli import HTTPEnrollmentTransport, MetaTrader5Adapter, main
+from abt.worker.cli import HTTPEnrollmentTransport, MetaTrader5Adapter, _print_diagnostic, main
 from abt.worker.credentials import retrieve_mt5_password
 from abt.worker.enrollment import WorkerEnrollmentError, register_worker
 from abt.worker.session import AuthenticatedWorkerSession, open_authenticated_worker_session
@@ -473,6 +473,29 @@ class WorkerCredentialTests(unittest.TestCase):
         self.assertEqual(2, len(key_store.signed_payloads))
         self.assertNotIn("memory-only-password", "".join(certificate_socket.sent + session_socket.sent))
 
+    def test_names_session_phase_when_controller_closes_websocket(self) -> None:
+        key_store = FakeKeyStore()
+        certificate_socket = FakeWebSocket(
+            [
+                {"purpose": "certificate_delivery", "worker_id": "worker-123", "nonce": "certificate-nonce"},
+                {"worker_id": "worker-123", "certificate": "certificate"},
+            ]
+        )
+        session_socket = ClosingWebSocket()
+
+        with self.assertRaisesRegex(WorkerEnrollmentError, "authenticated worker session") as raised:
+            open_authenticated_worker_session(
+                controller_url="https://controller.example",
+                enrollment_id="enrollment-123",
+                key_store=key_store,
+                connect=lambda url: certificate_socket if url.endswith("/certificate") else session_socket,
+            )
+
+        errors = io.StringIO()
+        _print_diagnostic(raised.exception, errors)
+        self.assertIn("authenticated worker session", errors.getvalue())
+        self.assertIn("code 1011", errors.getvalue())
+
 
 class FakeWebSocket:
     def __init__(self, responses: list[dict[str, str]]) -> None:
@@ -490,6 +513,14 @@ class FakeWebSocket:
 
     def recv(self) -> str:
         return self._responses.pop(0)
+
+
+class ClosingWebSocket(FakeWebSocket):
+    def __init__(self) -> None:
+        super().__init__([])
+
+    def recv(self) -> str:
+        raise ConnectionClosedError(Close(1011, ""), None)
 
 
 def _connect(
