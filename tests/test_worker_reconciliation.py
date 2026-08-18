@@ -216,6 +216,46 @@ class WorkerReconciliationTests(unittest.TestCase):
         self.assertEqual("m1_verification", response["stage"])
         self.assertEqual("M1", response["timeframe"])
 
+    def test_sends_market_data_analysis_error_without_stopping_reconciliation(self) -> None:
+        mt5 = AnalysisMT5()
+        mt5.symbol_info_tick = lambda _: None  # type: ignore[method-assign]
+        session = AnalysisSession(
+            {
+                "analysis_id": "analysis-123",
+                "request_id": "request-123",
+                "stage": "m15_screening",
+                "policy": {},
+                "timeframe": "M15",
+                "period_start_utc": "2026-08-10T00:00:00Z",
+                "period_end_utc": "2026-08-17T00:00:00Z",
+                "symbols": ["EURUSD"],
+            }
+        )
+
+        with self.assertRaises(StopIteration):
+            reconcile_authenticated_worker(
+                mt5=mt5,
+                session=session,
+                login=123456,
+                server="Broker-Demo",
+                now=lambda: datetime(2026, 8, 16, tzinfo=UTC),
+                sleep=lambda _: None,
+            )
+
+        self.assertEqual(
+            {
+                "analysis_id": "analysis-123",
+                "request_id": "request-123",
+                "stage": "m15_screening",
+                "timeframe": "M15",
+                "reason": (
+                    "Unable to collect M15 market-data evidence for EURUSD after 3 attempts: "
+                    "The local MT5 terminal returned incomplete market-data evidence."
+                ),
+            },
+            session.analysis_error,
+        )
+
     def test_collects_catalog_evidence_from_mt5_namedtuple_symbol_info(self) -> None:
         mt5 = AnalysisMT5()
         specification = mt5.symbols_get()[0]
@@ -335,12 +375,16 @@ class AnalysisSession(MemoryOnlySession):
         super().__init__([])
         self._requests = [request, None]
         self.analysis_response: dict[str, object] = {}
+        self.analysis_error: dict[str, object] = {}
 
     def receive_product_catalog_analysis(self, timeout: float | None = None) -> dict[str, object] | None:
         return self._requests.pop(0)
 
     def send_product_catalog_analysis(self, **response: object) -> None:
         self.analysis_response = response
+
+    def send_product_catalog_analysis_error(self, **response: object) -> None:
+        self.analysis_error = response
 
     def heartbeat(self) -> bool:
         raise StopIteration

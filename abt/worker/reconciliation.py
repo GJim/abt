@@ -55,6 +55,16 @@ class AnalysisWorkerSession(Protocol):
         period_end_utc: str | None = None,
     ) -> None: ...
 
+    def send_product_catalog_analysis_error(
+        self,
+        *,
+        analysis_id: str,
+        request_id: str,
+        stage: str,
+        reason: str,
+        timeframe: str | None = None,
+    ) -> None: ...
+
 
 class WorkerSafetyAdapter:
     """Maintain the native worker's read-only lost-link safety state."""
@@ -286,7 +296,11 @@ def _serve_product_catalog_analysis(
     stage = _request_text(request, "stage")
     collected_at = now()
     if stage == "catalog":
-        evidence = collect_product_catalog_evidence(mt5, collected_at=collected_at)  # type: ignore[arg-type]
+        try:
+            evidence = collect_product_catalog_evidence(mt5, collected_at=collected_at)  # type: ignore[arg-type]
+        except WorkerEnrollmentError as error:
+            _send_product_catalog_analysis_error(session, analysis_id, request_id, stage, error)
+            return
         session.send_product_catalog_analysis(
             analysis_id=analysis_id,
             request_id=request_id,
@@ -313,15 +327,8 @@ def _serve_product_catalog_analysis(
             collected_at=collected_at,
         )
     except WorkerEnrollmentError as error:
-        _LOGGER.error(
-            "Analysis %s request %s failed at %s (%s): %s",
-            analysis_id,
-            request_id,
-            stage,
-            timeframe,
-            error,
-        )
-        raise
+        _send_product_catalog_analysis_error(session, analysis_id, request_id, stage, error, timeframe)
+        return
     session.send_product_catalog_analysis(
         analysis_id=analysis_id,
         request_id=request_id,
@@ -331,6 +338,31 @@ def _serve_product_catalog_analysis(
         timeframe=timeframe,
         period_start_utc=period_start_utc,
         period_end_utc=period_end_utc,
+    )
+
+
+def _send_product_catalog_analysis_error(
+    session: AnalysisWorkerSession,
+    analysis_id: str,
+    request_id: str,
+    stage: str,
+    error: WorkerEnrollmentError,
+    timeframe: str | None = None,
+) -> None:
+    _LOGGER.error(
+        "Analysis %s request %s failed at %s%s: %s",
+        analysis_id,
+        request_id,
+        stage,
+        f" ({timeframe})" if timeframe is not None else "",
+        error,
+    )
+    session.send_product_catalog_analysis_error(
+        analysis_id=analysis_id,
+        request_id=request_id,
+        stage=stage,
+        timeframe=timeframe,
+        reason=str(error),
     )
 
 

@@ -179,6 +179,7 @@ test('administrator can launch an analysis with CSRF protection and inspect pass
       buildWorker({ worker_id: 'worker-d', login: 444444, server: 'Broker-D', connectivity: 'stale' }),
     ],
   })
+
   await page.route('**/api/admin/product-catalog-analyses', async (route) => {
     receivedHeaders = route.request().headers()
     receivedBody = route.request().postDataJSON() as Record<string, unknown>
@@ -226,6 +227,36 @@ test('administrator can launch an analysis with CSRF protection and inspect pass
   await expect(page.getByRole('heading', { name: 'Calculation-mode exceptions' })).toBeVisible()
   await expect(page.getByText('Trade Calc Mode Mismatch')).toBeVisible()
   await expect(page.getByText('Worker timed out once.')).toBeVisible()
+})
+
+test('administrator sees the worker-provided analysis failure reason as an alert', async ({ page }) => {
+  await mockLogin(page)
+  await mockManagementData(page, {
+    workers: [
+      buildWorker({ worker_id: 'worker-a', login: 111111, server: 'Broker-A' }),
+      buildWorker({ worker_id: 'worker-b', login: 222222, server: 'Broker-B' }),
+    ],
+  })
+  await page.route('**/api/admin/product-catalog-analyses', async (route) => {
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify(buildAnalysis({
+        status: 'failed',
+        current_stage: 'm15_failed',
+        failure_reason: 'AUDNZDC M15 evidence is unavailable.',
+      })),
+    })
+  })
+
+  await page.goto('http://127.0.0.1:4173/')
+  await page.getByLabel('Administrator account').fill('ABCDEF')
+  await page.getByLabel('Password').fill('A-secure-admin-password!')
+  await page.getByRole('button', { name: 'Sign in' }).click()
+  await page.getByLabel('First analysis worker').selectOption('worker-a')
+  await page.getByLabel('Second analysis worker').selectOption('worker-b')
+  await page.getByRole('button', { name: 'Launch analysis' }).click()
+
+  await expect(page.getByRole('alert')).toHaveText('Analysis failed: AUDNZDC M15 evidence is unavailable.')
 })
 
 test('administrator can inspect immutable evidence, build a pair, and retire it without any broker-write path', async ({ page }) => {

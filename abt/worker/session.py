@@ -158,6 +158,30 @@ class AuthenticatedWorkerSession:
             response,
         )
 
+    def send_product_catalog_analysis_error(
+        self,
+        *,
+        analysis_id: str,
+        request_id: str,
+        stage: str,
+        reason: str,
+        timeframe: str | None = None,
+    ) -> None:
+        if stage not in {"catalog", "m15_screening", "m1_verification"} or not reason:
+            raise WorkerEnrollmentError("The worker cannot send an invalid product catalog analysis error.")
+        response = {
+            "type": "product_catalog_analysis_error",
+            "analysis_id": analysis_id,
+            "request_id": request_id,
+            "stage": stage,
+            "reason": reason,
+        }
+        if stage in {"m15_screening", "m1_verification"}:
+            if not isinstance(timeframe, str) or not timeframe:
+                raise WorkerEnrollmentError("Market-data analysis errors must include a timeframe.")
+            response["timeframe"] = timeframe
+        _send(self.socket, response)
+
 
 def collect_product_catalog_evidence(
     mt5: ProductCatalogReadOnlyMT5,

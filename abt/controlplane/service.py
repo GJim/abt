@@ -855,6 +855,8 @@ def create_app(
                     await websocket.send_json({"type": "accepted", "cursor": request["cursor"]})
                 elif message_type == "product_catalog_analysis_response":
                     _record_product_catalog_analysis_response(connection, request)
+                elif message_type == "product_catalog_analysis_error":
+                    _record_product_catalog_analysis_error(connection, request)
                 else:
                     raise ValueError("Invalid worker message.")
         except WebSocketDisconnect as error:
@@ -1049,6 +1051,33 @@ def _record_product_catalog_analysis_response(
         raise ValueError("Invalid worker product catalog analysis response.")
     if not pending.future.done():
         pending.future.set_result(request)
+
+
+def _record_product_catalog_analysis_error(
+    connection: _WorkerSessionConnection,
+    request: dict[str, object],
+) -> None:
+    analysis_id = _required_text(request, "analysis_id")
+    request_id = _required_text(request, "request_id")
+    reason = _required_text(request, "reason")
+    pending = connection.pending.get(request_id)
+    if pending is None:
+        return
+    stage = request.get("stage", "catalog")
+    if pending.analysis_id != analysis_id or stage != pending.stage:
+        raise ValueError("Invalid worker product catalog analysis error.")
+    expected_fields = {"type", "analysis_id", "request_id", "stage", "reason"}
+    if stage in {"m15_screening", "m1_verification"}:
+        if _required_text(request, "timeframe") not in {"M15", "M1"}:
+            raise ValueError("Invalid worker product catalog analysis error.")
+        expected_fields.add("timeframe")
+    elif stage != "catalog":
+        raise ValueError("Invalid worker product catalog analysis error.")
+    if set(request) != expected_fields:
+        raise ValueError("Invalid worker product catalog analysis error.")
+    connection.pending.pop(request_id, None)
+    if not pending.future.done():
+        pending.future.set_exception(LedgerError(reason))
 
 
 def _fail_pending_worker_analysis_requests(connection: _WorkerSessionConnection, reason: str) -> None:

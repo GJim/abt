@@ -944,11 +944,13 @@ class ControlPlaneServiceTests(unittest.TestCase):
                 kwargs={
                     "request_key": "first",
                     "ready_event": first_ready,
-                    "market_data_by_symbol": {
-                        "EURUSD.a": [
+                    "market_data_by_stage": {
+                        "m15_screening": {
+                            "EURUSD.a": [
                             {"time": 1000, "open": 1.1000, "high": 1.1020, "low": 1.0990, "close": 1.1010},
                             {"time": 1900, "open": 1.1010, "high": 1.1030, "low": 1.1000, "close": 1.1022},
-                        ]
+                            ],
+                        },
                     },
                 },
             )
@@ -963,7 +965,7 @@ class ControlPlaneServiceTests(unittest.TestCase):
                 kwargs={
                     "request_key": "second",
                     "ready_event": second_ready,
-                    "market_data_responses": [None, None],
+                    "market_data_error": "AUDNZDC M15 evidence is unavailable.",
                 },
             )
             first_responder.start()
@@ -979,6 +981,7 @@ class ControlPlaneServiceTests(unittest.TestCase):
         self.assertEqual(1, outcome["retry_count"])
         self.assertEqual([], outcome["m15_screening_results"])
         self.assertEqual(1, len(outcome["eligible_candidates"]))
+        self.assertEqual("AUDNZDC M15 evidence is unavailable.", outcome["failure_reason"])
         self.assertEqual(3, len(harness.requests["second"]))
 
     def test_catalog_analysis_fails_atomically_when_both_workers_omit_the_same_weekday(self) -> None:
@@ -2315,6 +2318,7 @@ class _LiveCatalogAnalysisHarness:
         market_data_by_symbol: dict[str, list[dict[str, object]]] | None = None,
         market_data_by_stage: dict[str, dict[str, list[dict[str, object]]]] | None = None,
         market_data_responses: list[dict[str, list[dict[str, object]]] | None] | None = None,
+        market_data_error: str | None = None,
         ready_event: threading.Event | None = None,
     ) -> None:
         with websocket_connect(f"ws://127.0.0.1:{self.port}/api/worker/session") as websocket:
@@ -2340,10 +2344,25 @@ class _LiveCatalogAnalysisHarness:
                     if symbols is not None:
                         response["symbols"] = symbols
                     websocket.send(json.dumps(response))
-                    if market_data_by_symbol is None and market_data_by_stage is None and not pending_market_data:
+                    if (
+                        market_data_by_symbol is None
+                        and market_data_by_stage is None
+                        and market_data_error is None
+                        and not pending_market_data
+                    ):
                         return
                     continue
                 if stage in {"m15_screening", "m1_verification"}:
+                    if market_data_error is not None:
+                        websocket.send(json.dumps({
+                            "type": "product_catalog_analysis_error",
+                            "analysis_id": request["analysis_id"],
+                            "request_id": request["request_id"],
+                            "stage": stage,
+                            "timeframe": request["timeframe"],
+                            "reason": market_data_error,
+                        }))
+                        continue
                     response_payload = (
                         pending_market_data.pop(0)
                         if pending_market_data

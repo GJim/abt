@@ -1136,6 +1136,7 @@ function AnalysisDetails({
             <div><dt>Completed</dt><dd>{analysis.completed_at ? <time dateTime={analysis.completed_at}>{formatDateTime(analysis.completed_at)}</time> : '—'}</dd></div>
             <div><dt>Failure reason</dt><dd>{analysis.failure_reason ?? '—'}</dd></div>
           </dl>
+          {analysis.failure_reason && <p className="error" role="alert">Analysis failed: {analysis.failure_reason}</p>}
         </article>
 
         <article className="panel">
