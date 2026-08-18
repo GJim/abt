@@ -211,12 +211,16 @@ def collect_market_data_evidence(
         raise WorkerEnrollmentError("The controller requested an invalid market-data interval.")
     if not symbols or not all(isinstance(symbol, str) and symbol for symbol in symbols):
         raise WorkerEnrollmentError("The controller requested invalid market-data symbols.")
+    calibration = _market_data_calibration(mt5, symbols)
     return {
         "collected_at": when,
         "timeframe": timeframe,
         "period_start_utc": period_start_utc,
         "period_end_utc": period_end_utc,
-        "symbols": [_market_data_symbol_evidence_with_retry(mt5, symbol, timeframe, start, end) for symbol in symbols],
+        "symbols": [
+            _market_data_symbol_evidence_with_retry(mt5, symbol, timeframe, start, end, calibration)
+            for symbol in symbols
+        ],
     }
 
 
@@ -226,11 +230,12 @@ def _market_data_symbol_evidence_with_retry(
     timeframe: str,
     start: datetime,
     end: datetime,
+    calibration: dict[str, object],
 ) -> dict[str, object]:
     last_error: WorkerEnrollmentError | None = None
     for attempt in range(1, 4):
         try:
-            return _market_data_symbol_evidence(mt5, symbol, timeframe, start, end)
+            return _market_data_symbol_evidence(mt5, symbol, timeframe, start, end, calibration)
         except WorkerEnrollmentError as error:
             last_error = error
             _LOGGER.debug(
@@ -389,8 +394,8 @@ def _market_data_symbol_evidence(
     timeframe: str,
     start: datetime,
     end: datetime,
+    calibration: dict[str, object],
 ) -> dict[str, object]:
-    calibration = _market_data_calibration(mt5, symbol)
     raw_rates = mt5.copy_rates_range(symbol, _timeframe_value(mt5, timeframe), start, end - timedelta(seconds=1))
     bars = _structured_market_data(raw_rates)
     if not bars:
@@ -413,29 +418,32 @@ def _market_data_symbol_evidence(
     return {"symbol": symbol, "bars": records, "time_metadata": time_metadata}
 
 
-def _market_data_calibration(mt5: MarketDataReadOnlyMT5, symbol: str) -> dict[str, object]:
-    samples = tuple(sample for _ in range(3) if (sample := _market_sample(mt5, symbol)) is not None)
-    if not samples:
-        raise WorkerEnrollmentError(
-            f"No valid symbol_info_tick.time was available for {symbol} across 3 calibration samples."
+def _market_data_calibration(mt5: MarketDataReadOnlyMT5, symbols: list[str]) -> dict[str, object]:
+    for symbol in symbols:
+        samples = tuple(sample for _ in range(3) if (sample := _market_sample(mt5, symbol)) is not None)
+        if not samples:
+            continue
+        offset = int(round(median(sample["offset_seconds"] for sample in samples)))
+        selected = samples[-1]
+        calibration = render_calibration(
+            TimeCalibrationFamily(
+                offset_seconds=offset,
+                calibrated_local_date=_parse_utc(str(selected["calibrated_at_utc"])).date().isoformat(),
+                calibrated_at_utc=str(selected["calibrated_at_utc"]),
+                status="calibrated",
+                calibration_symbol=symbol,
+            ),
+            MARKET_DATA,
+            ZoneInfo("UTC"),
+            now=_parse_utc(str(selected["calibrated_at_utc"])),
         )
-    offset = int(round(median(sample["offset_seconds"] for sample in samples)))
-    selected = samples[-1]
-    calibration = render_calibration(
-        TimeCalibrationFamily(
-            offset_seconds=offset,
-            calibrated_local_date=_parse_utc(str(selected["calibrated_at_utc"])).date().isoformat(),
-            calibrated_at_utc=str(selected["calibrated_at_utc"]),
-            status="calibrated",
-            calibration_symbol=symbol,
-        ),
-        MARKET_DATA,
-        ZoneInfo("UTC"),
-        now=_parse_utc(str(selected["calibrated_at_utc"])),
+        calibration["samples"] = list(samples)
+        calibration["sample_count"] = len(samples)
+        _LOGGER.debug("Using %s for shared market-data calibration.", symbol)
+        return calibration
+    raise WorkerEnrollmentError(
+        "No valid symbol_info_tick.time was available across 3 calibration samples for any requested symbol."
     )
-    calibration["samples"] = list(samples)
-    calibration["sample_count"] = len(samples)
-    return calibration
 
 
 def _market_sample(mt5: MarketDataReadOnlyMT5, symbol: str) -> dict[str, object] | None:

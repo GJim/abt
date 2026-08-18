@@ -165,6 +165,9 @@ def main(
                 _close_safely(transport, cleanup_errors)
         finally:
             _close_safely(key_store, cleanup_errors)
+    except KeyboardInterrupt:
+        print("Worker reconciliation stopped.", file=error_output)
+        return 130
     except Exception as error:
         print("Worker registration failed.", file=error_output)
         if arguments.verbose:

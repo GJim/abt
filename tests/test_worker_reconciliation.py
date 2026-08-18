@@ -248,10 +248,7 @@ class WorkerReconciliationTests(unittest.TestCase):
                 "request_id": "request-123",
                 "stage": "m15_screening",
                 "timeframe": "M15",
-                "reason": (
-                    "Unable to collect M15 market-data evidence for EURUSD after 3 attempts: "
-                    "No valid symbol_info_tick.time was available for EURUSD across 3 calibration samples."
-                ),
+                "reason": "No valid symbol_info_tick.time was available across 3 calibration samples for any requested symbol.",
             },
             session.analysis_error,
         )
@@ -262,7 +259,7 @@ class WorkerReconciliationTests(unittest.TestCase):
 
         with self.assertRaisesRegex(
             WorkerEnrollmentError,
-            "No valid symbol_info_tick.time was available for CADCHF across 3 calibration samples.",
+            "No valid symbol_info_tick.time was available across 3 calibration samples for any requested symbol.",
         ):
             collect_market_data_evidence(
                 mt5,
@@ -272,6 +269,27 @@ class WorkerReconciliationTests(unittest.TestCase):
                 period_end_utc="2026-08-17T00:00:00Z",
                 collected_at=datetime(2026, 8, 16, tzinfo=UTC),
             )
+
+    def test_uses_another_requested_symbol_for_shared_market_data_calibration(self) -> None:
+        mt5 = AnalysisMT5()
+        tick_symbols: list[str] = []
+
+        def symbol_info_tick(symbol: str) -> object:
+            tick_symbols.append(symbol)
+            return None if symbol == "CADCHF" else {"time": 1_785_945_600}
+
+        mt5.symbol_info_tick = symbol_info_tick  # type: ignore[method-assign]
+        evidence = collect_market_data_evidence(
+            mt5,
+            symbols=["CADCHF", "EURUSD"],
+            timeframe="M15",
+            period_start_utc="2026-08-10T00:00:00Z",
+            period_end_utc="2026-08-17T00:00:00Z",
+            collected_at=datetime(2026, 8, 16, tzinfo=UTC),
+        )
+
+        self.assertEqual(["CADCHF", "EURUSD"], [symbol["symbol"] for symbol in evidence["symbols"]])
+        self.assertEqual(["CADCHF"] * 3 + ["EURUSD"] * 3, tick_symbols)
 
     def test_collects_catalog_evidence_from_mt5_namedtuple_symbol_info(self) -> None:
         mt5 = AnalysisMT5()

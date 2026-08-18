@@ -180,6 +180,36 @@ class WorkerEnrollmentTests(unittest.TestCase):
         self.assertEqual(1, exit_code)
         self.assertIn("only supported on native Windows", errors.getvalue())
 
+    def test_cli_reconcile_stops_cleanly_on_keyboard_interrupt(self) -> None:
+        errors = io.StringIO()
+        session = InterruptibleSession()
+
+        with (
+            patch("abt.worker.cli.sys.platform", "win32"),
+            patch("abt.worker.cli.open_authenticated_worker_session", return_value=session),
+            patch("abt.worker.cli.reconcile_with_safety", side_effect=KeyboardInterrupt),
+        ):
+            exit_code = main(
+                [
+                    "reconcile",
+                    "--controller-url",
+                    "https://controller.example",
+                    "--enrollment-id",
+                    "enrollment-123",
+                    "--login",
+                    "123456",
+                    "--server",
+                    "Broker-Demo",
+                ],
+                mt5_factory=FakeMT5,
+                key_store_factory=lambda _: FakeKeyStore(),
+                error_output=errors,
+            )
+
+        self.assertEqual(130, exit_code)
+        self.assertTrue(session.closed)
+        self.assertIn("Worker reconciliation stopped.", errors.getvalue())
+
     def test_cli_does_not_print_a_password_when_submission_fails(self) -> None:
         password = "never-display-this-password"
         mt5 = FakeMT5()
@@ -347,6 +377,17 @@ class FailingTransport:
 
     def enroll(self, controller_url: str, request: dict[str, object]) -> dict[str, object]:
         raise RuntimeError(self._password)
+
+
+class InterruptibleSession:
+    def __init__(self) -> None:
+        self.closed = False
+
+    def __enter__(self) -> InterruptibleSession:
+        return self
+
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
+        self.closed = True
 
 
 class ClosingTransport:
