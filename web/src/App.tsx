@@ -1109,6 +1109,11 @@ function AnalysisDetails({
   const passingCandidates = analysis.m1_verification_results.filter((result) => result.verification_status === 'passed')
   const failingCandidates = analysis.m1_verification_results.filter((result) => result.verification_status !== 'passed')
   const failedScreening = analysis.m15_screening_results.filter((result) => result.screening_status !== 'passed')
+  const passedScreening = analysis.m15_screening_results.filter((result) => result.screening_status === 'passed')
+  const availableCandidates = passingCandidates.filter(
+    (result) => findMatchingActiveProductPair(productPairs, candidateEndpoints(result, analysis)) === null,
+  )
+  const builtCandidates = passingCandidates.length - availableCandidates.length
   const runtimeStatus = analysis.status === 'running' ? 'running' : analysis.status
 
   return (
@@ -1174,6 +1179,8 @@ function AnalysisDetails({
             <div><dt>Calculation-mode exceptions</dt><dd>{analysis.exceptions.length}</dd></div>
             <div><dt>M15 passed</dt><dd>{analysis.m15_screening_results.filter((result) => result.screening_status === 'passed').length}</dd></div>
             <div><dt>Final passing candidates</dt><dd>{passingCandidates.length}</dd></div>
+            <div><dt>Available to build</dt><dd>{availableCandidates.length}</dd></div>
+            <div><dt>Already built</dt><dd>{builtCandidates}</dd></div>
             <div><dt>Final failing candidates</dt><dd>{failingCandidates.length}</dd></div>
           </dl>
         </article>
@@ -1211,16 +1218,33 @@ function AnalysisDetails({
         {analysis.m15_screening_results.length === 0 ? (
           <p>No M15 screening results were recorded.</p>
         ) : (
-          <div className="result-grid">
-            {analysis.m15_screening_results.map((result) => (
+          <>
+            <div className="result-grid">
+              {passedScreening.map((result) => (
               <AnalysisResultCard
                 key={`${result.first_symbol}:${result.second_symbol}:m15`}
                 firstWorker={analysis.first_worker}
                 result={result}
                 secondWorker={analysis.second_worker}
               />
-            ))}
-          </div>
+              ))}
+            </div>
+            {failedScreening.length > 0 && (
+              <details>
+              <summary>Show {failedScreening.length} failed M15 candidate(s)</summary>
+              <div className="result-grid">
+                {failedScreening.map((result) => (
+                  <AnalysisResultCard
+                    key={`${result.first_symbol}:${result.second_symbol}:m15`}
+                    firstWorker={analysis.first_worker}
+                    result={result}
+                    secondWorker={analysis.second_worker}
+                  />
+                ))}
+              </div>
+              </details>
+            )}
+          </>
         )}
         {failedScreening.length > 0 && (
           <p className="hint">{failedScreening.length} candidate(s) stopped at M15 and never reached final verification.</p>
@@ -1229,23 +1253,26 @@ function AnalysisDetails({
 
       <section aria-labelledby="final-passing-heading">
         <h4 id="final-passing-heading">Final passing candidates</h4>
-        {passingCandidates.length === 0 ? (
-          <p>No final passing candidates were recorded.</p>
+        {availableCandidates.length === 0 ? (
+          <p>No final passing candidates are available to build.</p>
         ) : (
           <div className="result-grid">
-            {passingCandidates.map((result) => (
+            {availableCandidates.map((result) => (
               <BuildableVerificationCard
-                analysis={analysis}
-                csrfToken={csrfToken}
-                key={`${result.first_symbol}:${result.second_symbol}:passed`}
-                firstWorker={analysis.first_worker}
-                onProductPairsChanged={onProductPairsChanged}
-                productPairs={productPairs}
-                result={result}
-                secondWorker={analysis.second_worker}
+              analysis={analysis}
+              csrfToken={csrfToken}
+              key={`${result.first_symbol}:${result.second_symbol}:passed`}
+              firstWorker={analysis.first_worker}
+              onProductPairsChanged={onProductPairsChanged}
+              productPairs={productPairs}
+              result={result}
+              secondWorker={analysis.second_worker}
               />
             ))}
           </div>
+        )}
+        {builtCandidates > 0 && (
+          <p className="hint">{builtCandidates} final passing candidate(s) already have an active product pair; view them below in Active product pairs.</p>
         )}
       </section>
 
@@ -1254,16 +1281,19 @@ function AnalysisDetails({
         {failingCandidates.length === 0 ? (
           <p>No final failing candidates were recorded.</p>
         ) : (
-          <div className="result-grid">
-            {failingCandidates.map((result) => (
+          <details>
+            <summary>Show {failingCandidates.length} failed final candidate(s)</summary>
+            <div className="result-grid">
+              {failingCandidates.map((result) => (
               <AnalysisResultCard
                 key={`${result.first_symbol}:${result.second_symbol}:failed`}
                 firstWorker={analysis.first_worker}
                 result={result}
                 secondWorker={analysis.second_worker}
               />
-            ))}
-          </div>
+              ))}
+            </div>
+          </details>
         )}
       </section>
 
@@ -2252,6 +2282,16 @@ function findMatchingActiveProductPair(
 ) {
   const targetKey = endpointPairKey(endpoints)
   return productPairs.find((pair) => pair.status === 'active' && endpointPairKey(pair.endpoints) === targetKey) ?? null
+}
+
+function candidateEndpoints(
+  candidate: VerificationResult,
+  analysis: ProductCatalogAnalysis,
+) {
+  return [
+    { server: analysis.first_worker.server, symbol: candidate.first_symbol },
+    { server: analysis.second_worker.server, symbol: candidate.second_symbol },
+  ]
 }
 
 function getApplicabilityCompatibilityResult(applicability: WorkerApplicability | null) {

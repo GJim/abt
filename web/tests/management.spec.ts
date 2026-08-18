@@ -221,6 +221,9 @@ test('administrator can launch an analysis with CSRF protection and inspect pass
   await expect(finalPassingSection).toBeVisible()
   await expect(finalPassingSection.getByRole('heading', { name: 'EURUSD.a ↔ EURUSD' })).toBeVisible()
   await expect(finalPassingSection.getByRole('heading', { name: 'Warning differences' })).toBeVisible()
+  const failedCandidates = finalFailingSection.locator('details')
+  await expect(failedCandidates).not.toHaveAttribute('open', '')
+  await failedCandidates.locator('summary').click()
   await expect(finalFailingSection.getByRole('heading', { name: 'Hard-block differences' })).toBeVisible()
   await expect(page.getByText('volume_step')).toBeVisible()
   await expect(page.getByText('volume_max')).toBeVisible()
@@ -328,8 +331,8 @@ test('administrator can inspect immutable evidence, build a pair, and retire it 
   await expect(candidateCard.getByText('1:1')).toBeVisible()
   await expect(candidateCard.getByText('111111 on Broker-A')).toBeVisible()
   await expect(candidateCard.getByText('222222 on Broker-B')).toBeVisible()
-  await expect(candidateCard.getByText('Broker-A · EURUSD')).toBeVisible()
-  await expect(candidateCard.getByText('Broker-B · EURUSD.a')).toBeVisible()
+  await expect(candidateCard.getByText('Broker-A · EURUSD.a')).toBeVisible()
+  await expect(candidateCard.getByText('Broker-B · EURUSD')).toBeVisible()
 
   const buildButton = candidateCard.getByRole('button', { name: 'Build product pair' })
   await expect(buildButton).toBeDisabled()
@@ -340,10 +343,11 @@ test('administrator can inspect immutable evidence, build a pair, and retire it 
   expect(buildHeaders?.['x-csrf-token']).toBe('csrf-token')
   await expect(page.getByRole('heading', { name: 'Active product pairs' })).toBeVisible()
   const pairCard = page.locator('.product-pair-card').filter({ hasText: 'pair-1' })
-  await expect(pairCard.getByRole('heading', { name: 'Broker-A:EURUSD ↔ Broker-B:EURUSD.a' })).toBeVisible()
-  await expect(page.getByText('Built active product pair pair-1.')).toBeVisible()
+  await expect(pairCard.getByRole('heading', { name: 'Broker-A:EURUSD.a ↔ Broker-B:EURUSD' })).toBeVisible()
   await expect(pairCard).toContainText('Original policy snapshot')
   await expect(pairCard).toContainText('Passed')
+  await expect(page.locator('.buildable-result-card')).toHaveCount(0)
+  await expect(page.getByText('1 final passing candidate(s) already have an active product pair')).toBeVisible()
 
   await page.getByRole('button', { name: 'Retire product pair' }).click()
 
@@ -352,9 +356,7 @@ test('administrator can inspect immutable evidence, build a pair, and retire it 
   await expect(page.locator('.product-pair-card').first()).toContainText('Manual retirement')
 })
 
-test('administrator sees build validation errors, uniqueness conflicts, and can replace the active pair', async ({ page }) => {
-  let replaceHeaders: Record<string, string> | null = null
-  let confirmationRequests = 0
+test('administrator hides a final candidate already represented by an active pair', async ({ page }) => {
   const initialPair = buildProductPair({
     product_pair_id: 'pair-existing',
     built_from_analysis_id: 'analysis-old',
@@ -365,7 +367,7 @@ test('administrator sees build validation errors, uniqueness conflicts, and can 
     },
     created_at: '2026-08-16T00:00:00Z',
   })
-  let currentPairs: Record<string, unknown>[] = [initialPair]
+  const currentPairs: Record<string, unknown>[] = [initialPair]
 
   await mockLogin(page)
   await mockManagementData(page, {
@@ -385,57 +387,6 @@ test('administrator sees build validation errors, uniqueness conflicts, and can 
           maximum_m1_p99_price_difference_points: 20,
         },
       })),
-    })
-  })
-  await page.route('**/api/admin/product-catalog-analyses/analysis-1/product-pair-build-confirmations', async (route) => {
-    confirmationRequests += 1
-    if (confirmationRequests === 1) {
-      await route.fulfill({
-        status: 422,
-        contentType: 'application/json',
-        body: JSON.stringify({ detail: 'Selected candidate is not a final passing candidate.' }),
-      })
-      return
-    }
-    await route.fulfill({
-      status: 201,
-      contentType: 'application/json',
-      body: JSON.stringify(buildProductPairConfirmation({
-        policy_snapshot: {
-          ...buildAnalysis().policy,
-          label: 'FX catalog v3',
-          maximum_m1_p99_price_difference_points: 20,
-        },
-      })),
-    })
-  })
-  await page.route('**/api/admin/product-pairs/pair-existing/replace', async (route) => {
-    replaceHeaders = route.request().headers()
-    currentPairs = [
-      buildProductPair({
-        product_pair_id: 'pair-existing',
-        status: 'retired',
-        retired_at: '2026-08-17T00:15:00Z',
-        retired_by: 'ABCDEF',
-        retired_reason: 'replaced',
-        replaced_by_product_pair_id: 'pair-replacement',
-      }),
-      buildProductPair({
-        product_pair_id: 'pair-replacement',
-        built_from_analysis_id: 'analysis-1',
-        built_from_confirmation_id: 'confirmation-1',
-        policy_snapshot: {
-          ...buildAnalysis().policy,
-          label: 'FX catalog v3',
-          maximum_m1_p99_price_difference_points: 20,
-        },
-        replaces_product_pair_id: 'pair-existing',
-      }),
-    ]
-    await route.fulfill({
-      status: 201,
-      contentType: 'application/json',
-      body: JSON.stringify(currentPairs[1]),
     })
   })
   await page.route('**/api/admin/product-pairs', async (route) => {
@@ -459,25 +410,9 @@ test('administrator sees build validation errors, uniqueness conflicts, and can 
   await page.getByRole('button', { name: 'Sign in' }).click()
   await page.getByRole('button', { name: 'Launch analysis' }).click()
 
-  const candidateCard = page.locator('.buildable-result-card').first()
-  await candidateCard.getByRole('button', { name: 'Prepare Build confirmation' }).click()
-  await expect(candidateCard.getByText('Selected candidate is not a final passing candidate.')).toBeVisible()
-
-  await candidateCard.getByRole('button', { name: 'Prepare Build confirmation' }).click()
-  await candidateCard.getByRole('checkbox', { name: /Explicit Build confirmation/i }).check()
-  await candidateCard.getByRole('button', { name: 'Build product pair' }).click()
-
-  await expect(candidateCard.getByText('An active product pair already exists for this unordered endpoint pair.')).toBeVisible()
-  await expect(candidateCard.getByText('Build conflict: an active product pair already exists for Broker-A:EURUSD ↔ Broker-B:EURUSD.a.')).toBeVisible()
-  await candidateCard.getByRole('button', { name: 'Replace active pair' }).click()
-
-  expect(replaceHeaders?.['x-csrf-token']).toBe('csrf-token')
-  await expect(page.getByText('Replaced the active pair with pair-replacement.')).toBeVisible()
-  await expect(page.locator('.product-pair-card').nth(0)).toContainText('pair-replacement')
-  await expect(page.locator('.product-pair-card').nth(0)).toContainText('Active')
-  await expect(page.locator('.product-pair-card').nth(1)).toContainText('pair-existing')
-  await expect(page.locator('.product-pair-card').nth(1)).toContainText('Retired')
-  await expect(page.locator('.product-pair-card').nth(1)).toContainText('Replaced')
+  await expect(page.locator('.buildable-result-card')).toHaveCount(0)
+  await expect(page.getByText('1 final passing candidate(s) already have an active product pair')).toBeVisible()
+  await expect(page.locator('.product-pair-card').first()).toContainText('pair-existing')
 })
 
 test('administrator can inspect compatibility evidence and explicitly exclude one worker from one pair', async ({ page }) => {
@@ -1080,15 +1015,15 @@ function buildProductPairConfirmation(overrides?: Record<string, unknown>) {
       second_worker: buildAnalysis().second_worker,
     },
     endpoints: [
-      { server: 'Broker-A', symbol: 'EURUSD' },
-      { server: 'Broker-B', symbol: 'EURUSD.a' },
+      { server: 'Broker-A', symbol: 'EURUSD.a' },
+      { server: 'Broker-B', symbol: 'EURUSD' },
     ],
     reference_specifications: [
       {
         server: 'Broker-A',
-        symbol: 'EURUSD',
+        symbol: 'EURUSD.a',
         specification: {
-          symbol: 'EURUSD',
+          symbol: 'EURUSD.a',
           digits: 5,
           point: 0.00001,
           trade_calc_mode: 'FOREX',
@@ -1096,9 +1031,9 @@ function buildProductPairConfirmation(overrides?: Record<string, unknown>) {
       },
       {
         server: 'Broker-B',
-        symbol: 'EURUSD.a',
+        symbol: 'EURUSD',
         specification: {
-          symbol: 'EURUSD.a',
+          symbol: 'EURUSD',
           digits: 5,
           point: 0.00001,
           trade_calc_mode: 'FOREX',
