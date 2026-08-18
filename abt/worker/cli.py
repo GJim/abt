@@ -110,6 +110,7 @@ def main(
     arguments = parser.parse_args(argv)
     if arguments.command not in {"enroll", "reconcile"}:
         parser.error("a command is required")
+    cleanup_errors: list[Exception] = []
     try:
         mt5 = mt5_factory()
         key_store = key_store_factory(arguments.key_name)
@@ -139,9 +140,9 @@ def main(
                     password_prompt=password_prompt,
                 )
             finally:
-                _close(transport)
+                _close_safely(transport, cleanup_errors)
         finally:
-            _close(key_store)
+            _close_safely(key_store, cleanup_errors)
     except Exception as error:
         print("Worker registration failed.", file=error_output)
         if arguments.verbose:
@@ -149,6 +150,8 @@ def main(
         return 1
 
     print(result.display(), file=output)
+    for error in cleanup_errors:
+        print(f"Worker registration completed, but local cleanup failed: {type(error).__name__}.", file=error_output)
     return 0
 
 
@@ -222,6 +225,13 @@ def _close(value: object) -> None:
     close = getattr(value, "close", None)
     if callable(close):
         close()
+
+
+def _close_safely(value: object, errors: list[Exception]) -> None:
+    try:
+        _close(value)
+    except Exception as error:
+        errors.append(error)
 
 
 def _print_diagnostic(error: Exception, output: TextIO) -> None:

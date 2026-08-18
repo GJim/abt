@@ -206,6 +206,36 @@ class WorkerEnrollmentTests(unittest.TestCase):
         self.assertEqual(1, exit_code)
         self.assertNotIn(password, errors.getvalue())
 
+    def test_cli_reports_success_when_local_cleanup_fails_after_enrollment(self) -> None:
+        output = io.StringIO()
+        errors = io.StringIO()
+        transport = FakeTransport()
+        transport.close = lambda: (_ for _ in ()).throw(RuntimeError("never-display-this-error"))  # type: ignore[method-assign]
+
+        exit_code = main(
+            [
+                "enroll",
+                "--controller-url",
+                "https://controller.example",
+                "--login",
+                "123456",
+                "--server",
+                "Broker-Demo",
+            ],
+            mt5_factory=FakeMT5,
+            transport_factory=lambda: transport,
+            key_store_factory=lambda _: FakeKeyStore(),
+            password_prompt=lambda _: "never-display-this-password",
+            output=output,
+            error_output=errors,
+        )
+
+        self.assertEqual(0, exit_code)
+        self.assertIn("registration-123", output.getvalue())
+        self.assertIn("local cleanup failed: RuntimeError", errors.getvalue())
+        self.assertNotIn("never-display-this-error", errors.getvalue())
+        self.assertNotIn("never-display-this-password", errors.getvalue())
+
     def test_cli_verbose_mode_reports_safe_registration_diagnostics(self) -> None:
         password = "never-display-this-password"
         errors = io.StringIO()
