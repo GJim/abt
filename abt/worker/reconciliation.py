@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
 import logging
-from time import sleep as _sleep
+from time import monotonic, sleep as _sleep
 from typing import Protocol
 
 from .enrollment import WorkerEnrollmentError
@@ -317,6 +317,14 @@ def _serve_product_catalog_analysis(
     symbols = request.get("symbols")
     if not isinstance(symbols, list) or not all(isinstance(symbol, str) and symbol for symbol in symbols):
         raise WorkerEnrollmentError("The controller requested invalid market-data symbols.")
+    started_at = monotonic()
+    _LOGGER.debug(
+        "Collecting %s evidence for analysis %s request %s across %s symbols.",
+        timeframe,
+        analysis_id,
+        request_id,
+        len(symbols),
+    )
     try:
         evidence = collect_market_data_evidence(
             mt5,  # type: ignore[arg-type]
@@ -327,8 +335,24 @@ def _serve_product_catalog_analysis(
             collected_at=collected_at,
         )
     except WorkerEnrollmentError as error:
-        _send_product_catalog_analysis_error(session, analysis_id, request_id, stage, error, timeframe)
+        _send_product_catalog_analysis_error(
+            session,
+            analysis_id,
+            request_id,
+            stage,
+            error,
+            timeframe,
+            elapsed_seconds=monotonic() - started_at,
+        )
         return
+    _LOGGER.debug(
+        "Collected %s evidence for analysis %s request %s across %s symbols in %.3fs.",
+        timeframe,
+        analysis_id,
+        request_id,
+        len(symbols),
+        monotonic() - started_at,
+    )
     session.send_product_catalog_analysis(
         analysis_id=analysis_id,
         request_id=request_id,
@@ -348,13 +372,15 @@ def _send_product_catalog_analysis_error(
     stage: str,
     error: WorkerEnrollmentError,
     timeframe: str | None = None,
+    elapsed_seconds: float | None = None,
 ) -> None:
     _LOGGER.error(
-        "Analysis %s request %s failed at %s%s: %s",
+        "Analysis %s request %s failed at %s%s%s: %s",
         analysis_id,
         request_id,
         stage,
         f" ({timeframe})" if timeframe is not None else "",
+        f" after {elapsed_seconds:.3f}s" if elapsed_seconds is not None else "",
         error,
     )
     session.send_product_catalog_analysis_error(

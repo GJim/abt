@@ -205,10 +205,14 @@ class WorkerReconciliationTests(unittest.TestCase):
         self.assertEqual(0, mt5.broker_write_calls)
 
     def test_serves_m15_analysis_requests_during_reconciliation(self) -> None:
-        response = self._serve_market_data_analysis("m15_screening", "M15")
+        with self.assertLogs("abt.worker.reconciliation", level="DEBUG") as logs:
+            response = self._serve_market_data_analysis("m15_screening", "M15")
 
         self.assertEqual("m15_screening", response["stage"])
         self.assertEqual("M15", response["timeframe"])
+        self.assertTrue(
+            any("Collected M15 evidence for analysis analysis-123 request request-123 across 1 symbols in " in line for line in logs.output)
+        )
 
     def test_serves_m1_analysis_requests_during_reconciliation(self) -> None:
         response = self._serve_market_data_analysis("m1_verification", "M1")

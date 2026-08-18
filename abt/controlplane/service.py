@@ -13,6 +13,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 import secrets
 from statistics import median
+from time import monotonic
 from typing import Annotated, Any, Callable, cast
 from uuid import uuid4
 
@@ -91,6 +92,7 @@ class _WorkerAnalysisRequest:
     stage: str
     message: dict[str, object]
     future: ConcurrentFuture[dict[str, object]]
+    started_at: float = field(default_factory=monotonic)
 
 
 @dataclass(eq=False)
@@ -1059,6 +1061,12 @@ def _record_product_catalog_analysis_response(
     if pending.analysis_id != analysis_id or request.get("stage", "catalog") != pending.stage:
         raise ValueError("Invalid worker product catalog analysis response.")
     if not pending.future.done():
+        _LOGGER.info(
+            "Worker completed %s analysis request %s in %.3fs.",
+            pending.stage,
+            request_id,
+            monotonic() - pending.started_at,
+        )
         pending.future.set_result(request)
 
 
@@ -1086,6 +1094,13 @@ def _record_product_catalog_analysis_error(
         raise ValueError("Invalid worker product catalog analysis error.")
     connection.pending.pop(request_id, None)
     if not pending.future.done():
+        _LOGGER.warning(
+            "Worker failed %s analysis request %s after %.3fs: %s",
+            pending.stage,
+            request_id,
+            monotonic() - pending.started_at,
+            reason,
+        )
         pending.future.set_exception(LedgerError(reason))
 
 
