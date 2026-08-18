@@ -1632,12 +1632,22 @@ def _aligned_closes(
     first_symbol: dict[str, object],
     second_symbol: dict[str, object],
 ) -> list[tuple[str, float, float]]:
-    first_index = {str(bar["time_utc"]): float(bar["close"]) for bar in cast(list[dict[str, object]], first_symbol["bars"])}
-    second_index = {str(bar["time_utc"]): float(bar["close"]) for bar in cast(list[dict[str, object]], second_symbol["bars"])}
+    first_index = {
+        _bar_minute_key(str(bar["time_utc"])): float(bar["close"])
+        for bar in cast(list[dict[str, object]], first_symbol["bars"])
+    }
+    second_index = {
+        _bar_minute_key(str(bar["time_utc"])): float(bar["close"])
+        for bar in cast(list[dict[str, object]], second_symbol["bars"])
+    }
     return [
         (time_utc, first_index[time_utc], second_index[time_utc])
         for time_utc in sorted(first_index.keys() & second_index.keys())
     ]
+
+
+def _bar_minute_key(value: str) -> str:
+    return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(UTC).replace(second=0, microsecond=0).isoformat()
 
 
 def _market_data_statistics(

@@ -28,6 +28,7 @@ from abt.controlplane.secrets import SecretStore, SecretStoreError
 from abt.controlplane.service import (
     _analyze_product_catalogs,
     _delete_expired_pending_secrets,
+    _market_data_statistics,
     _shared_supported_filling_modes,
     _validated_market_data_response,
     _validated_product_catalog_response,
@@ -53,6 +54,29 @@ class MemorySecretStore:
             self.fail_next_delete = False
             raise SecretStoreError("OpenBao is unavailable.")
         del self.passwords[reference]
+
+
+class MarketDataAlignmentTests(unittest.TestCase):
+    def test_aligns_bars_within_the_same_utc_minute_despite_calibration_jitter(self) -> None:
+        first = {
+            "bars": [
+                {"time_utc": "2026-08-10T00:00:01Z", "close": 1.1000},
+                {"time_utc": "2026-08-10T00:15:01Z", "close": 1.1010},
+                {"time_utc": "2026-08-10T00:30:01Z", "close": 1.1020},
+            ]
+        }
+        second = {
+            "bars": [
+                {"time_utc": "2026-08-10T00:00:02Z", "close": 1.1001},
+                {"time_utc": "2026-08-10T00:15:02Z", "close": 1.1011},
+                {"time_utc": "2026-08-10T00:30:02Z", "close": 1.1021},
+            ]
+        }
+
+        statistics = _market_data_statistics({}, first, second)
+
+        self.assertEqual(3, statistics["aligned_bar_count"])
+        self.assertEqual(1.0, statistics["coverage_ratio"])
 
 
 class MemoryCertificateIssuer:
