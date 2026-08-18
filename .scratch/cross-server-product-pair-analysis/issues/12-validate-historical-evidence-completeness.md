@@ -1,6 +1,6 @@
 # 12 — Validate historical evidence completeness
 
-**Status:** ready-for-agent
+**Status:** done
 
 **Blocked by:** None — requires a broker-session completeness decision before implementation.
 
@@ -14,12 +14,12 @@ Define a broker-session-aware completeness contract for requested M15/M1 histori
 
 ## Acceptance criteria
 
-- [ ] The domain rule states how expected trading windows, weekend closures, broker daily maintenance windows, holidays, and DST are handled.
-- [ ] The worker or controller validates that each returned series covers the requested UTC period according to that rule.
-- [ ] Matching partial series cannot satisfy `minimum_common_coverage` merely because both omit the same interval.
-- [ ] Incomplete evidence fails the applicable stage atomically and records a clear analysis failure reason.
-- [ ] Tests cover a complete FX week, a missing leading/trailing segment, and a matching internal gap on both workers.
-- [ ] Validation does not introduce broker-write operations or persist raw M15/M1 bars.
+- [x] The domain rule states how expected trading windows, weekend closures, broker daily maintenance windows, holidays, and DST are handled.
+- [x] The worker or controller validates that each returned series covers the requested UTC period according to that rule.
+- [x] Matching partial series cannot satisfy `minimum_common_coverage` merely because both omit the same interval.
+- [x] Incomplete evidence fails the applicable stage atomically and records a clear analysis failure reason.
+- [x] Tests cover a complete FX week, a missing leading/trailing segment, and a matching internal gap on both workers.
+- [x] Validation does not introduce broker-write operations or persist raw M15/M1 bars.
 
 ## Relevant code
 
@@ -32,3 +32,5 @@ Define a broker-session-aware completeness contract for requested M15/M1 histori
 ## Comments
 
 - 2026-08-18: Identified during review of ticket 10. Implementation must not assume a fixed number of bars without first defining the broker-session calendar semantics.
+- 2026-08-18: Policy selected by the operator: each requested UTC Monday-Friday must contain at least one returned bar for every requested symbol and timeframe. Weekend closure is expected; broker maintenance, holidays, DST shifts, and intraday gaps are allowed because no fixed intraday bar count is inferred. The controller rejects missing leading, trailing, or internal weekdays before coverage calculation.
+- 2026-08-18: Coverage includes direct leading/trailing/internal weekday validation and a live two-worker M15 stage test where both workers omit the same internal weekday; the controller fails the stage atomically before coverage evaluation.

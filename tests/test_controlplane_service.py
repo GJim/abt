@@ -20,11 +20,19 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from fastapi.testclient import TestClient
 import uvicorn
+from websockets.exceptions import ConnectionClosed
 from websockets.sync.client import connect as websocket_connect
 
 from abt.controlplane.crypto import ProofError, device_certificate_payload, enrollment_payload, worker_proof_payload
 from abt.controlplane.secrets import SecretStore, SecretStoreError
-from abt.controlplane.service import _delete_expired_pending_secrets, _validated_product_catalog_response, create_app
+from abt.controlplane.service import (
+    _delete_expired_pending_secrets,
+    _validated_market_data_response,
+    _validated_product_catalog_response,
+    create_app,
+)
+from abt.worker.reconciliation import reconcile_authenticated_worker
+from abt.worker.session import AuthenticatedWorkerSession
 
 
 class MemorySecretStore:
@@ -817,6 +825,58 @@ class ControlPlaneServiceTests(unittest.TestCase):
                         "analysis-123",
                     )
 
+    def test_market_data_response_requires_evidence_from_every_utc_weekday(self) -> None:
+        analysis_period = {
+            "started_at_utc": "2026-08-10T00:00:00Z",
+            "ended_at_utc": "2026-08-17T00:00:00Z",
+        }
+
+        def response_for(days: list[int]) -> dict[str, object]:
+            return {
+                "type": "product_catalog_analysis_response",
+                "stage": "m15_screening",
+                "analysis_id": "analysis-123",
+                "collected_at": "2026-08-17T07:05:00Z",
+                "timeframe": "M15",
+                "period_start_utc": analysis_period["started_at_utc"],
+                "period_end_utc": analysis_period["ended_at_utc"],
+                "symbols": [{
+                    "symbol": "EURUSD",
+                    "time_metadata": {},
+                    "bars": [
+                        {
+                            "time": int(datetime(2026, 8, day, tzinfo=UTC).timestamp()),
+                            "time_utc": datetime(2026, 8, day, tzinfo=UTC).isoformat().replace("+00:00", "Z"),
+                            "close": 1.1,
+                        }
+                        for day in days
+                    ],
+                }],
+            }
+
+        accepted = _validated_market_data_response(
+            response_for([10, 11, 12, 13, 14]),
+            "analysis-123",
+            "m15_screening",
+            "M15",
+            ["EURUSD"],
+            analysis_period,
+        )
+        self.assertEqual(5, len(accepted["symbols"]["EURUSD"]["bars"]))
+
+        for missing_day in (10, 14, 12):
+            with self.subTest(missing_day=missing_day):
+                days = [day for day in (10, 11, 12, 13, 14) if day != missing_day]
+                with self.assertRaisesRegex(ValueError, "every UTC weekday"):
+                    _validated_market_data_response(
+                        response_for(days),
+                        "analysis-123",
+                        "m15_screening",
+                        "M15",
+                        ["EURUSD"],
+                        analysis_period,
+                    )
+
     def test_catalog_analysis_retries_m15_once_and_fails_without_partial_screening_results_when_worker_evidence_is_incomplete(self) -> None:
         with self._live_catalog_analysis_harness() as harness:
             first_key, first_worker, first_certificate = harness.approved_worker(123456, "Broker-A")
@@ -870,6 +930,51 @@ class ControlPlaneServiceTests(unittest.TestCase):
         self.assertEqual([], outcome["m15_screening_results"])
         self.assertEqual(1, len(outcome["eligible_candidates"]))
         self.assertEqual(3, len(harness.requests["second"]))
+
+    def test_catalog_analysis_fails_atomically_when_both_workers_omit_the_same_weekday(self) -> None:
+        with self._live_catalog_analysis_harness() as harness:
+            first_key, first_worker, first_certificate = harness.approved_worker(123456, "Broker-A")
+            second_key, second_worker, second_certificate = harness.approved_worker(654321, "Broker-B")
+            first_ready = threading.Event()
+            second_ready = threading.Event()
+            missing_wednesday = [
+                {
+                    "time": int(datetime(2026, 8, day, tzinfo=UTC).timestamp()),
+                    "time_utc": datetime(2026, 8, day, tzinfo=UTC).isoformat().replace("+00:00", "Z"),
+                    "close": 1.1000 + index * 0.0001,
+                }
+                for index, day in enumerate((10, 11, 13, 14))
+            ]
+            first_responder = threading.Thread(
+                target=harness.respond_to_catalog_analysis,
+                args=(first_key, first_worker, first_certificate, [self._forex_symbol("EURUSD.a", 100.0)]),
+                kwargs={
+                    "request_key": "first",
+                    "ready_event": first_ready,
+                    "market_data_by_stage": {"m15_screening": {"EURUSD.a": missing_wednesday}},
+                },
+            )
+            second_responder = threading.Thread(
+                target=harness.respond_to_catalog_analysis,
+                args=(second_key, second_worker, second_certificate, [self._forex_symbol("EURUSD", 100.0)]),
+                kwargs={
+                    "request_key": "second",
+                    "ready_event": second_ready,
+                    "market_data_by_stage": {"m15_screening": {"EURUSD": missing_wednesday}},
+                },
+            )
+            first_responder.start()
+            second_responder.start()
+            self.assertTrue(first_ready.wait(timeout=5))
+            self.assertTrue(second_ready.wait(timeout=5))
+            outcome = harness.launch_catalog_analysis(first_worker, second_worker, {"label": "FX catalog v1"})
+            first_responder.join(timeout=5)
+            second_responder.join(timeout=5)
+
+        self.assertEqual("failed", outcome["status"])
+        self.assertEqual("m15_failed", outcome["current_stage"])
+        self.assertEqual([], outcome["m15_screening_results"])
+        self.assertIn("every UTC weekday", outcome["failure_reason"])
 
     def test_catalog_analysis_retries_m1_once_and_fails_without_partial_verification_results_when_worker_evidence_is_incomplete(self) -> None:
         with self._live_catalog_analysis_harness() as harness:
@@ -1108,6 +1213,41 @@ class ControlPlaneServiceTests(unittest.TestCase):
         self.assertEqual([], outcome["eligible_candidates"])
         self.assertEqual([], outcome["exceptions"])
         self.assertIn("incomplete", outcome["failure_reason"])
+
+    def test_catalog_analysis_uses_two_live_reconciliation_workers_without_broker_writes(self) -> None:
+        with self._live_catalog_analysis_harness() as harness:
+            first_key, first_worker, first_certificate = harness.approved_worker(123456, "Broker-A")
+            second_key, second_worker, second_certificate = harness.approved_worker(654321, "Broker-B")
+            first_mt5 = RuntimeAnalysisMT5(123456, "Broker-A", "EURUSD.a", 0.0)
+            second_mt5 = RuntimeAnalysisMT5(654321, "Broker-B", "EURUSD", 0.00001)
+            first_ready = threading.Event()
+            second_ready = threading.Event()
+            first_runner = threading.Thread(
+                target=harness.run_reconciliation_worker,
+                args=(first_key, first_worker, first_certificate, first_mt5, first_ready),
+                daemon=True,
+            )
+            second_runner = threading.Thread(
+                target=harness.run_reconciliation_worker,
+                args=(second_key, second_worker, second_certificate, second_mt5, second_ready),
+                daemon=True,
+            )
+            first_runner.start()
+            second_runner.start()
+            self.assertTrue(first_ready.wait(timeout=5))
+            self.assertTrue(second_ready.wait(timeout=5))
+
+            outcome = harness.launch_catalog_analysis(first_worker, second_worker, {"label": "FX catalog v1"})
+            first_runner.join(timeout=5)
+            second_runner.join(timeout=5)
+
+        self.assertEqual("succeeded", outcome["status"])
+        self.assertEqual(["passed"], [result["screening_status"] for result in outcome["m15_screening_results"]], outcome)
+        self.assertEqual(["passed"], [result["verification_status"] for result in outcome["m1_verification_results"]])
+        self.assertFalse(first_runner.is_alive())
+        self.assertFalse(second_runner.is_alive())
+        self.assertEqual(0, first_mt5.broker_write_calls)
+        self.assertEqual(0, second_mt5.broker_write_calls)
 
     def test_catalog_analysis_rejects_same_server_unhealthy_disconnected_and_revoked_workers_before_dispatch(self) -> None:
         first_key, first_worker, first_certificate = self._approved_worker(123456, "Broker-A")
@@ -2131,7 +2271,10 @@ class _LiveCatalogAnalysisHarness:
                 ready_event.set()
             pending_market_data = list(market_data_responses or [])
             while True:
-                request = json.loads(websocket.recv())
+                try:
+                    request = json.loads(websocket.recv())
+                except ConnectionClosed:
+                    return
                 self.requests.setdefault(request_key, []).append(request)
                 stage = request.get("stage", "catalog")
                 if stage == "catalog":
@@ -2170,6 +2313,27 @@ class _LiveCatalogAnalysisHarness:
                     return
                 raise AssertionError(f"Unexpected analysis stage: {stage}")
 
+    def run_reconciliation_worker(
+        self,
+        private_key: ec.EllipticCurvePrivateKey,
+        worker_id: str,
+        certificate: str,
+        mt5: RuntimeAnalysisMT5,
+        ready_event: threading.Event,
+    ) -> None:
+        with websocket_connect(f"ws://127.0.0.1:{self.port}/api/worker/session") as websocket:
+            self.authenticate_worker_socket(websocket, private_key, worker_id, certificate)
+            ready_event.set()
+            try:
+                reconcile_authenticated_worker(
+                    mt5=mt5,
+                    session=FiniteAuthenticatedWorkerSession(websocket, reconciliation_cursor=0),
+                    login=mt5.login_id,
+                    server=mt5.server,
+                )
+            except (ConnectionClosed, StopIteration):
+                pass
+
     def authenticate_worker_socket(
         self,
         websocket: object,
@@ -2207,18 +2371,23 @@ class _LiveCatalogAnalysisHarness:
             "period_end_utc": request["period_end_utc"],
         }
         if market_data_by_symbol is not None:
+            period_start = datetime.fromisoformat(str(request["period_start_utc"]).replace("Z", "+00:00"))
+            preserve_timestamps = all(
+                all(isinstance(bar.get("time_utc"), str) for bar in bars)
+                for bars in market_data_by_symbol.values()
+            )
             response["symbols"] = [
                 {
                     "symbol": symbol,
                     "bars": [
                         {
                             **bar,
-                            "time_utc": bar.get(
-                                "time_utc",
-                                datetime.fromtimestamp(int(bar["time"]), UTC).isoformat().replace("+00:00", "Z"),
-                            ),
+                            "time": int(bar["time"]) if preserve_timestamps else int((period_start + timedelta(days=index)).timestamp()),
+                            "time_utc": str(bar["time_utc"]) if preserve_timestamps else (period_start + timedelta(days=index)).isoformat().replace("+00:00", "Z"),
                         }
-                        for bar in bars
+                        for index, bar in enumerate(
+                            bars if preserve_timestamps else (bars + [dict(bars[-1])] * max(0, 5 - len(bars)))[:5]
+                        )
                     ],
                     "time_metadata": {
                         "source_family": "market_data",
@@ -2261,3 +2430,92 @@ class _LiveCatalogAnalysisHarness:
         cookie.load(response.headers["set-cookie"])
         token = cookie["abt_admin_session"].value
         return f"abt_admin_session={token}", response.json()["csrf_token"]
+
+
+class FiniteAuthenticatedWorkerSession(AuthenticatedWorkerSession):
+    def __init__(self, socket: object, reconciliation_cursor: int) -> None:
+        super().__init__(socket, reconciliation_cursor)
+        self._analysis_response_count = 0
+
+    def send_product_catalog_analysis(self, **response: object) -> None:
+        super().send_product_catalog_analysis(**response)
+        self._analysis_response_count += 1
+        if self._analysis_response_count == 3:
+            raise StopIteration
+
+
+class RuntimeAnalysisMT5:
+    TIMEFRAME_M15 = "M15"
+    TIMEFRAME_M1 = "M1"
+
+    def __init__(self, login_id: int, server: str, symbol: str, price_offset: float) -> None:
+        self.login_id = login_id
+        self.server = server
+        self.symbol = symbol
+        self.price_offset = price_offset
+        self.broker_write_calls = 0
+
+    def initialize(self) -> bool:
+        return True
+
+    def login(self, login: int, *, password: str, server: str) -> bool:
+        return login == self.login_id and bool(password) and server == self.server
+
+    def shutdown(self) -> None:
+        pass
+
+    def account_info(self) -> object:
+        return {"login": self.login_id, "server": self.server}
+
+    def terminal_info(self) -> object:
+        return {"connected": True, "trade_allowed": False}
+
+    def orders_get(self) -> object:
+        return []
+
+    def positions_get(self) -> object:
+        return []
+
+    def symbols_get(self) -> object:
+        return [{
+            "name": self.symbol,
+            "trade_calc_mode": "FOREX",
+            "currency_base": "EUR",
+            "currency_profit": "USD",
+            "digits": 5,
+            "point": 0.00001,
+            "trade_tick_size": 0.00001,
+            "trade_contract_size": 100000.0,
+            "volume_min": 0.01,
+            "volume_step": 0.01,
+            "volume_max": 100.0,
+            "filling_mode": 3,
+            "order_mode": 3,
+            "trade_stops_level": 0,
+            "trade_freeze_level": 0,
+            "trade_tick_value": 1.0,
+            "currency_margin": "USD",
+            "swap_long": 0.0,
+            "swap_short": 0.0,
+            "swap_rollover3days": 3,
+        }]
+
+    def copy_rates_range(self, symbol: str, timeframe: object, from_time: datetime, to_time: datetime) -> object:
+        self._last_market_epoch = int(datetime.now(UTC).timestamp())
+        return [
+            {
+                "time": int((from_time + timedelta(days=offset)).timestamp()),
+                "open": 1.10000 + (0.00010 * offset * (offset + 1) / 2) + self.price_offset,
+                "high": 1.10100 + (0.00010 * offset * (offset + 1) / 2) + self.price_offset,
+                "low": 1.09900 + (0.00010 * offset * (offset + 1) / 2) + self.price_offset,
+                "close": 1.10050 + (0.00010 * offset * (offset + 1) / 2) + self.price_offset,
+            }
+            for offset in range(5)
+        ]
+
+    def symbol_info_tick(self, symbol: str) -> object:
+        return {"time": getattr(self, "_last_market_epoch", int(datetime.now(UTC).timestamp()))}
+
+    def order_send(self, *_: object, **__: object) -> object:
+        self.broker_write_calls += 1
+        raise AssertionError("Broker writes are prohibited.")

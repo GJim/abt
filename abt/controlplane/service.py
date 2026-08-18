@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from concurrent.futures import Future as ConcurrentFuture
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 import hashlib
 import json
 import logging
@@ -1134,6 +1134,7 @@ def _validated_market_data_response(
     symbols: dict[str, dict[str, object]] = {}
     for symbol_payload in raw_symbols:
         symbol = _validated_market_data_symbol(symbol_payload)
+        _validate_weekday_market_data_completeness(symbol, analysis_period)
         symbols[str(symbol["symbol"])] = symbol
     if set(symbols) != set(requested_symbols):
         raise ValueError("Worker returned incomplete market-data evidence.")
@@ -1144,6 +1145,38 @@ def _validated_market_data_response(
         "period_end_utc": _required_text(response, "period_end_utc"),
         "symbols": symbols,
     }
+
+
+def _validate_weekday_market_data_completeness(
+    symbol: dict[str, object],
+    analysis_period: dict[str, object],
+) -> None:
+    """Require one UTC bar per weekday, without assuming broker intraday sessions."""
+
+    start = _parse_utc_timestamp(str(analysis_period["started_at_utc"]))
+    end = _parse_utc_timestamp(str(analysis_period["ended_at_utc"]))
+    expected_days = {
+        (start + timedelta(days=offset)).date()
+        for offset in range((end.date() - start.date()).days)
+        if (start + timedelta(days=offset)).weekday() < 5
+    }
+    observed_days: set[date] = set()
+    for bar in cast(list[dict[str, object]], symbol["bars"]):
+        observed_at = _parse_utc_timestamp(str(bar["time_utc"]))
+        if start <= observed_at < end and observed_at.weekday() < 5:
+            observed_days.add(observed_at.date())
+    if not expected_days.issubset(observed_days):
+        raise ValueError("Worker market-data evidence must include every UTC weekday in the requested period.")
+
+
+def _parse_utc_timestamp(value: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise ValueError("Worker returned incomplete market-data evidence.") from error
+    if parsed.tzinfo is None:
+        raise ValueError("Worker returned incomplete market-data evidence.")
+    return parsed.astimezone(UTC)
 
 
 def _validated_market_data_symbol(value: object) -> dict[str, object]:
