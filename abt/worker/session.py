@@ -416,7 +416,9 @@ def _market_data_symbol_evidence(
 def _market_data_calibration(mt5: MarketDataReadOnlyMT5, symbol: str) -> dict[str, object]:
     samples = tuple(sample for _ in range(3) if (sample := _market_sample(mt5, symbol)) is not None)
     if not samples:
-        raise WorkerEnrollmentError("The local MT5 terminal returned incomplete market-data evidence.")
+        raise WorkerEnrollmentError(
+            f"No valid symbol_info_tick.time was available for {symbol} across 3 calibration samples."
+        )
     offset = int(round(median(sample["offset_seconds"] for sample in samples)))
     selected = samples[-1]
     calibration = render_calibration(

@@ -11,7 +11,7 @@ from abt.worker.reconciliation import (
     WorkerSafetyAdapter,
     reconcile_authenticated_worker,
 )
-from abt.worker.session import collect_product_catalog_evidence
+from abt.worker.session import collect_market_data_evidence, collect_product_catalog_evidence
 
 
 class ReadOnlyMT5:
@@ -250,11 +250,28 @@ class WorkerReconciliationTests(unittest.TestCase):
                 "timeframe": "M15",
                 "reason": (
                     "Unable to collect M15 market-data evidence for EURUSD after 3 attempts: "
-                    "The local MT5 terminal returned incomplete market-data evidence."
+                    "No valid symbol_info_tick.time was available for EURUSD across 3 calibration samples."
                 ),
             },
             session.analysis_error,
         )
+
+    def test_identifies_missing_symbol_tick_calibration_evidence(self) -> None:
+        mt5 = AnalysisMT5()
+        mt5.symbol_info_tick = lambda _: None  # type: ignore[method-assign]
+
+        with self.assertRaisesRegex(
+            WorkerEnrollmentError,
+            "No valid symbol_info_tick.time was available for CADCHF across 3 calibration samples.",
+        ):
+            collect_market_data_evidence(
+                mt5,
+                symbols=["CADCHF"],
+                timeframe="M15",
+                period_start_utc="2026-08-10T00:00:00Z",
+                period_end_utc="2026-08-17T00:00:00Z",
+                collected_at=datetime(2026, 8, 16, tzinfo=UTC),
+            )
 
     def test_collects_catalog_evidence_from_mt5_namedtuple_symbol_info(self) -> None:
         mt5 = AnalysisMT5()
