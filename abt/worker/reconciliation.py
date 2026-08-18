@@ -6,6 +6,7 @@ from time import sleep as _sleep
 from typing import Protocol
 
 from .enrollment import WorkerEnrollmentError
+from .session import collect_market_data_evidence, collect_product_catalog_evidence
 
 
 class ReadOnlyMT5(Protocol):
@@ -32,6 +33,23 @@ class WorkerSafetySession(Protocol):
     def heartbeat(self) -> bool: ...
 
     def send_safety_state(self, state: str, reason: str) -> None: ...
+
+
+class AnalysisWorkerSession(Protocol):
+    def receive_product_catalog_analysis(self, timeout: float | None = None) -> dict[str, object] | None: ...
+
+    def send_product_catalog_analysis(
+        self,
+        *,
+        analysis_id: str,
+        request_id: str,
+        collected_at: str,
+        symbols: list[dict[str, object]],
+        stage: str = "catalog",
+        timeframe: str | None = None,
+        period_start_utc: str | None = None,
+        period_end_utc: str | None = None,
+    ) -> None: ...
 
 
 class WorkerSafetyAdapter:
@@ -189,13 +207,25 @@ def reconcile_authenticated_worker(
         safety: WorkerSafetyAdapter | None = None
         if callable(getattr(session, "heartbeat", None)) and callable(getattr(session, "send_safety_state", None)):
             safety = WorkerSafetyAdapter(session)  # type: ignore[arg-type]
-        MT5ReconciliationAdapter(
+        reconciliation = MT5ReconciliationAdapter(
             mt5, emit=session.send_reconciliation, initial_cursor=getattr(session, "reconciliation_cursor", 0)
-        ).run_forever(
-            now=now,
-            sleep=sleep,
-            heartbeat=None if safety is None else lambda: safety.heartbeat(now()),
         )
+        if callable(getattr(session, "receive_product_catalog_analysis", None)) and callable(
+            getattr(session, "send_product_catalog_analysis", None)
+        ):
+            _run_reconciliation_with_analysis(
+                reconciliation,
+                mt5=mt5,
+                session=session,  # type: ignore[arg-type]
+                now=now,
+                safety=safety,
+            )
+        else:
+            reconciliation.run_forever(
+                now=now,
+                sleep=sleep,
+                heartbeat=None if safety is None else lambda: safety.heartbeat(now()),
+            )
     finally:
         password = ""
         if initialized:
@@ -221,6 +251,79 @@ def reconcile_with_safety(
         ),
         sleep=sleep,
     )
+
+
+def _run_reconciliation_with_analysis(
+    reconciliation: MT5ReconciliationAdapter,
+    *,
+    mt5: ReadOnlyMT5,
+    session: AnalysisWorkerSession,
+    now: Callable[[], datetime],
+    safety: WorkerSafetyAdapter | None,
+) -> None:
+    while True:
+        reconciliation.poll(now())
+        for _ in range(2):
+            request = session.receive_product_catalog_analysis(timeout=30.0)
+            if request is not None:
+                _serve_product_catalog_analysis(mt5, session, request, now)
+            if safety is not None:
+                safety.heartbeat(now())
+
+
+def _serve_product_catalog_analysis(
+    mt5: ReadOnlyMT5,
+    session: AnalysisWorkerSession,
+    request: dict[str, object],
+    now: Callable[[], datetime],
+) -> None:
+    analysis_id = _request_text(request, "analysis_id")
+    request_id = _request_text(request, "request_id")
+    stage = _request_text(request, "stage")
+    collected_at = now()
+    if stage == "catalog":
+        evidence = collect_product_catalog_evidence(mt5, collected_at=collected_at)  # type: ignore[arg-type]
+        session.send_product_catalog_analysis(
+            analysis_id=analysis_id,
+            request_id=request_id,
+            stage=stage,
+            collected_at=str(evidence["collected_at"]),
+            symbols=list(evidence["symbols"]),
+        )
+        return
+    if stage not in {"m15_screening", "m1_verification"}:
+        raise WorkerEnrollmentError("The controller requested an invalid product catalog analysis stage.")
+    timeframe = _request_text(request, "timeframe")
+    period_start_utc = _request_text(request, "period_start_utc")
+    period_end_utc = _request_text(request, "period_end_utc")
+    symbols = request.get("symbols")
+    if not isinstance(symbols, list) or not all(isinstance(symbol, str) and symbol for symbol in symbols):
+        raise WorkerEnrollmentError("The controller requested invalid market-data symbols.")
+    evidence = collect_market_data_evidence(
+        mt5,  # type: ignore[arg-type]
+        symbols=symbols,
+        timeframe=timeframe,
+        period_start_utc=period_start_utc,
+        period_end_utc=period_end_utc,
+        collected_at=collected_at,
+    )
+    session.send_product_catalog_analysis(
+        analysis_id=analysis_id,
+        request_id=request_id,
+        stage=stage,
+        collected_at=str(evidence["collected_at"]),
+        symbols=list(evidence["symbols"]),
+        timeframe=timeframe,
+        period_start_utc=period_start_utc,
+        period_end_utc=period_end_utc,
+    )
+
+
+def _request_text(request: dict[str, object], field: str) -> str:
+    value = request.get(field)
+    if not isinstance(value, str) or not value:
+        raise WorkerEnrollmentError("The controller returned an invalid product catalog analysis request.")
+    return value
 
 
 def _evidence(value: object, kind: str) -> dict[str, object]:

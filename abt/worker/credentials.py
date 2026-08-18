@@ -15,7 +15,7 @@ from .keystore import HardwareKeyStore
 class WorkerWebSocket(Protocol):
     def send(self, message: str) -> None: ...
 
-    def recv(self) -> str: ...
+    def recv(self, timeout: float | None = None) -> str: ...
 
     def __enter__(self) -> WorkerWebSocket: ...
 
@@ -84,9 +84,9 @@ def _send(socket: WorkerWebSocket, message: dict[str, object]) -> None:
     socket.send(json.dumps(message, separators=(",", ":"), sort_keys=True))
 
 
-def _message(socket: WorkerWebSocket) -> dict[str, object]:
+def _message(socket: WorkerWebSocket, *, timeout: float | None = None) -> dict[str, object]:
     try:
-        message = json.loads(socket.recv())
+        message = json.loads(socket.recv(timeout=timeout))
     except (TypeError, ValueError) as error:
         raise WorkerEnrollmentError("The controller returned an invalid worker response.") from error
     if not isinstance(message, dict):

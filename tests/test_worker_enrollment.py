@@ -458,6 +458,10 @@ class WorkerCredentialTests(unittest.TestCase):
             terminal_info=lambda: {},
             orders_get=lambda: ("order",),
             positions_get=lambda: ("position",),
+            symbols_get=lambda: ("symbol",),
+            copy_rates_range=lambda *_: ("rate",),
+            symbol_info_tick=lambda _: {"time": 1},
+            TIMEFRAME_M15=15,
             shutdown=lambda: None,
         )
         with patch.dict("sys.modules", {"MetaTrader5": api}):
@@ -465,6 +469,10 @@ class WorkerCredentialTests(unittest.TestCase):
 
         self.assertEqual(("order",), adapter.orders_get())
         self.assertEqual(("position",), adapter.positions_get())
+        self.assertEqual(("symbol",), adapter.symbols_get())
+        self.assertEqual(("rate",), adapter.copy_rates_range("EURUSD", 15, object(), object()))
+        self.assertEqual({"time": 1}, adapter.symbol_info_tick("EURUSD"))
+        self.assertEqual(15, adapter.TIMEFRAME_M15)
 
     def test_authenticated_session_uses_one_wss_channel_for_password_and_reconciliation(self) -> None:
         key_store = FakeKeyStore()
@@ -502,6 +510,30 @@ class WorkerCredentialTests(unittest.TestCase):
         )
         self.assertEqual(2, len(key_store.signed_payloads))
         self.assertNotIn("memory-only-password", "".join(certificate_socket.sent + session_socket.sent))
+
+    def test_buffers_analysis_request_while_waiting_for_reconciliation_acknowledgement(self) -> None:
+        socket = FakeWebSocket(
+            [
+                {
+                    "type": "product_catalog_analysis_request",
+                    "analysis_id": "analysis-123",
+                    "request_id": "request-123",
+                    "stage": "catalog",
+                    "policy": {},
+                },
+                {"type": "accepted", "cursor": 0},
+            ]
+        )
+        session = AuthenticatedWorkerSession(socket=socket, reconciliation_cursor=0)
+
+        session.send_reconciliation(
+            {"type": "snapshot", "cursor": 0, "observed_at": "2026-08-16T00:00:00+00:00",
+             "account": {}, "terminal": {}, "orders": [], "positions": []}
+        )
+        request = session.receive_product_catalog_analysis(timeout=0)
+
+        self.assertEqual("analysis-123", request["analysis_id"])
+        self.assertEqual("request-123", request["request_id"])
 
     def test_names_session_phase_when_controller_closes_websocket(self) -> None:
         key_store = FakeKeyStore()
@@ -552,7 +584,7 @@ class FakeWebSocket:
     def send(self, message: str) -> None:
         self.sent.append(message)
 
-    def recv(self) -> str:
+    def recv(self, timeout: float | None = None) -> str:
         return self._responses.pop(0)
 
 
@@ -563,7 +595,7 @@ class ClosingWebSocket(FakeWebSocket):
     def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
         raise ConnectionClosedError(Close(1011, ""), None)
 
-    def recv(self) -> str:
+    def recv(self, timeout: float | None = None) -> str:
         raise ConnectionClosedError(Close(1011, ""), None)
 
 

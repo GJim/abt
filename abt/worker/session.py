@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+from collections import deque
 from datetime import timedelta
 import json
 from math import floor
 from statistics import median
 from collections.abc import Callable
 from datetime import UTC, datetime
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol, Self
 from zoneinfo import ZoneInfo
 
@@ -42,6 +43,7 @@ class AuthenticatedWorkerSession:
 
     socket: WorkerWebSocket
     reconciliation_cursor: int
+    _analysis_requests: deque[dict[str, object]] = field(default_factory=deque, init=False, repr=False)
 
     def __enter__(self) -> Self:
         return self
@@ -52,7 +54,7 @@ class AuthenticatedWorkerSession:
     def request_password(self) -> str:
         try:
             _send(self.socket, {"type": "password_request"})
-            response = _message(self.socket)
+            response = self._response()
             if response.get("type") != "password":
                 raise WorkerEnrollmentError("The controller returned an invalid worker response.")
             return _required_text(response, "password")
@@ -61,23 +63,39 @@ class AuthenticatedWorkerSession:
 
     def send_reconciliation(self, message: dict[str, object]) -> None:
         _send(self.socket, message)
-        response = _message(self.socket)
+        response = self._response()
         if response.get("type") != "accepted" or response.get("cursor") != message.get("cursor"):
             raise WorkerEnrollmentError("The controller rejected worker reconciliation.")
 
     def heartbeat(self) -> bool:
         _send(self.socket, {"type": "heartbeat"})
-        response = _message(self.socket)
+        response = self._response()
         return response == {"type": "heartbeat_ack"}
 
     def send_safety_state(self, state: str, reason: str) -> None:
         _send(self.socket, {"type": "safety_state", "state": state, "reason": reason})
-        response = _message(self.socket)
+        response = self._response()
         if response != {"type": "accepted", "state": state}:
             raise WorkerEnrollmentError("The controller rejected the worker safety state.")
 
-    def receive_product_catalog_analysis(self) -> dict[str, object]:
-        response = _message(self.socket)
+    def receive_product_catalog_analysis(self, timeout: float | None = None) -> dict[str, object] | None:
+        if self._analysis_requests:
+            return self._parse_product_catalog_analysis(self._analysis_requests.popleft())
+        try:
+            response = _message(self.socket, timeout=timeout)
+        except TimeoutError:
+            return None
+        return self._parse_product_catalog_analysis(response)
+
+    def _response(self) -> dict[str, object]:
+        while True:
+            response = _message(self.socket)
+            if response.get("type") == "product_catalog_analysis_request":
+                self._analysis_requests.append(response)
+                continue
+            return response
+
+    def _parse_product_catalog_analysis(self, response: dict[str, object]) -> dict[str, object]:
         if response.get("type") != "product_catalog_analysis_request":
             raise WorkerEnrollmentError("The controller returned an invalid worker response.")
         stage = response.get("stage", "catalog")

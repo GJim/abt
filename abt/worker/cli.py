@@ -84,6 +84,20 @@ class MetaTrader5Adapter:
     def positions_get(self) -> object:
         return self._mt5.positions_get()
 
+    def symbols_get(self) -> object:
+        return self._mt5.symbols_get()
+
+    def copy_rates_range(self, symbol: str, timeframe: object, from_time: object, to_time: object) -> object:
+        return self._mt5.copy_rates_range(symbol, timeframe, from_time, to_time)
+
+    def symbol_info_tick(self, symbol: str) -> object:
+        return self._mt5.symbol_info_tick(symbol)
+
+    def __getattr__(self, name: str) -> object:
+        if name.startswith("TIMEFRAME_"):
+            return getattr(self._mt5, name)
+        raise AttributeError(name)
+
     def shutdown(self) -> None:
         self._mt5.shutdown()
 

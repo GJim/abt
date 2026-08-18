@@ -175,6 +175,75 @@ class WorkerReconciliationTests(unittest.TestCase):
         self.assertEqual("snapshot", emitted[0]["type"])
         self.assertEqual(0, mt5.broker_write_calls)
 
+    def test_serves_catalog_analysis_requests_during_reconciliation(self) -> None:
+        mt5 = AnalysisMT5()
+        session = AnalysisSession(
+            {
+                "analysis_id": "analysis-123",
+                "request_id": "request-123",
+                "stage": "catalog",
+                "policy": {},
+            }
+        )
+
+        with self.assertRaises(StopIteration):
+            reconcile_authenticated_worker(
+                mt5=mt5,
+                session=session,
+                login=123456,
+                server="Broker-Demo",
+                now=lambda: datetime(2026, 8, 16, tzinfo=UTC),
+                sleep=lambda _: None,
+            )
+
+        self.assertEqual("analysis-123", session.analysis_response["analysis_id"])
+        self.assertEqual("request-123", session.analysis_response["request_id"])
+        self.assertEqual("catalog", session.analysis_response["stage"])
+        self.assertEqual(["EURUSD"], [symbol["symbol"] for symbol in session.analysis_response["symbols"]])
+        self.assertEqual(0, mt5.broker_write_calls)
+
+    def test_serves_m15_analysis_requests_during_reconciliation(self) -> None:
+        response = self._serve_market_data_analysis("m15_screening", "M15")
+
+        self.assertEqual("m15_screening", response["stage"])
+        self.assertEqual("M15", response["timeframe"])
+
+    def test_serves_m1_analysis_requests_during_reconciliation(self) -> None:
+        response = self._serve_market_data_analysis("m1_verification", "M1")
+
+        self.assertEqual("m1_verification", response["stage"])
+        self.assertEqual("M1", response["timeframe"])
+
+    def _serve_market_data_analysis(self, stage: str, timeframe: str) -> dict[str, object]:
+        mt5 = AnalysisMT5()
+        session = AnalysisSession(
+            {
+                "analysis_id": "analysis-123",
+                "request_id": "request-123",
+                "stage": stage,
+                "policy": {},
+                "timeframe": timeframe,
+                "period_start_utc": "2026-08-10T00:00:00Z",
+                "period_end_utc": "2026-08-17T00:00:00Z",
+                "symbols": ["EURUSD"],
+            }
+        )
+
+        with self.assertRaises(StopIteration):
+            reconcile_authenticated_worker(
+                mt5=mt5,
+                session=session,
+                login=123456,
+                server="Broker-Demo",
+                now=lambda: datetime(2026, 8, 16, tzinfo=UTC),
+                sleep=lambda _: None,
+            )
+
+        self.assertEqual("EURUSD", session.analysis_response["symbols"][0]["symbol"])
+        self.assertEqual(["EURUSD"], mt5.market_data_symbols)
+        self.assertEqual(0, mt5.broker_write_calls)
+        return session.analysis_response
+
 
 class MemoryOnlySession:
     def __init__(self, emitted: list[dict[str, object]]) -> None:
@@ -198,3 +267,70 @@ class SafetySession:
 
     def send_safety_state(self, state: str, reason: str) -> None:
         self.states.append(state)
+
+
+class AnalysisMT5(ReadOnlyMT5):
+    def initialize(self) -> bool:
+        return True
+
+    def login(self, login: int, *, password: str, server: str) -> bool:
+        return login == 123456 and password == "memory-only" and server == "Broker-Demo"
+
+    def shutdown(self) -> None:
+        self.calls.append("shutdown")
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.market_data_symbols: list[str] = []
+
+    def symbols_get(self) -> object:
+        return [
+            {
+                "name": "EURUSD",
+                "trade_calc_mode": "FOREX",
+                "currency_base": "EUR",
+                "currency_profit": "USD",
+                "digits": 5,
+                "point": 0.00001,
+                "trade_tick_size": 0.00001,
+                "trade_contract_size": 100000.0,
+                "volume_min": 0.01,
+                "volume_step": 0.01,
+                "filling_mode": 0,
+                "order_mode": 3,
+                "volume_max": 100.0,
+                "trade_stops_level": 0,
+                "trade_freeze_level": 0,
+                "trade_tick_value": 1.0,
+                "currency_margin": "EUR",
+                "swap_long": 0.0,
+                "swap_short": 0.0,
+                "swap_rollover3days": 3,
+            }
+        ]
+
+    def copy_rates_range(self, symbol: str, timeframe: object, start: datetime, end: datetime) -> object:
+        self.market_data_symbols.append(symbol)
+        return [{"time": 1_785_945_600, "open": 1.1, "high": 1.2, "low": 1.0, "close": 1.15}]
+
+    def symbol_info_tick(self, symbol: str) -> object:
+        return {"time": 1_785_945_600}
+
+
+class AnalysisSession(MemoryOnlySession):
+    def __init__(self, request: dict[str, object]) -> None:
+        super().__init__([])
+        self._requests = [request, None]
+        self.analysis_response: dict[str, object] = {}
+
+    def receive_product_catalog_analysis(self, timeout: float | None = None) -> dict[str, object] | None:
+        return self._requests.pop(0)
+
+    def send_product_catalog_analysis(self, **response: object) -> None:
+        self.analysis_response = response
+
+    def heartbeat(self) -> bool:
+        raise StopIteration
+
+    def send_safety_state(self, state: str, reason: str) -> None:
+        pass
