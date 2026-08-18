@@ -496,6 +496,17 @@ class WorkerCredentialTests(unittest.TestCase):
         self.assertIn("authenticated worker session", errors.getvalue())
         self.assertIn("code 1011", errors.getvalue())
 
+    def test_names_password_request_when_controller_closes_websocket(self) -> None:
+        session = AuthenticatedWorkerSession(socket=ClosingWebSocket(), reconciliation_cursor=0)
+
+        with self.assertRaisesRegex(WorkerEnrollmentError, "password request") as raised:
+            session.request_password()
+
+        errors = io.StringIO()
+        _print_diagnostic(raised.exception, errors)
+        self.assertIn("password request", errors.getvalue())
+        self.assertIn("code 1011", errors.getvalue())
+
 
 class FakeWebSocket:
     def __init__(self, responses: list[dict[str, str]]) -> None:
@@ -518,6 +529,9 @@ class FakeWebSocket:
 class ClosingWebSocket(FakeWebSocket):
     def __init__(self) -> None:
         super().__init__([])
+
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
+        raise ConnectionClosedError(Close(1011, ""), None)
 
     def recv(self) -> str:
         raise ConnectionClosedError(Close(1011, ""), None)

@@ -50,11 +50,14 @@ class AuthenticatedWorkerSession:
         self.socket.__exit__(exc_type, exc_value, traceback)
 
     def request_password(self) -> str:
-        _send(self.socket, {"type": "password_request"})
-        response = _message(self.socket)
-        if response.get("type") != "password":
-            raise WorkerEnrollmentError("The controller returned an invalid worker response.")
-        return _required_text(response, "password")
+        try:
+            _send(self.socket, {"type": "password_request"})
+            response = _message(self.socket)
+            if response.get("type") != "password":
+                raise WorkerEnrollmentError("The controller returned an invalid worker response.")
+            return _required_text(response, "password")
+        except Exception as error:
+            _raise_closed_connection(error, "password request")
 
     def send_reconciliation(self, message: dict[str, object]) -> None:
         _send(self.socket, message)
@@ -448,7 +451,10 @@ def open_authenticated_worker_session(
         ):
             raise WorkerEnrollmentError("The controller returned an invalid worker response.")
     except BaseException as error:
-        socket.__exit__(type(error), error, error.__traceback__)
+        try:
+            socket.__exit__(type(error), error, error.__traceback__)
+        except Exception:
+            pass
         if isinstance(error, Exception):
             _raise_closed_connection(error, "authenticated worker session")
         raise

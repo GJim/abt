@@ -742,6 +742,9 @@ def create_app(
         except (LedgerError, ProofError, ValueError) as error:
             _LOGGER.warning("Worker certificate delivery failed: %s", error)
             await _reject_worker(websocket)
+        except Exception:
+            _LOGGER.exception("Worker certificate delivery failed unexpectedly.")
+            await _reject_worker(websocket)
 
     @app.websocket("/api/worker/credentials")
     async def mediate_password(websocket: WebSocket) -> None:
@@ -782,6 +785,9 @@ def create_app(
             await _reject_worker(websocket)
         except (LedgerError, ProofError, SecretStoreError, ValueError) as error:
             _LOGGER.warning("Worker password mediation failed: %s", error)
+            await _reject_worker(websocket)
+        except Exception:
+            _LOGGER.exception("Worker password mediation failed unexpectedly.")
             await _reject_worker(websocket)
 
     @app.websocket("/api/worker/session")
@@ -857,6 +863,9 @@ def create_app(
             await _reject_worker(websocket)
         except (LedgerError, ProofError, SecretStoreError, ValueError) as error:
             _LOGGER.warning("Worker session authentication or request failed: %s", error)
+            await _reject_worker(websocket)
+        except Exception:
+            _LOGGER.exception("Worker session authentication or request failed unexpectedly.")
             await _reject_worker(websocket)
         finally:
             if sender_task is not None:
