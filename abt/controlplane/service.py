@@ -56,11 +56,11 @@ class ProductCatalogAnalysisPolicy(BaseModel):
     label: str = Field(min_length=1, max_length=128)
     require_equal_base_currency: bool = True
     require_equal_profit_currency: bool = True
-    minimum_common_coverage: float = Field(default=0.99, ge=0, le=1)
-    minimum_m15_return_correlation: float = Field(default=0.98, ge=-1, le=1)
-    minimum_m1_return_correlation: float = Field(default=0.97, ge=-1, le=1)
+    minimum_m15_common_coverage: float = Field(default=1.0, ge=0, le=1)
+    minimum_m1_common_coverage: float = Field(default=0.98, ge=0, le=1)
+    minimum_m15_return_correlation: float = Field(default=0.97, ge=-1, le=1)
+    minimum_m1_return_correlation: float = Field(default=0.95, ge=-1, le=1)
     maximum_m1_median_price_difference_points: float = Field(default=2.0, ge=0)
-    maximum_m1_p99_price_difference_points: float = Field(default=15.0, ge=0)
 
 
 class ProductCatalogAnalysisRequest(BaseModel):
@@ -1367,8 +1367,8 @@ def _screen_m15_candidates(
     first_symbols = cast(dict[str, dict[str, object]], first_market_data["symbols"])
     second_symbols = cast(dict[str, dict[str, object]], second_market_data["symbols"])
     results: list[dict[str, object]] = []
-    coverage_minimum = float(policy.get("minimum_common_coverage", 0.99))
-    correlation_minimum = float(policy.get("minimum_m15_return_correlation", 0.98))
+    coverage_minimum = float(policy.get("minimum_m15_common_coverage", policy.get("minimum_common_coverage", 1.0)))
+    correlation_minimum = float(policy.get("minimum_m15_return_correlation", 0.97))
     for candidate in candidates:
         first_symbol = first_symbols[str(candidate["first_symbol"])]
         second_symbol = second_symbols[str(candidate["second_symbol"])]
@@ -1383,7 +1383,7 @@ def _screen_m15_candidates(
                 "screening_status": "passed" if coverage_passed and correlation_passed else "failed",
                 "statistics": statistics,
                 "policy_evaluation": {
-                    "minimum_common_coverage": coverage_minimum,
+                    "minimum_m15_common_coverage": coverage_minimum,
                     "minimum_m15_return_correlation": correlation_minimum,
                     "coverage_passed": coverage_passed,
                     "return_correlation_passed": correlation_passed,
@@ -1407,10 +1407,9 @@ def _verify_m1_candidates(
     second_symbols = cast(dict[str, dict[str, object]], second_market_data["symbols"])
     first_index = {str(symbol["symbol"]): symbol for symbol in first_specifications}
     second_index = {str(symbol["symbol"]): symbol for symbol in second_specifications}
-    coverage_minimum = float(policy.get("minimum_common_coverage", 0.99))
-    correlation_minimum = float(policy.get("minimum_m1_return_correlation", 0.97))
+    coverage_minimum = float(policy.get("minimum_m1_common_coverage", policy.get("minimum_common_coverage", 0.98)))
+    correlation_minimum = float(policy.get("minimum_m1_return_correlation", 0.95))
     median_maximum = float(policy.get("maximum_m1_median_price_difference_points", 2.0))
-    p99_maximum = float(policy.get("maximum_m1_p99_price_difference_points", 15.0))
     results: list[dict[str, object]] = []
     for candidate in candidates:
         first_symbol_name = str(candidate["first_symbol"])
@@ -1446,16 +1445,13 @@ def _verify_m1_candidates(
         coverage_ratio = float(statistics["coverage_ratio"])
         return_correlation = cast(float | None, statistics["return_correlation"])
         median_difference = cast(float | None, statistics["median_price_difference_points"])
-        p99_difference = cast(float | None, statistics["p99_price_difference_points"])
         policy_evaluation = {
-            "minimum_common_coverage": coverage_minimum,
+            "minimum_m1_common_coverage": coverage_minimum,
             "minimum_m1_return_correlation": correlation_minimum,
             "maximum_m1_median_price_difference_points": median_maximum,
-            "maximum_m1_p99_price_difference_points": p99_maximum,
             "coverage_passed": coverage_ratio >= coverage_minimum,
             "return_correlation_passed": return_correlation is not None and return_correlation >= correlation_minimum,
             "median_price_difference_passed": median_difference is not None and median_difference <= median_maximum,
-            "p99_price_difference_passed": p99_difference is not None and p99_difference <= p99_maximum,
             "hard_block_differences_passed": not hard_block_differences,
         }
         results.append(

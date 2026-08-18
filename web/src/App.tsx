@@ -75,11 +75,11 @@ type ProductCatalogAnalysisPolicy = {
   label: string
   require_equal_base_currency: boolean
   require_equal_profit_currency: boolean
-  minimum_common_coverage: number
+  minimum_m15_common_coverage: number
+  minimum_m1_common_coverage: number
   minimum_m15_return_correlation: number
   minimum_m1_return_correlation: number
   maximum_m1_median_price_difference_points: number
-  maximum_m1_p99_price_difference_points: number
 }
 
 type WorkerReference = {
@@ -319,11 +319,11 @@ const DEFAULT_POLICY: ProductCatalogAnalysisPolicy = {
   label: 'FX catalog v1',
   require_equal_base_currency: true,
   require_equal_profit_currency: true,
-  minimum_common_coverage: 0.99,
-  minimum_m15_return_correlation: 0.98,
-  minimum_m1_return_correlation: 0.97,
+  minimum_m15_common_coverage: 1,
+  minimum_m1_common_coverage: 0.98,
+  minimum_m15_return_correlation: 0.97,
+  minimum_m1_return_correlation: 0.95,
   maximum_m1_median_price_difference_points: 2,
-  maximum_m1_p99_price_difference_points: 15,
 }
 
 const BOOLEAN_POLICY_FIELDS: Array<{
@@ -352,9 +352,17 @@ const NUMBER_POLICY_FIELDS: Array<{
   step: number
 }> = [
   {
-    key: 'minimum_common_coverage',
-    label: 'Minimum common coverage',
-    description: 'Minimum overlapping bar coverage ratio.',
+    key: 'minimum_m15_common_coverage',
+    label: 'Minimum M15 common coverage',
+    description: 'Minimum overlapping M15 bar coverage ratio.',
+    min: 0,
+    max: 1,
+    step: 0.01,
+  },
+  {
+    key: 'minimum_m1_common_coverage',
+    label: 'Minimum M1 common coverage',
+    description: 'Minimum overlapping M1 bar coverage ratio.',
     min: 0,
     max: 1,
     step: 0.01,
@@ -382,13 +390,6 @@ const NUMBER_POLICY_FIELDS: Array<{
     min: 0,
     step: 0.1,
   },
-  {
-    key: 'maximum_m1_p99_price_difference_points',
-    label: 'Maximum M1 P99 price difference',
-    description: 'P99 price difference threshold in points.',
-    min: 0,
-    step: 0.1,
-  },
 ]
 
 const STAGE_LABELS: Record<string, string> = {
@@ -412,15 +413,14 @@ const EVENT_LABELS: Record<string, string> = {
 }
 
 const POLICY_EVALUATION_LABELS: Record<string, string> = {
-  minimum_common_coverage: 'Minimum common coverage',
+  minimum_m15_common_coverage: 'Minimum M15 common coverage',
+  minimum_m1_common_coverage: 'Minimum M1 common coverage',
   minimum_m15_return_correlation: 'Minimum M15 return correlation',
   minimum_m1_return_correlation: 'Minimum M1 return correlation',
   maximum_m1_median_price_difference_points: 'Maximum M1 median difference',
-  maximum_m1_p99_price_difference_points: 'Maximum M1 P99 difference',
   coverage_passed: 'Coverage passed',
   return_correlation_passed: 'Return correlation passed',
   median_price_difference_passed: 'Median difference passed',
-  p99_price_difference_passed: 'P99 difference passed',
   hard_block_differences_passed: 'Hard-block differences passed',
 }
 

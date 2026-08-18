@@ -611,11 +611,11 @@ class ControlPlaneServiceTests(unittest.TestCase):
             "label": "FX catalog v1",
             "require_equal_base_currency": True,
             "require_equal_profit_currency": True,
-            "minimum_common_coverage": 0.99,
-            "minimum_m15_return_correlation": 0.98,
-            "minimum_m1_return_correlation": 0.97,
+            "minimum_m15_common_coverage": 1.0,
+            "minimum_m1_common_coverage": 0.98,
+            "minimum_m15_return_correlation": 0.97,
+            "minimum_m1_return_correlation": 0.95,
             "maximum_m1_median_price_difference_points": 2.0,
-            "maximum_m1_p99_price_difference_points": 15.0,
         }
         with self._live_catalog_analysis_harness() as harness:
             first_key, first_worker, first_certificate = harness.approved_worker(123456, "Broker-A")
@@ -786,7 +786,6 @@ class ControlPlaneServiceTests(unittest.TestCase):
         self.assertTrue(gbp_result["policy_evaluation"]["coverage_passed"])
         self.assertTrue(gbp_result["policy_evaluation"]["return_correlation_passed"])
         self.assertTrue(gbp_result["policy_evaluation"]["median_price_difference_passed"])
-        self.assertTrue(gbp_result["policy_evaluation"]["p99_price_difference_passed"])
         self.assertFalse(gbp_result["policy_evaluation"]["hard_block_differences_passed"])
         self.assertNotIn("bars", json.dumps(outcome["m15_screening_results"][0], sort_keys=True))
         self.assertNotIn("bars", json.dumps(outcome["m1_verification_results"][0], sort_keys=True))

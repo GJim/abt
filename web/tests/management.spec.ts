@@ -206,11 +206,11 @@ test('administrator can launch an analysis with CSRF protection and inspect pass
       label: 'FX catalog v2',
       require_equal_base_currency: true,
       require_equal_profit_currency: true,
-      minimum_common_coverage: 0.99,
-      minimum_m15_return_correlation: 0.98,
-      minimum_m1_return_correlation: 0.97,
+      minimum_m15_common_coverage: 1,
+      minimum_m1_common_coverage: 0.98,
+      minimum_m15_return_correlation: 0.97,
+      minimum_m1_return_correlation: 0.95,
       maximum_m1_median_price_difference_points: 2,
-      maximum_m1_p99_price_difference_points: 15,
     },
   })
 
