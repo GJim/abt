@@ -32,13 +32,13 @@ certificates through the configured Transit key; it must not be the OpenBao
 root token or the health token. Pending registration credentials are deleted
 when the registration is rejected or expires.
 
-## First-time OpenBao bootstrap
+## First-time deployment bootstrap
 
 Create `deploy/.env` with high-entropy `OPENBAO_PKCS11_PIN` and
 `SOFTHSM_SO_PIN`, plus the rotated `ABT_CLOUDFLARE_TUNNEL_TOKEN`, then run:
 
 ```bash
-sudo ./deploy/bootstrap-openbao.sh
+sudo ./deploy/bootstrap-deployment.sh
 ```
 
 The script waits for SoftHSM to create the `abt-root` seal key, initializes
@@ -58,7 +58,7 @@ verify worker device certificates.
 
 ## First administrator
 
-`bootstrap-openbao.sh` creates the one-time administrator before the
+`bootstrap-deployment.sh` creates the one-time administrator before the
 controller starts and prints its credentials once. Do not run `abt-console`
 against an active controller ledger: DuckDB has a single-writer boundary and
 the controller holds its lock.
