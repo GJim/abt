@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import namedtuple
 from datetime import UTC, datetime, timedelta
 import unittest
 
@@ -10,6 +11,7 @@ from abt.worker.reconciliation import (
     WorkerSafetyAdapter,
     reconcile_authenticated_worker,
 )
+from abt.worker.session import collect_product_catalog_evidence
 
 
 class ReadOnlyMT5:
@@ -213,6 +215,16 @@ class WorkerReconciliationTests(unittest.TestCase):
 
         self.assertEqual("m1_verification", response["stage"])
         self.assertEqual("M1", response["timeframe"])
+
+    def test_collects_catalog_evidence_from_mt5_namedtuple_symbol_info(self) -> None:
+        mt5 = AnalysisMT5()
+        specification = mt5.symbols_get()[0]
+        symbol_info = namedtuple("SymbolInfo", specification)(**specification)
+        mt5.symbols_get = lambda: [symbol_info]  # type: ignore[method-assign]
+
+        evidence = collect_product_catalog_evidence(mt5, collected_at=datetime(2026, 8, 16, tzinfo=UTC))
+
+        self.assertEqual("EURUSD", evidence["symbols"][0]["symbol"])
 
     def _serve_market_data_analysis(self, stage: str, timeframe: str) -> dict[str, object]:
         mt5 = AnalysisMT5()

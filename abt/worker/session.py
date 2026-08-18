@@ -193,7 +193,7 @@ def collect_market_data_evidence(
 
 
 def _symbol_specification(symbol: object) -> dict[str, object]:
-    source = symbol if isinstance(symbol, dict) else vars(symbol)
+    source = _symbol_source(symbol)
     name = _symbol_field(source, "symbol", "name")
     trade_calc_mode = _symbol_field(source, "trade_calc_mode")
     currency_base = _symbol_field(source, "currency_base")
@@ -234,6 +234,23 @@ def _symbol_specification(symbol: object) -> dict[str, object]:
         "swap_short": _required_symbol_float(source, "swap_short"),
         "swap_rollover3days": _required_symbol_int(source, "swap_rollover3days"),
     }
+
+
+def _symbol_source(symbol: object) -> dict[str, object]:
+    if isinstance(symbol, dict):
+        return symbol
+    as_dict = getattr(symbol, "_asdict", None)
+    if callable(as_dict):
+        source = as_dict()
+        if isinstance(source, dict):
+            return source
+    try:
+        source = vars(symbol)
+    except TypeError as error:
+        raise WorkerEnrollmentError("The local MT5 terminal returned an invalid product catalog.") from error
+    if not isinstance(source, dict):
+        raise WorkerEnrollmentError("The local MT5 terminal returned an invalid product catalog.")
+    return source
 
 
 def _symbol_field(source: dict[str, object], *names: str) -> object:
