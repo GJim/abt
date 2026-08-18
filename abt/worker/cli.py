@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import logging
 import sys
 from collections.abc import Callable, Mapping
 from typing import TextIO
@@ -124,6 +125,13 @@ def main(
     arguments = parser.parse_args(argv)
     if arguments.command not in {"enroll", "reconcile"}:
         parser.error("a command is required")
+    if arguments.verbose:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(levelname)s %(name)s: %(message)s",
+            stream=error_output,
+        )
+        logging.getLogger("abt.worker").setLevel(logging.DEBUG)
     cleanup_errors: list[Exception] = []
     try:
         mt5 = mt5_factory()

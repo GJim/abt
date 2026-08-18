@@ -2,11 +2,15 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
+import logging
 from time import sleep as _sleep
 from typing import Protocol
 
 from .enrollment import WorkerEnrollmentError
 from .session import collect_market_data_evidence, collect_product_catalog_evidence
+
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class ReadOnlyMT5(Protocol):
@@ -299,14 +303,25 @@ def _serve_product_catalog_analysis(
     symbols = request.get("symbols")
     if not isinstance(symbols, list) or not all(isinstance(symbol, str) and symbol for symbol in symbols):
         raise WorkerEnrollmentError("The controller requested invalid market-data symbols.")
-    evidence = collect_market_data_evidence(
-        mt5,  # type: ignore[arg-type]
-        symbols=symbols,
-        timeframe=timeframe,
-        period_start_utc=period_start_utc,
-        period_end_utc=period_end_utc,
-        collected_at=collected_at,
-    )
+    try:
+        evidence = collect_market_data_evidence(
+            mt5,  # type: ignore[arg-type]
+            symbols=symbols,
+            timeframe=timeframe,
+            period_start_utc=period_start_utc,
+            period_end_utc=period_end_utc,
+            collected_at=collected_at,
+        )
+    except WorkerEnrollmentError as error:
+        _LOGGER.error(
+            "Analysis %s request %s failed at %s (%s): %s",
+            analysis_id,
+            request_id,
+            stage,
+            timeframe,
+            error,
+        )
+        raise
     session.send_product_catalog_analysis(
         analysis_id=analysis_id,
         request_id=request_id,
