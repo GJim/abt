@@ -79,7 +79,7 @@ services:
 
   cloudflared:
     image: cloudflare/cloudflared:latest
-    command: tunnel --no-autoupdate run
+    command: tunnel --protocol http2 --no-autoupdate run
     environment:
       TUNNEL_TOKEN: ${ABT_CLOUDFLARE_TUNNEL_TOKEN:?Set ABT_CLOUDFLARE_TUNNEL_TOKEN}
     depends_on:

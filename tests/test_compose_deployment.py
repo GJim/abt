@@ -17,6 +17,7 @@ class ComposeDeploymentTests(unittest.TestCase):
         self.assertTrue(all("ports" not in service for service in services.values()))
         self.assertEqual(["controller"], services["cloudflared"]["depends_on"])
         self.assertEqual("cloudflare/cloudflared:latest", services["cloudflared"]["image"])
+        self.assertEqual("tunnel --protocol http2 --no-autoupdate run", services["cloudflared"]["command"])
         self.assertEqual({"ingress"}, set(services["cloudflared"]["networks"]))
         self.assertEqual({"ingress", "secrets"}, set(services["controller"]["networks"]))
         self.assertEqual("172.30.0.3", services["controller"]["networks"]["ingress"]["ipv4_address"])
