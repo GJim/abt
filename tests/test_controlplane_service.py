@@ -28,6 +28,7 @@ from abt.controlplane.secrets import SecretStore, SecretStoreError
 from abt.controlplane.service import (
     _analyze_product_catalogs,
     _delete_expired_pending_secrets,
+    _shared_supported_filling_modes,
     _validated_market_data_response,
     _validated_product_catalog_response,
     create_app,
@@ -679,7 +680,10 @@ class ControlPlaneServiceTests(unittest.TestCase):
                     second_worker,
                     second_certificate,
                     [
-                        self._forex_symbol("EURUSD", 50.0, swap_mode=2),
+                        {
+                            **self._forex_symbol("EURUSD", 50.0, swap_mode=2),
+                            "filling_modes": ["IOC"],
+                        },
                         self._forex_symbol("GBPUSD", 100.0, currency_base="GBP", volume_step=0.1),
                         self._forex_symbol("AUDUSD", 100.0, currency_base="AUD"),
                         self._forex_symbol("XAUUSD", 100.0, currency_base="XAU", digits=2, point=0.01, trade_tick_size=0.01),
@@ -769,6 +773,7 @@ class ControlPlaneServiceTests(unittest.TestCase):
         eur_result, gbp_result = outcome["m1_verification_results"]
         self.assertEqual("passed", eur_result["verification_status"])
         self.assertEqual([], eur_result["hard_block_differences"])
+        self.assertEqual(["IOC"], eur_result["supported_filling_modes"])
         self.assertEqual(["volume_max", "trade_stops_level", "swap_mode"], [
             difference["field"] for difference in eur_result["warning_differences"]
         ])
@@ -849,6 +854,10 @@ class ControlPlaneServiceTests(unittest.TestCase):
             "first_trade_calc_mode": 0,
             "second_trade_calc_mode": 1,
         }], exceptions)
+
+    def test_verification_accepts_shared_ioc_when_filling_capabilities_differ(self) -> None:
+        self.assertEqual(["IOC"], _shared_supported_filling_modes(["FOK", "IOC"], ["IOC"]))
+        self.assertEqual([], _shared_supported_filling_modes(["BOC"], ["RETURN"]))
 
     def test_market_data_response_requires_evidence_from_every_utc_weekday(self) -> None:
         analysis_period = {
@@ -1268,7 +1277,7 @@ class ControlPlaneServiceTests(unittest.TestCase):
 
         self.assertEqual("succeeded", outcome["status"])
         self.assertEqual(["passed"], [result["screening_status"] for result in outcome["m15_screening_results"]], outcome)
-        self.assertEqual(["passed"], [result["verification_status"] for result in outcome["m1_verification_results"]])
+        self.assertEqual(["passed"], [result["verification_status"] for result in outcome["m1_verification_results"]], outcome)
         self.assertFalse(first_runner.is_alive())
         self.assertFalse(second_runner.is_alive())
         self.assertEqual(0, first_mt5.broker_write_calls)

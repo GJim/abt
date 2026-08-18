@@ -1425,6 +1425,19 @@ def _verify_m1_candidates(
             second_index[second_symbol_name],
             _HARD_BLOCK_FIELDS,
         )
+        supported_filling_modes = _shared_supported_filling_modes(
+            first_index[first_symbol_name]["filling_modes"],
+            second_index[second_symbol_name]["filling_modes"],
+        )
+        if not supported_filling_modes:
+            hard_block_differences.append(
+                {
+                    "field": "filling_modes",
+                    "first_value": first_index[first_symbol_name]["filling_modes"],
+                    "second_value": second_index[second_symbol_name]["filling_modes"],
+                    "reason": "no_common_supported_filling_mode",
+                }
+            )
         warning_differences = _specification_differences(
             first_index[first_symbol_name],
             second_index[second_symbol_name],
@@ -1455,6 +1468,7 @@ def _verify_m1_candidates(
                 "policy_evaluation": policy_evaluation,
                 "hard_block_differences": hard_block_differences,
                 "warning_differences": warning_differences,
+                "supported_filling_modes": supported_filling_modes,
                 "first_market_data": _market_data_summary(first_symbols[first_symbol_name]),
                 "second_market_data": _market_data_summary(second_symbols[second_symbol_name]),
             }
@@ -1470,7 +1484,6 @@ _HARD_BLOCK_FIELDS = (
     "contract_size",
     "volume_min",
     "volume_step",
-    "filling_modes",
     "allowed_directions",
 )
 
@@ -1488,6 +1501,13 @@ _WARNING_FIELDS = (
 )
 
 _COMPATIBILITY_CAPABILITY_FIELDS = ("filling_modes", "allowed_directions")
+_SUPPORTED_ENTRY_FILLING_MODES = ("FOK", "IOC")
+
+
+def _shared_supported_filling_modes(first_modes: object, second_modes: object) -> list[str]:
+    first = _normalized_capability_set(first_modes)
+    second = _normalized_capability_set(second_modes)
+    return [mode for mode in _SUPPORTED_ENTRY_FILLING_MODES if mode in first and mode in second]
 
 
 def _specification_differences(
