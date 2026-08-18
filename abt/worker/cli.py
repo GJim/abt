@@ -227,5 +227,15 @@ def _close(value: object) -> None:
 def _print_diagnostic(error: Exception, output: TextIO) -> None:
     if isinstance(error, WorkerEnrollmentError):
         print(f"Diagnostic: {error}", file=output)
-    else:
-        print(f"Diagnostic: {type(error).__name__}", file=output)
+        return
+    received_close = getattr(error, "rcvd", None)
+    sent_close = getattr(error, "sent", None)
+    received_code = getattr(received_close, "code", None)
+    sent_code = getattr(sent_close, "code", None)
+    if isinstance(received_code, int):
+        print(f"Diagnostic: WebSocket closed by controller with code {received_code}.", file=output)
+        return
+    if isinstance(sent_code, int):
+        print(f"Diagnostic: WebSocket closed locally with code {sent_code}.", file=output)
+        return
+    print(f"Diagnostic: {type(error).__name__}", file=output)

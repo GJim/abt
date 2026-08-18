@@ -7,6 +7,8 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import httpx
+from websockets.exceptions import ConnectionClosedError
+from websockets.frames import Close
 
 from abt.controlplane.crypto import enrollment_payload
 from abt.worker.cli import HTTPEnrollmentTransport, MetaTrader5Adapter, main
@@ -231,6 +233,31 @@ class WorkerEnrollmentTests(unittest.TestCase):
         self.assertIn("RuntimeError", errors.getvalue())
         self.assertNotIn(password, errors.getvalue())
 
+    def test_cli_verbose_mode_reports_websocket_close_code(self) -> None:
+        errors = io.StringIO()
+
+        exit_code = main(
+            [
+                "enroll",
+                "-v",
+                "--controller-url",
+                "https://controller.example",
+                "--login",
+                "123456",
+                "--server",
+                "Broker-Demo",
+            ],
+            mt5_factory=FakeMT5,
+            transport_factory=lambda: ClosingTransport(),
+            key_store_factory=lambda _: FakeKeyStore(),
+            password_prompt=lambda _: "never-display-this-password",
+            error_output=errors,
+        )
+
+        self.assertEqual(1, exit_code)
+        self.assertIn("WebSocket closed by controller with code 1008.", errors.getvalue())
+        self.assertNotIn("never-display-this-password", errors.getvalue())
+
     def test_analysis_helper_accepts_m1_verification_requests(self) -> None:
         session = AuthenticatedWorkerSession(
             socket=FakeWebSocket(
@@ -290,6 +317,14 @@ class FailingTransport:
 
     def enroll(self, controller_url: str, request: dict[str, object]) -> dict[str, object]:
         raise RuntimeError(self._password)
+
+
+class ClosingTransport:
+    def enrollment_challenge(self, controller_url: str) -> dict[str, object]:
+        return {"challenge": "controller-one-time-challenge"}
+
+    def enroll(self, controller_url: str, request: dict[str, object]) -> dict[str, object]:
+        raise ConnectionClosedError(Close(1008, ""), None)
 
 
 class HTTPEnrollmentTransportTests(unittest.TestCase):
