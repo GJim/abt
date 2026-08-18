@@ -80,7 +80,7 @@ def _send_proof(
     _send(socket, {"signature": b64encode(signature).decode("ascii")})
 
 
-def _send(socket: WorkerWebSocket, message: dict[str, str]) -> None:
+def _send(socket: WorkerWebSocket, message: dict[str, object]) -> None:
     socket.send(json.dumps(message, separators=(",", ":"), sort_keys=True))
 
 

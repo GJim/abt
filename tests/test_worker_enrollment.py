@@ -12,7 +12,7 @@ from abt.controlplane.crypto import enrollment_payload
 from abt.worker.cli import HTTPEnrollmentTransport, MetaTrader5Adapter, main
 from abt.worker.credentials import retrieve_mt5_password
 from abt.worker.enrollment import WorkerEnrollmentError, register_worker
-from abt.worker.session import open_authenticated_worker_session
+from abt.worker.session import AuthenticatedWorkerSession, open_authenticated_worker_session
 
 
 class FakeMT5:
@@ -203,6 +203,55 @@ class WorkerEnrollmentTests(unittest.TestCase):
 
         self.assertEqual(1, exit_code)
         self.assertNotIn(password, errors.getvalue())
+
+    def test_analysis_helper_accepts_m1_verification_requests(self) -> None:
+        session = AuthenticatedWorkerSession(
+            socket=FakeWebSocket(
+                [
+                    {
+                        "type": "product_catalog_analysis_request",
+                        "analysis_id": "analysis-123",
+                        "request_id": "request-123",
+                        "stage": "m1_verification",
+                        "policy": {"label": "FX catalog"},
+                        "timeframe": "M1",
+                        "period_start_utc": "2026-08-10T00:00:00Z",
+                        "period_end_utc": "2026-08-17T00:00:00Z",
+                        "symbols": ["EURUSD"],
+                    }
+                ]
+            ),
+            reconciliation_cursor=0,
+        )
+
+        request = session.receive_product_catalog_analysis()
+
+        self.assertEqual("m1_verification", request["stage"])
+        self.assertEqual("M1", request["timeframe"])
+        self.assertEqual("2026-08-10T00:00:00Z", request["period_start_utc"])
+        self.assertEqual("2026-08-17T00:00:00Z", request["period_end_utc"])
+        self.assertEqual(["EURUSD"], request["symbols"])
+
+    def test_analysis_helper_includes_period_fields_in_market_data_responses(self) -> None:
+        socket = FakeWebSocket([])
+        session = AuthenticatedWorkerSession(socket=socket, reconciliation_cursor=0)
+
+        session.send_product_catalog_analysis(
+            analysis_id="analysis-123",
+            request_id="request-123",
+            collected_at="2026-08-17T07:05:00Z",
+            symbols=[{"symbol": "EURUSD", "bars": [], "time_metadata": {}}],
+            stage="m1_verification",
+            timeframe="M1",
+            period_start_utc="2026-08-10T00:00:00Z",
+            period_end_utc="2026-08-17T00:00:00Z",
+        )
+
+        payload = json.loads(socket.sent[-1])
+        self.assertEqual("m1_verification", payload["stage"])
+        self.assertEqual("M1", payload["timeframe"])
+        self.assertEqual("2026-08-10T00:00:00Z", payload["period_start_utc"])
+        self.assertEqual("2026-08-17T00:00:00Z", payload["period_end_utc"])
 
 
 class FailingTransport:

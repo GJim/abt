@@ -1,5 +1,5 @@
 .management {
-  align-items: center;
+  align-items: start;
   display: grid;
   justify-items: center;
   min-height: 100svh;
@@ -24,7 +24,7 @@
   box-shadow: var(--shadow);
   display: grid;
   gap: 1.5rem;
-  max-width: 60rem;
+  max-width: 90rem;
   padding: 2.5rem;
   width: 100%;
 }
@@ -47,7 +47,8 @@ form {
   gap: 1.25rem;
 }
 
-label {
+label,
+fieldset {
   color: var(--text-h);
   display: grid;
   font-size: 0.9rem;
@@ -55,13 +56,34 @@ label {
   gap: 0.5rem;
 }
 
-input {
+fieldset {
+  border: 1px solid var(--border);
+  border-radius: 0.75rem;
+  margin: 0;
+  padding: 1rem;
+}
+
+legend {
+  color: var(--text-h);
+  font-weight: 700;
+  padding: 0 0.35rem;
+}
+
+input,
+select {
   background: var(--bg);
   border: 1px solid var(--border);
   border-radius: 0.4rem;
   color: var(--text-h);
   font: inherit;
   padding: 0.7rem 0.8rem;
+}
+
+small,
+.hint {
+  color: var(--text);
+  font-weight: 400;
+  margin: 0;
 }
 
 button {
@@ -80,8 +102,9 @@ button {
   margin: 0;
 }
 
-ul {
-  list-style: none;
+ul,
+ol {
+  margin: 0;
   padding: 0;
 }
 
@@ -92,11 +115,174 @@ li {
   padding: 0.75rem 0;
 }
 
+.section-header {
+  align-items: start;
+  display: flex;
+  gap: 1rem;
+  justify-content: space-between;
+}
+
+.section-header p {
+  margin: 0.35rem 0 0;
+}
+
+.analysis-section,
+.analysis-results {
+  display: grid;
+  gap: 1rem;
+}
+
+.analysis-layout,
+.summary-grid,
+.result-grid,
+.policy-grid,
+.product-pair-list,
+.buildable-result-card,
+.pair-worker-list,
+.compatibility-panel {
+  display: grid;
+  gap: 1rem;
+}
+
+.analysis-layout {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.summary-grid {
+  grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr));
+}
+
+.result-grid {
+  grid-template-columns: repeat(auto-fit, minmax(18rem, 1fr));
+}
+
+.policy-grid {
+  grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr));
+}
+
+.panel,
+.result-card {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 0.75rem;
+  display: grid;
+  gap: 0.75rem;
+  padding: 1rem;
+}
+
+.result-card {
+  background: white;
+}
+
+.build-panel {
+  background: #f8fafc;
+}
+
+.worker-status-list li,
+.exception-list li,
+.timeline li,
+.difference-list li {
+  align-items: start;
+  gap: 1rem;
+}
+
+.worker-status-list span,
+.exception-list span,
+.difference-list span {
+  color: var(--text);
+}
+
+.policy-fieldset {
+  gap: 1rem;
+}
+
+.checkbox-field {
+  align-items: start;
+  grid-template-columns: auto 1fr;
+}
+
+.checkbox-field input {
+  margin-top: 0.15rem;
+}
+
+.checkbox-field span {
+  display: grid;
+  gap: 0.15rem;
+}
+
+.compact-form {
+  align-items: end;
+  grid-template-columns: 1fr auto;
+}
+
+.compact-list {
+  display: grid;
+  gap: 0.6rem;
+  margin: 0;
+}
+
+.compact-list > div {
+  display: grid;
+  gap: 0.15rem;
+}
+
+.status-badge {
+  border-radius: 999px;
+  font-size: 0.85rem;
+  font-weight: 700;
+  padding: 0.35rem 0.75rem;
+  white-space: nowrap;
+}
+
+.status-queued,
+.status-running {
+  background: #ebe9fe;
+  color: #4f46e5;
+}
+
+.status-succeeded {
+  background: #dcfae6;
+  color: #166534;
+}
+
+.status-retired {
+  background: #e5e7eb;
+  color: #374151;
+}
+
+.status-failed {
+  background: #fee4e2;
+  color: #b42318;
+}
+
+.success {
+  color: #166534;
+  margin: 0;
+}
+
+.mono {
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 0.85rem;
+  overflow-wrap: anywhere;
+}
+
+.timeline {
+  list-style: none;
+}
+
+.timeline li {
+  align-items: center;
+}
+
+.worker-alerts,
 .enrollment-list,
 .audit-events,
 .worker-list,
-.worker-deltas {
-  margin: 0;
+.worker-deltas,
+.worker-status-list,
+.difference-list,
+.exception-list {
+  list-style: none;
 }
 
 .enrollment {
@@ -113,6 +299,7 @@ li {
 
 .worker dl {
   display: flex;
+  flex-wrap: wrap;
   gap: 2rem;
   margin: 0;
 }
@@ -122,9 +309,11 @@ li {
   gap: 0.15rem;
 }
 
-.worker h3 {
-  font-size: 0.9rem;
-  margin: 0 0 0.5rem;
+.worker h3,
+.analysis-results h4,
+.analysis-results h5,
+.analysis-results h6 {
+  margin: 0;
 }
 
 .worker-deltas li {
@@ -174,8 +363,19 @@ dd {
   margin: 0 0 0.5rem;
 }
 
+details {
+  display: grid;
+  gap: 0.75rem;
+}
+
+summary {
+  color: var(--accent);
+  cursor: pointer;
+  font-weight: 700;
+}
+
 pre {
-  background: var(--bg);
+  background: white;
   border: 1px solid var(--border);
   border-radius: 0.4rem;
   margin: 0;
@@ -188,6 +388,50 @@ pre {
   background: #b42318;
 }
 
+.secondary-button {
+  background: #4f46e5;
+}
+
+.action-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+}
+
+.conflict-panel {
+  background: #fff7ed;
+  border: 1px solid #fdba74;
+  border-radius: 0.75rem;
+  color: #9a3412;
+  padding: 0.9rem 1rem;
+}
+
+.product-pair-card > .section-header h3,
+.buildable-result-card h6 {
+  margin: 0;
+}
+
+.product-pair-list {
+  grid-template-columns: repeat(auto-fit, minmax(20rem, 1fr));
+}
+
+.pair-worker-list {
+  grid-template-columns: repeat(auto-fit, minmax(20rem, 1fr));
+}
+
+.pair-worker-card h5,
+.pair-worker-card h6,
+.compatibility-panel h6 {
+  margin: 0;
+}
+
+.confirmation-check {
+  background: white;
+  border: 1px solid var(--border);
+  border-radius: 0.75rem;
+  padding: 0.75rem;
+}
+
 button:disabled {
   cursor: wait;
   opacity: 0.7;
@@ -196,6 +440,12 @@ button:disabled {
 time {
   color: var(--text);
   font-size: 0.85rem;
+}
+
+@media (max-width: 70rem) {
+  .analysis-layout {
+    grid-template-columns: 1fr;
+  }
 }
 
 @media (max-width: 40rem) {
@@ -208,16 +458,13 @@ time {
     padding: 1.5rem;
   }
 
-  .enrollment {
-    flex-direction: column;
-  }
-
-  .enrollment dl {
-    grid-template-columns: 1fr;
-    width: 100%;
-  }
-
+  .compact-form,
+  .enrollment dl,
   .enrollment-evidence {
     grid-template-columns: 1fr;
+  }
+
+  .section-header {
+    flex-direction: column;
   }
 }

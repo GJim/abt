@@ -491,14 +491,1216 @@ class ControlLedger:
                 )
         return result
 
+    def create_product_catalog_analysis(
+        self,
+        *,
+        first_worker_id: str,
+        second_worker_id: str,
+        requested_by: str,
+        policy: dict[str, object],
+        analysis_period: dict[str, object],
+    ) -> str:
+        if first_worker_id == second_worker_id:
+            raise LedgerError("Product catalog analysis requires two distinct workers.")
+        now = _utc_now()
+        with self._transaction():
+            first = self._analysis_worker(first_worker_id, now)
+            second = self._analysis_worker(second_worker_id, now)
+            if first["server"] == second["server"]:
+                raise LedgerError("Product catalog analysis requires workers on different exact MT5 servers.")
+            analysis_id = str(uuid4())
+            self._connection.execute(
+                """
+                INSERT INTO product_catalog_analyses (
+                    analysis_id, requested_by, first_worker_id, first_login, first_server,
+                    second_worker_id, second_login, second_server, policy, status, current_stage,
+                    analysis_period, requested_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', 'catalog', ?, ?)
+                """,
+                [
+                    analysis_id,
+                    requested_by,
+                    first["worker_id"],
+                    first["login"],
+                    first["server"],
+                    second["worker_id"],
+                    second["login"],
+                    second["server"],
+                    json.dumps(policy, sort_keys=True),
+                    json.dumps(analysis_period, sort_keys=True),
+                    now,
+                ],
+            )
+            self._event(
+                "product_catalog_analysis_requested",
+                {
+                    "analysis_id": analysis_id,
+                    "requested_by": requested_by,
+                    "first_worker_id": first_worker_id,
+                    "second_worker_id": second_worker_id,
+                },
+            )
+            return analysis_id
+
+    def _analysis_worker(self, worker_id: str, now: datetime) -> dict[str, Any]:
+        row = self._connection.execute(
+            """
+            SELECT worker_id, login, server, status, safety_state, last_seen_at
+            FROM workers
+            WHERE worker_id = ?
+            """,
+            [worker_id],
+        ).fetchone()
+        if row is None or row[3] != "active":
+            raise LedgerError("Selected worker must be approved, healthy, and connected.")
+        if row[4] != "connected":
+            raise LedgerError("Selected worker must be approved, healthy, and connected.")
+        if row[5] is None or now - row[5] > timedelta(minutes=5):
+            raise LedgerError("Selected worker must be approved, healthy, and connected.")
+        return {"worker_id": row[0], "login": row[1], "server": row[2]}
+
+    def record_product_catalog_analysis_catalog(
+        self,
+        analysis_id: str,
+        *,
+        first_evidence: dict[str, object],
+        second_evidence: dict[str, object],
+        eligible_candidates: list[dict[str, object]],
+        exceptions: list[dict[str, object]],
+    ) -> None:
+        with self._transaction():
+            self._require_running_product_catalog_analysis(analysis_id)
+            self._connection.execute(
+                """
+                UPDATE product_catalog_analyses
+                SET first_catalog_evidence = ?,
+                    second_catalog_evidence = ?,
+                    eligible_candidates = ?,
+                    exceptions = ?,
+                    current_stage = 'm15_screening',
+                    catalog_completed_at = ?
+                WHERE analysis_id = ?
+                """,
+                [
+                    json.dumps(first_evidence, sort_keys=True),
+                    json.dumps(second_evidence, sort_keys=True),
+                    json.dumps(eligible_candidates, sort_keys=True),
+                    json.dumps(exceptions, sort_keys=True),
+                    _utc_now(),
+                    analysis_id,
+                ],
+            )
+            self._event("product_catalog_analysis_catalog_completed", {"analysis_id": analysis_id})
+
+    def complete_product_catalog_analysis(
+        self,
+        analysis_id: str,
+        *,
+        m15_screening_results: list[dict[str, object]],
+        m1_verification_results: list[dict[str, object]],
+        m1_verified: bool,
+    ) -> None:
+        with self._transaction():
+            self._require_running_product_catalog_analysis(analysis_id)
+            self._connection.execute(
+                """
+                UPDATE product_catalog_analyses
+                SET status = 'succeeded',
+                    current_stage = 'completed',
+                    failure_reason = NULL,
+                    m15_screening_results = ?,
+                    m1_verification_results = ?,
+                    m15_screened_at = ?,
+                    m1_verified_at = ?,
+                    completed_at = ?
+                WHERE analysis_id = ?
+                """,
+                [
+                    json.dumps(m15_screening_results, sort_keys=True),
+                    json.dumps(m1_verification_results, sort_keys=True),
+                    _utc_now(),
+                    _utc_now() if m1_verified else None,
+                    _utc_now(),
+                    analysis_id,
+                ],
+            )
+            self._event("product_catalog_analysis_m15_completed", {"analysis_id": analysis_id})
+            if m1_verified:
+                self._event("product_catalog_analysis_m1_completed", {"analysis_id": analysis_id})
+            self._event("product_catalog_analysis_succeeded", {"analysis_id": analysis_id})
+
+    def record_product_catalog_analysis_retry(self, analysis_id: str, stage: str, reason: str) -> None:
+        with self._transaction():
+            self._require_running_product_catalog_analysis(analysis_id)
+            self._connection.execute(
+                """
+                UPDATE product_catalog_analyses
+                SET retry_count = retry_count + 1
+                WHERE analysis_id = ?
+                """,
+                [analysis_id],
+            )
+            self._event(
+                "product_catalog_analysis_retry",
+                {"analysis_id": analysis_id, "stage": stage, "reason": reason},
+            )
+
+    def fail_product_catalog_analysis(
+        self,
+        analysis_id: str,
+        reason: str,
+        *,
+        stage: str,
+        clear_m15_results: bool = True,
+        m15_screening_results: list[dict[str, object]] | None = None,
+    ) -> None:
+        with self._transaction():
+            self._require_running_product_catalog_analysis(analysis_id)
+            persisted_m15_screening_results = (
+                "[]"
+                if clear_m15_results
+                else json.dumps(m15_screening_results, sort_keys=True)
+                if m15_screening_results is not None
+                else self._connection.execute(
+                    "SELECT m15_screening_results FROM product_catalog_analyses WHERE analysis_id = ?",
+                    [analysis_id],
+                ).fetchone()[0]
+            )
+            self._connection.execute(
+                """
+                UPDATE product_catalog_analyses
+                SET status = 'failed',
+                    current_stage = ?,
+                    failure_reason = ?,
+                    m15_screening_results = ?,
+                    m1_verification_results = '[]',
+                    completed_at = ?
+                WHERE analysis_id = ?
+                """,
+                [stage, reason, persisted_m15_screening_results, _utc_now(), analysis_id],
+            )
+            self._event(
+                "product_catalog_analysis_failed",
+                {"analysis_id": analysis_id, "stage": stage, "reason": reason},
+            )
+
+    def _require_running_product_catalog_analysis(self, analysis_id: str) -> None:
+        row = self._connection.execute(
+            "SELECT status FROM product_catalog_analyses WHERE analysis_id = ?",
+            [analysis_id],
+        ).fetchone()
+        if row is None:
+            raise LedgerError("Product catalog analysis does not exist.")
+        if row[0] != "running":
+            raise LedgerError("Product catalog analysis is no longer running.")
+
+    def product_catalog_analysis(self, analysis_id: str) -> dict[str, Any]:
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT analysis_id, requested_by, first_worker_id, first_login, first_server,
+                       second_worker_id, second_login, second_server, policy, status, failure_reason,
+                       current_stage, retry_count, analysis_period, first_catalog_evidence, second_catalog_evidence,
+                       eligible_candidates, exceptions, m15_screening_results, m1_verification_results, requested_at,
+                       catalog_completed_at, m15_screened_at, m1_verified_at, completed_at
+                FROM product_catalog_analyses
+                WHERE analysis_id = ?
+                """,
+                [analysis_id],
+            ).fetchone()
+        if row is None:
+            raise LedgerError("Product catalog analysis does not exist.")
+        return {
+            "analysis_id": row[0],
+            "requested_by": row[1],
+            "first_worker": {"worker_id": row[2], "login": row[3], "server": row[4]},
+            "second_worker": {"worker_id": row[5], "login": row[6], "server": row[7]},
+            "policy": json.loads(row[8]),
+            "status": row[9],
+            "failure_reason": row[10],
+            "current_stage": row[11],
+            "retry_count": row[12],
+            "analysis_period": json.loads(row[13]),
+            "first_catalog_evidence": None if row[14] is None else json.loads(row[14]),
+            "second_catalog_evidence": None if row[15] is None else json.loads(row[15]),
+            "eligible_candidates": json.loads(row[16]),
+            "exceptions": json.loads(row[17]),
+            "m15_screening_results": json.loads(row[18]),
+            "m1_verification_results": json.loads(row[19]),
+            "requested_at": row[20],
+            "catalog_completed_at": row[21],
+            "m15_screened_at": row[22],
+            "m1_verified_at": row[23],
+            "completed_at": row[24],
+        }
+
+    def create_product_pair_build_confirmation(
+        self,
+        analysis_id: str,
+        *,
+        first_symbol: str,
+        second_symbol: str,
+        requested_by: str,
+    ) -> dict[str, Any]:
+        with self._transaction():
+            analysis = self._product_catalog_analysis_for_update(analysis_id)
+            if analysis["status"] != "succeeded":
+                raise LedgerError("Product catalog analysis is not ready for Build confirmation.")
+            verification_result = next(
+                (
+                    result
+                    for result in analysis["m1_verification_results"]
+                    if result["first_symbol"] == first_symbol and result["second_symbol"] == second_symbol
+                ),
+                None,
+            )
+            if verification_result is None or verification_result["verification_status"] != "passed":
+                raise LedgerError("Selected candidate is not a final passing candidate.")
+            first_specification = self._analysis_symbol_specification(analysis["first_catalog_evidence"], first_symbol)
+            second_specification = self._analysis_symbol_specification(analysis["second_catalog_evidence"], second_symbol)
+            confirmation_id = str(uuid4())
+            confirmation = self._product_pair_confirmation_payload(
+                confirmation_id=confirmation_id,
+                analysis=analysis,
+                verification_result=verification_result,
+                first_specification=first_specification,
+                second_specification=second_specification,
+                requested_by=requested_by,
+            )
+            self._connection.execute(
+                """
+                INSERT INTO product_pair_build_confirmations (
+                    confirmation_id, analysis_id, requested_by, first_server, first_symbol,
+                    second_server, second_symbol, confirmation, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    confirmation_id,
+                    analysis_id,
+                    requested_by,
+                    str(confirmation["endpoints"][0]["server"]),
+                    str(confirmation["endpoints"][0]["symbol"]),
+                    str(confirmation["endpoints"][1]["server"]),
+                    str(confirmation["endpoints"][1]["symbol"]),
+                    json.dumps(confirmation, sort_keys=True),
+                    _utc_now(),
+                ],
+            )
+            self._event(
+                "product_pair_build_confirmation_requested",
+                {
+                    "confirmation_id": confirmation_id,
+                    "analysis_id": analysis_id,
+                    "requested_by": requested_by,
+                    "first_symbol": first_symbol,
+                    "second_symbol": second_symbol,
+                },
+            )
+            return confirmation
+
+    def build_product_pair(self, confirmation_id: str, built_by: str) -> dict[str, Any]:
+        with self._transaction():
+            confirmation = self._product_pair_build_confirmation(confirmation_id)
+            self._require_no_active_product_pair(confirmation["endpoints"])
+            product_pair_id = self._insert_product_pair(
+                confirmation=confirmation,
+                confirmation_id=confirmation_id,
+                built_by=built_by,
+            )
+            self._connection.execute(
+                "UPDATE product_pair_build_confirmations SET used_at = ? WHERE confirmation_id = ?",
+                [_utc_now(), confirmation_id],
+            )
+            self._event(
+                "product_pair_built",
+                {
+                    "product_pair_id": product_pair_id,
+                    "confirmation_id": confirmation_id,
+                    "analysis_id": confirmation["analysis_id"],
+                    "built_by": built_by,
+                },
+            )
+            return self._product_pair_by_id(product_pair_id)
+
+    def replace_product_pair(
+        self,
+        product_pair_id: str,
+        *,
+        confirmation_id: str,
+        replaced_by: str,
+    ) -> dict[str, Any]:
+        with self._transaction():
+            current = self._product_pair_by_id(product_pair_id)
+            if current["status"] != "active":
+                raise LedgerError("Active product pair does not exist.")
+            confirmation = self._product_pair_build_confirmation(confirmation_id)
+            if confirmation["endpoints"] != current["endpoints"]:
+                raise LedgerError("Replacement confirmation must target the same unordered endpoint pair.")
+            self._connection.execute(
+                """
+                UPDATE product_pairs
+                SET status = 'retired',
+                    retired_at = ?,
+                    retired_by = ?,
+                    retired_reason = 'replaced',
+                    replaced_by_product_pair_id = ?,
+                    active_pair_key = NULL
+                WHERE product_pair_id = ? AND status = 'active'
+                """,
+                [_utc_now(), replaced_by, None, product_pair_id],
+            )
+            new_product_pair_id = self._insert_product_pair(
+                confirmation=confirmation,
+                confirmation_id=confirmation_id,
+                built_by=replaced_by,
+                replaces_product_pair_id=product_pair_id,
+            )
+            self._connection.execute(
+                "UPDATE product_pairs SET replaced_by_product_pair_id = ? WHERE product_pair_id = ?",
+                [new_product_pair_id, product_pair_id],
+            )
+            self._connection.execute(
+                "UPDATE product_pair_build_confirmations SET used_at = ? WHERE confirmation_id = ?",
+                [_utc_now(), confirmation_id],
+            )
+            self._event(
+                "product_pair_built",
+                {
+                    "product_pair_id": new_product_pair_id,
+                    "confirmation_id": confirmation_id,
+                    "analysis_id": confirmation["analysis_id"],
+                    "built_by": replaced_by,
+                },
+            )
+            self._event(
+                "product_pair_retired",
+                {
+                    "product_pair_id": product_pair_id,
+                    "retired_by": replaced_by,
+                    "reason": "replaced",
+                },
+            )
+            self._event(
+                "product_pair_replaced",
+                {
+                    "retired_product_pair_id": product_pair_id,
+                    "replacement_product_pair_id": new_product_pair_id,
+                    "confirmation_id": confirmation_id,
+                    "analysis_id": confirmation["analysis_id"],
+                    "replaced_by": replaced_by,
+                },
+            )
+            return self._product_pair_by_id(new_product_pair_id)
+
+    def retire_product_pair(self, product_pair_id: str, retired_by: str) -> dict[str, Any]:
+        with self._transaction():
+            current = self._product_pair_by_id(product_pair_id)
+            if current["status"] != "active":
+                raise LedgerError("Active product pair does not exist.")
+            self._connection.execute(
+                """
+                UPDATE product_pairs
+                SET status = 'retired',
+                    retired_at = ?,
+                    retired_by = ?,
+                    retired_reason = 'manual_retirement',
+                    active_pair_key = NULL
+                WHERE product_pair_id = ? AND status = 'active'
+                """,
+                [_utc_now(), retired_by, product_pair_id],
+            )
+            self._event(
+                "product_pair_retired",
+                {
+                    "product_pair_id": product_pair_id,
+                    "retired_by": retired_by,
+                    "reason": "manual_retirement",
+                },
+            )
+            return self._product_pair_by_id(product_pair_id)
+
+    def product_pairs(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT product_pair_id, status, endpoint_a_server, endpoint_a_symbol, endpoint_b_server, endpoint_b_symbol,
+                       lot_relationship, policy_snapshot, analysis_period, reference_specifications, approval_evidence,
+                       source_workers, built_from_analysis_id, built_from_confirmation_id, built_by, created_at,
+                       retired_at, retired_by, retired_reason, replaced_by_product_pair_id, replaces_product_pair_id
+                FROM product_pairs
+                ORDER BY created_at, product_pair_id
+                """
+            ).fetchall()
+        return [self._product_pair_with_worker_applicability(self._product_pair_from_row(row)) for row in rows]
+
+    def product_pair_worker_reference(self, product_pair_id: str, worker_id: str) -> dict[str, Any]:
+        with self._lock:
+            pair = self._product_pair_by_id(product_pair_id)
+            if pair["status"] != "active":
+                raise LedgerError("Active product pair does not exist.")
+            row = self._connection.execute(
+                "SELECT worker_id, login, server FROM workers WHERE worker_id = ? AND status = 'active'",
+                [worker_id],
+            ).fetchone()
+            if row is None:
+                raise LedgerError("Worker is not active.")
+            endpoint = next((item for item in pair["endpoints"] if item["server"] == row[2]), None)
+            if endpoint is None:
+                raise LedgerError("Worker does not belong to this product pair's endpoint servers.")
+            reference = next(
+                (
+                    item
+                    for item in pair["reference_specifications"]
+                    if item["server"] == endpoint["server"] and item["symbol"] == endpoint["symbol"]
+                ),
+                None,
+            )
+            if reference is None:
+                raise LedgerError("Product pair reference specification does not exist.")
+            return {
+                "product_pair_id": pair["product_pair_id"],
+                "worker_id": row[0],
+                "login": row[1],
+                "server": row[2],
+                "reference_symbol": endpoint["symbol"],
+                "reference_specification": reference["specification"],
+            }
+
+    def create_product_pair_retest(
+        self,
+        product_pair_id: str,
+        *,
+        first_worker_id: str,
+        second_worker_id: str,
+        requested_by: str,
+        analysis_period: dict[str, object],
+    ) -> dict[str, Any]:
+        if first_worker_id == second_worker_id:
+            raise LedgerError("Product pair re-test requires two distinct workers.")
+        now = _utc_now()
+        with self._transaction():
+            pair = self._product_pair_by_id(product_pair_id)
+            if pair["status"] != "active":
+                raise LedgerError("Active product pair does not exist.")
+            first = self._analysis_worker(first_worker_id, now)
+            second = self._analysis_worker(second_worker_id, now)
+            workers_by_server = {
+                str(first["server"]): first,
+                str(second["server"]): second,
+            }
+            pair_servers = {str(endpoint["server"]) for endpoint in pair["endpoints"]}
+            if len(workers_by_server) != 2 or set(workers_by_server) != pair_servers:
+                raise LedgerError("Selected workers must belong to this product pair's exact MT5 servers.")
+            source_workers = [
+                workers_by_server[str(endpoint["server"])]
+                for endpoint in pair["endpoints"]
+            ]
+            retest_id = str(uuid4())
+            self._connection.execute(
+                """
+                INSERT INTO product_pair_retests (
+                    retest_id, product_pair_id, requested_by,
+                    first_worker_id, first_login, first_server,
+                    second_worker_id, second_login, second_server,
+                    policy_snapshot, analysis_period, reference_specifications,
+                    status, current_stage, retry_count, requested_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', 'catalog', 0, ?)
+                """,
+                [
+                    retest_id,
+                    product_pair_id,
+                    requested_by,
+                    source_workers[0]["worker_id"],
+                    source_workers[0]["login"],
+                    source_workers[0]["server"],
+                    source_workers[1]["worker_id"],
+                    source_workers[1]["login"],
+                    source_workers[1]["server"],
+                    json.dumps(pair["policy_snapshot"], sort_keys=True),
+                    json.dumps(analysis_period, sort_keys=True),
+                    json.dumps(pair["reference_specifications"], sort_keys=True),
+                    now,
+                ],
+            )
+            self._event(
+                "product_pair_retest_requested",
+                {
+                    "retest_id": retest_id,
+                    "product_pair_id": product_pair_id,
+                    "requested_by": requested_by,
+                    "first_worker_id": source_workers[0]["worker_id"],
+                    "second_worker_id": source_workers[1]["worker_id"],
+                },
+            )
+            return self.product_pair_retest(retest_id)
+
+    def record_product_pair_retest_catalog(
+        self,
+        retest_id: str,
+        *,
+        first_evidence: dict[str, object],
+        second_evidence: dict[str, object],
+    ) -> None:
+        with self._transaction():
+            self._require_running_product_pair_retest(retest_id)
+            self._connection.execute(
+                """
+                UPDATE product_pair_retests
+                SET first_catalog_evidence = ?,
+                    second_catalog_evidence = ?,
+                    current_stage = 'm15_screening',
+                    catalog_completed_at = ?
+                WHERE retest_id = ?
+                """,
+                [
+                    json.dumps(first_evidence, sort_keys=True),
+                    json.dumps(second_evidence, sort_keys=True),
+                    _utc_now(),
+                    retest_id,
+                ],
+            )
+            self._event("product_pair_retest_catalog_completed", {"retest_id": retest_id})
+
+    def record_product_pair_retest_retry(self, retest_id: str, stage: str, reason: str) -> None:
+        with self._transaction():
+            self._require_running_product_pair_retest(retest_id)
+            self._connection.execute(
+                """
+                UPDATE product_pair_retests
+                SET retry_count = retry_count + 1
+                WHERE retest_id = ?
+                """,
+                [retest_id],
+            )
+            self._event(
+                "product_pair_retest_retry",
+                {"retest_id": retest_id, "stage": stage, "reason": reason},
+            )
+
+    def complete_product_pair_retest(
+        self,
+        retest_id: str,
+        *,
+        m15_screening_results: list[dict[str, object]],
+        m1_verification_results: list[dict[str, object]],
+        passed: bool,
+        failure_reason: str | None = None,
+    ) -> dict[str, Any]:
+        with self._transaction():
+            self._require_running_product_pair_retest(retest_id)
+            status = "passed" if passed else "failed"
+            self._connection.execute(
+                """
+                UPDATE product_pair_retests
+                SET status = ?,
+                    current_stage = 'completed',
+                    failure_reason = ?,
+                    m15_screening_results = ?,
+                    m1_verification_results = ?,
+                    m15_screened_at = ?,
+                    m1_verified_at = ?,
+                    completed_at = ?
+                WHERE retest_id = ?
+                """,
+                [
+                    status,
+                    None if passed else failure_reason,
+                    json.dumps(m15_screening_results, sort_keys=True),
+                    json.dumps(m1_verification_results, sort_keys=True),
+                    _utc_now(),
+                    _utc_now() if m1_verification_results else None,
+                    _utc_now(),
+                    retest_id,
+                ],
+            )
+            self._event("product_pair_retest_m15_completed", {"retest_id": retest_id})
+            if m1_verification_results:
+                self._event("product_pair_retest_m1_completed", {"retest_id": retest_id})
+            if passed:
+                self._event("product_pair_retest_succeeded", {"retest_id": retest_id})
+            else:
+                retest = self.product_pair_retest(retest_id)
+                self._alert(
+                    str(retest["source_workers"]["first_worker"]["worker_id"]),
+                    "high",
+                    "product_pair_retest_failed",
+                    "latest_retest_failed",
+                    product_pair_id=str(retest["product_pair_id"]),
+                )
+                self._event(
+                    "product_pair_retest_failed",
+                    {
+                        "retest_id": retest_id,
+                        "product_pair_id": retest["product_pair_id"],
+                        "reason": failure_reason,
+                    },
+                )
+            return self.product_pair_retest(retest_id)
+
+    def fail_product_pair_retest(
+        self,
+        retest_id: str,
+        reason: str,
+        *,
+        stage: str,
+        clear_m15_results: bool = True,
+        m15_screening_results: list[dict[str, object]] | None = None,
+    ) -> dict[str, Any]:
+        with self._transaction():
+            self._require_running_product_pair_retest(retest_id)
+            persisted_m15_screening_results = (
+                "[]"
+                if clear_m15_results
+                else json.dumps(m15_screening_results, sort_keys=True)
+                if m15_screening_results is not None
+                else self._connection.execute(
+                    "SELECT m15_screening_results FROM product_pair_retests WHERE retest_id = ?",
+                    [retest_id],
+                ).fetchone()[0]
+            )
+            self._connection.execute(
+                """
+                UPDATE product_pair_retests
+                SET status = 'failed',
+                    current_stage = ?,
+                    failure_reason = ?,
+                    m15_screening_results = ?,
+                    m1_verification_results = '[]',
+                    completed_at = ?
+                WHERE retest_id = ?
+                """,
+                [stage, reason, persisted_m15_screening_results, _utc_now(), retest_id],
+            )
+            retest = self.product_pair_retest(retest_id)
+            self._alert(
+                str(retest["source_workers"]["first_worker"]["worker_id"]),
+                "high",
+                "product_pair_retest_failed",
+                "latest_retest_failed",
+                product_pair_id=str(retest["product_pair_id"]),
+            )
+            self._event(
+                "product_pair_retest_failed",
+                {
+                    "retest_id": retest_id,
+                    "product_pair_id": retest["product_pair_id"],
+                    "stage": stage,
+                    "reason": reason,
+                },
+            )
+            return retest
+
+    def product_pair_retest(self, retest_id: str) -> dict[str, Any]:
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT retest_id, product_pair_id, requested_by,
+                       first_worker_id, first_login, first_server,
+                       second_worker_id, second_login, second_server,
+                       policy_snapshot, analysis_period, reference_specifications,
+                       status, current_stage, retry_count, failure_reason,
+                       first_catalog_evidence, second_catalog_evidence,
+                       m15_screening_results, m1_verification_results,
+                       requested_at, catalog_completed_at, m15_screened_at, m1_verified_at, completed_at
+                FROM product_pair_retests
+                WHERE retest_id = ?
+                """,
+                [retest_id],
+            ).fetchone()
+        if row is None:
+            raise LedgerError("Product pair re-test does not exist.")
+        return self._product_pair_retest_from_row(row)
+
+    def record_product_pair_worker_compatibility_check(
+        self,
+        product_pair_id: str,
+        worker_id: str,
+        *,
+        checked_by: str,
+        reference_symbol: str,
+        reference_specification: dict[str, object],
+        live_specification: dict[str, object] | None,
+        hard_block_differences: list[dict[str, object]],
+        warning_differences: list[dict[str, object]],
+    ) -> dict[str, Any]:
+        checked_at = _utc_now()
+        with self._transaction():
+            reference = self.product_pair_worker_reference(product_pair_id, worker_id)
+            compatibility_check_id = str(uuid4())
+            self._connection.execute(
+                """
+                INSERT INTO product_pair_worker_compatibility_checks (
+                    compatibility_check_id, product_pair_id, worker_id, server, reference_symbol,
+                    checked_by, reference_specification, live_specification,
+                    hard_block_differences, warning_differences, checked_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    compatibility_check_id,
+                    product_pair_id,
+                    worker_id,
+                    reference["server"],
+                    reference_symbol,
+                    checked_by,
+                    json.dumps(reference_specification, sort_keys=True),
+                    None if live_specification is None else json.dumps(live_specification, sort_keys=True),
+                    json.dumps(hard_block_differences, sort_keys=True),
+                    json.dumps(warning_differences, sort_keys=True),
+                    checked_at,
+                ],
+            )
+            self._event(
+                "product_pair_worker_compatibility_checked",
+                {
+                    "compatibility_check_id": compatibility_check_id,
+                    "product_pair_id": product_pair_id,
+                    "worker_id": worker_id,
+                    "checked_by": checked_by,
+                    "reference_symbol": reference_symbol,
+                    "hard_block_differences": hard_block_differences,
+                    "warning_differences": warning_differences,
+                    "applicability_status": "applicable",
+                },
+            )
+            summary = self._product_pair_worker_applicability(
+                self._product_pair_by_id(product_pair_id),
+                {"worker_id": worker_id, "login": reference["login"], "server": reference["server"]},
+            )
+            return {
+                "product_pair_id": product_pair_id,
+                **summary,
+                "compatibility_check_id": compatibility_check_id,
+                "checked_by": checked_by,
+                "checked_at": checked_at,
+                "reference_symbol": reference_symbol,
+                "reference_specification": reference_specification,
+                "live_specification": live_specification,
+                "hard_block_differences": hard_block_differences,
+                "warning_differences": warning_differences,
+            }
+
+    def exclude_product_pair_worker(
+        self,
+        product_pair_id: str,
+        worker_id: str,
+        *,
+        excluded_by: str,
+    ) -> dict[str, Any]:
+        excluded_at = _utc_now()
+        with self._transaction():
+            reference = self.product_pair_worker_reference(product_pair_id, worker_id)
+            existing = self._product_pair_worker_exclusion(product_pair_id, worker_id)
+            if existing is not None:
+                raise LedgerError("Worker is already excluded for this product pair.")
+            latest_check = self._latest_product_pair_worker_compatibility_check(product_pair_id, worker_id)
+            self._connection.execute(
+                """
+                INSERT INTO product_pair_worker_exclusions (
+                    product_pair_id, worker_id, excluded_by, compatibility_check_id, excluded_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                [
+                    product_pair_id,
+                    worker_id,
+                    excluded_by,
+                    None if latest_check is None else latest_check["compatibility_check_id"],
+                    excluded_at,
+                ],
+            )
+            self._event(
+                "product_pair_worker_excluded",
+                {
+                    "product_pair_id": product_pair_id,
+                    "worker_id": worker_id,
+                    "excluded_by": excluded_by,
+                    "compatibility_check_id": None if latest_check is None else latest_check["compatibility_check_id"],
+                },
+            )
+            return self._product_pair_worker_applicability(
+                self._product_pair_by_id(product_pair_id),
+                {"worker_id": worker_id, "login": reference["login"], "server": reference["server"]},
+            )
+
+    def _product_pair_build_confirmation(self, confirmation_id: str) -> dict[str, Any]:
+        row = self._connection.execute(
+            "SELECT confirmation, used_at FROM product_pair_build_confirmations WHERE confirmation_id = ?",
+            [confirmation_id],
+        ).fetchone()
+        if row is None:
+            raise LedgerError("Product pair Build confirmation does not exist.")
+        if row[1] is not None:
+            raise LedgerError("Product pair Build confirmation has already been used.")
+        return json.loads(row[0])
+
+    def _product_catalog_analysis_for_update(self, analysis_id: str) -> dict[str, Any]:
+        row = self._connection.execute(
+            """
+            SELECT analysis_id, requested_by, first_worker_id, first_login, first_server,
+                   second_worker_id, second_login, second_server, policy, status, failure_reason,
+                   current_stage, retry_count, analysis_period, first_catalog_evidence, second_catalog_evidence,
+                   eligible_candidates, exceptions, m15_screening_results, m1_verification_results, requested_at,
+                   catalog_completed_at, m15_screened_at, m1_verified_at, completed_at
+            FROM product_catalog_analyses
+            WHERE analysis_id = ?
+            """,
+            [analysis_id],
+        ).fetchone()
+        if row is None:
+            raise LedgerError("Product catalog analysis does not exist.")
+        return {
+            "analysis_id": row[0],
+            "requested_by": row[1],
+            "first_worker": {"worker_id": row[2], "login": row[3], "server": row[4]},
+            "second_worker": {"worker_id": row[5], "login": row[6], "server": row[7]},
+            "policy": json.loads(row[8]),
+            "status": row[9],
+            "failure_reason": row[10],
+            "current_stage": row[11],
+            "retry_count": row[12],
+            "analysis_period": json.loads(row[13]),
+            "first_catalog_evidence": None if row[14] is None else json.loads(row[14]),
+            "second_catalog_evidence": None if row[15] is None else json.loads(row[15]),
+            "eligible_candidates": json.loads(row[16]),
+            "exceptions": json.loads(row[17]),
+            "m15_screening_results": json.loads(row[18]),
+            "m1_verification_results": json.loads(row[19]),
+            "requested_at": row[20],
+            "catalog_completed_at": row[21],
+            "m15_screened_at": row[22],
+            "m1_verified_at": row[23],
+            "completed_at": row[24],
+        }
+
+    def _analysis_symbol_specification(
+        self,
+        catalog_evidence: dict[str, Any] | None,
+        symbol: str,
+    ) -> dict[str, Any]:
+        if catalog_evidence is None:
+            raise LedgerError("Product catalog analysis does not have immutable catalog evidence.")
+        result = next(
+            (specification for specification in catalog_evidence["symbols"] if specification["symbol"] == symbol),
+            None,
+        )
+        if result is None:
+            raise LedgerError("Selected candidate specification does not exist.")
+        return result
+
+    def _product_pair_confirmation_payload(
+        self,
+        *,
+        confirmation_id: str,
+        analysis: dict[str, Any],
+        verification_result: dict[str, Any],
+        first_specification: dict[str, Any],
+        second_specification: dict[str, Any],
+        requested_by: str,
+    ) -> dict[str, Any]:
+        canonical = sorted(
+            (
+                {
+                    "server": analysis["first_worker"]["server"],
+                    "symbol": verification_result["first_symbol"],
+                    "specification": first_specification,
+                },
+                {
+                    "server": analysis["second_worker"]["server"],
+                    "symbol": verification_result["second_symbol"],
+                    "specification": second_specification,
+                },
+            ),
+            key=lambda item: (str(item["server"]), str(item["symbol"])),
+        )
+        return {
+            "confirmation_id": confirmation_id,
+            "analysis_id": analysis["analysis_id"],
+            "requested_by": requested_by,
+            "analysis_period": analysis["analysis_period"],
+            "policy_snapshot": analysis["policy"],
+            "lot_relationship": {"version": "FX_V1", "ratio": "1:1", "first_lots": 1, "second_lots": 1},
+            "source_workers": {
+                "first_worker": analysis["first_worker"],
+                "second_worker": analysis["second_worker"],
+            },
+            "endpoints": [
+                {"server": item["server"], "symbol": item["symbol"]}
+                for item in canonical
+            ],
+            "reference_specifications": canonical,
+            "approval_evidence": verification_result,
+        }
+
+    def _require_no_active_product_pair(self, endpoints: list[dict[str, Any]]) -> None:
+        existing = self._connection.execute(
+            """
+            SELECT product_pair_id
+            FROM product_pairs
+            WHERE status = 'active'
+              AND endpoint_a_server = ?
+              AND endpoint_a_symbol = ?
+              AND endpoint_b_server = ?
+              AND endpoint_b_symbol = ?
+            """,
+            [
+                str(endpoints[0]["server"]),
+                str(endpoints[0]["symbol"]),
+                str(endpoints[1]["server"]),
+                str(endpoints[1]["symbol"]),
+            ],
+        ).fetchone()
+        if existing is not None:
+            raise LedgerError("An active product pair already exists for this unordered endpoint pair.")
+
+    def _insert_product_pair(
+        self,
+        *,
+        confirmation: dict[str, Any],
+        confirmation_id: str,
+        built_by: str,
+        replaces_product_pair_id: str | None = None,
+    ) -> str:
+        product_pair_id = str(uuid4())
+        endpoints = confirmation["endpoints"]
+        try:
+            self._connection.execute(
+                """
+                INSERT INTO product_pairs (
+                    product_pair_id, status, endpoint_a_server, endpoint_a_symbol, endpoint_b_server, endpoint_b_symbol,
+                    active_pair_key, lot_relationship, policy_snapshot, analysis_period, reference_specifications,
+                    approval_evidence, source_workers, built_from_analysis_id, built_from_confirmation_id, built_by,
+                    created_at, replaces_product_pair_id
+                ) VALUES (?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    product_pair_id,
+                    str(endpoints[0]["server"]),
+                    str(endpoints[0]["symbol"]),
+                    str(endpoints[1]["server"]),
+                    str(endpoints[1]["symbol"]),
+                    _active_product_pair_key(endpoints),
+                    json.dumps(confirmation["lot_relationship"], sort_keys=True),
+                    json.dumps(confirmation["policy_snapshot"], sort_keys=True),
+                    json.dumps(confirmation["analysis_period"], sort_keys=True),
+                    json.dumps(confirmation["reference_specifications"], sort_keys=True),
+                    json.dumps(confirmation["approval_evidence"], sort_keys=True),
+                    json.dumps(confirmation["source_workers"], sort_keys=True),
+                    str(confirmation["analysis_id"]),
+                    confirmation_id,
+                    built_by,
+                    _utc_now(),
+                    replaces_product_pair_id,
+                ],
+            )
+        except duckdb.ConstraintException as error:
+            if "active_pair_key" in str(error):
+                raise LedgerError("An active product pair already exists for this unordered endpoint pair.") from error
+            raise
+        return product_pair_id
+
+    def _product_pair_by_id(self, product_pair_id: str) -> dict[str, Any]:
+        row = self._connection.execute(
+            """
+            SELECT product_pair_id, status, endpoint_a_server, endpoint_a_symbol, endpoint_b_server, endpoint_b_symbol,
+                   lot_relationship, policy_snapshot, analysis_period, reference_specifications, approval_evidence,
+                   source_workers, built_from_analysis_id, built_from_confirmation_id, built_by, created_at,
+                   retired_at, retired_by, retired_reason, replaced_by_product_pair_id, replaces_product_pair_id
+            FROM product_pairs
+            WHERE product_pair_id = ?
+            """,
+            [product_pair_id],
+        ).fetchone()
+        if row is None:
+            raise LedgerError("Product pair does not exist.")
+        return self._product_pair_from_row(row)
+
+    def _product_pair_from_row(self, row: Any) -> dict[str, Any]:
+        return {
+            "product_pair_id": row[0],
+            "status": row[1],
+            "endpoints": [
+                {"server": row[2], "symbol": row[3]},
+                {"server": row[4], "symbol": row[5]},
+            ],
+            "lot_relationship": json.loads(row[6]),
+            "policy_snapshot": json.loads(row[7]),
+            "analysis_period": json.loads(row[8]),
+            "reference_specifications": json.loads(row[9]),
+            "approval_evidence": json.loads(row[10]),
+            "source_workers": json.loads(row[11]),
+            "built_from_analysis_id": row[12],
+            "built_from_confirmation_id": row[13],
+            "built_by": row[14],
+            "created_at": row[15],
+            "retired_at": row[16],
+            "retired_by": row[17],
+            "retired_reason": row[18],
+            "replaced_by_product_pair_id": row[19],
+            "replaces_product_pair_id": row[20],
+        }
+
+    def _product_pair_with_worker_applicability(self, pair: dict[str, Any]) -> dict[str, Any]:
+        latest_retest = self._latest_product_pair_retest(pair["product_pair_id"])
+        if pair["status"] != "active":
+            return {**pair, "latest_retest": latest_retest, "worker_applicability": []}
+        rows = self._connection.execute(
+            """
+            SELECT worker_id, login, server
+            FROM workers
+            WHERE status = 'active' AND server IN (?, ?)
+            ORDER BY approved_at, worker_id
+            """,
+            [pair["endpoints"][0]["server"], pair["endpoints"][1]["server"]],
+        ).fetchall()
+        return {
+            **pair,
+            "latest_retest": latest_retest,
+            "worker_applicability": [
+                self._product_pair_worker_applicability(
+                    pair,
+                    {"worker_id": row[0], "login": row[1], "server": row[2]},
+                )
+                for row in rows
+            ],
+        }
+
+    def _product_pair_worker_applicability(
+        self,
+        pair: dict[str, Any],
+        worker: dict[str, Any],
+    ) -> dict[str, Any]:
+        latest_check = self._latest_product_pair_worker_compatibility_check(pair["product_pair_id"], worker["worker_id"])
+        exclusion = self._product_pair_worker_exclusion(pair["product_pair_id"], worker["worker_id"])
+        return {
+            "worker_id": worker["worker_id"],
+            "login": worker["login"],
+            "server": worker["server"],
+            "applicability_status": "excluded" if exclusion is not None else "applicable",
+            "inspection_status": _product_pair_worker_inspection_status(latest_check),
+            "latest_compatibility_check": latest_check,
+            "exclusion": exclusion,
+        }
+
+    def _latest_product_pair_worker_compatibility_check(
+        self,
+        product_pair_id: str,
+        worker_id: str,
+    ) -> dict[str, Any] | None:
+        row = self._connection.execute(
+            """
+            SELECT compatibility_check_id, checked_by, checked_at, reference_symbol, reference_specification,
+                   live_specification, hard_block_differences, warning_differences
+            FROM product_pair_worker_compatibility_checks
+            WHERE product_pair_id = ? AND worker_id = ?
+            ORDER BY checked_at DESC, compatibility_check_id DESC
+            LIMIT 1
+            """,
+            [product_pair_id, worker_id],
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "compatibility_check_id": row[0],
+            "checked_by": row[1],
+            "checked_at": row[2],
+            "reference_symbol": row[3],
+            "reference_specification": json.loads(row[4]),
+            "live_specification": None if row[5] is None else json.loads(row[5]),
+            "hard_block_differences": json.loads(row[6]),
+            "warning_differences": json.loads(row[7]),
+        }
+
+    def _product_pair_worker_exclusion(
+        self,
+        product_pair_id: str,
+        worker_id: str,
+    ) -> dict[str, Any] | None:
+        row = self._connection.execute(
+            """
+            SELECT excluded_by, compatibility_check_id, excluded_at
+            FROM product_pair_worker_exclusions
+            WHERE product_pair_id = ? AND worker_id = ?
+            """,
+            [product_pair_id, worker_id],
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "excluded_by": row[0],
+            "compatibility_check_id": row[1],
+            "excluded_at": row[2],
+        }
+
+    def _require_running_product_pair_retest(self, retest_id: str) -> None:
+        row = self._connection.execute(
+            "SELECT status FROM product_pair_retests WHERE retest_id = ?",
+            [retest_id],
+        ).fetchone()
+        if row is None:
+            raise LedgerError("Product pair re-test does not exist.")
+        if row[0] != "running":
+            raise LedgerError("Product pair re-test is no longer running.")
+
+    def _latest_product_pair_retest(self, product_pair_id: str) -> dict[str, Any] | None:
+        row = self._connection.execute(
+            """
+            SELECT retest_id, product_pair_id, requested_by,
+                   first_worker_id, first_login, first_server,
+                   second_worker_id, second_login, second_server,
+                   policy_snapshot, analysis_period, reference_specifications,
+                   status, current_stage, retry_count, failure_reason,
+                   first_catalog_evidence, second_catalog_evidence,
+                   m15_screening_results, m1_verification_results,
+                   requested_at, catalog_completed_at, m15_screened_at, m1_verified_at, completed_at
+            FROM product_pair_retests
+            WHERE product_pair_id = ?
+            ORDER BY requested_at DESC, retest_id DESC
+            LIMIT 1
+            """,
+            [product_pair_id],
+        ).fetchone()
+        if row is None:
+            return None
+        return self._product_pair_retest_from_row(row)
+
+    def _product_pair_retest_from_row(self, row: Any) -> dict[str, Any]:
+        return {
+            "retest_id": row[0],
+            "product_pair_id": row[1],
+            "requested_by": row[2],
+            "source_workers": {
+                "first_worker": {"worker_id": row[3], "login": row[4], "server": row[5]},
+                "second_worker": {"worker_id": row[6], "login": row[7], "server": row[8]},
+            },
+            "policy_snapshot": json.loads(row[9]),
+            "analysis_period": json.loads(row[10]),
+            "reference_specifications": json.loads(row[11]),
+            "status": row[12],
+            "current_stage": row[13],
+            "retry_count": row[14],
+            "failure_reason": row[15],
+            "first_catalog_evidence": None if row[16] is None else json.loads(row[16]),
+            "second_catalog_evidence": None if row[17] is None else json.loads(row[17]),
+            "m15_screening_results": json.loads(row[18]),
+            "m1_verification_results": json.loads(row[19]),
+            "requested_at": row[20],
+            "catalog_completed_at": row[21],
+            "m15_screened_at": row[22],
+            "m1_verified_at": row[23],
+            "completed_at": row[24],
+        }
+
     def alerts(self) -> list[dict[str, Any]]:
         with self._lock:
             rows = self._connection.execute(
-                "SELECT alert_id, worker_id, priority, alert_type, reason, occurred_at FROM alerts ORDER BY alert_id"
+                """
+                SELECT alert_id, worker_id, product_pair_id, priority, alert_type, reason, occurred_at
+                FROM alerts
+                ORDER BY alert_id
+                """
             ).fetchall()
         return [
-            {"alert_id": row[0], "worker_id": row[1], "priority": row[2], "alert_type": row[3],
-             "reason": row[4], "occurred_at": row[5]}
+            {"alert_id": row[0], "worker_id": row[1], "product_pair_id": row[2], "priority": row[3], "alert_type": row[4],
+             "reason": row[5], "occurred_at": row[6]}
             for row in rows
         ]
 
@@ -624,10 +1826,21 @@ class ControlLedger:
             [event_type, json.dumps(payload, sort_keys=True), _utc_now()],
         )
 
-    def _alert(self, worker_id: str, priority: str, alert_type: str, reason: str) -> None:
+    def _alert(
+        self,
+        worker_id: str,
+        priority: str,
+        alert_type: str,
+        reason: str,
+        *,
+        product_pair_id: str | None = None,
+    ) -> None:
         self._connection.execute(
-            "INSERT INTO alerts (worker_id, priority, alert_type, reason, occurred_at) VALUES (?, ?, ?, ?, ?)",
-            [worker_id, priority, alert_type, reason, _utc_now()],
+            """
+            INSERT INTO alerts (worker_id, product_pair_id, priority, alert_type, reason, occurred_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            [worker_id, product_pair_id, priority, alert_type, reason, _utc_now()],
         )
 
     def _initialize(self) -> None:
@@ -729,20 +1942,186 @@ class ControlLedger:
                 CREATE TABLE IF NOT EXISTS alerts (
                     alert_id BIGINT PRIMARY KEY DEFAULT nextval('alerts_sequence'),
                     worker_id VARCHAR NOT NULL,
+                    product_pair_id VARCHAR,
                     priority VARCHAR NOT NULL,
                     alert_type VARCHAR NOT NULL,
                     reason VARCHAR NOT NULL,
                     occurred_at TIMESTAMPTZ NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS product_catalog_analyses (
+                    analysis_id VARCHAR PRIMARY KEY,
+                    requested_by VARCHAR NOT NULL,
+                    first_worker_id VARCHAR NOT NULL,
+                    first_login BIGINT NOT NULL,
+                    first_server VARCHAR NOT NULL,
+                    second_worker_id VARCHAR NOT NULL,
+                    second_login BIGINT NOT NULL,
+                    second_server VARCHAR NOT NULL,
+                    policy JSON NOT NULL,
+                    status VARCHAR NOT NULL,
+                    current_stage VARCHAR NOT NULL DEFAULT 'catalog',
+                    retry_count INTEGER NOT NULL DEFAULT 0,
+                    analysis_period JSON NOT NULL DEFAULT '{"ended_at_utc":"","started_at_utc":"","timeframe":"M15"}',
+                    failure_reason VARCHAR,
+                    first_catalog_evidence JSON,
+                    second_catalog_evidence JSON,
+                    eligible_candidates JSON NOT NULL DEFAULT '[]',
+                    exceptions JSON NOT NULL DEFAULT '[]',
+                    m15_screening_results JSON NOT NULL DEFAULT '[]',
+                    m1_verification_results JSON NOT NULL DEFAULT '[]',
+                    requested_at TIMESTAMPTZ NOT NULL,
+                    catalog_completed_at TIMESTAMPTZ,
+                    m15_screened_at TIMESTAMPTZ,
+                    m1_verified_at TIMESTAMPTZ,
+                    completed_at TIMESTAMPTZ
+                );
+                CREATE TABLE IF NOT EXISTS product_pair_build_confirmations (
+                    confirmation_id VARCHAR PRIMARY KEY,
+                    analysis_id VARCHAR NOT NULL,
+                    requested_by VARCHAR NOT NULL,
+                    first_server VARCHAR NOT NULL,
+                    first_symbol VARCHAR NOT NULL,
+                    second_server VARCHAR NOT NULL,
+                    second_symbol VARCHAR NOT NULL,
+                    confirmation JSON NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL,
+                    used_at TIMESTAMPTZ
+                );
+                CREATE TABLE IF NOT EXISTS product_pairs (
+                    product_pair_id VARCHAR PRIMARY KEY,
+                    status VARCHAR NOT NULL,
+                    endpoint_a_server VARCHAR NOT NULL,
+                    endpoint_a_symbol VARCHAR NOT NULL,
+                    endpoint_b_server VARCHAR NOT NULL,
+                    endpoint_b_symbol VARCHAR NOT NULL,
+                    active_pair_key VARCHAR,
+                    lot_relationship JSON NOT NULL,
+                    policy_snapshot JSON NOT NULL,
+                    analysis_period JSON NOT NULL,
+                    reference_specifications JSON NOT NULL,
+                    approval_evidence JSON NOT NULL,
+                    source_workers JSON NOT NULL,
+                    built_from_analysis_id VARCHAR NOT NULL,
+                    built_from_confirmation_id VARCHAR NOT NULL,
+                    built_by VARCHAR NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL,
+                    retired_at TIMESTAMPTZ,
+                    retired_by VARCHAR,
+                    retired_reason VARCHAR,
+                    replaced_by_product_pair_id VARCHAR,
+                    replaces_product_pair_id VARCHAR
+                );
+                CREATE TABLE IF NOT EXISTS product_pair_worker_compatibility_checks (
+                    compatibility_check_id VARCHAR PRIMARY KEY,
+                    product_pair_id VARCHAR NOT NULL,
+                    worker_id VARCHAR NOT NULL,
+                    server VARCHAR NOT NULL,
+                    reference_symbol VARCHAR NOT NULL,
+                    checked_by VARCHAR NOT NULL,
+                    reference_specification JSON NOT NULL,
+                    live_specification JSON,
+                    hard_block_differences JSON NOT NULL,
+                    warning_differences JSON NOT NULL,
+                    checked_at TIMESTAMPTZ NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS product_pair_worker_exclusions (
+                    product_pair_id VARCHAR NOT NULL,
+                    worker_id VARCHAR NOT NULL,
+                    excluded_by VARCHAR NOT NULL,
+                    compatibility_check_id VARCHAR,
+                    excluded_at TIMESTAMPTZ NOT NULL,
+                    PRIMARY KEY (product_pair_id, worker_id)
+                );
+                CREATE TABLE IF NOT EXISTS product_pair_retests (
+                    retest_id VARCHAR PRIMARY KEY,
+                    product_pair_id VARCHAR NOT NULL,
+                    requested_by VARCHAR NOT NULL,
+                    first_worker_id VARCHAR NOT NULL,
+                    first_login BIGINT NOT NULL,
+                    first_server VARCHAR NOT NULL,
+                    second_worker_id VARCHAR NOT NULL,
+                    second_login BIGINT NOT NULL,
+                    second_server VARCHAR NOT NULL,
+                    policy_snapshot JSON NOT NULL,
+                    analysis_period JSON NOT NULL,
+                    reference_specifications JSON NOT NULL,
+                    status VARCHAR NOT NULL,
+                    current_stage VARCHAR NOT NULL DEFAULT 'catalog',
+                    retry_count INTEGER NOT NULL DEFAULT 0,
+                    failure_reason VARCHAR,
+                    first_catalog_evidence JSON,
+                    second_catalog_evidence JSON,
+                    m15_screening_results JSON NOT NULL DEFAULT '[]',
+                    m1_verification_results JSON NOT NULL DEFAULT '[]',
+                    requested_at TIMESTAMPTZ NOT NULL,
+                    catalog_completed_at TIMESTAMPTZ,
+                    m15_screened_at TIMESTAMPTZ,
+                    m1_verified_at TIMESTAMPTZ,
+                    completed_at TIMESTAMPTZ
+                );
                 """
             )
+            self._connection.execute("ALTER TABLE alerts ADD COLUMN IF NOT EXISTS product_pair_id VARCHAR")
             self._connection.execute(
                 "ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS password_secret_deleted_at TIMESTAMPTZ"
             )
             self._connection.execute("ALTER TABLE workers ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ")
             self._connection.execute("ALTER TABLE workers ADD COLUMN IF NOT EXISTS safety_state VARCHAR DEFAULT 'connected'")
             self._connection.execute("ALTER TABLE workers ADD COLUMN IF NOT EXISTS revoked_at TIMESTAMPTZ")
+            self._connection.execute("ALTER TABLE product_pairs ADD COLUMN IF NOT EXISTS active_pair_key VARCHAR")
+            self._connection.execute(
+                """
+                UPDATE product_pairs
+                SET active_pair_key = json_array(
+                    json_array(endpoint_a_server, endpoint_a_symbol),
+                    json_array(endpoint_b_server, endpoint_b_symbol)
+                )
+                WHERE status = 'active' AND active_pair_key IS NULL
+                """
+            )
+            self._connection.execute(
+                "UPDATE product_pairs SET active_pair_key = NULL WHERE status <> 'active' AND active_pair_key IS NOT NULL"
+            )
+            self._connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS product_pairs_active_pair_key_idx ON product_pairs(active_pair_key)"
+            )
             self._connection.execute("UPDATE workers SET safety_state = 'connected' WHERE safety_state IS NULL")
+            self._connection.execute("ALTER TABLE product_catalog_analyses ADD COLUMN IF NOT EXISTS current_stage VARCHAR DEFAULT 'catalog'")
+            self._connection.execute("ALTER TABLE product_catalog_analyses ADD COLUMN IF NOT EXISTS retry_count INTEGER DEFAULT 0")
+            self._connection.execute(
+                """ALTER TABLE product_catalog_analyses
+                ADD COLUMN IF NOT EXISTS analysis_period JSON DEFAULT '{"ended_at_utc":"","started_at_utc":"","timeframe":"M15"}'"""
+            )
+            self._connection.execute(
+                "ALTER TABLE product_catalog_analyses ADD COLUMN IF NOT EXISTS m15_screening_results JSON DEFAULT '[]'"
+            )
+            self._connection.execute(
+                "ALTER TABLE product_catalog_analyses ADD COLUMN IF NOT EXISTS m1_verification_results JSON DEFAULT '[]'"
+            )
+            self._connection.execute(
+                "ALTER TABLE product_catalog_analyses ADD COLUMN IF NOT EXISTS catalog_completed_at TIMESTAMPTZ"
+            )
+            self._connection.execute(
+                "ALTER TABLE product_catalog_analyses ADD COLUMN IF NOT EXISTS m15_screened_at TIMESTAMPTZ"
+            )
+            self._connection.execute(
+                "ALTER TABLE product_catalog_analyses ADD COLUMN IF NOT EXISTS m1_verified_at TIMESTAMPTZ"
+            )
+            self._connection.execute(
+                "UPDATE product_catalog_analyses SET current_stage = 'catalog' WHERE current_stage IS NULL"
+            )
+            self._connection.execute("UPDATE product_catalog_analyses SET retry_count = 0 WHERE retry_count IS NULL")
+            self._connection.execute(
+                """UPDATE product_catalog_analyses
+                SET analysis_period = '{"ended_at_utc":"","started_at_utc":"","timeframe":"M15"}'
+                WHERE analysis_period IS NULL"""
+            )
+            self._connection.execute(
+                "UPDATE product_catalog_analyses SET m15_screening_results = '[]' WHERE m15_screening_results IS NULL"
+            )
+            self._connection.execute(
+                "UPDATE product_catalog_analyses SET m1_verification_results = '[]' WHERE m1_verification_results IS NULL"
+            )
             self._migrate_reconciliation_snapshots()
 
     def _migrate_reconciliation_snapshots(self) -> None:
@@ -798,6 +2177,24 @@ class _Transaction:
         self._connection.execute("COMMIT" if exc_type is None or commit_authentication_state else "ROLLBACK")
         self._lock.release()
         return False
+
+
+def _product_pair_worker_inspection_status(latest_check: dict[str, Any] | None) -> str:
+    if latest_check is None:
+        return "uninspected"
+    if latest_check["hard_block_differences"] or latest_check["warning_differences"]:
+        return "differences_detected"
+    return "compatible"
+
+
+def _active_product_pair_key(endpoints: list[dict[str, Any]]) -> str:
+    return json.dumps(
+        [
+            [str(endpoints[0]["server"]), str(endpoints[0]["symbol"])],
+            [str(endpoints[1]["server"]), str(endpoints[1]["symbol"])],
+        ],
+        separators=(",", ":"),
+    )
 
 
 def _hash(value: str) -> str:

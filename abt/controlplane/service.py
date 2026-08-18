@@ -1,11 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import Future as ConcurrentFuture
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
+import hashlib
+import json
 import logging
+import math
+import queue
 from contextlib import asynccontextmanager
 from pathlib import Path
 import secrets
-from typing import Annotated, Callable, cast
+from statistics import median
+from typing import Annotated, Any, Callable, cast
 from uuid import uuid4
 
 from fastapi import Cookie, FastAPI, Header, HTTPException, Response, WebSocket, WebSocketDisconnect, status
@@ -42,6 +50,54 @@ class EnrollmentRequest(BaseModel):
         if any(character in value for character in "\r\n"):
             raise ValueError("server must not contain control characters")
         return value
+
+
+class ProductCatalogAnalysisPolicy(BaseModel):
+    label: str = Field(min_length=1, max_length=128)
+    require_forex_calculation_mode: bool = True
+    require_equal_base_currency: bool = True
+    require_equal_profit_currency: bool = True
+    minimum_common_coverage: float = Field(default=0.99, ge=0, le=1)
+    minimum_m15_return_correlation: float = Field(default=0.98, ge=-1, le=1)
+    minimum_m1_return_correlation: float = Field(default=0.97, ge=-1, le=1)
+    maximum_m1_median_price_difference_points: float = Field(default=2.0, ge=0)
+    maximum_m1_p99_price_difference_points: float = Field(default=15.0, ge=0)
+
+
+class ProductCatalogAnalysisRequest(BaseModel):
+    first_worker_id: str = Field(min_length=1)
+    second_worker_id: str = Field(min_length=1)
+    policy: ProductCatalogAnalysisPolicy
+
+
+class ProductPairBuildConfirmationRequest(BaseModel):
+    first_symbol: str = Field(min_length=1)
+    second_symbol: str = Field(min_length=1)
+
+
+class ProductPairConfirmationUseRequest(BaseModel):
+    confirmation_id: str = Field(min_length=1)
+
+
+class ProductPairRetestRequest(BaseModel):
+    first_worker_id: str = Field(min_length=1)
+    second_worker_id: str = Field(min_length=1)
+
+
+@dataclass
+class _WorkerAnalysisRequest:
+    analysis_id: str
+    request_id: str
+    stage: str
+    message: dict[str, object]
+    future: ConcurrentFuture[dict[str, object]]
+
+
+@dataclass(eq=False)
+class _WorkerSessionConnection:
+    websocket: WebSocket
+    outbound: queue.Queue[_WorkerAnalysisRequest | None] = field(default_factory=queue.Queue)
+    pending: dict[str, _WorkerAnalysisRequest] = field(default_factory=dict)
 
 
 def create_app(
@@ -90,7 +146,8 @@ def create_app(
 
     app = FastAPI(title="abt control plane", version="0.1.0", lifespan=lifespan)
     app.state.ledger = ledger
-    worker_connections: dict[str, set[WebSocket]] = {}
+    worker_connections: dict[str, set[_WorkerSessionConnection]] = {}
+    worker_execution_locks: dict[str, asyncio.Lock] = {}
 
     @app.get("/health")
     def health() -> dict[str, str]:
@@ -202,6 +259,387 @@ def create_app(
         _require_admin(ledger, abt_admin_session)
         return ledger.alerts()
 
+    @app.post("/api/admin/product-catalog-analyses", status_code=status.HTTP_201_CREATED)
+    async def create_product_catalog_analysis(
+        body: ProductCatalogAnalysisRequest,
+        abt_admin_session: Annotated[str | None, Cookie()] = None,
+        x_csrf_token: Annotated[str | None, Header()] = None,
+    ) -> dict[str, object]:
+        username = _require_admin(ledger, abt_admin_session, x_csrf_token, require_csrf=True)
+        policy = cast(dict[str, object], body.policy.model_dump(mode="json"))
+        try:
+            first_connection = _connected_worker_session(worker_connections, body.first_worker_id)
+            second_connection = _connected_worker_session(worker_connections, body.second_worker_id)
+            analysis_period = _previous_complete_utc_week()
+            async with _pair_worker_execution(worker_execution_locks, body.first_worker_id, body.second_worker_id):
+                analysis_id = ledger.create_product_catalog_analysis(
+                    first_worker_id=body.first_worker_id,
+                    second_worker_id=body.second_worker_id,
+                    requested_by=username,
+                    policy=policy,
+                    analysis_period=analysis_period,
+                )
+                current_stage = "catalog"
+                m15_screening_results: list[dict[str, object]] = []
+                try:
+                    first_result, second_result = await asyncio.gather(
+                        _request_product_catalog_evidence(first_connection, analysis_id, policy),
+                        _request_product_catalog_evidence(second_connection, analysis_id, policy),
+                    )
+                    first_evidence = _validated_product_catalog_response(first_result, analysis_id)
+                    second_evidence = _validated_product_catalog_response(second_result, analysis_id)
+                    eligible_candidates, exceptions = _analyze_product_catalogs(
+                        first_evidence["symbols"], second_evidence["symbols"]
+                    )
+                    ledger.record_product_catalog_analysis_catalog(
+                        analysis_id,
+                        first_evidence=first_evidence,
+                        second_evidence=second_evidence,
+                        eligible_candidates=eligible_candidates,
+                        exceptions=exceptions,
+                    )
+                    m1_verification_results: list[dict[str, object]] = []
+                    if eligible_candidates:
+                        current_stage = "m15_screening"
+                        first_market_data, second_market_data = await _request_market_data_with_retry(
+                            analysis_id,
+                            first_connection=first_connection,
+                            second_connection=second_connection,
+                            first_symbols=_candidate_symbols(eligible_candidates, "first_symbol"),
+                            second_symbols=_candidate_symbols(eligible_candidates, "second_symbol"),
+                            analysis_period=analysis_period,
+                            policy=policy,
+                            stage="m15_screening",
+                            timeframe="M15",
+                            record_retry=lambda reason: ledger.record_product_catalog_analysis_retry(
+                                analysis_id,
+                                "m15_screening",
+                                reason,
+                            ),
+                        )
+                        m15_screening_results = _screen_m15_candidates(
+                            eligible_candidates,
+                            first_market_data,
+                            second_market_data,
+                            policy,
+                        )
+                        m15_passing_candidates = [
+                            result for result in m15_screening_results if result["screening_status"] == "passed"
+                        ]
+                        if m15_passing_candidates:
+                            current_stage = "m1_verification"
+                            first_m1_market_data, second_m1_market_data = await _request_market_data_with_retry(
+                                analysis_id,
+                                first_connection=first_connection,
+                                second_connection=second_connection,
+                                first_symbols=_candidate_symbols(m15_passing_candidates, "first_symbol"),
+                                second_symbols=_candidate_symbols(m15_passing_candidates, "second_symbol"),
+                                analysis_period=analysis_period,
+                                policy=policy,
+                                stage="m1_verification",
+                                timeframe="M1",
+                                record_retry=lambda reason: ledger.record_product_catalog_analysis_retry(
+                                    analysis_id,
+                                    "m1_verification",
+                                    reason,
+                                ),
+                            )
+                            m1_verification_results = _verify_m1_candidates(
+                                m15_passing_candidates,
+                                first_m1_market_data,
+                                second_m1_market_data,
+                                first_evidence["symbols"],
+                                second_evidence["symbols"],
+                                policy,
+                            )
+                    ledger.complete_product_catalog_analysis(
+                        analysis_id,
+                        m15_screening_results=m15_screening_results,
+                        m1_verification_results=m1_verification_results,
+                        m1_verified=bool(m1_verification_results),
+                    )
+                except (asyncio.TimeoutError, LedgerError, ValueError) as error:
+                    stage = {
+                        "catalog": "catalog_failed",
+                        "m15_screening": "m15_failed",
+                        "m1_verification": "m1_failed",
+                    }[current_stage]
+                    ledger.fail_product_catalog_analysis(
+                        analysis_id,
+                        str(error),
+                        stage=stage,
+                        clear_m15_results=stage != "m1_failed",
+                        m15_screening_results=m15_screening_results,
+                    )
+                return ledger.product_catalog_analysis(analysis_id)
+        except LedgerError as error:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
+
+    @app.get("/api/admin/product-catalog-analyses/{analysis_id}")
+    def get_product_catalog_analysis(
+        analysis_id: str,
+        abt_admin_session: Annotated[str | None, Cookie()] = None,
+    ) -> dict[str, object]:
+        _require_admin(ledger, abt_admin_session)
+        try:
+            return ledger.product_catalog_analysis(analysis_id)
+        except LedgerError as error:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
+
+    @app.post("/api/admin/product-catalog-analyses/{analysis_id}/product-pair-build-confirmations", status_code=status.HTTP_201_CREATED)
+    def create_product_pair_build_confirmation(
+        analysis_id: str,
+        body: ProductPairBuildConfirmationRequest,
+        abt_admin_session: Annotated[str | None, Cookie()] = None,
+        x_csrf_token: Annotated[str | None, Header()] = None,
+    ) -> dict[str, object]:
+        username = _require_admin(ledger, abt_admin_session, x_csrf_token, require_csrf=True)
+        try:
+            return ledger.create_product_pair_build_confirmation(
+                analysis_id,
+                first_symbol=body.first_symbol,
+                second_symbol=body.second_symbol,
+                requested_by=username,
+            )
+        except LedgerError as error:
+            raise HTTPException(status_code=_ledger_error_status(error), detail=str(error)) from error
+
+    @app.get("/api/admin/product-pairs")
+    def list_product_pairs(
+        abt_admin_session: Annotated[str | None, Cookie()] = None,
+    ) -> list[dict[str, object]]:
+        _require_admin(ledger, abt_admin_session)
+        return ledger.product_pairs()
+
+    @app.post("/api/admin/product-pairs/{product_pair_id}/workers/{worker_id}/compatibility-check")
+    async def check_product_pair_worker_compatibility(
+        product_pair_id: str,
+        worker_id: str,
+        abt_admin_session: Annotated[str | None, Cookie()] = None,
+        x_csrf_token: Annotated[str | None, Header()] = None,
+    ) -> dict[str, object]:
+        username = _require_admin(ledger, abt_admin_session, x_csrf_token, require_csrf=True)
+        try:
+            reference = ledger.product_pair_worker_reference(product_pair_id, worker_id)
+            connection = _connected_worker_session(
+                worker_connections,
+                worker_id,
+                reason="Selected worker must remain connected during product pair compatibility checks.",
+            )
+            request_analysis_id = f"compatibility-check:{uuid4()}"
+            response = await _request_product_catalog_evidence(connection, request_analysis_id, {})
+            live_catalog = _validated_product_catalog_response(response, request_analysis_id)
+            live_specification = next(
+                (
+                    symbol
+                    for symbol in cast(list[dict[str, object]], live_catalog["symbols"])
+                    if symbol["symbol"] == reference["reference_symbol"]
+                ),
+                None,
+            )
+            hard_block_differences, warning_differences = _product_pair_compatibility_differences(
+                cast(dict[str, object], reference["reference_specification"]),
+                live_specification,
+            )
+            return ledger.record_product_pair_worker_compatibility_check(
+                product_pair_id,
+                worker_id,
+                checked_by=username,
+                reference_symbol=str(reference["reference_symbol"]),
+                reference_specification=cast(dict[str, object], reference["reference_specification"]),
+                live_specification=live_specification,
+                hard_block_differences=hard_block_differences,
+                warning_differences=warning_differences,
+            )
+        except (LedgerError, ValueError) as error:
+            raise HTTPException(status_code=_ledger_error_status(error), detail=str(error)) from error
+
+    @app.post("/api/admin/product-pairs/{product_pair_id}/workers/{worker_id}/exclude")
+    def exclude_product_pair_worker(
+        product_pair_id: str,
+        worker_id: str,
+        abt_admin_session: Annotated[str | None, Cookie()] = None,
+        x_csrf_token: Annotated[str | None, Header()] = None,
+    ) -> dict[str, object]:
+        username = _require_admin(ledger, abt_admin_session, x_csrf_token, require_csrf=True)
+        try:
+            return ledger.exclude_product_pair_worker(product_pair_id, worker_id, excluded_by=username)
+        except LedgerError as error:
+            raise HTTPException(status_code=_ledger_error_status(error), detail=str(error)) from error
+
+    @app.post("/api/admin/product-pairs/{product_pair_id}/retests", status_code=status.HTTP_201_CREATED)
+    async def retest_product_pair(
+        product_pair_id: str,
+        body: ProductPairRetestRequest,
+        abt_admin_session: Annotated[str | None, Cookie()] = None,
+        x_csrf_token: Annotated[str | None, Header()] = None,
+    ) -> dict[str, object]:
+        username = _require_admin(ledger, abt_admin_session, x_csrf_token, require_csrf=True)
+        try:
+            analysis_period = _previous_complete_utc_week()
+            retest = ledger.create_product_pair_retest(
+                product_pair_id,
+                first_worker_id=body.first_worker_id,
+                second_worker_id=body.second_worker_id,
+                requested_by=username,
+                analysis_period=analysis_period,
+            )
+            first_worker = cast(dict[str, object], retest["source_workers"])["first_worker"]
+            second_worker = cast(dict[str, object], retest["source_workers"])["second_worker"]
+            first_connection = _connected_worker_session(
+                worker_connections,
+                str(cast(dict[str, object], first_worker)["worker_id"]),
+                reason="Selected worker must remain connected during product pair re-tests.",
+            )
+            second_connection = _connected_worker_session(
+                worker_connections,
+                str(cast(dict[str, object], second_worker)["worker_id"]),
+                reason="Selected worker must remain connected during product pair re-tests.",
+            )
+            policy = cast(dict[str, object], retest["policy_snapshot"])
+            current_stage = "catalog"
+            m15_screening_results: list[dict[str, object]] = []
+            async with _pair_worker_execution(
+                worker_execution_locks,
+                str(cast(dict[str, object], first_worker)["worker_id"]),
+                str(cast(dict[str, object], second_worker)["worker_id"]),
+            ):
+                try:
+                    first_result, second_result = await asyncio.gather(
+                        _request_product_catalog_evidence(first_connection, str(retest["retest_id"]), policy),
+                        _request_product_catalog_evidence(second_connection, str(retest["retest_id"]), policy),
+                    )
+                    first_evidence = _validated_product_catalog_response(first_result, str(retest["retest_id"]))
+                    second_evidence = _validated_product_catalog_response(second_result, str(retest["retest_id"]))
+                    ledger.record_product_pair_retest_catalog(
+                        str(retest["retest_id"]),
+                        first_evidence=first_evidence,
+                        second_evidence=second_evidence,
+                    )
+                    candidate = _product_pair_retest_candidate(
+                        cast(list[dict[str, object]], retest["reference_specifications"]),
+                        first_evidence,
+                        second_evidence,
+                    )
+                    current_stage = "m15_screening"
+                    first_market_data, second_market_data = await _request_market_data_with_retry(
+                        str(retest["retest_id"]),
+                        first_connection=first_connection,
+                        second_connection=second_connection,
+                        first_symbols=[str(candidate["first_symbol"])],
+                        second_symbols=[str(candidate["second_symbol"])],
+                        analysis_period=analysis_period,
+                        policy=policy,
+                        stage="m15_screening",
+                        timeframe="M15",
+                        record_retry=lambda reason: ledger.record_product_pair_retest_retry(
+                            str(retest["retest_id"]),
+                            "m15_screening",
+                            reason,
+                        ),
+                    )
+                    m15_screening_results = _screen_m15_candidates(
+                        [candidate],
+                        first_market_data,
+                        second_market_data,
+                        policy,
+                    )
+                    m1_verification_results: list[dict[str, object]] = []
+                    if m15_screening_results[0]["screening_status"] == "passed":
+                        current_stage = "m1_verification"
+                        first_m1_market_data, second_m1_market_data = await _request_market_data_with_retry(
+                            str(retest["retest_id"]),
+                            first_connection=first_connection,
+                            second_connection=second_connection,
+                            first_symbols=[str(candidate["first_symbol"])],
+                            second_symbols=[str(candidate["second_symbol"])],
+                            analysis_period=analysis_period,
+                            policy=policy,
+                            stage="m1_verification",
+                            timeframe="M1",
+                            record_retry=lambda reason: ledger.record_product_pair_retest_retry(
+                                str(retest["retest_id"]),
+                                "m1_verification",
+                                reason,
+                            ),
+                        )
+                        m1_verification_results = _verify_m1_candidates(
+                            [candidate],
+                            first_m1_market_data,
+                            second_m1_market_data,
+                            cast(list[dict[str, object]], first_evidence["symbols"]),
+                            cast(list[dict[str, object]], second_evidence["symbols"]),
+                            policy,
+                        )
+                    passed = (
+                        bool(m1_verification_results)
+                        and m1_verification_results[0]["verification_status"] == "passed"
+                    )
+                    failure_reason = None if passed else "Re-test failed the original analysis policy."
+                    return ledger.complete_product_pair_retest(
+                        str(retest["retest_id"]),
+                        m15_screening_results=m15_screening_results,
+                        m1_verification_results=m1_verification_results,
+                        passed=passed,
+                        failure_reason=failure_reason,
+                    )
+                except (asyncio.TimeoutError, LedgerError, ValueError) as error:
+                    stage = {
+                        "catalog": "catalog_failed",
+                        "m15_screening": "m15_failed",
+                        "m1_verification": "m1_failed",
+                    }[current_stage]
+                    return ledger.fail_product_pair_retest(
+                        str(retest["retest_id"]),
+                        str(error),
+                        stage=stage,
+                        clear_m15_results=stage != "m1_failed",
+                        m15_screening_results=m15_screening_results,
+                    )
+        except LedgerError as error:
+            raise HTTPException(status_code=_ledger_error_status(error), detail=str(error)) from error
+
+    @app.post("/api/admin/product-pairs", status_code=status.HTTP_201_CREATED)
+    def build_product_pair(
+        body: ProductPairConfirmationUseRequest,
+        abt_admin_session: Annotated[str | None, Cookie()] = None,
+        x_csrf_token: Annotated[str | None, Header()] = None,
+    ) -> dict[str, object]:
+        username = _require_admin(ledger, abt_admin_session, x_csrf_token, require_csrf=True)
+        try:
+            return ledger.build_product_pair(body.confirmation_id, username)
+        except LedgerError as error:
+            raise HTTPException(status_code=_ledger_error_status(error), detail=str(error)) from error
+
+    @app.post("/api/admin/product-pairs/{product_pair_id}/replace", status_code=status.HTTP_201_CREATED)
+    def replace_product_pair(
+        product_pair_id: str,
+        body: ProductPairConfirmationUseRequest,
+        abt_admin_session: Annotated[str | None, Cookie()] = None,
+        x_csrf_token: Annotated[str | None, Header()] = None,
+    ) -> dict[str, object]:
+        username = _require_admin(ledger, abt_admin_session, x_csrf_token, require_csrf=True)
+        try:
+            return ledger.replace_product_pair(
+                product_pair_id,
+                confirmation_id=body.confirmation_id,
+                replaced_by=username,
+            )
+        except LedgerError as error:
+            raise HTTPException(status_code=_ledger_error_status(error), detail=str(error)) from error
+
+    @app.post("/api/admin/product-pairs/{product_pair_id}/retire")
+    def retire_product_pair(
+        product_pair_id: str,
+        abt_admin_session: Annotated[str | None, Cookie()] = None,
+        x_csrf_token: Annotated[str | None, Header()] = None,
+    ) -> dict[str, object]:
+        username = _require_admin(ledger, abt_admin_session, x_csrf_token, require_csrf=True)
+        try:
+            return ledger.retire_product_pair(product_pair_id, username)
+        except LedgerError as error:
+            raise HTTPException(status_code=_ledger_error_status(error), detail=str(error)) from error
+
     @app.post("/api/admin/workers/{worker_id}/revoke", status_code=status.HTTP_204_NO_CONTENT)
     async def revoke_worker(
         worker_id: str,
@@ -216,7 +654,7 @@ def create_app(
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
         connections = tuple(worker_connections.pop(worker_id, set()))
         await asyncio.gather(
-            *(connection.close(code=status.WS_1008_POLICY_VIOLATION) for connection in connections),
+            *(connection.websocket.close(code=status.WS_1008_POLICY_VIOLATION) for connection in connections),
             return_exceptions=True,
         )
         return Response(status_code=status.HTTP_204_NO_CONTENT)
@@ -341,6 +779,7 @@ def create_app(
     @app.websocket("/api/worker/session")
     async def worker_session(websocket: WebSocket) -> None:
         await websocket.accept()
+        sender_task: asyncio.Task[None] | None = None
         try:
             request = await _worker_message(websocket, {"worker_id", "certificate"})
             worker = ledger.active_worker(_required_text(request, "worker_id"))
@@ -368,7 +807,9 @@ def create_app(
                 nonce=nonce,
             )
             ledger.record_worker_session(worker.worker_id)
-            worker_connections.setdefault(worker.worker_id, set()).add(websocket)
+            connection = _WorkerSessionConnection(websocket)
+            worker_connections.setdefault(worker.worker_id, set()).add(connection)
+            sender_task = asyncio.create_task(_send_worker_analysis_requests(connection))
             await websocket.send_json(
                 {"type": "authenticated", "worker_id": worker.worker_id, "cursor": ledger.reconciliation_cursor(worker.worker_id)}
             )
@@ -399,14 +840,21 @@ def create_app(
                 elif message_type == "delta":
                     _record_delta(ledger, worker.worker_id, request)
                     await websocket.send_json({"type": "accepted", "cursor": request["cursor"]})
+                elif message_type == "product_catalog_analysis_response":
+                    _record_product_catalog_analysis_response(connection, request)
                 else:
                     raise ValueError("Invalid worker message.")
         except (LedgerError, ProofError, SecretStoreError, ValueError, WebSocketDisconnect):
             await _reject_worker(websocket)
         finally:
+            if sender_task is not None:
+                connection.outbound.put(None)
+                await asyncio.gather(sender_task, return_exceptions=True)
+            if "connection" in locals():
+                _fail_pending_worker_analysis_requests(connection, "Worker disconnected during product catalog analysis.")
             connections = worker_connections.get(worker.worker_id) if "worker" in locals() else None
-            if connections is not None:
-                connections.discard(websocket)
+            if connections is not None and "connection" in locals():
+                connections.discard(connection)
                 if not connections:
                     worker_connections.pop(worker.worker_id, None)
 
@@ -446,6 +894,700 @@ def _delete_expired_pending_secrets(ledger: ControlLedger, secret_store: SecretS
     for secret_ref in ledger.expire_pending_enrollments():
         secret_store.delete_password(secret_ref)
         ledger.mark_pending_password_deleted(secret_ref)
+
+
+def _ledger_error_status(error: LedgerError) -> int:
+    return status.HTTP_404_NOT_FOUND if "does not exist" in str(error) else status.HTTP_409_CONFLICT
+
+
+def _connected_worker_session(
+    worker_connections: dict[str, set[_WorkerSessionConnection]],
+    worker_id: str,
+    *,
+    reason: str = "Selected worker must remain connected during product catalog analysis.",
+) -> _WorkerSessionConnection:
+    connections = worker_connections.get(worker_id)
+    if not connections:
+        raise LedgerError(reason)
+    return next(iter(connections))
+
+
+async def _send_worker_analysis_requests(connection: _WorkerSessionConnection) -> None:
+    while True:
+        request = await asyncio.to_thread(connection.outbound.get)
+        if request is None:
+            return
+        connection.pending[request.request_id] = request
+        await connection.websocket.send_json(request.message)
+
+
+async def _request_product_catalog_evidence(
+    connection: _WorkerSessionConnection,
+    analysis_id: str,
+    policy: dict[str, object],
+) -> dict[str, object]:
+    return await _request_worker_analysis(
+        connection,
+        analysis_id=analysis_id,
+        stage="catalog",
+        timeout=5,
+        message={
+            "type": "product_catalog_analysis_request",
+            "stage": "catalog",
+            "analysis_id": analysis_id,
+            "request_id": str(uuid4()),
+            "policy": policy,
+        },
+    )
+
+
+async def _request_market_data_with_retry(
+    analysis_id: str,
+    *,
+    first_connection: _WorkerSessionConnection,
+    second_connection: _WorkerSessionConnection,
+    first_symbols: list[str],
+    second_symbols: list[str],
+    analysis_period: dict[str, object],
+    policy: dict[str, object],
+    stage: str,
+    timeframe: str,
+    record_retry: Callable[[str], None],
+) -> tuple[dict[str, object], dict[str, object]]:
+    last_error: asyncio.TimeoutError | LedgerError | ValueError | None = None
+    for attempt in range(2):
+        try:
+            first_response, second_response = await asyncio.gather(
+                _request_worker_analysis(
+                    first_connection,
+                    analysis_id=analysis_id,
+                    stage=stage,
+                    timeout=5,
+                    message=_market_data_request(analysis_id, stage, timeframe, first_symbols, analysis_period, policy),
+                ),
+                _request_worker_analysis(
+                    second_connection,
+                    analysis_id=analysis_id,
+                    stage=stage,
+                    timeout=5,
+                    message=_market_data_request(analysis_id, stage, timeframe, second_symbols, analysis_period, policy),
+                ),
+            )
+            return (
+                _validated_market_data_response(first_response, analysis_id, stage, timeframe, first_symbols, analysis_period),
+                _validated_market_data_response(second_response, analysis_id, stage, timeframe, second_symbols, analysis_period),
+            )
+        except (asyncio.TimeoutError, LedgerError, ValueError) as error:
+            last_error = error
+            if attempt == 1:
+                break
+            record_retry(str(error))
+    assert last_error is not None
+    raise last_error
+
+
+async def _request_worker_analysis(
+    connection: _WorkerSessionConnection,
+    *,
+    analysis_id: str,
+    stage: str,
+    timeout: int,
+    message: dict[str, object],
+) -> dict[str, object]:
+    request = _WorkerAnalysisRequest(
+        analysis_id=analysis_id,
+        request_id=str(message["request_id"]),
+        stage=stage,
+        message=message,
+        future=ConcurrentFuture(),
+    )
+    connection.outbound.put(request)
+    try:
+        return await asyncio.wait_for(asyncio.wrap_future(request.future), timeout=timeout)
+    finally:
+        connection.pending.pop(request.request_id, None)
+
+
+def _record_product_catalog_analysis_response(
+    connection: _WorkerSessionConnection,
+    request: dict[str, object],
+) -> None:
+    analysis_id = _required_text(request, "analysis_id")
+    request_id = _required_text(request, "request_id")
+    pending = connection.pending.pop(request_id, None)
+    if pending is None:
+        return
+    if pending.analysis_id != analysis_id or request.get("stage", "catalog") != pending.stage:
+        raise ValueError("Invalid worker product catalog analysis response.")
+    if not pending.future.done():
+        pending.future.set_result(request)
+
+
+def _fail_pending_worker_analysis_requests(connection: _WorkerSessionConnection, reason: str) -> None:
+    for request in connection.pending.values():
+        if not request.future.done():
+            request.future.set_exception(LedgerError(reason))
+    connection.pending.clear()
+
+
+def _validated_product_catalog_response(response: dict[str, object], analysis_id: str) -> dict[str, object]:
+    if response.get("type") != "product_catalog_analysis_response":
+        raise ValueError("Worker returned an invalid product catalog analysis response.")
+    if response.get("stage", "catalog") != "catalog":
+        raise ValueError("Worker returned an invalid product catalog analysis response.")
+    if _required_text(response, "analysis_id") != analysis_id:
+        raise ValueError("Worker returned a mismatched product catalog analysis response.")
+    collected_at = _required_text(response, "collected_at")
+    raw_symbols = response.get("symbols")
+    if not isinstance(raw_symbols, list):
+        raise ValueError("Worker returned incomplete product catalog evidence.")
+    return {
+        "collected_at": collected_at,
+        "symbols": [_validated_symbol_specification(symbol) for symbol in raw_symbols],
+    }
+
+
+def _validated_symbol_specification(symbol: object) -> dict[str, object]:
+    if not isinstance(symbol, dict):
+        raise ValueError("Worker returned incomplete product catalog evidence.")
+    normalized = {
+        "symbol": symbol.get("symbol"),
+        "trade_calc_mode": symbol.get("trade_calc_mode"),
+        "currency_base": symbol.get("currency_base"),
+        "currency_profit": symbol.get("currency_profit"),
+        "digits": symbol.get("digits"),
+        "point": symbol.get("point"),
+    }
+    if not all(isinstance(normalized[field], str) and normalized[field] for field in ("symbol", "trade_calc_mode", "currency_base", "currency_profit")):
+        raise ValueError("Worker returned incomplete product catalog evidence.")
+    if not isinstance(normalized["digits"], int) or isinstance(normalized["digits"], bool):
+        raise ValueError("Worker returned incomplete product catalog evidence.")
+    if not isinstance(normalized["point"], (int, float)) or isinstance(normalized["point"], bool):
+        raise ValueError("Worker returned incomplete product catalog evidence.")
+    for field in ("trade_tick_size", "contract_size", "volume_min", "volume_step", "volume_max", "trade_tick_value", "swap_long", "swap_short"):
+        value = symbol.get(field)
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            raise ValueError("Worker returned incomplete product catalog evidence.")
+        normalized[field] = float(value)
+    for field in ("trade_stops_level", "trade_freeze_level", "swap_rollover3days"):
+        value = symbol.get(field)
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ValueError("Worker returned incomplete product catalog evidence.")
+        normalized[field] = value
+    for field in ("currency_margin",):
+        value = symbol.get(field)
+        if not isinstance(value, str) or not value:
+            raise ValueError("Worker returned incomplete product catalog evidence.")
+        normalized[field] = value
+    for field in ("filling_modes", "allowed_directions"):
+        value = symbol.get(field)
+        if not isinstance(value, list) or not value or not all(isinstance(item, str) and item for item in value):
+            raise ValueError("Worker returned incomplete product catalog evidence.")
+        normalized[field] = list(value)
+    return normalized
+
+
+def _validated_market_data_response(
+    response: dict[str, object],
+    analysis_id: str,
+    stage: str,
+    timeframe: str,
+    requested_symbols: list[str],
+    analysis_period: dict[str, object],
+) -> dict[str, object]:
+    if response.get("type") != "product_catalog_analysis_response":
+        raise ValueError("Worker returned an invalid market-data analysis response.")
+    if response.get("stage") != stage:
+        raise ValueError("Worker returned an invalid market-data analysis response.")
+    if _required_text(response, "analysis_id") != analysis_id:
+        raise ValueError("Worker returned a mismatched market-data analysis response.")
+    if _required_text(response, "timeframe") != timeframe:
+        raise ValueError("Worker returned incomplete market-data evidence.")
+    if _required_text(response, "period_start_utc") != str(analysis_period["started_at_utc"]):
+        raise ValueError("Worker returned incomplete market-data evidence.")
+    if _required_text(response, "period_end_utc") != str(analysis_period["ended_at_utc"]):
+        raise ValueError("Worker returned incomplete market-data evidence.")
+    raw_symbols = response.get("symbols")
+    if not isinstance(raw_symbols, list):
+        raise ValueError("Worker returned incomplete market-data evidence.")
+    symbols: dict[str, dict[str, object]] = {}
+    for symbol_payload in raw_symbols:
+        symbol = _validated_market_data_symbol(symbol_payload)
+        symbols[str(symbol["symbol"])] = symbol
+    if set(symbols) != set(requested_symbols):
+        raise ValueError("Worker returned incomplete market-data evidence.")
+    return {
+        "collected_at": _required_text(response, "collected_at"),
+        "timeframe": timeframe,
+        "period_start_utc": _required_text(response, "period_start_utc"),
+        "period_end_utc": _required_text(response, "period_end_utc"),
+        "symbols": symbols,
+    }
+
+
+def _validated_market_data_symbol(value: object) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise ValueError("Worker returned incomplete market-data evidence.")
+    symbol = _required_text(value, "symbol")
+    bars = value.get("bars")
+    time_metadata = value.get("time_metadata")
+    if not isinstance(bars, list) or not bars or not isinstance(time_metadata, dict):
+        raise ValueError("Worker returned incomplete market-data evidence.")
+    normalized_bars: list[dict[str, object]] = []
+    seen_times: set[str] = set()
+    for bar in bars:
+        if not isinstance(bar, dict):
+            raise ValueError("Worker returned incomplete market-data evidence.")
+        time_utc = _required_text(bar, "time_utc")
+        if time_utc in seen_times:
+            raise ValueError("Worker returned incomplete market-data evidence.")
+        seen_times.add(time_utc)
+        raw_time = bar.get("time")
+        close = bar.get("close")
+        if not isinstance(raw_time, (int, float)) or isinstance(raw_time, bool) or raw_time <= 0:
+            raise ValueError("Worker returned incomplete market-data evidence.")
+        if not isinstance(close, (int, float)) or isinstance(close, bool):
+            raise ValueError("Worker returned incomplete market-data evidence.")
+        normalized_bars.append({"time": int(raw_time), "time_utc": time_utc, "close": float(close)})
+    return {"symbol": symbol, "bars": normalized_bars, "time_metadata": dict(time_metadata)}
+
+
+def _analyze_product_catalogs(
+    first_symbols: list[dict[str, object]],
+    second_symbols: list[dict[str, object]],
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    first_index: dict[tuple[str, str], list[dict[str, object]]] = {}
+    second_index: dict[tuple[str, str], list[dict[str, object]]] = {}
+    for symbol in first_symbols:
+        first_index.setdefault((str(symbol["currency_base"]), str(symbol["currency_profit"])), []).append(symbol)
+    for symbol in second_symbols:
+        second_index.setdefault((str(symbol["currency_base"]), str(symbol["currency_profit"])), []).append(symbol)
+    candidates: list[dict[str, object]] = []
+    exceptions: list[dict[str, object]] = []
+    for currencies in sorted(set(first_index) & set(second_index)):
+        for first in first_index[currencies]:
+            for second in second_index[currencies]:
+                if first["trade_calc_mode"] == "FOREX" and second["trade_calc_mode"] == "FOREX":
+                    candidates.append(
+                        {
+                            "first_symbol": first["symbol"],
+                            "second_symbol": second["symbol"],
+                            "currency_base": first["currency_base"],
+                            "currency_profit": first["currency_profit"],
+                            "first_point": first["point"],
+                            "second_point": second["point"],
+                        }
+                    )
+                else:
+                    exceptions.append(
+                        {
+                            "first_symbol": first["symbol"],
+                            "second_symbol": second["symbol"],
+                            "currency_base": first["currency_base"],
+                            "currency_profit": first["currency_profit"],
+                            "reason": "non_forex_calculation_mode",
+                            "first_trade_calc_mode": first["trade_calc_mode"],
+                            "second_trade_calc_mode": second["trade_calc_mode"],
+                        }
+                    )
+    return candidates, exceptions
+
+
+def _candidate_symbols(candidates: list[dict[str, object]], field: str) -> list[str]:
+    return list(dict.fromkeys(str(candidate[field]) for candidate in candidates))
+
+
+def _product_pair_retest_candidate(
+    reference_specifications: list[dict[str, object]],
+    first_evidence: dict[str, object],
+    second_evidence: dict[str, object],
+) -> dict[str, object]:
+    first_server = str(reference_specifications[0]["server"])
+    second_server = str(reference_specifications[1]["server"])
+    first_symbol_name = str(reference_specifications[0]["symbol"])
+    second_symbol_name = str(reference_specifications[1]["symbol"])
+    first_specification = next(
+        (
+            symbol
+            for symbol in cast(list[dict[str, object]], first_evidence["symbols"])
+            if symbol["symbol"] == first_symbol_name
+        ),
+        None,
+    )
+    second_specification = next(
+        (
+            symbol
+            for symbol in cast(list[dict[str, object]], second_evidence["symbols"])
+            if symbol["symbol"] == second_symbol_name
+        ),
+        None,
+    )
+    if first_specification is None or second_specification is None:
+        raise ValueError("Worker returned incomplete product catalog evidence for the active product pair.")
+    eligible_candidates, _exceptions = _analyze_product_catalogs([first_specification], [second_specification])
+    candidate = next(
+        (
+            item
+            for item in eligible_candidates
+            if item["first_symbol"] == first_symbol_name and item["second_symbol"] == second_symbol_name
+        ),
+        None,
+    )
+    if candidate is None:
+        raise ValueError(
+            f"Active product pair symbols {first_server}:{first_symbol_name} and "
+            f"{second_server}:{second_symbol_name} no longer satisfy the original catalog requirements."
+        )
+    return candidate
+
+
+def _market_data_request(
+    analysis_id: str,
+    stage: str,
+    timeframe: str,
+    symbols: list[str],
+    analysis_period: dict[str, object],
+    policy: dict[str, object],
+) -> dict[str, object]:
+    return {
+        "type": "product_catalog_analysis_request",
+        "stage": stage,
+        "analysis_id": analysis_id,
+        "request_id": str(uuid4()),
+        "policy": policy,
+        "timeframe": timeframe,
+        "period_start_utc": analysis_period["started_at_utc"],
+        "period_end_utc": analysis_period["ended_at_utc"],
+        "symbols": symbols,
+    }
+
+
+@asynccontextmanager
+async def _pair_worker_execution(
+    worker_execution_locks: dict[str, asyncio.Lock],
+    first_worker_id: str,
+    second_worker_id: str,
+):
+    first_lock = worker_execution_locks.setdefault(first_worker_id, asyncio.Lock())
+    second_lock = worker_execution_locks.setdefault(second_worker_id, asyncio.Lock())
+    ordered = sorted(
+        ((first_worker_id, first_lock), (second_worker_id, second_lock)),
+        key=lambda item: item[0],
+    )
+    await ordered[0][1].acquire()
+    if ordered[1][1] is ordered[0][1]:
+        try:
+            yield
+        finally:
+            ordered[0][1].release()
+        return
+    await ordered[1][1].acquire()
+    try:
+        yield
+    finally:
+        ordered[1][1].release()
+        ordered[0][1].release()
+
+
+def _previous_complete_utc_week(now: datetime | None = None) -> dict[str, str]:
+    now = datetime.now(UTC) if now is None else now.astimezone(UTC)
+    current_week_start = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+    previous_week_start = current_week_start - timedelta(days=7)
+    return {
+        "timeframe": "M15",
+        "started_at_utc": previous_week_start.isoformat().replace("+00:00", "Z"),
+        "ended_at_utc": current_week_start.isoformat().replace("+00:00", "Z"),
+    }
+
+
+def _screen_m15_candidates(
+    candidates: list[dict[str, object]],
+    first_market_data: dict[str, object],
+    second_market_data: dict[str, object],
+    policy: dict[str, object],
+) -> list[dict[str, object]]:
+    first_symbols = cast(dict[str, dict[str, object]], first_market_data["symbols"])
+    second_symbols = cast(dict[str, dict[str, object]], second_market_data["symbols"])
+    results: list[dict[str, object]] = []
+    coverage_minimum = float(policy.get("minimum_common_coverage", 0.99))
+    correlation_minimum = float(policy.get("minimum_m15_return_correlation", 0.98))
+    for candidate in candidates:
+        first_symbol = first_symbols[str(candidate["first_symbol"])]
+        second_symbol = second_symbols[str(candidate["second_symbol"])]
+        statistics = _market_data_statistics(candidate, first_symbol, second_symbol)
+        coverage_ratio = float(statistics["coverage_ratio"])
+        return_correlation = cast(float | None, statistics["return_correlation"])
+        coverage_passed = coverage_ratio >= coverage_minimum
+        correlation_passed = return_correlation is not None and return_correlation >= correlation_minimum
+        results.append(
+            {
+                **candidate,
+                "screening_status": "passed" if coverage_passed and correlation_passed else "failed",
+                "statistics": statistics,
+                "policy_evaluation": {
+                    "minimum_common_coverage": coverage_minimum,
+                    "minimum_m15_return_correlation": correlation_minimum,
+                    "coverage_passed": coverage_passed,
+                    "return_correlation_passed": correlation_passed,
+                },
+                "first_market_data": _market_data_summary(first_symbol),
+                "second_market_data": _market_data_summary(second_symbol),
+            }
+        )
+    return results
+
+
+def _verify_m1_candidates(
+    candidates: list[dict[str, object]],
+    first_market_data: dict[str, object],
+    second_market_data: dict[str, object],
+    first_specifications: list[dict[str, object]],
+    second_specifications: list[dict[str, object]],
+    policy: dict[str, object],
+) -> list[dict[str, object]]:
+    first_symbols = cast(dict[str, dict[str, object]], first_market_data["symbols"])
+    second_symbols = cast(dict[str, dict[str, object]], second_market_data["symbols"])
+    first_index = {str(symbol["symbol"]): symbol for symbol in first_specifications}
+    second_index = {str(symbol["symbol"]): symbol for symbol in second_specifications}
+    coverage_minimum = float(policy.get("minimum_common_coverage", 0.99))
+    correlation_minimum = float(policy.get("minimum_m1_return_correlation", 0.97))
+    median_maximum = float(policy.get("maximum_m1_median_price_difference_points", 2.0))
+    p99_maximum = float(policy.get("maximum_m1_p99_price_difference_points", 15.0))
+    results: list[dict[str, object]] = []
+    for candidate in candidates:
+        first_symbol_name = str(candidate["first_symbol"])
+        second_symbol_name = str(candidate["second_symbol"])
+        statistics = _market_data_statistics(
+            candidate,
+            first_symbols[first_symbol_name],
+            second_symbols[second_symbol_name],
+        )
+        hard_block_differences = _specification_differences(
+            first_index[first_symbol_name],
+            second_index[second_symbol_name],
+            _HARD_BLOCK_FIELDS,
+        )
+        warning_differences = _specification_differences(
+            first_index[first_symbol_name],
+            second_index[second_symbol_name],
+            _WARNING_FIELDS,
+        )
+        coverage_ratio = float(statistics["coverage_ratio"])
+        return_correlation = cast(float | None, statistics["return_correlation"])
+        median_difference = cast(float | None, statistics["median_price_difference_points"])
+        p99_difference = cast(float | None, statistics["p99_price_difference_points"])
+        policy_evaluation = {
+            "minimum_common_coverage": coverage_minimum,
+            "minimum_m1_return_correlation": correlation_minimum,
+            "maximum_m1_median_price_difference_points": median_maximum,
+            "maximum_m1_p99_price_difference_points": p99_maximum,
+            "coverage_passed": coverage_ratio >= coverage_minimum,
+            "return_correlation_passed": return_correlation is not None and return_correlation >= correlation_minimum,
+            "median_price_difference_passed": median_difference is not None and median_difference <= median_maximum,
+            "p99_price_difference_passed": p99_difference is not None and p99_difference <= p99_maximum,
+            "hard_block_differences_passed": not hard_block_differences,
+        }
+        results.append(
+            {
+                **candidate,
+                "verification_status": "passed" if all(
+                    isinstance(value, bool) and value for key, value in policy_evaluation.items() if key.endswith("_passed")
+                ) else "failed",
+                "statistics": statistics,
+                "policy_evaluation": policy_evaluation,
+                "hard_block_differences": hard_block_differences,
+                "warning_differences": warning_differences,
+                "first_market_data": _market_data_summary(first_symbols[first_symbol_name]),
+                "second_market_data": _market_data_summary(second_symbols[second_symbol_name]),
+            }
+        )
+    return results
+
+
+_HARD_BLOCK_FIELDS = (
+    "digits",
+    "point",
+    "trade_tick_size",
+    "contract_size",
+    "volume_min",
+    "volume_step",
+    "filling_modes",
+    "allowed_directions",
+)
+
+_WARNING_FIELDS = (
+    "volume_max",
+    "trade_stops_level",
+    "trade_freeze_level",
+    "trade_tick_value",
+    "currency_margin",
+    "currency_profit",
+    "swap_long",
+    "swap_short",
+    "swap_rollover3days",
+)
+
+_COMPATIBILITY_CAPABILITY_FIELDS = ("filling_modes", "allowed_directions")
+
+
+def _specification_differences(
+    first_specification: dict[str, object],
+    second_specification: dict[str, object],
+    fields: tuple[str, ...],
+) -> list[dict[str, object]]:
+    differences: list[dict[str, object]] = []
+    for field in fields:
+        if field not in first_specification or field not in second_specification:
+            continue
+        if _normalized_comparison_value(first_specification[field]) == _normalized_comparison_value(second_specification[field]):
+            continue
+        differences.append(
+            {
+                "field": field,
+                "first_value": first_specification[field],
+                "second_value": second_specification[field],
+            }
+        )
+    return differences
+
+
+def _product_pair_compatibility_differences(
+    reference_specification: dict[str, object],
+    live_specification: dict[str, object] | None,
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    if live_specification is None:
+        return (
+            [{
+                "field": "symbol",
+                "reference_value": reference_specification["symbol"],
+                "worker_value": None,
+                "reason": "missing_symbol",
+            }],
+            [],
+        )
+    return (
+        _compatibility_differences(reference_specification, live_specification, _HARD_BLOCK_FIELDS),
+        _compatibility_differences(reference_specification, live_specification, _WARNING_FIELDS),
+    )
+
+
+def _compatibility_differences(
+    reference_specification: dict[str, object],
+    live_specification: dict[str, object],
+    fields: tuple[str, ...],
+) -> list[dict[str, object]]:
+    differences: list[dict[str, object]] = []
+    for field in fields:
+        if field not in reference_specification:
+            continue
+        reference_value = reference_specification[field]
+        worker_value = live_specification.get(field)
+        if field in _COMPATIBILITY_CAPABILITY_FIELDS:
+            required = _normalized_capability_set(reference_value)
+            available = _normalized_capability_set(worker_value)
+            if required and required.issubset(available):
+                continue
+        elif worker_value is not None and _normalized_comparison_value(reference_value) == _normalized_comparison_value(worker_value):
+            continue
+        differences.append(
+            {
+                "field": field,
+                "reference_value": reference_value,
+                "worker_value": worker_value,
+            }
+        )
+    return differences
+
+
+def _normalized_capability_set(value: object) -> set[object]:
+    if not isinstance(value, list):
+        return set()
+    return { _normalized_comparison_value(item) for item in value }
+
+
+def _normalized_comparison_value(value: object) -> object:
+    if isinstance(value, list):
+        return tuple(sorted(_normalized_comparison_value(item) for item in value))
+    return value
+
+
+def _aligned_closes(
+    first_symbol: dict[str, object],
+    second_symbol: dict[str, object],
+) -> list[tuple[str, float, float]]:
+    first_index = {str(bar["time_utc"]): float(bar["close"]) for bar in cast(list[dict[str, object]], first_symbol["bars"])}
+    second_index = {str(bar["time_utc"]): float(bar["close"]) for bar in cast(list[dict[str, object]], second_symbol["bars"])}
+    return [
+        (time_utc, first_index[time_utc], second_index[time_utc])
+        for time_utc in sorted(first_index.keys() & second_index.keys())
+    ]
+
+
+def _market_data_statistics(
+    candidate: dict[str, object],
+    first_symbol: dict[str, object],
+    second_symbol: dict[str, object],
+) -> dict[str, object]:
+    aligned = _aligned_closes(first_symbol, second_symbol)
+    first_bars = cast(list[dict[str, object]], first_symbol["bars"])
+    second_bars = cast(list[dict[str, object]], second_symbol["bars"])
+    denominator = max(len(first_bars), len(second_bars))
+    coverage_ratio = 0.0 if denominator == 0 else len(aligned) / denominator
+    first_returns = _returns([pair[1] for pair in aligned])
+    second_returns = _returns([pair[2] for pair in aligned])
+    return_correlation = _correlation(first_returns, second_returns)
+    target_point = max(float(candidate.get("first_point", 0) or 0), float(candidate.get("second_point", 0) or 0), 0.00001)
+    price_differences = [abs(first_close - second_close) / target_point for _, first_close, second_close in aligned]
+    return {
+        "aligned_bar_count": len(aligned),
+        "first_bar_count": len(first_bars),
+        "second_bar_count": len(second_bars),
+        "coverage_ratio": round(coverage_ratio, 6),
+        "return_correlation": None if return_correlation is None else round(return_correlation, 6),
+        "median_price_difference_points": None if not price_differences else round(float(median(price_differences)), 6),
+        "p99_price_difference_points": None if not price_differences else round(_p99(price_differences), 6),
+        "target_point": target_point,
+    }
+
+
+def _returns(closes: list[float]) -> list[float]:
+    if len(closes) < 2:
+        return []
+    return [closes[index] - closes[index - 1] for index in range(1, len(closes))]
+
+
+def _correlation(first: list[float], second: list[float]) -> float | None:
+    if len(first) != len(second) or len(first) < 2:
+        return None
+    first_mean = sum(first) / len(first)
+    second_mean = sum(second) / len(second)
+    numerator = sum((left - first_mean) * (right - second_mean) for left, right in zip(first, second, strict=False))
+    first_variance = sum((value - first_mean) ** 2 for value in first)
+    second_variance = sum((value - second_mean) ** 2 for value in second)
+    if first_variance <= 0 or second_variance <= 0:
+        return None
+    return numerator / math.sqrt(first_variance * second_variance)
+
+
+def _p99(values: list[float]) -> float:
+    ordered = sorted(values)
+    return float(ordered[max(0, math.ceil(len(ordered) * 0.99) - 1)])
+
+
+def _market_data_summary(symbol: dict[str, object]) -> dict[str, object]:
+    bars = cast(list[dict[str, object]], symbol["bars"])
+    return {
+        "symbol": symbol["symbol"],
+        "bar_count": len(bars),
+        "first_raw_epoch": bars[0]["time"],
+        "last_raw_epoch": bars[-1]["time"],
+        "first_utc": bars[0]["time_utc"],
+        "last_utc": bars[-1]["time_utc"],
+        "content_hash": hashlib.sha256(
+            json.dumps(bars, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        ).hexdigest(),
+        "time_metadata": symbol["time_metadata"],
+    }
 
 
 def _require_admin(

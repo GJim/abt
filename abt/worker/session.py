@@ -1,9 +1,18 @@
 from __future__ import annotations
 
+from datetime import timedelta
+import json
+from math import floor
+from statistics import median
 from collections.abc import Callable
+from datetime import UTC, datetime
 from dataclasses import dataclass
-from typing import Self
+from typing import Protocol, Self
+from zoneinfo import ZoneInfo
 
+from ..config import TimeCalibrationFamily
+from ..output import render
+from ..timecalibration import MARKET_DATA, render_calibration
 from .credentials import (
     WebSocketConnector,
     WorkerWebSocket,
@@ -15,6 +24,16 @@ from .credentials import (
 )
 from .enrollment import WorkerEnrollmentError
 from .keystore import HardwareKeyStore
+
+
+class ProductCatalogReadOnlyMT5(Protocol):
+    def symbols_get(self) -> object: ...
+
+
+class MarketDataReadOnlyMT5(Protocol):
+    def copy_rates_range(self, symbol: str, timeframe: object, from_time: datetime, to_time: datetime) -> object: ...
+
+    def symbol_info_tick(self, symbol: str) -> object: ...
 
 
 @dataclass
@@ -53,6 +72,338 @@ class AuthenticatedWorkerSession:
         response = _message(self.socket)
         if response != {"type": "accepted", "state": state}:
             raise WorkerEnrollmentError("The controller rejected the worker safety state.")
+
+    def receive_product_catalog_analysis(self) -> dict[str, object]:
+        response = _message(self.socket)
+        if response.get("type") != "product_catalog_analysis_request":
+            raise WorkerEnrollmentError("The controller returned an invalid worker response.")
+        stage = response.get("stage", "catalog")
+        if stage not in {"catalog", "m15_screening", "m1_verification"}:
+            raise WorkerEnrollmentError("The controller returned an invalid worker response.")
+        result = {
+            "analysis_id": _required_text(response, "analysis_id"),
+            "request_id": _required_text(response, "request_id"),
+            "stage": stage,
+            "policy": response.get("policy") if isinstance(response.get("policy"), dict) else {},
+        }
+        if stage in {"m15_screening", "m1_verification"}:
+            raw_symbols = response.get("symbols")
+            result.update(
+                {
+                    "timeframe": _required_text(response, "timeframe"),
+                    "period_start_utc": _required_text(response, "period_start_utc"),
+                    "period_end_utc": _required_text(response, "period_end_utc"),
+                    "symbols": [symbol for symbol in raw_symbols] if isinstance(raw_symbols, list) else [],
+                }
+            )
+        return result
+
+    def send_product_catalog_analysis(
+        self,
+        *,
+        analysis_id: str,
+        request_id: str,
+        collected_at: str,
+        symbols: list[dict[str, object]],
+        stage: str = "catalog",
+        timeframe: str | None = None,
+        period_start_utc: str | None = None,
+        period_end_utc: str | None = None,
+    ) -> None:
+        response = {
+            "type": "product_catalog_analysis_response",
+            "stage": stage,
+            "analysis_id": analysis_id,
+            "request_id": request_id,
+            "collected_at": collected_at,
+            "symbols": symbols,
+        }
+        if stage in {"m15_screening", "m1_verification"}:
+            if not all(isinstance(value, str) and value for value in (timeframe, period_start_utc, period_end_utc)):
+                raise WorkerEnrollmentError("Market-data analysis responses must include timeframe and UTC period.")
+            response.update(
+                {
+                    "timeframe": timeframe,
+                    "period_start_utc": period_start_utc,
+                    "period_end_utc": period_end_utc,
+                }
+            )
+        _send(
+            self.socket,
+            response,
+        )
+
+
+def collect_product_catalog_evidence(
+    mt5: ProductCatalogReadOnlyMT5,
+    *,
+    collected_at: datetime | None = None,
+) -> dict[str, object]:
+    when = (datetime.now(UTC) if collected_at is None else collected_at).isoformat()
+    raw_symbols = mt5.symbols_get()
+    if not isinstance(raw_symbols, (list, tuple)):
+        raise WorkerEnrollmentError("The local MT5 terminal returned an invalid product catalog.")
+    return {"collected_at": when, "symbols": [_symbol_specification(symbol) for symbol in raw_symbols]}
+
+
+def collect_market_data_evidence(
+    mt5: MarketDataReadOnlyMT5,
+    *,
+    symbols: list[str],
+    timeframe: str,
+    period_start_utc: str,
+    period_end_utc: str,
+    collected_at: datetime | None = None,
+) -> dict[str, object]:
+    when = (datetime.now(UTC) if collected_at is None else collected_at).isoformat()
+    start = _parse_utc(period_start_utc)
+    end = _parse_utc(period_end_utc)
+    if start >= end:
+        raise WorkerEnrollmentError("The controller requested an invalid market-data interval.")
+    if not symbols or not all(isinstance(symbol, str) and symbol for symbol in symbols):
+        raise WorkerEnrollmentError("The controller requested invalid market-data symbols.")
+    return {
+        "collected_at": when,
+        "timeframe": timeframe,
+        "period_start_utc": period_start_utc,
+        "period_end_utc": period_end_utc,
+        "symbols": [_market_data_symbol_evidence(mt5, symbol, timeframe, start, end) for symbol in symbols],
+    }
+
+
+def _symbol_specification(symbol: object) -> dict[str, object]:
+    source = symbol if isinstance(symbol, dict) else vars(symbol)
+    name = _symbol_field(source, "symbol", "name")
+    trade_calc_mode = _symbol_field(source, "trade_calc_mode")
+    currency_base = _symbol_field(source, "currency_base")
+    currency_profit = _symbol_field(source, "currency_profit")
+    digits = _symbol_field(source, "digits")
+    point = _symbol_field(source, "point")
+    if not isinstance(name, str) or not name:
+        raise WorkerEnrollmentError("The local MT5 terminal returned an invalid product catalog.")
+    if not isinstance(trade_calc_mode, str) or not trade_calc_mode:
+        raise WorkerEnrollmentError("The local MT5 terminal returned an invalid product catalog.")
+    if not isinstance(currency_base, str) or not currency_base:
+        raise WorkerEnrollmentError("The local MT5 terminal returned an invalid product catalog.")
+    if not isinstance(currency_profit, str) or not currency_profit:
+        raise WorkerEnrollmentError("The local MT5 terminal returned an invalid product catalog.")
+    if not isinstance(digits, int) or isinstance(digits, bool):
+        raise WorkerEnrollmentError("The local MT5 terminal returned an invalid product catalog.")
+    if not isinstance(point, (int, float)) or isinstance(point, bool):
+        raise WorkerEnrollmentError("The local MT5 terminal returned an invalid product catalog.")
+    return {
+        "symbol": name,
+        "trade_calc_mode": trade_calc_mode,
+        "currency_base": currency_base,
+        "currency_profit": currency_profit,
+        "digits": digits,
+        "point": point,
+        "trade_tick_size": _required_symbol_float(source, "trade_tick_size"),
+        "contract_size": _required_symbol_float(source, "contract_size", "trade_contract_size"),
+        "volume_min": _required_symbol_float(source, "volume_min"),
+        "volume_step": _required_symbol_float(source, "volume_step"),
+        "filling_modes": _symbol_filling_modes(source),
+        "allowed_directions": _symbol_allowed_directions(source),
+        "volume_max": _required_symbol_float(source, "volume_max"),
+        "trade_stops_level": _required_symbol_int(source, "trade_stops_level"),
+        "trade_freeze_level": _required_symbol_int(source, "trade_freeze_level"),
+        "trade_tick_value": _required_symbol_float(source, "trade_tick_value"),
+        "currency_margin": _required_symbol_text(source, "currency_margin"),
+        "swap_long": _required_symbol_float(source, "swap_long"),
+        "swap_short": _required_symbol_float(source, "swap_short"),
+        "swap_rollover3days": _required_symbol_int(source, "swap_rollover3days"),
+    }
+
+
+def _symbol_field(source: dict[str, object], *names: str) -> object:
+    for name in names:
+        if name in source:
+            return source[name]
+    return None
+
+
+def _required_symbol_float(source: dict[str, object], *names: str) -> float:
+    value = _symbol_field(source, *names)
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise WorkerEnrollmentError("The local MT5 terminal returned an invalid product catalog.")
+    return float(value)
+
+
+def _required_symbol_int(source: dict[str, object], *names: str) -> int:
+    value = _symbol_field(source, *names)
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise WorkerEnrollmentError("The local MT5 terminal returned an invalid product catalog.")
+    return value
+
+
+def _required_symbol_text(source: dict[str, object], *names: str) -> str:
+    value = _symbol_field(source, *names)
+    if not isinstance(value, str) or not value:
+        raise WorkerEnrollmentError("The local MT5 terminal returned an invalid product catalog.")
+    return value
+
+
+def _required_symbol_text_list(source: dict[str, object], *names: str) -> list[str]:
+    value = _symbol_field(source, *names)
+    if not isinstance(value, list) or not value or not all(isinstance(item, str) and item for item in value):
+        raise WorkerEnrollmentError("The local MT5 terminal returned an invalid product catalog.")
+    return list(value)
+
+
+def _symbol_filling_modes(source: dict[str, object]) -> list[str]:
+    if isinstance(_symbol_field(source, "filling_modes"), list):
+        return _required_symbol_text_list(source, "filling_modes")
+    filling_mode = _symbol_field(source, "filling_mode")
+    if isinstance(filling_mode, int) and not isinstance(filling_mode, bool):
+        modes = [name for bit, name in ((1, "FOK"), (2, "IOC"), (4, "BOC")) if filling_mode & bit]
+        if modes:
+            return modes
+        legacy_mode = {0: ["FOK"], 1: ["IOC"], 2: ["RETURN"], 3: ["BOC"]}.get(filling_mode)
+        if legacy_mode is not None:
+            return legacy_mode
+    raise WorkerEnrollmentError("The local MT5 terminal returned an invalid product catalog.")
+
+
+def _symbol_allowed_directions(source: dict[str, object]) -> list[str]:
+    if isinstance(_symbol_field(source, "allowed_directions"), list):
+        return _required_symbol_text_list(source, "allowed_directions")
+    order_mode = _symbol_field(source, "order_mode")
+    if isinstance(order_mode, int) and not isinstance(order_mode, bool):
+        directions = []
+        if order_mode & 1:
+            directions.append("LONG")
+        if order_mode & 2:
+            directions.append("SHORT")
+        if directions:
+            return directions
+    trade_mode = _symbol_field(source, "trade_mode")
+    if isinstance(trade_mode, int) and not isinstance(trade_mode, bool):
+        directions = {
+            1: ["LONG"],
+            2: ["SHORT"],
+            4: ["LONG", "SHORT"],
+        }.get(trade_mode)
+        if directions is not None:
+            return directions
+    raise WorkerEnrollmentError("The local MT5 terminal returned an invalid product catalog.")
+
+
+def _market_data_symbol_evidence(
+    mt5: MarketDataReadOnlyMT5,
+    symbol: str,
+    timeframe: str,
+    start: datetime,
+    end: datetime,
+) -> dict[str, object]:
+    calibration = _market_data_calibration(mt5, symbol)
+    raw_rates = mt5.copy_rates_range(symbol, _timeframe_value(mt5, timeframe), start, end - timedelta(seconds=1))
+    bars = _structured_market_data(raw_rates)
+    if not bars:
+        raise WorkerEnrollmentError("The local MT5 terminal returned incomplete market-data evidence.")
+    rendered = json.loads(
+        render(
+            bars,
+            "json",
+            user_timezone=ZoneInfo("UTC"),
+            source_family=MARKET_DATA,
+            calibration=calibration,
+        )
+    )
+    if not isinstance(rendered, dict):
+        raise WorkerEnrollmentError("The local MT5 terminal returned incomplete market-data evidence.")
+    records = rendered.get("records")
+    time_metadata = rendered.get("time_metadata")
+    if not isinstance(records, list) or not isinstance(time_metadata, dict):
+        raise WorkerEnrollmentError("The local MT5 terminal returned incomplete market-data evidence.")
+    return {"symbol": symbol, "bars": records, "time_metadata": time_metadata}
+
+
+def _market_data_calibration(mt5: MarketDataReadOnlyMT5, symbol: str) -> dict[str, object]:
+    samples = tuple(sample for _ in range(3) if (sample := _market_sample(mt5, symbol)) is not None)
+    if not samples:
+        raise WorkerEnrollmentError("The local MT5 terminal returned incomplete market-data evidence.")
+    offset = int(round(median(sample["offset_seconds"] for sample in samples)))
+    selected = samples[-1]
+    calibration = render_calibration(
+        TimeCalibrationFamily(
+            offset_seconds=offset,
+            calibrated_local_date=_parse_utc(str(selected["calibrated_at_utc"])).date().isoformat(),
+            calibrated_at_utc=str(selected["calibrated_at_utc"]),
+            status="calibrated",
+            calibration_symbol=symbol,
+        ),
+        MARKET_DATA,
+        ZoneInfo("UTC"),
+        now=_parse_utc(str(selected["calibrated_at_utc"])),
+    )
+    calibration["samples"] = list(samples)
+    calibration["sample_count"] = len(samples)
+    return calibration
+
+
+def _market_sample(mt5: MarketDataReadOnlyMT5, symbol: str) -> dict[str, object] | None:
+    before = datetime.now(UTC)
+    tick = mt5.symbol_info_tick(symbol)
+    after = datetime.now(UTC)
+    epoch = _field(tick, "time")
+    if not isinstance(epoch, (int, float)) or isinstance(epoch, bool) or epoch <= 0:
+        return None
+    midpoint = before + (after - before) / 2
+    difference = float(epoch) - midpoint.timestamp()
+    offset = int(round(difference))
+    error = abs(difference - offset) + (after - before).total_seconds() / 2
+    return {
+        "source": "symbol_info_tick.time",
+        "calibrated_at_utc": after.isoformat().replace("+00:00", "Z"),
+        "offset_seconds": offset,
+        "error_seconds": round(error, 6),
+        "symbol": symbol,
+    }
+
+
+def _timeframe_value(mt5: object, timeframe: str) -> object:
+    value = getattr(mt5, f"TIMEFRAME_{timeframe}", None)
+    return timeframe if value is None else value
+
+
+def _structured_market_data(values: object) -> list[dict[str, object]]:
+    if values is None:
+        raise WorkerEnrollmentError("The local MT5 terminal returned incomplete market-data evidence.")
+    if isinstance(values, (list, tuple)):
+        return [_market_bar(value) for value in values]
+    names = getattr(getattr(values, "dtype", None), "names", None)
+    if names is None:
+        raise WorkerEnrollmentError("The local MT5 terminal returned incomplete market-data evidence.")
+    return [
+        _market_bar({name: row[name].item() if hasattr(row[name], "item") else row[name] for name in names})
+        for row in values
+    ]
+
+
+def _market_bar(value: object) -> dict[str, object]:
+    source = value if isinstance(value, dict) else vars(value) if hasattr(value, "__dict__") else value
+    if not isinstance(source, dict):
+        raise WorkerEnrollmentError("The local MT5 terminal returned incomplete market-data evidence.")
+    time = source.get("time")
+    if not isinstance(time, (int, float)) or isinstance(time, bool) or time <= 0:
+        raise WorkerEnrollmentError("The local MT5 terminal returned incomplete market-data evidence.")
+    bar = {"time": floor(float(time))}
+    for field in ("open", "high", "low", "close"):
+        numeric = source.get(field)
+        if not isinstance(numeric, (int, float)) or isinstance(numeric, bool):
+            raise WorkerEnrollmentError("The local MT5 terminal returned incomplete market-data evidence.")
+        bar[field] = float(numeric)
+    return bar
+
+
+def _field(value: object, name: str) -> object:
+    if isinstance(value, dict):
+        return value.get(name)
+    return getattr(value, name, None)
+
+
+def _parse_utc(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(UTC)
 
 
 def open_authenticated_worker_session(

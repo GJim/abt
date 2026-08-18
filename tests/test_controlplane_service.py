@@ -1,20 +1,30 @@
 from __future__ import annotations
 
 import base64
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
+import http.cookies
+import httpx
 import json
+import socket
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
+from uuid import uuid4
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from fastapi.testclient import TestClient
+import uvicorn
+from websockets.sync.client import connect as websocket_connect
 
 from abt.controlplane.crypto import ProofError, device_certificate_payload, enrollment_payload, worker_proof_payload
 from abt.controlplane.secrets import SecretStore, SecretStoreError
-from abt.controlplane.service import _delete_expired_pending_secrets, create_app
+from abt.controlplane.service import _delete_expired_pending_secrets, _validated_product_catalog_response, create_app
 
 
 class MemorySecretStore:
@@ -83,9 +93,11 @@ class ControlPlaneServiceTests(unittest.TestCase):
             certificate_issuer=self.certificate_issuer,
         )
         self.client = TestClient(self.app, base_url="https://testserver")
+        self.http_client = TestClient(self.app, base_url="https://testserver")
         self.app.state.ledger.create_admin("ABCDEF", "A-secure-admin-password!")
 
     def tearDown(self) -> None:
+        self.http_client.close()
         self.client.close()
         self._directory.cleanup()
 
@@ -584,6 +596,996 @@ class ControlPlaneServiceTests(unittest.TestCase):
                 websocket.receive_json()
         self.assertEqual(1008, getattr(error.exception, "code", None))
 
+    def test_admin_can_launch_a_catalog_analysis_over_worker_wss_and_read_the_result(self) -> None:
+        policy = {
+            "label": "FX catalog v1",
+            "require_forex_calculation_mode": True,
+            "require_equal_base_currency": True,
+            "require_equal_profit_currency": True,
+            "minimum_common_coverage": 0.99,
+            "minimum_m15_return_correlation": 0.98,
+            "minimum_m1_return_correlation": 0.97,
+            "maximum_m1_median_price_difference_points": 2.0,
+            "maximum_m1_p99_price_difference_points": 15.0,
+        }
+        with self._live_catalog_analysis_harness() as harness:
+            first_key, first_worker, first_certificate = harness.approved_worker(123456, "Broker-A")
+            second_key, second_worker, second_certificate = harness.approved_worker(654321, "Broker-B")
+            first_ready = threading.Event()
+            second_ready = threading.Event()
+            first_responder = threading.Thread(
+                target=harness.respond_to_catalog_analysis,
+                args=(
+                    first_key,
+                    first_worker,
+                    first_certificate,
+                    [
+                        self._forex_symbol("EURUSD.a", 100.0, trade_stops_level=0),
+                        self._forex_symbol("GBPUSD.a", 100.0, currency_base="GBP"),
+                        self._forex_symbol("AUDUSD.a", 100.0, currency_base="AUD"),
+                        self._forex_symbol("XAUUSD.a", 100.0, trade_calc_mode="CFD", currency_base="XAU", digits=2, point=0.01, trade_tick_size=0.01),
+                    ],
+                ),
+                kwargs={
+                    "request_key": "first",
+                    "ready_event": first_ready,
+                    "market_data_by_stage": {
+                        "m15_screening": {
+                            "EURUSD.a": [
+                                {"time": 1000, "open": 1.1000, "high": 1.1020, "low": 1.0990, "close": 1.1010},
+                                {"time": 1900, "open": 1.1010, "high": 1.1030, "low": 1.1000, "close": 1.1022},
+                                {"time": 2800, "open": 1.1020, "high": 1.1040, "low": 1.1010, "close": 1.1030},
+                            ],
+                            "GBPUSD.a": [
+                                {"time": 1000, "open": 1.2500, "high": 1.2520, "low": 1.2490, "close": 1.2510},
+                                {"time": 1900, "open": 1.2510, "high": 1.2530, "low": 1.2500, "close": 1.2525},
+                                {"time": 2800, "open": 1.2524, "high": 1.2540, "low": 1.2510, "close": 1.2530},
+                            ],
+                            "AUDUSD.a": [
+                                {"time": 1000, "open": 0.6500, "high": 0.6510, "low": 0.6490, "close": 0.6505},
+                                {"time": 1900, "open": 0.6505, "high": 0.6515, "low": 0.6495, "close": 0.6510},
+                                {"time": 2800, "open": 0.6510, "high": 0.6520, "low": 0.6500, "close": 0.6515},
+                            ],
+                        },
+                        "m1_verification": {
+                            "EURUSD.a": [
+                                {"time": 1000, "close": 1.10000},
+                                {"time": 1060, "close": 1.10050},
+                                {"time": 1120, "close": 1.10120},
+                                {"time": 1180, "close": 1.10180},
+                            ],
+                            "GBPUSD.a": [
+                                {"time": 1000, "close": 1.25000},
+                                {"time": 1060, "close": 1.25060},
+                                {"time": 1120, "close": 1.25110},
+                                {"time": 1180, "close": 1.25180},
+                            ],
+                        },
+                    },
+                },
+            )
+            second_responder = threading.Thread(
+                target=harness.respond_to_catalog_analysis,
+                args=(
+                    second_key,
+                    second_worker,
+                    second_certificate,
+                    [
+                        self._forex_symbol("EURUSD", 50.0),
+                        self._forex_symbol("GBPUSD", 100.0, currency_base="GBP", volume_step=0.1),
+                        self._forex_symbol("AUDUSD", 100.0, currency_base="AUD"),
+                        self._forex_symbol("XAUUSD", 100.0, trade_calc_mode="CFD", currency_base="XAU", digits=2, point=0.01, trade_tick_size=0.01),
+                    ],
+                ),
+                kwargs={
+                    "request_key": "second",
+                    "ready_event": second_ready,
+                    "market_data_by_stage": {
+                        "m15_screening": {
+                            "EURUSD": [
+                                {"time": 1000, "open": 1.1002, "high": 1.1022, "low": 1.0992, "close": 1.1012},
+                                {"time": 1900, "open": 1.1012, "high": 1.1032, "low": 1.1002, "close": 1.1024},
+                                {"time": 2800, "open": 1.1021, "high": 1.1041, "low": 1.1011, "close": 1.1032},
+                            ],
+                            "GBPUSD": [
+                                {"time": 1000, "open": 1.2501, "high": 1.2521, "low": 1.2491, "close": 1.2511},
+                                {"time": 1900, "open": 1.2511, "high": 1.2531, "low": 1.2501, "close": 1.2526},
+                                {"time": 2800, "open": 1.2525, "high": 1.2541, "low": 1.2511, "close": 1.2531},
+                            ],
+                            "AUDUSD": [
+                                {"time": 1000, "open": 0.6505, "high": 0.6515, "low": 0.6495, "close": 0.6510},
+                                {"time": 1900, "open": 0.6510, "high": 0.6520, "low": 0.6500, "close": 0.6505},
+                                {"time": 2800, "open": 0.6505, "high": 0.6515, "low": 0.6495, "close": 0.6500},
+                            ],
+                        },
+                        "m1_verification": {
+                            "EURUSD": [
+                                {"time": 1000, "close": 1.10001},
+                                {"time": 1060, "close": 1.10052},
+                                {"time": 1120, "close": 1.10121},
+                                {"time": 1180, "close": 1.10181},
+                            ],
+                            "GBPUSD": [
+                                {"time": 1000, "close": 1.25001},
+                                {"time": 1060, "close": 1.25061},
+                                {"time": 1120, "close": 1.25112},
+                                {"time": 1180, "close": 1.25181},
+                            ],
+                        },
+                    },
+                },
+            )
+            first_responder.start()
+            second_responder.start()
+            self.assertTrue(first_ready.wait(timeout=5))
+            self.assertTrue(second_ready.wait(timeout=5))
+            outcome = harness.launch_catalog_analysis(first_worker, second_worker, policy)
+            first_responder.join(timeout=5)
+            second_responder.join(timeout=5)
+            first_requests = harness.requests["first"]
+            second_requests = harness.requests["second"]
+            analysis = harness.read_catalog_analysis(outcome["analysis_id"])
+
+        first_request, first_m15_request, first_m1_request = first_requests
+        second_request, second_m15_request, second_m1_request = second_requests
+        self.assertEqual("product_catalog_analysis_request", first_request["type"])
+        self.assertEqual("product_catalog_analysis_request", second_request["type"])
+        self.assertEqual("catalog", first_request["stage"])
+        self.assertEqual("catalog", second_request["stage"])
+        self.assertEqual("m15_screening", first_m15_request["stage"])
+        self.assertEqual("m15_screening", second_m15_request["stage"])
+        self.assertEqual("m1_verification", first_m1_request["stage"])
+        self.assertEqual("m1_verification", second_m1_request["stage"])
+        self.assertEqual(first_request["analysis_id"], second_request["analysis_id"])
+        self.assertEqual(policy, first_request["policy"])
+        self.assertEqual(policy, second_request["policy"])
+        self.assertEqual(first_m15_request["period_start_utc"], second_m15_request["period_start_utc"])
+        self.assertEqual(first_m15_request["period_end_utc"], second_m15_request["period_end_utc"])
+        self.assertEqual(["AUDUSD.a", "EURUSD.a", "GBPUSD.a"], first_m15_request["symbols"])
+        self.assertEqual(["AUDUSD", "EURUSD", "GBPUSD"], second_m15_request["symbols"])
+        self.assertEqual("M15", first_m15_request["timeframe"])
+        self.assertEqual("M1", first_m1_request["timeframe"])
+        self.assertEqual(["EURUSD.a", "GBPUSD.a"], first_m1_request["symbols"])
+        self.assertEqual(["EURUSD", "GBPUSD"], second_m1_request["symbols"])
+        self.assertEqual("succeeded", outcome["status"])
+        self.assertEqual(policy, outcome["policy"])
+        self.assertEqual(3, len(outcome["eligible_candidates"]))
+        self.assertEqual("non_forex_calculation_mode", outcome["exceptions"][0]["reason"])
+        self.assertEqual(["failed", "passed", "passed"], [
+            result["screening_status"] for result in outcome["m15_screening_results"]
+        ])
+        self.assertEqual(2, len(outcome["m1_verification_results"]))
+        self.assertEqual(["EURUSD.a", "GBPUSD.a"], [
+            result["first_symbol"] for result in outcome["m1_verification_results"]
+        ])
+        eur_result, gbp_result = outcome["m1_verification_results"]
+        self.assertEqual("passed", eur_result["verification_status"])
+        self.assertEqual([], eur_result["hard_block_differences"])
+        self.assertEqual(["volume_max", "trade_stops_level"], [
+            difference["field"] for difference in eur_result["warning_differences"]
+        ])
+        self.assertTrue(all(eur_result["policy_evaluation"].values()))
+        self.assertEqual("failed", gbp_result["verification_status"])
+        self.assertEqual(["volume_step"], [
+            difference["field"] for difference in gbp_result["hard_block_differences"]
+        ])
+        self.assertEqual([], gbp_result["warning_differences"])
+        self.assertTrue(gbp_result["policy_evaluation"]["coverage_passed"])
+        self.assertTrue(gbp_result["policy_evaluation"]["return_correlation_passed"])
+        self.assertTrue(gbp_result["policy_evaluation"]["median_price_difference_passed"])
+        self.assertTrue(gbp_result["policy_evaluation"]["p99_price_difference_passed"])
+        self.assertFalse(gbp_result["policy_evaluation"]["hard_block_differences_passed"])
+        self.assertNotIn("bars", json.dumps(outcome["m15_screening_results"][0], sort_keys=True))
+        self.assertNotIn("bars", json.dumps(outcome["m1_verification_results"][0], sort_keys=True))
+        self.assertEqual(outcome["analysis_id"], analysis["analysis_id"])
+        self.assertEqual(policy, analysis["policy"])
+        self.assertEqual("Broker-A", analysis["first_worker"]["server"])
+        self.assertEqual("Broker-B", analysis["second_worker"]["server"])
+        self.assertEqual("M15", analysis["analysis_period"]["timeframe"])
+        self.assertIsNotNone(analysis["m1_verified_at"])
+
+    def test_catalog_response_requires_every_comparison_field(self) -> None:
+        required_fields = (
+            "trade_tick_size",
+            "contract_size",
+            "volume_min",
+            "volume_step",
+            "filling_modes",
+            "allowed_directions",
+            "volume_max",
+            "trade_stops_level",
+            "trade_freeze_level",
+            "trade_tick_value",
+            "currency_margin",
+            "swap_long",
+            "swap_short",
+            "swap_rollover3days",
+        )
+        for field in required_fields:
+            with self.subTest(field=field):
+                symbol = self._forex_symbol("EURUSD", 100.0)
+                del symbol[field]
+                with self.assertRaisesRegex(ValueError, "incomplete"):
+                    _validated_product_catalog_response(
+                        {
+                            "type": "product_catalog_analysis_response",
+                            "stage": "catalog",
+                            "analysis_id": "analysis-123",
+                            "collected_at": "2026-08-17T07:05:00+00:00",
+                            "symbols": [symbol],
+                        },
+                        "analysis-123",
+                    )
+
+    def test_catalog_analysis_retries_m15_once_and_fails_without_partial_screening_results_when_worker_evidence_is_incomplete(self) -> None:
+        with self._live_catalog_analysis_harness() as harness:
+            first_key, first_worker, first_certificate = harness.approved_worker(123456, "Broker-A")
+            second_key, second_worker, second_certificate = harness.approved_worker(654321, "Broker-B")
+            first_ready = threading.Event()
+            second_ready = threading.Event()
+            first_responder = threading.Thread(
+                target=harness.respond_to_catalog_analysis,
+                args=(
+                    first_key,
+                    first_worker,
+                    first_certificate,
+                    [self._forex_symbol("EURUSD.a", 100.0)],
+                ),
+                kwargs={
+                    "request_key": "first",
+                    "ready_event": first_ready,
+                    "market_data_by_symbol": {
+                        "EURUSD.a": [
+                            {"time": 1000, "open": 1.1000, "high": 1.1020, "low": 1.0990, "close": 1.1010},
+                            {"time": 1900, "open": 1.1010, "high": 1.1030, "low": 1.1000, "close": 1.1022},
+                        ]
+                    },
+                },
+            )
+            second_responder = threading.Thread(
+                target=harness.respond_to_catalog_analysis,
+                args=(
+                    second_key,
+                    second_worker,
+                    second_certificate,
+                    [self._forex_symbol("EURUSD", 100.0)],
+                ),
+                kwargs={
+                    "request_key": "second",
+                    "ready_event": second_ready,
+                    "market_data_responses": [None, None],
+                },
+            )
+            first_responder.start()
+            second_responder.start()
+            self.assertTrue(first_ready.wait(timeout=5))
+            self.assertTrue(second_ready.wait(timeout=5))
+            outcome = harness.launch_catalog_analysis(first_worker, second_worker, {"label": "FX catalog v1"})
+            first_responder.join(timeout=5)
+            second_responder.join(timeout=5)
+
+        self.assertEqual("failed", outcome["status"])
+        self.assertEqual("m15_failed", outcome["current_stage"])
+        self.assertEqual(1, outcome["retry_count"])
+        self.assertEqual([], outcome["m15_screening_results"])
+        self.assertEqual(1, len(outcome["eligible_candidates"]))
+        self.assertEqual(3, len(harness.requests["second"]))
+
+    def test_catalog_analysis_retries_m1_once_and_fails_without_partial_verification_results_when_worker_evidence_is_incomplete(self) -> None:
+        with self._live_catalog_analysis_harness() as harness:
+            first_key, first_worker, first_certificate = harness.approved_worker(123456, "Broker-A")
+            second_key, second_worker, second_certificate = harness.approved_worker(654321, "Broker-B")
+            first_ready = threading.Event()
+            second_ready = threading.Event()
+            first_responder = threading.Thread(
+                target=harness.respond_to_catalog_analysis,
+                args=(
+                    first_key,
+                    first_worker,
+                    first_certificate,
+                    [self._forex_symbol("EURUSD.a", 100.0)],
+                ),
+                kwargs={
+                    "request_key": "first",
+                    "ready_event": first_ready,
+                    "market_data_responses": [
+                        {
+                            "EURUSD.a": [
+                                {"time": 1000, "close": 1.1010},
+                                {"time": 1900, "close": 1.1022},
+                                {"time": 2800, "close": 1.1030},
+                            ]
+                        },
+                        {
+                            "EURUSD.a": [
+                                {"time": 1000, "close": 1.1000},
+                                {"time": 1060, "close": 1.1005},
+                                {"time": 1120, "close": 1.1010},
+                            ]
+                        },
+                    ],
+                },
+            )
+            second_responder = threading.Thread(
+                target=harness.respond_to_catalog_analysis,
+                args=(
+                    second_key,
+                    second_worker,
+                    second_certificate,
+                    [self._forex_symbol("EURUSD", 100.0)],
+                ),
+                kwargs={
+                    "request_key": "second",
+                    "ready_event": second_ready,
+                    "market_data_responses": [
+                        {
+                            "EURUSD": [
+                                {"time": 1000, "close": 1.1012},
+                                {"time": 1900, "close": 1.1024},
+                                {"time": 2800, "close": 1.1032},
+                            ]
+                        },
+                        None,
+                        None,
+                    ],
+                },
+            )
+            first_responder.start()
+            second_responder.start()
+            self.assertTrue(first_ready.wait(timeout=5))
+            self.assertTrue(second_ready.wait(timeout=5))
+            outcome = harness.launch_catalog_analysis(first_worker, second_worker, {"label": "FX catalog v1"})
+            first_responder.join(timeout=5)
+            second_responder.join(timeout=5)
+
+        self.assertEqual("failed", outcome["status"])
+        self.assertEqual("m1_failed", outcome["current_stage"])
+        self.assertEqual(1, outcome["retry_count"])
+        self.assertEqual(1, len(outcome["m15_screening_results"]))
+        self.assertEqual([], outcome["m1_verification_results"])
+        self.assertEqual(4, len(harness.requests["second"]))
+
+    def test_catalog_analysis_queues_shared_worker_work_until_the_running_analysis_completes(self) -> None:
+        with self._live_catalog_analysis_harness() as harness:
+            first_key, first_worker, first_certificate = harness.approved_worker(123456, "Broker-A")
+            second_key, second_worker, second_certificate = harness.approved_worker(654321, "Broker-B")
+            third_key, third_worker, third_certificate = harness.approved_worker(777777, "Broker-C")
+            first_ready = threading.Event()
+            second_ready = threading.Event()
+            third_ready = threading.Event()
+            release_first_analysis = threading.Event()
+            third_received_request = threading.Event()
+            first_result: dict[str, object] = {}
+            second_result: dict[str, object] = {}
+
+            def shared_worker() -> None:
+                with websocket_connect(f"ws://127.0.0.1:{harness.port}/api/worker/session") as websocket:
+                    harness.authenticate_worker_socket(websocket, first_key, first_worker, first_certificate)
+                    first_ready.set()
+                    for sequence, (symbol, currency_base, market_data_by_stage) in enumerate((
+                        ("EURUSD.a", "EUR", self._passing_market_data("EURUSD.a")),
+                        ("GBPUSD.a", "GBP", self._passing_market_data("GBPUSD.a", m15_base=1.3000, m1_base=1.30000)),
+                    ), start=1):
+                        catalog_request = json.loads(websocket.recv())
+                        harness.requests.setdefault("shared", []).append(catalog_request)
+                        websocket.send(json.dumps({
+                            "type": "product_catalog_analysis_response",
+                            "stage": "catalog",
+                            "analysis_id": catalog_request["analysis_id"],
+                            "request_id": catalog_request["request_id"],
+                            "collected_at": "2026-08-17T07:00:00+00:00",
+                            "symbols": [self._forex_symbol(symbol, 100.0, currency_base=currency_base)],
+                        }))
+                        for stage in ("m15_screening", "m1_verification"):
+                            market_request = json.loads(websocket.recv())
+                            harness.requests.setdefault("shared", []).append(market_request)
+                            if sequence == 1 and stage == "m15_screening":
+                                release_first_analysis.wait(timeout=5)
+                            websocket.send(json.dumps(harness.market_data_response(
+                                market_request,
+                                market_data_by_stage[stage],
+                            )))
+
+            def dedicated_worker(
+                key: ec.EllipticCurvePrivateKey,
+                worker_id: str,
+                certificate: str,
+                request_key: str,
+                symbol: str,
+                currency_base: str,
+                ready_event: threading.Event,
+                received_event: threading.Event | None = None,
+                *,
+                market_data_by_stage: dict[str, dict[str, list[dict[str, object]]]],
+            ) -> None:
+                with websocket_connect(f"ws://127.0.0.1:{harness.port}/api/worker/session") as websocket:
+                    harness.authenticate_worker_socket(websocket, key, worker_id, certificate)
+                    ready_event.set()
+                    catalog_request = json.loads(websocket.recv())
+                    harness.requests.setdefault(request_key, []).append(catalog_request)
+                    if received_event is not None:
+                        received_event.set()
+                    websocket.send(json.dumps({
+                        "type": "product_catalog_analysis_response",
+                        "stage": "catalog",
+                        "analysis_id": catalog_request["analysis_id"],
+                        "request_id": catalog_request["request_id"],
+                        "collected_at": "2026-08-17T07:00:00+00:00",
+                        "symbols": [self._forex_symbol(symbol, 100.0, currency_base=currency_base)],
+                    }))
+                    for stage in ("m15_screening", "m1_verification"):
+                        market_request = json.loads(websocket.recv())
+                        harness.requests.setdefault(request_key, []).append(market_request)
+                        websocket.send(json.dumps(harness.market_data_response(
+                            market_request,
+                            market_data_by_stage[stage],
+                        )))
+
+            first_responder = threading.Thread(target=shared_worker)
+            second_responder = threading.Thread(
+                target=dedicated_worker,
+                args=(second_key, second_worker, second_certificate, "second", "EURUSD", "EUR", second_ready),
+                kwargs={"market_data_by_stage": self._passing_market_data("EURUSD", m15_base=1.1001, m1_base=1.10001)},
+            )
+            third_responder = threading.Thread(
+                target=dedicated_worker,
+                args=(third_key, third_worker, third_certificate, "third", "GBPUSD", "GBP", third_ready, third_received_request),
+                kwargs={"market_data_by_stage": self._passing_market_data("GBPUSD", m15_base=1.3001, m1_base=1.30001)},
+            )
+            first_responder.start()
+            second_responder.start()
+            third_responder.start()
+            self.assertTrue(first_ready.wait(timeout=5))
+            self.assertTrue(second_ready.wait(timeout=5))
+            self.assertTrue(third_ready.wait(timeout=5))
+
+            first_launch = threading.Thread(
+                target=lambda: first_result.update(harness.launch_catalog_analysis(
+                    first_worker, second_worker, {"label": "FX catalog v1"}
+                ))
+            )
+            first_launch.start()
+            wait_deadline = time.monotonic() + 5
+            while len(harness.requests.get("shared", [])) < 2 and time.monotonic() < wait_deadline:
+                time.sleep(0.05)
+            self.assertGreaterEqual(len(harness.requests.get("shared", [])), 2)
+            second_launch = threading.Thread(
+                target=lambda: second_result.update(harness.launch_catalog_analysis(
+                    first_worker, third_worker, {"label": "FX catalog v1"}
+                ))
+            )
+            second_launch.start()
+            time.sleep(0.5)
+            self.assertFalse(third_received_request.is_set())
+            release_first_analysis.set()
+            first_launch.join(timeout=10)
+            second_launch.join(timeout=10)
+            first_responder.join(timeout=5)
+            second_responder.join(timeout=5)
+            third_responder.join(timeout=5)
+
+        self.assertEqual("succeeded", first_result["status"])
+        self.assertEqual("succeeded", second_result["status"])
+        self.assertTrue(third_received_request.is_set())
+
+    def test_catalog_analysis_fails_without_partial_candidates_when_worker_evidence_is_incomplete(self) -> None:
+        with self._live_catalog_analysis_harness() as harness:
+            first_key, first_worker, first_certificate = harness.approved_worker(123456, "Broker-A")
+            second_key, second_worker, second_certificate = harness.approved_worker(654321, "Broker-B")
+            first_ready = threading.Event()
+            second_ready = threading.Event()
+            first_responder = threading.Thread(
+                target=harness.respond_to_catalog_analysis,
+                args=(
+                    first_key,
+                    first_worker,
+                    first_certificate,
+                    [
+                        {
+                            "symbol": "EURUSD.a",
+                            "trade_calc_mode": "FOREX",
+                            "currency_base": "EUR",
+                            "currency_profit": "USD",
+                        }
+                    ],
+                ),
+                kwargs={"request_key": "first", "collected_at": "2026-08-17T07:00:00+00:00", "ready_event": first_ready},
+            )
+            second_responder = threading.Thread(
+                target=harness.respond_to_catalog_analysis,
+                args=(second_key, second_worker, second_certificate, None),
+                kwargs={"request_key": "second", "collected_at": "2026-08-17T07:00:01+00:00", "ready_event": second_ready},
+            )
+            first_responder.start()
+            second_responder.start()
+            self.assertTrue(first_ready.wait(timeout=5))
+            self.assertTrue(second_ready.wait(timeout=5))
+            outcome = harness.launch_catalog_analysis(first_worker, second_worker, {"label": "FX catalog v1"})
+            first_responder.join(timeout=5)
+            second_responder.join(timeout=5)
+
+        self.assertEqual("failed", outcome["status"])
+        self.assertEqual([], outcome["eligible_candidates"])
+        self.assertEqual([], outcome["exceptions"])
+        self.assertIn("incomplete", outcome["failure_reason"])
+
+    def test_catalog_analysis_rejects_same_server_unhealthy_disconnected_and_revoked_workers_before_dispatch(self) -> None:
+        first_key, first_worker, first_certificate = self._approved_worker(123456, "Broker-A")
+        second_key, second_worker, second_certificate = self._approved_worker(654321, "Broker-A")
+        login = self.client.post("/api/admin/login", json={"username": "ABCDEF", "password": "A-secure-admin-password!"})
+        csrf = login.json()["csrf_token"]
+
+        with self.client.websocket_connect("/api/worker/session") as first_socket, self.client.websocket_connect("/api/worker/session") as second_socket:
+            self._authenticate_worker_socket(first_socket, first_key, first_worker, first_certificate)
+            self._authenticate_worker_socket(second_socket, second_key, second_worker, second_certificate)
+            same_server = self.client.post(
+                "/api/admin/product-catalog-analyses",
+                headers={"X-CSRF-Token": csrf},
+                json={"first_worker_id": first_worker, "second_worker_id": second_worker, "policy": {"label": "FX"}},
+            )
+            self.assertEqual(409, same_server.status_code)
+
+            first_socket.send_json({"type": "safety_state", "state": "needs_human", "reason": "manual_test"})
+            self.assertEqual({"type": "accepted", "state": "needs_human"}, first_socket.receive_json())
+            unhealthy = self.client.post(
+                "/api/admin/product-catalog-analyses",
+                headers={"X-CSRF-Token": csrf},
+                json={"first_worker_id": first_worker, "second_worker_id": second_worker, "policy": {"label": "FX"}},
+            )
+            self.assertEqual(409, unhealthy.status_code)
+
+        self.app.state.ledger._connection.execute(
+            "UPDATE workers SET last_seen_at = ? WHERE worker_id = ?",
+            [datetime.now(UTC) - timedelta(minutes=6), second_worker],
+        )
+        disconnected = self.client.post(
+            "/api/admin/product-catalog-analyses",
+            headers={"X-CSRF-Token": csrf},
+            json={"first_worker_id": first_worker, "second_worker_id": second_worker, "policy": {"label": "FX"}},
+        )
+        self.assertEqual(409, disconnected.status_code)
+
+        self.app.state.ledger._connection.execute(
+            "UPDATE workers SET safety_state = 'connected', last_seen_at = ? WHERE worker_id = ?",
+            [datetime.now(UTC), second_worker],
+        )
+        self.assertEqual(
+            204,
+            self.client.post(f"/api/admin/workers/{second_worker}/revoke", headers={"X-CSRF-Token": csrf}).status_code,
+        )
+        revoked = self.client.post(
+            "/api/admin/product-catalog-analyses",
+            headers={"X-CSRF-Token": csrf},
+            json={"first_worker_id": first_worker, "second_worker_id": second_worker, "policy": {"label": "FX"}},
+        )
+        self.assertEqual(409, revoked.status_code)
+
+    def test_build_requires_explicit_confirmation_and_persists_unordered_active_pair_evidence(self) -> None:
+        with self._live_catalog_analysis_harness() as harness:
+            analysis, first_worker, second_worker = self._create_passing_analysis(
+                harness,
+                first_login=123456,
+                first_server="Broker-B",
+                second_login=654321,
+                second_server="Broker-A",
+                policy={"label": "FX catalog v1"},
+            )
+            self.assertEqual("passed", analysis["m1_verification_results"][0]["verification_status"])
+            self.assertEqual(404, harness.build_product_pair("missing-confirmation", expected_status=404).status_code)
+
+            confirmation = harness.request_product_pair_build_confirmation(
+                analysis["analysis_id"],
+                "EURUSD.a",
+                "EURUSD",
+            )
+            self.assertEqual(analysis["analysis_id"], confirmation["analysis_id"])
+            self.assertEqual(analysis["policy"], confirmation["policy_snapshot"])
+            self.assertEqual(analysis["analysis_period"], confirmation["analysis_period"])
+            self.assertEqual(first_worker, confirmation["source_workers"]["first_worker"]["worker_id"])
+            self.assertEqual(second_worker, confirmation["source_workers"]["second_worker"]["worker_id"])
+            self.assertEqual(["Broker-A", "Broker-B"], [
+                endpoint["server"] for endpoint in confirmation["reference_specifications"]
+            ])
+            self.assertEqual("1:1", confirmation["lot_relationship"]["ratio"])
+            self.assertEqual("FX_V1", confirmation["lot_relationship"]["version"])
+
+            built_pair = harness.build_product_pair(confirmation["confirmation_id"]).json()
+            self.assertEqual("active", built_pair["status"])
+            self.assertEqual(["Broker-A", "Broker-B"], [
+                endpoint["server"] for endpoint in built_pair["endpoints"]
+            ])
+            self.assertEqual(["EURUSD", "EURUSD.a"], [
+                endpoint["symbol"] for endpoint in built_pair["endpoints"]
+            ])
+            self.assertEqual(analysis["policy"], built_pair["policy_snapshot"])
+            self.assertEqual(analysis["analysis_period"], built_pair["analysis_period"])
+            self.assertEqual([], built_pair["approval_evidence"]["hard_block_differences"])
+            self.assertEqual(["volume_max"], [
+                difference["field"] for difference in built_pair["approval_evidence"]["warning_differences"]
+            ])
+            self.assertEqual("1:1", built_pair["lot_relationship"]["ratio"])
+
+            pairs = harness.list_product_pairs()
+            self.assertEqual(1, len([pair for pair in pairs if pair["status"] == "active"]))
+            self.assertEqual(built_pair["product_pair_id"], pairs[0]["product_pair_id"])
+
+            second_confirmation = harness.request_product_pair_build_confirmation(
+                analysis["analysis_id"],
+                "EURUSD.a",
+                "EURUSD",
+            )
+            self.assertEqual(409, harness.build_product_pair(second_confirmation["confirmation_id"], expected_status=409).status_code)
+            self.assertTrue({
+                "product_pair_build_confirmation_requested",
+                "product_pair_built",
+            }.issubset({event["event_type"] for event in harness.list_events()}))
+
+    def test_active_pair_uniqueness_is_enforced_even_if_precheck_is_bypassed(self) -> None:
+        with self._live_catalog_analysis_harness() as harness:
+            initial_pair = self._build_active_product_pair(
+                harness,
+                first_login=123456,
+                first_server="Broker-B",
+                second_login=654321,
+                second_server="Broker-A",
+                policy={"label": "FX catalog v1"},
+            )
+            analysis, _first_worker, _second_worker = self._create_passing_analysis(
+                harness,
+                first_login=123457,
+                first_server="Broker-B",
+                second_login=654322,
+                second_server="Broker-A",
+                policy={"label": "FX catalog v2"},
+            )
+            confirmation = harness.request_product_pair_build_confirmation(analysis["analysis_id"], "EURUSD.a", "EURUSD")
+
+            with patch.object(harness._app.state.ledger, "_require_no_active_product_pair", lambda _endpoints: None):
+                response = harness.build_product_pair(confirmation["confirmation_id"], expected_status=409)
+
+            self.assertEqual(409, response.status_code)
+            active_pairs = [pair for pair in harness.list_product_pairs() if pair["status"] == "active"]
+            self.assertEqual([initial_pair["product_pair_id"]], [pair["product_pair_id"] for pair in active_pairs])
+
+    def test_replace_retires_old_pair_atomically_and_retirement_preserves_audit_history(self) -> None:
+        with self._live_catalog_analysis_harness() as harness:
+            initial_pair = self._build_active_product_pair(
+                harness,
+                first_login=123456,
+                first_server="Broker-B",
+                second_login=654321,
+                second_server="Broker-A",
+                policy={"label": "FX catalog v1"},
+            )
+
+            replacement_pair = self._prepare_replacement_confirmation(
+                harness,
+                active_pair_id=initial_pair["product_pair_id"],
+                first_login=123457,
+                first_server="Broker-B",
+                second_login=654322,
+                second_server="Broker-A",
+                policy={"label": "FX catalog v2", "maximum_m1_p99_price_difference_points": 20.0},
+                first_volume_max=300.0,
+                second_volume_max=320.0,
+            )
+
+            pairs_after_replace = {pair["product_pair_id"]: pair for pair in harness.list_product_pairs()}
+            self.assertEqual("retired", pairs_after_replace[initial_pair["product_pair_id"]]["status"])
+            self.assertEqual(replacement_pair["product_pair_id"], pairs_after_replace[initial_pair["product_pair_id"]]["replaced_by_product_pair_id"])
+            self.assertEqual("active", pairs_after_replace[replacement_pair["product_pair_id"]]["status"])
+            self.assertEqual(1, len([pair for pair in pairs_after_replace.values() if pair["status"] == "active"]))
+
+            retired = harness.retire_product_pair(replacement_pair["product_pair_id"]).json()
+            self.assertEqual("retired", retired["status"])
+            self.assertEqual("manual_retirement", retired["retired_reason"])
+
+            retained_pairs = {pair["product_pair_id"]: pair for pair in harness.list_product_pairs()}
+            self.assertEqual("retired", retained_pairs[initial_pair["product_pair_id"]]["status"])
+            self.assertEqual("retired", retained_pairs[replacement_pair["product_pair_id"]]["status"])
+            self.assertEqual(0, len([pair for pair in retained_pairs.values() if pair["status"] == "active"]))
+            self.assertTrue({
+                "product_pair_replaced",
+                "product_pair_retired",
+            }.issubset({event["event_type"] for event in harness.list_events()}))
+
+    def test_product_pair_workers_default_to_applicable_and_manual_compatibility_checks_do_not_auto_exclude(self) -> None:
+        with self._live_catalog_analysis_harness() as harness:
+            built_pair = self._build_active_product_pair(
+                harness,
+                first_login=123456,
+                first_server="Broker-B",
+                second_login=654321,
+                second_server="Broker-A",
+                policy={"label": "FX catalog v1"},
+            )
+            third_key, third_worker, third_certificate = harness.approved_worker(777777, "Broker-B")
+            third_ready = threading.Event()
+            third_responder = threading.Thread(
+                target=harness.respond_to_catalog_analysis,
+                args=(
+                    third_key,
+                    third_worker,
+                    third_certificate,
+                    [self._forex_symbol("EURUSD.a", 300.0, volume_step=0.1)],
+                ),
+                kwargs={"request_key": f"compatibility-{third_worker}", "ready_event": third_ready},
+            )
+            third_responder.start()
+            self.assertTrue(third_ready.wait(timeout=5))
+
+            before_check = next(
+                worker
+                for worker in harness.list_product_pairs()[0]["worker_applicability"]
+                if worker["worker_id"] == third_worker
+            )
+            self.assertEqual("applicable", before_check["applicability_status"])
+            self.assertEqual("uninspected", before_check["inspection_status"])
+            self.assertIsNone(before_check["latest_compatibility_check"])
+            self.assertIsNone(before_check["exclusion"])
+
+            compatibility = harness.check_product_pair_worker_compatibility(
+                built_pair["product_pair_id"],
+                third_worker,
+            )
+            third_responder.join(timeout=5)
+
+            self.assertEqual(built_pair["product_pair_id"], compatibility["product_pair_id"])
+            self.assertEqual(third_worker, compatibility["worker_id"])
+            self.assertEqual("applicable", compatibility["applicability_status"])
+            self.assertEqual("differences_detected", compatibility["inspection_status"])
+            self.assertEqual("EURUSD.a", compatibility["reference_symbol"])
+            self.assertEqual(["volume_step"], [
+                difference["field"] for difference in compatibility["hard_block_differences"]
+            ])
+            self.assertEqual(["volume_max"], [
+                difference["field"] for difference in compatibility["warning_differences"]
+            ])
+
+            after_check = next(
+                worker
+                for worker in harness.list_product_pairs()[0]["worker_applicability"]
+                if worker["worker_id"] == third_worker
+            )
+            self.assertEqual("applicable", after_check["applicability_status"])
+            self.assertEqual("differences_detected", after_check["inspection_status"])
+            self.assertIsNotNone(after_check["latest_compatibility_check"])
+            self.assertIsNone(after_check["exclusion"])
+
+            exclusion = harness.exclude_product_pair_worker(built_pair["product_pair_id"], third_worker)
+            self.assertEqual("excluded", exclusion["applicability_status"])
+            self.assertEqual("ABCDEF", exclusion["exclusion"]["excluded_by"])
+            self.assertEqual(
+                compatibility["compatibility_check_id"],
+                exclusion["exclusion"]["compatibility_check_id"],
+            )
+
+            after_exclusion = next(
+                worker
+                for worker in harness.list_product_pairs()[0]["worker_applicability"]
+                if worker["worker_id"] == third_worker
+            )
+            self.assertEqual("excluded", after_exclusion["applicability_status"])
+            self.assertEqual("differences_detected", after_exclusion["inspection_status"])
+            self.assertEqual(
+                compatibility["compatibility_check_id"],
+                after_exclusion["latest_compatibility_check"]["compatibility_check_id"],
+            )
+            self.assertEqual(
+                compatibility["compatibility_check_id"],
+                after_exclusion["exclusion"]["compatibility_check_id"],
+            )
+            still_applicable = {
+                worker["worker_id"]: worker["applicability_status"]
+                for worker in harness.list_product_pairs()[0]["worker_applicability"]
+            }
+            self.assertEqual("applicable", still_applicable[built_pair["source_workers"]["first_worker"]["worker_id"]])
+            self.assertEqual("applicable", still_applicable[built_pair["source_workers"]["second_worker"]["worker_id"]])
+            self.assertTrue({
+                "product_pair_worker_compatibility_checked",
+                "product_pair_worker_excluded",
+            }.issubset({event["event_type"] for event in harness.list_events()}))
+
+    def test_manual_retest_uses_original_policy_records_fresh_evidence_and_preserves_reference_snapshot(self) -> None:
+        with self._live_catalog_analysis_harness() as harness:
+            built_pair = self._build_active_product_pair(
+                harness,
+                first_login=123456,
+                first_server="Broker-B",
+                second_login=654321,
+                second_server="Broker-A",
+                policy={"label": "FX catalog v1"},
+            )
+            original_reference_snapshot = json.loads(json.dumps(built_pair["reference_specifications"]))
+
+            first_retest_key, first_retest_worker, first_retest_certificate = harness.approved_worker(777777, "Broker-A")
+            second_retest_key, second_retest_worker, second_retest_certificate = harness.approved_worker(888888, "Broker-B")
+            first_ready = threading.Event()
+            second_ready = threading.Event()
+            first_responder = threading.Thread(
+                target=harness.respond_to_catalog_analysis,
+                args=(
+                    first_retest_key,
+                    first_retest_worker,
+                    first_retest_certificate,
+                    [self._forex_symbol("EURUSD", 330.0)],
+                ),
+                kwargs={
+                    "request_key": f"retest-first-{first_retest_worker}",
+                    "collected_at": "2026-08-24T07:00:00+00:00",
+                    "market_data_collected_at": "2026-08-24T07:05:00+00:00",
+                    "ready_event": first_ready,
+                    "market_data_by_stage": self._passing_market_data("EURUSD"),
+                },
+            )
+            second_responder = threading.Thread(
+                target=harness.respond_to_catalog_analysis,
+                args=(
+                    second_retest_key,
+                    second_retest_worker,
+                    second_retest_certificate,
+                    [self._forex_symbol("EURUSD.a", 360.0)],
+                ),
+                kwargs={
+                    "request_key": f"retest-second-{second_retest_worker}",
+                    "collected_at": "2026-08-24T07:00:01+00:00",
+                    "market_data_collected_at": "2026-08-24T07:05:01+00:00",
+                    "ready_event": second_ready,
+                    "market_data_by_stage": self._passing_market_data("EURUSD.a", m15_base=1.1001, m1_base=1.10001),
+                },
+            )
+            first_responder.start()
+            second_responder.start()
+            self.assertTrue(first_ready.wait(timeout=5))
+            self.assertTrue(second_ready.wait(timeout=5))
+
+            retest = harness.launch_product_pair_retest(
+                built_pair["product_pair_id"],
+                first_retest_worker,
+                second_retest_worker,
+            )
+
+            first_responder.join(timeout=5)
+            second_responder.join(timeout=5)
+
+            self.assertEqual("passed", retest["status"])
+            self.assertEqual(built_pair["product_pair_id"], retest["product_pair_id"])
+            self.assertEqual(built_pair["policy_snapshot"], retest["policy_snapshot"])
+            self.assertEqual(original_reference_snapshot, retest["reference_specifications"])
+            self.assertEqual("2026-08-24T07:00:00+00:00", retest["first_catalog_evidence"]["collected_at"])
+            self.assertEqual("2026-08-24T07:00:01+00:00", retest["second_catalog_evidence"]["collected_at"])
+            self.assertEqual("2026-08-24T07:05:00+00:00", retest["m15_screening_results"][0]["first_market_data"]["time_metadata"]["calibration"]["calibrated_at_utc"])
+            self.assertEqual("2026-08-24T07:05:01+00:00", retest["m15_screening_results"][0]["second_market_data"]["time_metadata"]["calibration"]["calibrated_at_utc"])
+            self.assertEqual("2026-08-24T07:05:00+00:00", retest["m1_verification_results"][0]["first_market_data"]["time_metadata"]["calibration"]["calibrated_at_utc"])
+            self.assertEqual(first_retest_worker, retest["source_workers"]["first_worker"]["worker_id"])
+            self.assertEqual(second_retest_worker, retest["source_workers"]["second_worker"]["worker_id"])
+            self.assertEqual(330.0, retest["first_catalog_evidence"]["symbols"][0]["volume_max"])
+            self.assertEqual(
+                {"Broker-A": 250.0, "Broker-B": 200.0},
+                {
+                    item["server"]: item["specification"]["volume_max"]
+                    for item in original_reference_snapshot
+                },
+            )
+
+            pair_after_retest = harness.list_product_pairs()[0]
+            self.assertEqual("passed", pair_after_retest["latest_retest"]["status"])
+            self.assertEqual(retest["retest_id"], pair_after_retest["latest_retest"]["retest_id"])
+            self.assertEqual(original_reference_snapshot, pair_after_retest["reference_specifications"])
+            self.assertTrue({
+                "product_pair_retest_requested",
+                "product_pair_retest_succeeded",
+            }.issubset({event["event_type"] for event in harness.list_events()}))
+
+    def test_manual_retest_requires_healthy_connected_workers_on_the_pairs_exact_servers(self) -> None:
+        with self._live_catalog_analysis_harness() as harness:
+            built_pair = self._build_active_product_pair(
+                harness,
+                first_login=123456,
+                first_server="Broker-B",
+                second_login=654321,
+                second_server="Broker-A",
+                policy={"label": "FX catalog v1"},
+            )
+            healthy_endpoint_worker = harness.approved_worker(777777, "Broker-A")[1]
+            wrong_server_worker = harness.approved_worker(888888, "Broker-C")[1]
+            harness._app.state.ledger.record_worker_session(healthy_endpoint_worker)
+            harness._app.state.ledger.record_worker_session(wrong_server_worker)
+
+            wrong_server = harness.launch_product_pair_retest(
+                built_pair["product_pair_id"],
+                healthy_endpoint_worker,
+                wrong_server_worker,
+                expected_status=409,
+            )
+            self.assertEqual("Selected workers must belong to this product pair's exact MT5 servers.", wrong_server["detail"])
+
+            disconnected_worker = harness.approved_worker(999999, "Broker-B")[1]
+            disconnected = harness.launch_product_pair_retest(
+                built_pair["product_pair_id"],
+                healthy_endpoint_worker,
+                disconnected_worker,
+                expected_status=409,
+            )
+            self.assertEqual(
+                "Selected worker must be approved, healthy, and connected.",
+                disconnected["detail"],
+            )
+
+    def test_manual_retest_failure_creates_an_alert_marks_latest_failed_and_keeps_the_pair_active(self) -> None:
+        with self._live_catalog_analysis_harness() as harness:
+            built_pair = self._build_active_product_pair(
+                harness,
+                first_login=123456,
+                first_server="Broker-B",
+                second_login=654321,
+                second_server="Broker-A",
+                policy={"label": "FX catalog v1"},
+            )
+            first_retest_key, first_retest_worker, first_retest_certificate = harness.approved_worker(777777, "Broker-A")
+            second_retest_key, second_retest_worker, second_retest_certificate = harness.approved_worker(888888, "Broker-B")
+            first_ready = threading.Event()
+            second_ready = threading.Event()
+            first_responder = threading.Thread(
+                target=harness.respond_to_catalog_analysis,
+                args=(
+                    first_retest_key,
+                    first_retest_worker,
+                    first_retest_certificate,
+                    [self._forex_symbol("EURUSD", 330.0)],
+                ),
+                kwargs={
+                    "request_key": f"failed-retest-first-{first_retest_worker}",
+                    "ready_event": first_ready,
+                    "market_data_by_stage": self._passing_market_data("EURUSD"),
+                },
+            )
+            second_responder = threading.Thread(
+                target=harness.respond_to_catalog_analysis,
+                args=(
+                    second_retest_key,
+                    second_retest_worker,
+                    second_retest_certificate,
+                    [self._forex_symbol("EURUSD.a", 360.0)],
+                ),
+                kwargs={
+                    "request_key": f"failed-retest-second-{second_retest_worker}",
+                    "ready_event": second_ready,
+                    "market_data_by_stage": self._passing_market_data("EURUSD.a", m15_base=1.1001, m1_base=1.10500),
+                },
+            )
+            first_responder.start()
+            second_responder.start()
+            self.assertTrue(first_ready.wait(timeout=5))
+            self.assertTrue(second_ready.wait(timeout=5))
+
+            retest = harness.launch_product_pair_retest(
+                built_pair["product_pair_id"],
+                first_retest_worker,
+                second_retest_worker,
+            )
+
+            first_responder.join(timeout=5)
+            second_responder.join(timeout=5)
+
+            self.assertEqual("failed", retest["status"])
+            self.assertEqual("failed", retest["m1_verification_results"][0]["verification_status"])
+            self.assertEqual("Re-test failed the original analysis policy.", retest["failure_reason"])
+
+            pair_after_failure = harness.list_product_pairs()[0]
+            self.assertEqual("active", pair_after_failure["status"])
+            self.assertEqual("failed", pair_after_failure["latest_retest"]["status"])
+            self.assertEqual(retest["retest_id"], pair_after_failure["latest_retest"]["retest_id"])
+
+            latest_alert = harness.list_alerts()[-1]
+            self.assertEqual("product_pair_retest_failed", latest_alert["alert_type"])
+            self.assertEqual("latest_retest_failed", latest_alert["reason"])
+            self.assertEqual(built_pair["product_pair_id"], latest_alert["product_pair_id"])
+            self.assertTrue({
+                "product_pair_retest_requested",
+                "product_pair_retest_failed",
+            }.issubset({event["event_type"] for event in harness.list_events()}))
+
     def _create_pending_enrollment(self) -> str:
         private_key = ec.generate_private_key(ec.SECP256R1())
         public_key_pem = private_key.public_key().public_bytes(
@@ -600,22 +1602,662 @@ class ControlPlaneServiceTests(unittest.TestCase):
         self.assertEqual(200, response.status_code)
         return response.json()["challenge"]
 
+    def _approved_worker(self, login: int, server: str) -> tuple[ec.EllipticCurvePrivateKey, str, str]:
+        private_key = ec.generate_private_key(ec.SECP256R1())
+        public_key_pem = private_key.public_key().public_bytes(
+            serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
+        ).decode("utf-8")
+        enrollment = self._enrollment_response(
+            private_key,
+            public_key_pem,
+            {"login": login, "server": server},
+            {"name": "MetaTrader 5"},
+            password=f"worker-{login}-memory-only-password",
+            login=login,
+            server=server,
+        )
+        approval = self.client.post(
+            f"/api/admin/enrollments/{enrollment.json()['enrollment_id']}/approve",
+            headers={
+                "X-CSRF-Token": self.client.post(
+                    "/api/admin/login", json={"username": "ABCDEF", "password": "A-secure-admin-password!"}
+                ).json()["csrf_token"]
+            },
+        )
+        worker_id = approval.json()["worker_id"]
+        return private_key, worker_id, self.app.state.ledger.active_worker(worker_id).certificate
+
+    def _launch_catalog_analysis(
+        self, first_worker_id: str, second_worker_id: str, policy: dict[str, object]
+    ) -> dict[str, object]:
+        login = self.http_client.post(
+            "/api/admin/login", json={"username": "ABCDEF", "password": "A-secure-admin-password!"}
+        )
+        response = self.http_client.post(
+            "/api/admin/product-catalog-analyses",
+            headers={"X-CSRF-Token": login.json()["csrf_token"]},
+            json={"first_worker_id": first_worker_id, "second_worker_id": second_worker_id, "policy": policy},
+        )
+        return response.json()
+
+    def _build_active_product_pair(
+        self,
+        harness: "_LiveCatalogAnalysisHarness",
+        *,
+        first_login: int,
+        first_server: str,
+        second_login: int,
+        second_server: str,
+        policy: dict[str, object],
+        first_volume_max: float = 200.0,
+        second_volume_max: float = 250.0,
+    ) -> dict[str, object]:
+        analysis, _first_worker, _second_worker = self._create_passing_analysis(
+            harness,
+            first_login=first_login,
+            first_server=first_server,
+            second_login=second_login,
+            second_server=second_server,
+            policy=policy,
+            first_volume_max=first_volume_max,
+            second_volume_max=second_volume_max,
+        )
+        confirmation = harness.request_product_pair_build_confirmation(analysis["analysis_id"], "EURUSD.a", "EURUSD")
+        response = harness.build_product_pair(confirmation["confirmation_id"])
+        return response.json()
+
+    def _prepare_replacement_confirmation(
+        self,
+        harness: "_LiveCatalogAnalysisHarness",
+        *,
+        active_pair_id: str,
+        first_login: int,
+        first_server: str,
+        second_login: int,
+        second_server: str,
+        policy: dict[str, object],
+        first_volume_max: float,
+        second_volume_max: float,
+    ) -> dict[str, object]:
+        analysis, _first_worker, _second_worker = self._create_passing_analysis(
+            harness,
+            first_login=first_login,
+            first_server=first_server,
+            second_login=second_login,
+            second_server=second_server,
+            policy=policy,
+            first_volume_max=first_volume_max,
+            second_volume_max=second_volume_max,
+        )
+        confirmation = harness.request_product_pair_build_confirmation(analysis["analysis_id"], "EURUSD.a", "EURUSD")
+        self.assertEqual(409, harness.build_product_pair(confirmation["confirmation_id"], expected_status=409).status_code)
+        return harness.replace_product_pair(active_pair_id, confirmation["confirmation_id"]).json()
+
+    def _create_passing_analysis(
+        self,
+        harness: "_LiveCatalogAnalysisHarness",
+        *,
+        first_login: int,
+        first_server: str,
+        second_login: int,
+        second_server: str,
+        policy: dict[str, object],
+        first_volume_max: float = 200.0,
+        second_volume_max: float = 250.0,
+    ) -> tuple[dict[str, object], str, str]:
+        first_key, first_worker, first_certificate = harness.approved_worker(first_login, first_server)
+        second_key, second_worker, second_certificate = harness.approved_worker(second_login, second_server)
+        first_ready = threading.Event()
+        second_ready = threading.Event()
+        first_responder = threading.Thread(
+            target=harness.respond_to_catalog_analysis,
+            args=(
+                first_key,
+                first_worker,
+                first_certificate,
+                [self._forex_symbol("EURUSD.a", first_volume_max)],
+            ),
+            kwargs={
+                "request_key": f"first-{first_login}",
+                "ready_event": first_ready,
+                "market_data_by_stage": self._passing_market_data("EURUSD.a"),
+            },
+        )
+        second_responder = threading.Thread(
+            target=harness.respond_to_catalog_analysis,
+            args=(
+                second_key,
+                second_worker,
+                second_certificate,
+                [self._forex_symbol("EURUSD", second_volume_max)],
+            ),
+            kwargs={
+                "request_key": f"second-{second_login}",
+                "ready_event": second_ready,
+                "market_data_by_stage": self._passing_market_data("EURUSD", m15_base=1.1001, m1_base=1.10001),
+            },
+        )
+        first_responder.start()
+        second_responder.start()
+        self.assertTrue(first_ready.wait(timeout=5))
+        self.assertTrue(second_ready.wait(timeout=5))
+        analysis = harness.launch_catalog_analysis(first_worker, second_worker, policy)
+        first_responder.join(timeout=5)
+        second_responder.join(timeout=5)
+        return analysis, first_worker, second_worker
+
+    def _forex_symbol(
+        self,
+        symbol: str,
+        volume_max: float,
+        *,
+        volume_step: float = 0.01,
+        trade_calc_mode: str = "FOREX",
+        currency_base: str = "EUR",
+        currency_profit: str = "USD",
+        digits: int = 5,
+        point: float = 0.00001,
+        trade_tick_size: float | None = None,
+        trade_stops_level: int = 10,
+    ) -> dict[str, object]:
+        tick_size = point if trade_tick_size is None else trade_tick_size
+        return {
+            "symbol": symbol,
+            "trade_calc_mode": trade_calc_mode,
+            "currency_base": currency_base,
+            "currency_profit": currency_profit,
+            "digits": digits,
+            "point": point,
+            "trade_tick_size": tick_size,
+            "contract_size": 100000,
+            "volume_min": 0.01,
+            "volume_step": volume_step,
+            "volume_max": volume_max,
+            "trade_stops_level": trade_stops_level,
+            "trade_freeze_level": 0,
+            "trade_tick_value": 1.0,
+            "currency_margin": currency_profit,
+            "swap_long": -1.5,
+            "swap_short": 0.5,
+            "swap_rollover3days": 3,
+            "filling_modes": ["FOK", "IOC"],
+            "allowed_directions": ["LONG", "SHORT"],
+        }
+
+    def _passing_market_data(self, symbol: str, *, m15_base: float = 1.1000, m1_base: float = 1.10000) -> dict[str, dict[str, list[dict[str, object]]]]:
+        return {
+            "m15_screening": {
+                symbol: [
+                    {"time": 1000, "open": m15_base, "high": round(m15_base + 0.0020, 5), "low": round(m15_base - 0.0010, 5), "close": round(m15_base + 0.0010, 5)},
+                    {"time": 1900, "open": round(m15_base + 0.0010, 5), "high": round(m15_base + 0.0030, 5), "low": m15_base, "close": round(m15_base + 0.0022, 5)},
+                    {"time": 2800, "open": round(m15_base + 0.0020, 5), "high": round(m15_base + 0.0040, 5), "low": round(m15_base + 0.0010, 5), "close": round(m15_base + 0.0030, 5)},
+                ]
+            },
+            "m1_verification": {
+                symbol: [
+                    {"time": 1000, "close": m1_base},
+                    {"time": 1060, "close": round(m1_base + 0.00050, 5)},
+                    {"time": 1120, "close": round(m1_base + 0.00120, 5)},
+                    {"time": 1180, "close": round(m1_base + 0.00180, 5)},
+                ]
+            },
+        }
+
+    def _respond_to_catalog_analysis(
+        self,
+        websocket: object,
+        requests: dict[str, dict[str, object]],
+        key: str,
+        symbols: list[dict[str, object]] | None,
+        *,
+        collected_at: str = "2026-08-17T07:00:00+00:00",
+    ) -> None:
+        request = websocket.receive_json()
+        requests[key] = request
+        response = {
+            "type": "product_catalog_analysis_response",
+            "analysis_id": request["analysis_id"],
+            "request_id": request["request_id"],
+            "collected_at": collected_at,
+        }
+        if symbols is not None:
+            response["symbols"] = symbols
+        websocket.send_json(response)
+
+    def _authenticate_worker_socket(
+        self,
+        websocket: object,
+        private_key: ec.EllipticCurvePrivateKey,
+        worker_id: str,
+        certificate: str,
+    ) -> None:
+        websocket.send_json({"worker_id": worker_id, "certificate": certificate})
+        challenge = websocket.receive_json()
+        signature = private_key.sign(
+            worker_proof_payload(purpose="worker_session", worker_id=worker_id, nonce=challenge["nonce"]),
+            ec.ECDSA(hashes.SHA256()),
+        )
+        websocket.send_json({"signature": base64.b64encode(signature).decode("ascii")})
+        self.assertEqual({"type": "authenticated", "worker_id": worker_id, "cursor": 0}, websocket.receive_json())
+
+    @contextmanager
+    def _live_catalog_analysis_harness(self):
+        secret_store = MemorySecretStore()
+        certificate_issuer = MemoryCertificateIssuer()
+        app = create_app(
+            Path(self._directory.name) / f"live-{uuid4()}.duckdb",
+            secret_store=secret_store,
+            certificate_issuer=certificate_issuer,
+        )
+        app.state.ledger.create_admin("ABCDEF", "A-secure-admin-password!")
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning"))
+        thread = threading.Thread(target=server.run, daemon=True)
+        thread.start()
+        base_url = f"http://127.0.0.1:{port}"
+        for _ in range(50):
+            try:
+                if httpx.get(f"{base_url}/health", timeout=0.2).status_code == 200:
+                    break
+            except httpx.HTTPError:
+                time.sleep(0.1)
+        else:
+            server.should_exit = True
+            thread.join(timeout=5)
+            self.fail("live server did not start")
+        try:
+            yield _LiveCatalogAnalysisHarness(self, app, base_url)
+        finally:
+            server.should_exit = True
+            try:
+                httpx.get(f"{base_url}/health", timeout=0.2)
+            except httpx.HTTPError:
+                pass
+            thread.join(timeout=5)
+            if thread.is_alive():
+                server.force_exit = True
+                thread.join(timeout=5)
+
     def _enrollment_response(
-        self, private_key: ec.EllipticCurvePrivateKey, public_key_pem: str, account_info: dict[str, object],
-        terminal_info: dict[str, object], password: str = "worker-memory-only-password"
+        self,
+        private_key: ec.EllipticCurvePrivateKey,
+        public_key_pem: str,
+        account_info: dict[str, object],
+        terminal_info: dict[str, object],
+        password: str = "worker-memory-only-password",
+        *,
+        login: int = 123456,
+        server: str = "Broker-Demo",
     ):
         challenge = self._enrollment_challenge()
         signature = private_key.sign(
-            enrollment_payload(123456, "Broker-Demo", "12345678", account_info, terminal_info, password, challenge),
+            enrollment_payload(login, server, "12345678", account_info, terminal_info, password, challenge),
             ec.ECDSA(hashes.SHA256()),
         )
         return self.client.post(
             "/api/enrollments",
             headers={"CF-Connecting-IP": "203.0.113.11"},
             json={
-                "login": 123456, "server": "Broker-Demo", "pairing_code": "12345678",
+                "login": login, "server": server, "pairing_code": "12345678",
                 "account_info": account_info, "terminal_info": terminal_info, "mt5_password": password,
                 "enrollment_challenge": challenge, "public_key_pem": public_key_pem,
                 "proof_signature": base64.b64encode(signature).decode("ascii"),
             },
         )
+
+
+class _LiveCatalogAnalysisHarness:
+    def __init__(self, case: ControlPlaneServiceTests, app: object, base_url: str) -> None:
+        self._case = case
+        self._app = app
+        self._base_url = base_url
+        self.requests: dict[str, list[dict[str, object]]] = {}
+
+    @property
+    def port(self) -> str:
+        return self._base_url.rsplit(":", 1)[1]
+
+    def approved_worker(self, login: int, server: str) -> tuple[ec.EllipticCurvePrivateKey, str, str]:
+        private_key = ec.generate_private_key(ec.SECP256R1())
+        public_key_pem = private_key.public_key().public_bytes(
+            serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
+        ).decode("utf-8")
+        challenge = httpx.get(f"{self._base_url}/api/enrollment-challenge", timeout=5).json()["challenge"]
+        account_info = {"login": login, "server": server}
+        terminal_info = {"name": "MetaTrader 5"}
+        password = f"worker-{login}-memory-only-password"
+        signature = private_key.sign(
+            enrollment_payload(login, server, "12345678", account_info, terminal_info, password, challenge),
+            ec.ECDSA(hashes.SHA256()),
+        )
+        response = httpx.post(
+            f"{self._base_url}/api/enrollments",
+            json={
+                "login": login,
+                "server": server,
+                "pairing_code": "12345678",
+                "account_info": account_info,
+                "terminal_info": terminal_info,
+                "mt5_password": password,
+                "enrollment_challenge": challenge,
+                "public_key_pem": public_key_pem,
+                "proof_signature": base64.b64encode(signature).decode("ascii"),
+            },
+            timeout=5,
+        )
+        self._case.assertEqual(201, response.status_code)
+        session_cookie, csrf = self._admin_session()
+        approval = httpx.post(
+            f"{self._base_url}/api/admin/enrollments/{response.json()['enrollment_id']}/approve",
+            headers={"Cookie": session_cookie, "X-CSRF-Token": csrf},
+            timeout=5,
+        )
+        self._case.assertEqual(200, approval.status_code)
+        worker_id = approval.json()["worker_id"]
+        certificate = self._app.state.ledger.active_worker(worker_id).certificate
+        return private_key, worker_id, certificate
+
+    def launch_catalog_analysis(
+        self, first_worker_id: str, second_worker_id: str, policy: dict[str, object]
+    ) -> dict[str, object]:
+        session_cookie, csrf = self._admin_session()
+        response = httpx.post(
+            f"{self._base_url}/api/admin/product-catalog-analyses",
+            headers={"Cookie": session_cookie, "X-CSRF-Token": csrf},
+            json={"first_worker_id": first_worker_id, "second_worker_id": second_worker_id, "policy": policy},
+            timeout=10,
+        )
+        self._case.assertEqual(201, response.status_code)
+        return response.json()
+
+    def read_catalog_analysis(self, analysis_id: str) -> dict[str, object]:
+        session_cookie, _csrf = self._admin_session()
+        response = httpx.get(
+            f"{self._base_url}/api/admin/product-catalog-analyses/{analysis_id}",
+            headers={"Cookie": session_cookie},
+            timeout=5,
+        )
+        self._case.assertEqual(200, response.status_code)
+        return response.json()
+
+    def request_product_pair_build_confirmation(
+        self,
+        analysis_id: str,
+        first_symbol: str,
+        second_symbol: str,
+    ) -> dict[str, object]:
+        session_cookie, csrf = self._admin_session()
+        response = httpx.post(
+            f"{self._base_url}/api/admin/product-catalog-analyses/{analysis_id}/product-pair-build-confirmations",
+            headers={"Cookie": session_cookie, "X-CSRF-Token": csrf},
+            json={"first_symbol": first_symbol, "second_symbol": second_symbol},
+            timeout=5,
+        )
+        self._case.assertEqual(201, response.status_code)
+        return response.json()
+
+    def build_product_pair(self, confirmation_id: str, *, expected_status: int = 201) -> httpx.Response:
+        session_cookie, csrf = self._admin_session()
+        response = httpx.post(
+            f"{self._base_url}/api/admin/product-pairs",
+            headers={"Cookie": session_cookie, "X-CSRF-Token": csrf},
+            json={"confirmation_id": confirmation_id},
+            timeout=5,
+        )
+        self._case.assertEqual(expected_status, response.status_code)
+        return response
+
+    def replace_product_pair(self, product_pair_id: str, confirmation_id: str, *, expected_status: int = 201) -> httpx.Response:
+        session_cookie, csrf = self._admin_session()
+        response = httpx.post(
+            f"{self._base_url}/api/admin/product-pairs/{product_pair_id}/replace",
+            headers={"Cookie": session_cookie, "X-CSRF-Token": csrf},
+            json={"confirmation_id": confirmation_id},
+            timeout=5,
+        )
+        self._case.assertEqual(expected_status, response.status_code)
+        return response
+
+    def retire_product_pair(self, product_pair_id: str, *, expected_status: int = 200) -> httpx.Response:
+        session_cookie, csrf = self._admin_session()
+        response = httpx.post(
+            f"{self._base_url}/api/admin/product-pairs/{product_pair_id}/retire",
+            headers={"Cookie": session_cookie, "X-CSRF-Token": csrf},
+            timeout=5,
+        )
+        self._case.assertEqual(expected_status, response.status_code)
+        return response
+
+    def list_product_pairs(self) -> list[dict[str, object]]:
+        session_cookie, _csrf = self._admin_session()
+        response = httpx.get(
+            f"{self._base_url}/api/admin/product-pairs",
+            headers={"Cookie": session_cookie},
+            timeout=5,
+        )
+        self._case.assertEqual(200, response.status_code)
+        return response.json()
+
+    def launch_product_pair_retest(
+        self,
+        product_pair_id: str,
+        first_worker_id: str,
+        second_worker_id: str,
+        *,
+        expected_status: int = 201,
+    ) -> dict[str, object]:
+        session_cookie, csrf = self._admin_session()
+        response = httpx.post(
+            f"{self._base_url}/api/admin/product-pairs/{product_pair_id}/retests",
+            headers={"Cookie": session_cookie, "X-CSRF-Token": csrf},
+            json={"first_worker_id": first_worker_id, "second_worker_id": second_worker_id},
+            timeout=10,
+        )
+        self._case.assertEqual(expected_status, response.status_code)
+        return response.json()
+
+    def check_product_pair_worker_compatibility(
+        self,
+        product_pair_id: str,
+        worker_id: str,
+        *,
+        expected_status: int = 200,
+    ) -> dict[str, object]:
+        session_cookie, csrf = self._admin_session()
+        response = httpx.post(
+            f"{self._base_url}/api/admin/product-pairs/{product_pair_id}/workers/{worker_id}/compatibility-check",
+            headers={"Cookie": session_cookie, "X-CSRF-Token": csrf},
+            timeout=10,
+        )
+        self._case.assertEqual(expected_status, response.status_code)
+        return response.json()
+
+    def exclude_product_pair_worker(
+        self,
+        product_pair_id: str,
+        worker_id: str,
+        *,
+        expected_status: int = 200,
+    ) -> dict[str, object]:
+        session_cookie, csrf = self._admin_session()
+        response = httpx.post(
+            f"{self._base_url}/api/admin/product-pairs/{product_pair_id}/workers/{worker_id}/exclude",
+            headers={"Cookie": session_cookie, "X-CSRF-Token": csrf},
+            timeout=5,
+        )
+        self._case.assertEqual(expected_status, response.status_code)
+        return response.json()
+
+    def list_events(self) -> list[dict[str, object]]:
+        session_cookie, _csrf = self._admin_session()
+        response = httpx.get(
+            f"{self._base_url}/api/admin/events",
+            headers={"Cookie": session_cookie},
+            timeout=5,
+        )
+        self._case.assertEqual(200, response.status_code)
+        return response.json()
+
+    def list_alerts(self) -> list[dict[str, object]]:
+        session_cookie, _csrf = self._admin_session()
+        response = httpx.get(
+            f"{self._base_url}/api/admin/alerts",
+            headers={"Cookie": session_cookie},
+            timeout=5,
+        )
+        self._case.assertEqual(200, response.status_code)
+        return response.json()
+
+    def respond_to_catalog_analysis(
+        self,
+        private_key: ec.EllipticCurvePrivateKey,
+        worker_id: str,
+        certificate: str,
+        symbols: list[dict[str, object]] | None,
+        *,
+        request_key: str,
+        collected_at: str = "2026-08-17T07:00:00+00:00",
+        market_data_collected_at: str = "2026-08-17T07:05:00+00:00",
+        market_data_by_symbol: dict[str, list[dict[str, object]]] | None = None,
+        market_data_by_stage: dict[str, dict[str, list[dict[str, object]]]] | None = None,
+        market_data_responses: list[dict[str, list[dict[str, object]]] | None] | None = None,
+        ready_event: threading.Event | None = None,
+    ) -> None:
+        with websocket_connect(f"ws://127.0.0.1:{self.port}/api/worker/session") as websocket:
+            self.authenticate_worker_socket(websocket, private_key, worker_id, certificate)
+            if ready_event is not None:
+                ready_event.set()
+            pending_market_data = list(market_data_responses or [])
+            while True:
+                request = json.loads(websocket.recv())
+                self.requests.setdefault(request_key, []).append(request)
+                stage = request.get("stage", "catalog")
+                if stage == "catalog":
+                    response = {
+                        "type": "product_catalog_analysis_response",
+                        "stage": "catalog",
+                        "analysis_id": request["analysis_id"],
+                        "request_id": request["request_id"],
+                        "collected_at": collected_at,
+                    }
+                    if symbols is not None:
+                        response["symbols"] = symbols
+                    websocket.send(json.dumps(response))
+                    if market_data_by_symbol is None and market_data_by_stage is None and not pending_market_data:
+                        return
+                    continue
+                if stage in {"m15_screening", "m1_verification"}:
+                    response_payload = (
+                        pending_market_data.pop(0)
+                        if pending_market_data
+                        else None if market_data_by_stage is None else market_data_by_stage.get(stage, {})
+                    )
+                    if response_payload is None and market_data_by_stage is None:
+                        response_payload = market_data_by_symbol
+                    websocket.send(json.dumps(self.market_data_response(
+                        request,
+                        response_payload,
+                        collected_at=market_data_collected_at,
+                    )))
+                    if pending_market_data:
+                        continue
+                    if market_data_by_stage is not None and stage != "m1_verification":
+                        continue
+                    if market_data_by_stage is None:
+                        return
+                    return
+                raise AssertionError(f"Unexpected analysis stage: {stage}")
+
+    def authenticate_worker_socket(
+        self,
+        websocket: object,
+        private_key: ec.EllipticCurvePrivateKey,
+        worker_id: str,
+        certificate: str,
+    ) -> None:
+        websocket.send(json.dumps({"worker_id": worker_id, "certificate": certificate}))
+        challenge = json.loads(websocket.recv())
+        signature = private_key.sign(
+            worker_proof_payload(purpose="worker_session", worker_id=worker_id, nonce=challenge["nonce"]),
+            ec.ECDSA(hashes.SHA256()),
+        )
+        websocket.send(json.dumps({"signature": base64.b64encode(signature).decode("ascii")}))
+        self._case.assertEqual(
+            {"type": "authenticated", "worker_id": worker_id, "cursor": 0},
+            json.loads(websocket.recv()),
+        )
+
+    def market_data_response(
+        self,
+        request: dict[str, object],
+        market_data_by_symbol: dict[str, list[dict[str, object]]] | None,
+        *,
+        collected_at: str = "2026-08-17T07:05:00+00:00",
+    ) -> dict[str, object]:
+        response: dict[str, object] = {
+            "type": "product_catalog_analysis_response",
+            "stage": request["stage"],
+            "analysis_id": request["analysis_id"],
+            "request_id": request["request_id"],
+            "collected_at": collected_at,
+            "timeframe": request["timeframe"],
+            "period_start_utc": request["period_start_utc"],
+            "period_end_utc": request["period_end_utc"],
+        }
+        if market_data_by_symbol is not None:
+            response["symbols"] = [
+                {
+                    "symbol": symbol,
+                    "bars": [
+                        {
+                            **bar,
+                            "time_utc": bar.get(
+                                "time_utc",
+                                datetime.fromtimestamp(int(bar["time"]), UTC).isoformat().replace("+00:00", "Z"),
+                            ),
+                        }
+                        for bar in bars
+                    ],
+                    "time_metadata": {
+                        "source_family": "market_data",
+                        "offset_layer": "market_data_calibration",
+                        "offset_seconds_used": 0,
+                        "calibration_status": "calibrated",
+                        "calibration": {
+                            "family": "market_data",
+                            "status": "calibrated",
+                            "offset_seconds": 0,
+                            "offset_layer": "market_data_calibration",
+                            "calibrated_local_date": collected_at[:10],
+                            "calibrated_at_utc": collected_at,
+                            "calibration_symbol": symbol,
+                            "sample_count": 3,
+                            "samples": [
+                                {
+                                    "source": "symbol_info_tick.time",
+                                    "calibrated_at_utc": collected_at,
+                                    "offset_seconds": 0,
+                                    "error_seconds": 0.2,
+                                    "symbol": symbol,
+                                }
+                            ],
+                        },
+                    },
+                }
+                for symbol, bars in market_data_by_symbol.items()
+            ]
+        return response
+
+    def _admin_session(self) -> tuple[str, str]:
+        response = httpx.post(
+            f"{self._base_url}/api/admin/login",
+            json={"username": "ABCDEF", "password": "A-secure-admin-password!"},
+            timeout=5,
+        )
+        self._case.assertEqual(200, response.status_code)
+        cookie = http.cookies.SimpleCookie()
+        cookie.load(response.headers["set-cookie"])
+        token = cookie["abt_admin_session"].value
+        return f"abt_admin_session={token}", response.json()["csrf_token"]
