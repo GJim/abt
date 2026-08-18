@@ -829,6 +829,23 @@ class ControlPlaneServiceTests(unittest.TestCase):
                         "analysis-123",
                     )
 
+    def test_catalog_response_accepts_legacy_worker_without_swap_mode(self) -> None:
+        symbol = self._forex_symbol("EURUSD", 100.0)
+        del symbol["swap_mode"]
+
+        response = _validated_product_catalog_response(
+            {
+                "type": "product_catalog_analysis_response",
+                "stage": "catalog",
+                "analysis_id": "analysis-123",
+                "collected_at": "2026-08-17T07:05:00+00:00",
+                "symbols": [symbol],
+            },
+            "analysis-123",
+        )
+
+        self.assertIsNone(response["symbols"][0]["swap_mode"])
+
     def test_catalog_compares_native_trade_calculation_modes_without_translation(self) -> None:
         first = self._forex_symbol("EURUSD.a", 100.0, trade_calc_mode=0)
         second = self._forex_symbol("EURUSD", 100.0, trade_calc_mode=0)

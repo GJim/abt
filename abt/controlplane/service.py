@@ -1094,11 +1094,15 @@ def _validated_symbol_specification(symbol: object) -> dict[str, object]:
         if not isinstance(value, (int, float)) or isinstance(value, bool):
             raise ValueError("Worker returned incomplete product catalog evidence.")
         normalized[field] = float(value)
-    for field in ("trade_stops_level", "trade_freeze_level", "swap_mode", "swap_rollover3days"):
+    for field in ("trade_stops_level", "trade_freeze_level", "swap_rollover3days"):
         value = symbol.get(field)
         if not isinstance(value, int) or isinstance(value, bool):
             raise ValueError("Worker returned incomplete product catalog evidence.")
         normalized[field] = value
+    swap_mode = symbol.get("swap_mode")
+    if swap_mode is not None and (not isinstance(swap_mode, int) or isinstance(swap_mode, bool)):
+        raise ValueError("Worker returned incomplete product catalog evidence.")
+    normalized["swap_mode"] = swap_mode
     for field in ("currency_margin",):
         value = symbol.get(field)
         if not isinstance(value, str) or not value:
