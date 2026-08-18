@@ -234,6 +234,7 @@ def _symbol_specification(symbol: object) -> dict[str, object]:
         "currency_margin": _required_symbol_text(source, "currency_margin"),
         "swap_long": _required_symbol_float(source, "swap_long"),
         "swap_short": _required_symbol_float(source, "swap_short"),
+        "swap_mode": _required_symbol_int(source, "swap_mode"),
         "swap_rollover3days": _required_symbol_int(source, "swap_rollover3days"),
     }
 

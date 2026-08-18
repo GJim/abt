@@ -679,7 +679,7 @@ class ControlPlaneServiceTests(unittest.TestCase):
                     second_worker,
                     second_certificate,
                     [
-                        self._forex_symbol("EURUSD", 50.0),
+                        self._forex_symbol("EURUSD", 50.0, swap_mode=2),
                         self._forex_symbol("GBPUSD", 100.0, currency_base="GBP", volume_step=0.1),
                         self._forex_symbol("AUDUSD", 100.0, currency_base="AUD"),
                         self._forex_symbol("XAUUSD", 100.0, currency_base="XAU", digits=2, point=0.01, trade_tick_size=0.01),
@@ -769,7 +769,7 @@ class ControlPlaneServiceTests(unittest.TestCase):
         eur_result, gbp_result = outcome["m1_verification_results"]
         self.assertEqual("passed", eur_result["verification_status"])
         self.assertEqual([], eur_result["hard_block_differences"])
-        self.assertEqual(["volume_max", "trade_stops_level"], [
+        self.assertEqual(["volume_max", "trade_stops_level", "swap_mode"], [
             difference["field"] for difference in eur_result["warning_differences"]
         ])
         self.assertTrue(all(eur_result["policy_evaluation"].values()))
@@ -1924,6 +1924,7 @@ class ControlPlaneServiceTests(unittest.TestCase):
         point: float = 0.00001,
         trade_tick_size: float | None = None,
         trade_stops_level: int = 10,
+        swap_mode: int = 1,
     ) -> dict[str, object]:
         tick_size = point if trade_tick_size is None else trade_tick_size
         return {
@@ -1944,6 +1945,7 @@ class ControlPlaneServiceTests(unittest.TestCase):
             "currency_margin": currency_profit,
             "swap_long": -1.5,
             "swap_short": 0.5,
+            "swap_mode": swap_mode,
             "swap_rollover3days": 3,
             "filling_modes": ["FOK", "IOC"],
             "allowed_directions": ["LONG", "SHORT"],
@@ -2522,6 +2524,7 @@ class RuntimeAnalysisMT5:
             "currency_margin": "USD",
             "swap_long": 0.0,
             "swap_short": 0.0,
+            "swap_mode": 1,
             "swap_rollover3days": 3,
         }]
 

@@ -317,6 +317,7 @@ class AnalysisMT5(ReadOnlyMT5):
                 "currency_margin": "EUR",
                 "swap_long": 0.0,
                 "swap_short": 0.0,
+                "swap_mode": 1,
                 "swap_rollover3days": 3,
             }
         ]
