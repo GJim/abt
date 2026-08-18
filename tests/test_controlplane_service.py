@@ -26,6 +26,7 @@ from websockets.sync.client import connect as websocket_connect
 from abt.controlplane.crypto import ProofError, device_certificate_payload, enrollment_payload, worker_proof_payload
 from abt.controlplane.secrets import SecretStore, SecretStoreError
 from abt.controlplane.service import (
+    _analyze_product_catalogs,
     _delete_expired_pending_secrets,
     _validated_market_data_response,
     _validated_product_catalog_response,
@@ -607,7 +608,6 @@ class ControlPlaneServiceTests(unittest.TestCase):
     def test_admin_can_launch_a_catalog_analysis_over_worker_wss_and_read_the_result(self) -> None:
         policy = {
             "label": "FX catalog v1",
-            "require_forex_calculation_mode": True,
             "require_equal_base_currency": True,
             "require_equal_profit_currency": True,
             "minimum_common_coverage": 0.99,
@@ -682,7 +682,7 @@ class ControlPlaneServiceTests(unittest.TestCase):
                         self._forex_symbol("EURUSD", 50.0),
                         self._forex_symbol("GBPUSD", 100.0, currency_base="GBP", volume_step=0.1),
                         self._forex_symbol("AUDUSD", 100.0, currency_base="AUD"),
-                        self._forex_symbol("XAUUSD", 100.0, trade_calc_mode="CFD", currency_base="XAU", digits=2, point=0.01, trade_tick_size=0.01),
+                        self._forex_symbol("XAUUSD", 100.0, currency_base="XAU", digits=2, point=0.01, trade_tick_size=0.01),
                     ],
                 ),
                 kwargs={
@@ -758,7 +758,7 @@ class ControlPlaneServiceTests(unittest.TestCase):
         self.assertEqual("succeeded", outcome["status"])
         self.assertEqual(policy, outcome["policy"])
         self.assertEqual(3, len(outcome["eligible_candidates"]))
-        self.assertEqual("non_forex_calculation_mode", outcome["exceptions"][0]["reason"])
+        self.assertEqual("trade_calc_mode_mismatch", outcome["exceptions"][0]["reason"])
         self.assertEqual(["failed", "passed", "passed"], [
             result["screening_status"] for result in outcome["m15_screening_results"]
         ])
@@ -824,6 +824,31 @@ class ControlPlaneServiceTests(unittest.TestCase):
                         },
                         "analysis-123",
                     )
+
+    def test_catalog_compares_native_trade_calculation_modes_without_translation(self) -> None:
+        first = self._forex_symbol("EURUSD.a", 100.0, trade_calc_mode=0)
+        second = self._forex_symbol("EURUSD", 100.0, trade_calc_mode=0)
+
+        candidates, exceptions = _analyze_product_catalogs([first], [second])
+
+        self.assertEqual([("EURUSD.a", "EURUSD")], [
+            (candidate["first_symbol"], candidate["second_symbol"]) for candidate in candidates
+        ])
+        self.assertEqual([], exceptions)
+
+        _candidates, exceptions = _analyze_product_catalogs(
+            [first],
+            [self._forex_symbol("EURUSD", 100.0, trade_calc_mode=1)],
+        )
+        self.assertEqual([{
+            "first_symbol": "EURUSD.a",
+            "second_symbol": "EURUSD",
+            "currency_base": "EUR",
+            "currency_profit": "USD",
+            "reason": "trade_calc_mode_mismatch",
+            "first_trade_calc_mode": 0,
+            "second_trade_calc_mode": 1,
+        }], exceptions)
 
     def test_market_data_response_requires_evidence_from_every_utc_weekday(self) -> None:
         analysis_period = {
@@ -1892,7 +1917,7 @@ class ControlPlaneServiceTests(unittest.TestCase):
         volume_max: float,
         *,
         volume_step: float = 0.01,
-        trade_calc_mode: str = "FOREX",
+        trade_calc_mode: int | str = "FOREX",
         currency_base: str = "EUR",
         currency_profit: str = "USD",
         digits: int = 5,

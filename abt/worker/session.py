@@ -202,7 +202,9 @@ def _symbol_specification(symbol: object) -> dict[str, object]:
     point = _symbol_field(source, "point")
     if not isinstance(name, str) or not name:
         raise WorkerEnrollmentError("The local MT5 terminal returned an invalid product catalog.")
-    if not isinstance(trade_calc_mode, str) or not trade_calc_mode:
+    if isinstance(trade_calc_mode, bool) or not isinstance(trade_calc_mode, (int, str)):
+        raise WorkerEnrollmentError("The local MT5 terminal returned an invalid product catalog.")
+    if isinstance(trade_calc_mode, str) and not trade_calc_mode:
         raise WorkerEnrollmentError("The local MT5 terminal returned an invalid product catalog.")
     if not isinstance(currency_base, str) or not currency_base:
         raise WorkerEnrollmentError("The local MT5 terminal returned an invalid product catalog.")

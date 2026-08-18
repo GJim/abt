@@ -12,7 +12,7 @@ Status: done
 
 建立一個以 Console REST/WSS 商品配對分析契約為唯一主要接縫的唯讀垂直切片。管理員發起商品配對分析後，主控台向兩台選定 worker 請求完整商品目錄、規格與市場資料；分析依 UTC 最近完整交易週先以 M15 篩選、再以 M1 驗證。
 
-第一版只建立 FX 的跨伺服器商品配對：兩端必須位於不同、大小寫精確識別的 MT5 server，具有相同 base/profit currency，且皆由 broker 標示為 FOREX。通過候選由管理員檢視不可變的分析證據與政策快照後 Build；若相同無方向端點已有 active 配對，管理員使用原子 Replace 取代它。配對 server-wide 適用於其他對應 worker；管理員可人工檢查個別 worker 的規格並核准排除。
+第一版只建立兩端具有相同 base/profit currency 與相同原始 MT5 `trade_calc_mode` enum 的跨伺服器商品配對；主控台不得將 broker enum 映射為自訂類別。兩端必須位於不同、大小寫精確識別的 MT5 server。通過候選由管理員檢視不可變的分析證據與政策快照後 Build；若相同無方向端點已有 active 配對，管理員使用原子 Replace 取代它。配對 server-wide 適用於其他對應 worker；管理員可人工檢查個別 worker 的規格並核准排除。
 
 ## User Stories
 
@@ -21,8 +21,8 @@ Status: done
 3. As a 主控台管理員, I want to select or create an immutable 分析政策快照 before analysis, so that I can explain the thresholds used for every result.
 4. As a 主控台管理員, I want to make a policy stricter or more permissive, so that different approved research criteria can be preserved instead of overwriting prior evidence.
 5. As a 主控台管理員, I want the Console to request full symbol catalogs and specifications from both workers, so that candidate identity starts from broker-returned evidence.
-6. As a 主控台管理員, I want automatic FX candidates to require the same base/profit currencies and FOREX calculation mode on both sides, so that suffix similarity cannot create a false hedge relationship.
-7. As a 主控台管理員, I want non-FOREX or otherwise exceptional products displayed as exceptions rather than automatically analyzed or built, so that broker-specific classifications require later explicit design.
+6. As a 主控台管理員, I want automatic candidates to require the same base/profit currencies and exact broker-returned `trade_calc_mode` enum on both sides, so that suffix similarity or lossy enum translation cannot create a false hedge relationship.
+7. As a 主控台管理員, I want products with mismatched calculation modes displayed as exceptions rather than automatically analyzed or built, so that broker-specific classifications remain auditable.
 8. As a 主控台管理員, I want M15 screening followed by M1 verification over the same UTC complete trading week, so that expensive minute data is fetched only for plausible candidates.
 9. As a 主控台管理員, I want all compared market times accompanied by raw broker epochs and calibration evidence, so that cross-server bar alignment can be audited.
 10. As a 主控台管理員, I want an analysis to fail without buildable partial candidates when either worker disconnects, times out, or returns incomplete data, so that one-sided evidence cannot be approved.
@@ -57,7 +57,7 @@ Status: done
 - Workers expose only read-only analysis operations: symbol catalog and specification inspection, plus bounded historical rate retrieval. No analysis request is allowed to reach a broker-write surface.
 - The controller specifies the previous complete trading week using UTC bounds. Workers query using their market-data calibration and return raw epochs, derived UTC timestamps, and calibration evidence so the controller can align bars reproducibly.
 - Historical completeness requires every returned FX symbol/timeframe series to include at least one UTC bar on each Monday through Friday in the requested week. Weekend closure is expected; broker maintenance, holidays, DST shifts, and intraday gaps do not imply missing evidence because this v1 policy intentionally does not infer broker trading-session schedules or a fixed intraday bar count. A missing weekday fails the stage before common-coverage evaluation.
-- FX v1 candidate generation requires equal `currency_base` and `currency_profit` on both symbols and FOREX calculation mode on both sides. A broker-returned non-FOREX candidate is rendered as an exception only; it cannot enter automatic analysis or Build.
+- Candidate generation requires equal `currency_base`, `currency_profit`, and exact broker-returned `trade_calc_mode` enum on both symbols. The worker preserves the native enum; the controller does not translate it. A calculation-mode mismatch is rendered as an exception only and cannot enter automatic analysis or Build.
 - Candidate evaluation is two-stage: common M15 bars screen every eligible FX candidate, then only candidates that pass M15 fetch common M1 bars for final verification.
 - The initial policy defaults are: M15 return correlation at least 0.98; M1 return correlation at least 0.97; common-data coverage at least 99%; M1 median absolute price difference at most 2 target points; and M1 P99 absolute price difference at most 15 target points. Policies may set stricter or more permissive values, but every submitted analysis snapshots all values immutably.
 - The reference comparison distinguishes hard-block fields from warning fields. Hard blocks include missing or non-tradeable symbols, digits, point, trade tick size, contract size, minimum volume, volume step, required filling-mode capability, and the pair's required direction capability. Warnings include volume maximum, stops/freeze levels, tick value, margin/profit currency, and swap fields.
@@ -76,7 +76,7 @@ Status: done
 - The primary test surface is the observable Console REST/WSS product-pair analysis contract. Tests assert admin-visible lifecycle states, authenticated worker request/response behavior, persisted evidence, alerts, and authorization; they do not assert SQL layout, private scheduling fields, or individual MT5 wrapper calls.
 - Follow the repository's existing `unittest` style with isolated temporary ledger storage, API clients, and fake authenticated worker sessions. Reuse existing worker reconciliation/session test patterns for WSS authentication, health, retries, and controller-to-worker communication.
 - Contract tests cover selecting only approved healthy connected workers on different exact servers; rejecting same-server and unhealthy selections; requesting the catalog/M15/M1 stages; and preserving read-only behavior.
-- Candidate tests cover FX identity eligibility, non-FOREX exceptions, hard-block/warning classification, UTC alignment/calibration evidence, configurable immutable policy snapshots, M15-to-M1 staging, threshold pass/fail, and no partial result after a missing or malformed worker response.
+- Candidate tests cover currency and calculation-mode identity eligibility, calculation-mode exceptions, hard-block/warning classification, UTC alignment/calibration evidence, configurable immutable policy snapshots, M15-to-M1 staging, threshold pass/fail, and no partial result after a missing or malformed worker response.
 - Queue tests prove one active analysis per worker, FIFO or documented queue behavior, one retry after transient failure, and reconciliation priority.
 - Administrative contract tests cover Build confirmation, active endpoint uniqueness, atomic Replace, retirement, policy/audit linkage, and CSRF/session authorization.
 - Applicability tests cover server-wide default applicability, compatibility evidence, no automatic exclusion after a mismatch, explicit per-worker-per-pair exclusion, and non-interference with other pairs.
@@ -87,7 +87,7 @@ Status: done
 ## Out of Scope
 
 - Broker writes of any kind, including market/pending orders, modifications, cancellations, closes, protection changes, emergency flattening, Trader registration, or intent dispatch.
-- Non-FX automatic product-pair analysis and any automatic approval of non-FOREX exceptions.
+- Automatic approval of calculation-mode mismatches.
 - Quantity-ratio discovery, non-1:1 mappings, account-level risk sizing, margin allocation, execution sequencing, or hedged-order lifecycle management.
 - Automatic scheduled re-testing, automatic suspension, or automatic worker exclusion after a failed analysis or compatibility check.
 - Persisting complete M15/M1 bar sequences, adding a separate market-data warehouse, or allowing analysis history deletion from the Web UI.

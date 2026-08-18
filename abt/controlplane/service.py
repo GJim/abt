@@ -54,7 +54,6 @@ class EnrollmentRequest(BaseModel):
 
 class ProductCatalogAnalysisPolicy(BaseModel):
     label: str = Field(min_length=1, max_length=128)
-    require_forex_calculation_mode: bool = True
     require_equal_base_currency: bool = True
     require_equal_profit_currency: bool = True
     minimum_common_coverage: float = Field(default=0.99, ge=0, le=1)
@@ -1079,7 +1078,12 @@ def _validated_symbol_specification(symbol: object) -> dict[str, object]:
         "digits": symbol.get("digits"),
         "point": symbol.get("point"),
     }
-    if not all(isinstance(normalized[field], str) and normalized[field] for field in ("symbol", "trade_calc_mode", "currency_base", "currency_profit")):
+    if not all(isinstance(normalized[field], str) and normalized[field] for field in ("symbol", "currency_base", "currency_profit")):
+        raise ValueError("Worker returned incomplete product catalog evidence.")
+    trade_calc_mode = normalized["trade_calc_mode"]
+    if isinstance(trade_calc_mode, bool) or not isinstance(trade_calc_mode, (int, str)):
+        raise ValueError("Worker returned incomplete product catalog evidence.")
+    if isinstance(trade_calc_mode, str) and not trade_calc_mode:
         raise ValueError("Worker returned incomplete product catalog evidence.")
     if not isinstance(normalized["digits"], int) or isinstance(normalized["digits"], bool):
         raise ValueError("Worker returned incomplete product catalog evidence.")
@@ -1221,7 +1225,7 @@ def _analyze_product_catalogs(
     for currencies in sorted(set(first_index) & set(second_index)):
         for first in first_index[currencies]:
             for second in second_index[currencies]:
-                if first["trade_calc_mode"] == "FOREX" and second["trade_calc_mode"] == "FOREX":
+                if first["trade_calc_mode"] == second["trade_calc_mode"]:
                     candidates.append(
                         {
                             "first_symbol": first["symbol"],
@@ -1239,7 +1243,7 @@ def _analyze_product_catalogs(
                             "second_symbol": second["symbol"],
                             "currency_base": first["currency_base"],
                             "currency_profit": first["currency_profit"],
-                            "reason": "non_forex_calculation_mode",
+                            "reason": "trade_calc_mode_mismatch",
                             "first_trade_calc_mode": first["trade_calc_mode"],
                             "second_trade_calc_mode": second["trade_calc_mode"],
                         }
@@ -1459,6 +1463,7 @@ def _verify_m1_candidates(
 
 
 _HARD_BLOCK_FIELDS = (
+    "trade_calc_mode",
     "digits",
     "point",
     "trade_tick_size",

@@ -299,7 +299,7 @@ class AnalysisMT5(ReadOnlyMT5):
         return [
             {
                 "name": "EURUSD",
-                "trade_calc_mode": "FOREX",
+                "trade_calc_mode": 0,
                 "currency_base": "EUR",
                 "currency_profit": "USD",
                 "digits": 5,

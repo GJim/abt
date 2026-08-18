@@ -204,7 +204,6 @@ test('administrator can launch an analysis with CSRF protection and inspect pass
     second_worker_id: 'worker-b',
     policy: {
       label: 'FX catalog v2',
-      require_forex_calculation_mode: true,
       require_equal_base_currency: true,
       require_equal_profit_currency: true,
       minimum_common_coverage: 0.99,
@@ -224,8 +223,8 @@ test('administrator can launch an analysis with CSRF protection and inspect pass
   await expect(finalFailingSection.getByRole('heading', { name: 'Hard-block differences' })).toBeVisible()
   await expect(page.getByText('volume_step')).toBeVisible()
   await expect(page.getByText('volume_max')).toBeVisible()
-  await expect(page.getByRole('heading', { name: 'Non-FOREX exceptions' })).toBeVisible()
-  await expect(page.getByText('Non Forex Calculation Mode')).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'Calculation-mode exceptions' })).toBeVisible()
+  await expect(page.getByText('Trade Calc Mode Mismatch')).toBeVisible()
   await expect(page.getByText('Worker timed out once.')).toBeVisible()
 })
 
@@ -931,7 +930,6 @@ function buildAnalysis(overrides?: Record<string, unknown>) {
     second_worker: { worker_id: 'worker-b', login: 222222, server: 'Broker-B' },
     policy: {
       label: 'FX catalog v2',
-      require_forex_calculation_mode: true,
       require_equal_base_currency: true,
       require_equal_profit_currency: true,
       minimum_common_coverage: 0.99,
@@ -982,9 +980,9 @@ function buildAnalysis(overrides?: Record<string, unknown>) {
       currency_profit: 'USD',
       first_point: 0.01,
       second_point: 0.01,
-      reason: 'non_forex_calculation_mode',
-      first_trade_calc_mode: 'CFD',
-      second_trade_calc_mode: 'FOREX',
+      reason: 'trade_calc_mode_mismatch',
+      first_trade_calc_mode: 1,
+      second_trade_calc_mode: 0,
     }],
     m15_screening_results: [
       buildStageResult({

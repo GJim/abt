@@ -73,7 +73,6 @@ type WorkerAlert = {
 
 type ProductCatalogAnalysisPolicy = {
   label: string
-  require_forex_calculation_mode: boolean
   require_equal_base_currency: boolean
   require_equal_profit_currency: boolean
   minimum_common_coverage: number
@@ -318,7 +317,6 @@ type ProductPair = {
 
 const DEFAULT_POLICY: ProductCatalogAnalysisPolicy = {
   label: 'FX catalog v1',
-  require_forex_calculation_mode: true,
   require_equal_base_currency: true,
   require_equal_profit_currency: true,
   minimum_common_coverage: 0.99,
@@ -333,11 +331,6 @@ const BOOLEAN_POLICY_FIELDS: Array<{
   label: string
   description: string
 }> = [
-  {
-    key: 'require_forex_calculation_mode',
-    label: 'Require FOREX calculation mode',
-    description: 'Reject non-FOREX symbol combinations.',
-  },
   {
     key: 'require_equal_base_currency',
     label: 'Require equal base currency',
@@ -1177,7 +1170,7 @@ function AnalysisDetails({
           <h4>Candidate totals</h4>
           <dl className="compact-list">
             <div><dt>Eligible catalog candidates</dt><dd>{analysis.eligible_candidates.length}</dd></div>
-            <div><dt>Non-FOREX exceptions</dt><dd>{analysis.exceptions.length}</dd></div>
+            <div><dt>Calculation-mode exceptions</dt><dd>{analysis.exceptions.length}</dd></div>
             <div><dt>M15 passed</dt><dd>{analysis.m15_screening_results.filter((result) => result.screening_status === 'passed').length}</dd></div>
             <div><dt>Final passing candidates</dt><dd>{passingCandidates.length}</dd></div>
             <div><dt>Final failing candidates</dt><dd>{failingCandidates.length}</dd></div>
@@ -1274,7 +1267,7 @@ function AnalysisDetails({
       </section>
 
       <section aria-labelledby="analysis-exceptions-heading">
-        <h4 id="analysis-exceptions-heading">Non-FOREX exceptions</h4>
+        <h4 id="analysis-exceptions-heading">Calculation-mode exceptions</h4>
         {analysis.exceptions.length === 0 ? (
           <p>No catalog exceptions were recorded.</p>
         ) : (
