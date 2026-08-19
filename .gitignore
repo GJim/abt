@@ -12,6 +12,7 @@ htmlcov/
 build/
 dist/
 .env
+results/
 web/test-results/
 
 # Raw browser/source captures are reproducibility aids, not publishable research.
