@@ -69,6 +69,7 @@ def register_worker(
     controller_url: str,
     login: int,
     server: str,
+    registration_invite: str,
     key_store: HardwareKeyStore,
     mt5: MT5Client,
     transport: EnrollmentTransport,
@@ -79,6 +80,8 @@ def register_worker(
     password = password_prompt("MT5 password: ")
     if not isinstance(password, str) or not password:
         raise WorkerEnrollmentError("An MT5 password is required.")
+    if not registration_invite:
+        raise WorkerEnrollmentError("A registration invite is required.")
 
     initialized = False
     request: dict[str, object] | None = None
@@ -111,6 +114,7 @@ def register_worker(
             raise WorkerEnrollmentError("The Windows CNG key returned an invalid public key.")
 
         request = {
+            "registration_invite": registration_invite,
             "login": login,
             "server": server,
             "account_info": account_info,

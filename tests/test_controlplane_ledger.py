@@ -90,3 +90,14 @@ class ControlLedgerTests(unittest.TestCase):
             self.ledger.approve_enrollment(
                 enrollment.enrollment_id, "ABCDEF", lambda worker_id, *_: f"certificate:{worker_id}"
             )
+
+    def test_registration_invite_is_role_bound_and_single_use(self) -> None:
+        invite = self.ledger.create_registration_invite("ABCDEF", "trader")
+
+        self.assertEqual("trader", self.ledger.consume_registration_invite(invite, "trader"))
+        with self.assertRaisesRegex(LedgerError, "already used"):
+            self.ledger.consume_registration_invite(invite, "trader")
+
+        worker_invite = self.ledger.create_registration_invite("ABCDEF", "worker")
+        with self.assertRaisesRegex(LedgerError, "role"):
+            self.ledger.consume_registration_invite(worker_invite, "trader")

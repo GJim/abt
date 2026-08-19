@@ -184,6 +184,74 @@ class ControlLedger:
             )
         return csrf_token
 
+    def create_registration_invite(self, issued_by: str, role: str) -> str:
+        if role not in {"worker", "trader"}:
+            raise LedgerError("Registration invite role is invalid.")
+        invite = secrets.token_urlsafe(32)
+        now = _utc_now()
+        with self._transaction():
+            self._connection.execute(
+                """
+                INSERT INTO registration_invites (invite_hash, role, issued_by, issued_at, expires_at, status)
+                VALUES (?, ?, ?, ?, ?, 'active')
+                """,
+                [_hash(invite), role, issued_by, now, now + timedelta(hours=1)],
+            )
+            self._event("registration_invite_issued", {"issued_by": issued_by, "role": role})
+        return invite
+
+    def consume_registration_invite(self, invite: str, role: str) -> str:
+        now = _utc_now()
+        with self._transaction():
+            row = self._connection.execute(
+                "SELECT role, status, expires_at FROM registration_invites WHERE invite_hash = ?",
+                [_hash(invite)],
+            ).fetchone()
+            if row is None:
+                raise LedgerError("Registration invite is invalid.")
+            invite_role, status, expires_at = row
+            if invite_role != role:
+                raise LedgerError("Registration invite role does not match.")
+            if status == "used":
+                raise LedgerError("Registration invite is already used.")
+            if status != "active":
+                raise LedgerError("Registration invite is no longer active.")
+            if now >= expires_at:
+                self._connection.execute(
+                    "UPDATE registration_invites SET status = 'expired' WHERE invite_hash = ?",
+                    [_hash(invite)],
+                )
+                self._event("registration_invite_expired", {"role": role})
+                raise LedgerError("Registration invite is expired.")
+            self._connection.execute(
+                "UPDATE registration_invites SET status = 'used', used_at = ? WHERE invite_hash = ?",
+                [now, _hash(invite)],
+            )
+            self._event("registration_invite_used", {"role": role})
+        return role
+
+    def registration_invites(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT role, issued_by, issued_at, expires_at, status, used_at, revoked_at
+                FROM registration_invites
+                ORDER BY issued_at DESC
+                """
+            ).fetchall()
+        return [
+            {
+                "role": row[0],
+                "issued_by": row[1],
+                "issued_at": row[2],
+                "expires_at": row[3],
+                "status": row[4],
+                "used_at": row[5],
+                "revoked_at": row[6],
+            }
+            for row in rows
+        ]
+
     def create_enrollment(
         self,
         *,
@@ -2088,6 +2156,16 @@ class ControlLedger:
                 CREATE TABLE IF NOT EXISTS registration_attempts (
                     source_ip VARCHAR NOT NULL,
                     attempted_at TIMESTAMPTZ NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS registration_invites (
+                    invite_hash VARCHAR PRIMARY KEY,
+                    role VARCHAR NOT NULL,
+                    issued_by VARCHAR NOT NULL,
+                    issued_at TIMESTAMPTZ NOT NULL,
+                    expires_at TIMESTAMPTZ NOT NULL,
+                    status VARCHAR NOT NULL,
+                    used_at TIMESTAMPTZ,
+                    revoked_at TIMESTAMPTZ
                 );
                 CREATE TABLE IF NOT EXISTS enrollment_challenges (
                     challenge_hash VARCHAR PRIMARY KEY,

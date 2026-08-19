@@ -187,6 +187,7 @@ class ControlPlaneServiceTests(unittest.TestCase):
         enrollment_response = self.client.post(
             "/api/enrollments",
             json={
+                "registration_invite": self.app.state.ledger.create_registration_invite("ABCDEF", "worker"),
                 "login": 123456,
                 "server": "Broker-Demo",
                 "account_info": account_info,
@@ -270,6 +271,23 @@ class ControlPlaneServiceTests(unittest.TestCase):
         logout_response = self.client.post("/api/admin/logout", headers={"X-CSRF-Token": csrf_token})
         self.assertEqual(204, logout_response.status_code)
         self.assertEqual(401, self.client.get("/api/admin/events").status_code)
+
+    def test_administrator_can_issue_a_registration_invite_once(self) -> None:
+        login = self.client.post(
+            "/api/admin/login",
+            json={"username": "ABCDEF", "password": "A-secure-admin-password!"},
+        )
+
+        issued = self.client.post(
+            "/api/admin/registration-invites",
+            headers={"X-CSRF-Token": login.json()["csrf_token"]},
+            json={"role": "trader"},
+        )
+
+        self.assertEqual(201, issued.status_code)
+        self.assertEqual("trader", issued.json()["role"])
+        self.assertTrue(issued.json()["invite"])
+        self.assertNotIn("invite", self.client.get("/api/admin/registration-invites").json()[0])
 
     def test_admin_session_resumes_with_a_rotated_csrf_token(self) -> None:
         login_response = self.client.post(

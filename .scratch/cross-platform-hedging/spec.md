@@ -2,6 +2,16 @@
 
 Status: ready-for-agent
 
+## Superseded delivery boundary
+
+This document remains the historical specification for the completed
+**安全通訊與唯讀對帳切片**. Its prohibition on broker writes, Trader
+registration, and intent APIs is superseded for the next delivery by
+[`../trader-intent-execution/spec.md`](../trader-intent-execution/spec.md).
+That feature also replaces IP-based enrollment admission with role-bound,
+single-use registration invites for both workers and Traders. It does not
+retroactively change the behavior of already-approved workers.
+
 ## Problem Statement
 
 目前人工測試 CLI 已驗證 MetaTrader 5 API 可用，但它只附著於單一 terminal，不能安全地管理跨網路、跨帳戶的自動化避險實驗。使用者需要先交付一個不會對 broker 寫入的控制平面，證明主控台可安全辨識、批准、監控及撤銷兩台位於不同網路的帳戶工作者，並在未來雙限價進場前建立可稽核的信任、對帳與故障處置基礎。

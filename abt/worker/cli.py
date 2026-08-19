@@ -155,6 +155,7 @@ def main(
                     controller_url=arguments.controller_url,
                     login=arguments.login,
                     server=arguments.server,
+                    registration_invite=arguments.registration_invite,
                     key_store=key_store,
                     mt5=mt5,
                     transport=transport,
@@ -188,6 +189,7 @@ def _parser() -> argparse.ArgumentParser:
     enroll.add_argument("--controller-url", required=True, help="HTTPS controller origin")
     enroll.add_argument("--login", required=True, type=_positive_login, help="MT5 account login")
     enroll.add_argument("--server", required=True, help="MT5 server")
+    enroll.add_argument("--registration-invite", required=True, help="one-time worker enrollment invite")
     enroll.add_argument(
         "--key-name",
         default="abt-worker-device-key",

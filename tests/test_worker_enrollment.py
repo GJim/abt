@@ -88,6 +88,7 @@ class WorkerEnrollmentTests(unittest.TestCase):
             controller_url="https://controller.example",
             login=123456,
             server="Broker-Demo",
+            registration_invite="worker-invite",
             key_store=key_store,
             mt5=mt5,
             transport=transport,
@@ -97,6 +98,7 @@ class WorkerEnrollmentTests(unittest.TestCase):
 
         self.assertEqual([(123456, password, "Broker-Demo")], mt5.login_calls)
         self.assertEqual(password, transport.request["mt5_password"])
+        self.assertEqual("worker-invite", transport.request["registration_invite"])
         self.assertNotIn(password, output.getvalue())
         self.assertEqual(
             enrollment_payload(
@@ -123,6 +125,7 @@ class WorkerEnrollmentTests(unittest.TestCase):
                 controller_url="https://controller.example",
                 login=123456,
                 server="Broker-Demo",
+                registration_invite="worker-invite",
                 key_store=key_store,
                 mt5=mt5,
                 transport=transport,
@@ -149,6 +152,8 @@ class WorkerEnrollmentTests(unittest.TestCase):
                 "123456",
                 "--server",
                 "Broker-Demo",
+                "--registration-invite",
+                "worker-invite",
             ],
             mt5_factory=lambda: mt5,
             transport_factory=lambda: transport,
@@ -221,6 +226,8 @@ class WorkerEnrollmentTests(unittest.TestCase):
                 "123456",
                 "--server",
                 "Broker-Demo",
+                "--registration-invite",
+                "worker-invite",
             ],
             mt5_factory=lambda: mt5,
             transport_factory=lambda: FailingTransport(password),
@@ -247,6 +254,8 @@ class WorkerEnrollmentTests(unittest.TestCase):
                 "123456",
                 "--server",
                 "Broker-Demo",
+                "--registration-invite",
+                "worker-invite",
             ],
             mt5_factory=FakeMT5,
             transport_factory=lambda: transport,
@@ -276,6 +285,8 @@ class WorkerEnrollmentTests(unittest.TestCase):
                 "123456",
                 "--server",
                 "Broker-Demo",
+                "--registration-invite",
+                "worker-invite",
             ],
             mt5_factory=FakeMT5,
             transport_factory=lambda: FailingTransport(password),
@@ -302,6 +313,8 @@ class WorkerEnrollmentTests(unittest.TestCase):
                 "123456",
                 "--server",
                 "Broker-Demo",
+                "--registration-invite",
+                "worker-invite",
             ],
             mt5_factory=FakeMT5,
             transport_factory=lambda: ClosingTransport(),

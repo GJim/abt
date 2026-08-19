@@ -38,6 +38,7 @@ class LoginRequest(BaseModel):
 
 
 class EnrollmentRequest(BaseModel):
+    registration_invite: str = Field(min_length=1, max_length=512)
     login: int = Field(gt=0)
     server: str = Field(min_length=1, max_length=128)
     account_info: dict[str, object]
@@ -53,6 +54,10 @@ class EnrollmentRequest(BaseModel):
         if any(character in value for character in "\r\n"):
             raise ValueError("server must not contain control characters")
         return value
+
+
+class RegistrationInviteRequest(BaseModel):
+    role: Literal["worker", "trader"]
 
 
 class ProductCatalogAnalysisPolicy(BaseModel):
@@ -270,6 +275,24 @@ def create_app(
         except AuthenticationError as error:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(error)) from error
 
+    @app.post("/api/admin/registration-invites", status_code=status.HTTP_201_CREATED)
+    def create_registration_invite(
+        body: RegistrationInviteRequest,
+        abt_admin_session: Annotated[str | None, Cookie()] = None,
+        x_csrf_token: Annotated[str | None, Header()] = None,
+    ) -> dict[str, object]:
+        username = _require_admin(ledger, abt_admin_session, x_csrf_token, require_csrf=True)
+        invite = ledger.create_registration_invite(username, body.role)
+        record = ledger.registration_invites()[0]
+        return {**record, "invite": invite}
+
+    @app.get("/api/admin/registration-invites")
+    def list_registration_invites(
+        abt_admin_session: Annotated[str | None, Cookie()] = None,
+    ) -> list[dict[str, object]]:
+        _require_admin(ledger, abt_admin_session)
+        return ledger.registration_invites()
+
     @app.post("/api/enrollments", status_code=status.HTTP_201_CREATED)
     async def create_enrollment(body: EnrollmentRequest) -> dict[str, str]:
         try:
@@ -283,6 +306,7 @@ def create_app(
                 mt5_password=body.mt5_password,
                 enrollment_challenge=body.enrollment_challenge,
             )
+            ledger.consume_registration_invite(body.registration_invite, "worker")
             if secret_store is None:
                 raise SecretStoreError("The MT5 credential mediator is unavailable.")
             secret_ref = f"abt/data/mt5/pending/{uuid4()}"
