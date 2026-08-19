@@ -4,6 +4,7 @@ import { AppShell } from '@astryxdesign/core/AppShell'
 import { Collapsible } from '@astryxdesign/core/Collapsible'
 import { TopNav } from '@astryxdesign/core/TopNav'
 import { AuditEventsPage } from './AuditEventsPage'
+import { AnalysisHistoryPage } from './AnalysisHistoryPage'
 import { WorkerSnapshotsPage } from './WorkerSnapshotsPage'
 import './App.css'
 import './Console.css'
@@ -461,7 +462,7 @@ const POLICY_EVALUATION_LABELS: Record<string, string> = {
 const LIVE_REFRESH_INTERVAL_MS = 30_000
 const LIVE_REFRESH_TIMEOUT_MS = 10_000
 const LIVE_REFRESH_STALE_AFTER_MS = LIVE_REFRESH_INTERVAL_MS * 2
-type ConsolePage = 'main' | 'audit' | 'snapshots'
+type ConsolePage = 'main' | 'audit' | 'snapshots' | 'history'
 
 function App() {
   const [username, setUsername] = useState('')
@@ -875,7 +876,7 @@ function App() {
             <nav aria-label="Console sections" className="console-nav">
               <a aria-current={consolePage === 'main' ? 'page' : undefined} href="#main">Main</a>
               <a href="#analysis-heading">Launch analysis</a>
-              <a href="#analysis-results-heading">Analysis detail</a>
+              <a aria-current={consolePage === 'history' ? 'page' : undefined} href="#history">Analysis history</a>
               <a href="#product-pairs-heading">Current pairs</a>
               <a href="#retired-product-pairs-heading">Retired pairs</a>
               <a href="#snapshots">Workers</a>
@@ -902,7 +903,12 @@ function App() {
           </header>
           {error && <p className="error" role="alert">{error}</p>}
           {refreshError && <p className="error" role="alert">{refreshError}</p>}
-          {consolePage === 'audit' ? <AuditEventsPage /> : consolePage === 'snapshots' ? <WorkerSnapshotsPage /> : <>
+          {consolePage === 'audit' ? <AuditEventsPage /> : consolePage === 'snapshots' ? <WorkerSnapshotsPage /> : consolePage === 'history' ? (
+            <AnalysisHistoryPage onOpenAnalysis={(analysisId) => {
+              window.location.hash = '#analysis-heading'
+              void loadAnalysisById(analysisId)
+            }} />
+          ) : <>
 
           <section aria-labelledby="intervention-queue-heading" className="intervention-queue">
             <div className="section-header">
@@ -2731,6 +2737,8 @@ function readConsolePage(): ConsolePage {
       return 'audit'
     case '#snapshots':
       return 'snapshots'
+    case '#history':
+      return 'history'
     default:
       return 'main'
   }
