@@ -4,6 +4,7 @@ import { AppShell } from '@astryxdesign/core/AppShell'
 import { Collapsible } from '@astryxdesign/core/Collapsible'
 import { TopNav } from '@astryxdesign/core/TopNav'
 import './App.css'
+import './Console.css'
 
 type LoginResponse = {
   csrf_token: string
@@ -858,7 +859,20 @@ function App() {
         topNav={<TopNav heading={<strong>ABT control plane</strong>} label="Control-plane navigation" />}
         variant="section"
       >
-        <div className="management-content">
+        <div className="console-app-frame">
+          <aside className="console-sidebar">
+            <strong>ABT console</strong>
+            <nav aria-label="Console sections" className="console-nav">
+              <a aria-current="page" href="#intervention-queue-heading">Main</a>
+              <a href="#analysis-heading">Launch analysis</a>
+              <a href="#analysis-results-heading">Analysis detail</a>
+              <a href="#product-pairs-heading">Current pairs</a>
+              <a href="#retired-product-pairs-heading">Retired pairs</a>
+              <a href="#account-workers-heading">Workers</a>
+              <a href="#audit-events-heading">Audit events</a>
+            </nav>
+          </aside>
+          <main className="console-main management-content">
           <header>
             <h1>Management console</h1>
             <p>Launch and inspect cross-server product-pair analyses alongside worker health and audit events.</p>
@@ -1264,8 +1278,8 @@ function App() {
               </ul>
             )}
           </section>
-          <section aria-label="Audit events">
-            <h2>Audit events</h2>
+          <section aria-labelledby="audit-events-heading">
+            <h2 id="audit-events-heading">Audit events</h2>
             <ul className="audit-events" aria-label="Audit events">
               {events.map((event) => (
                 <li key={event.event_id}>
@@ -1275,6 +1289,7 @@ function App() {
               ))}
             </ul>
           </section>
+          </main>
         </div>
       </AppShell>
     )
