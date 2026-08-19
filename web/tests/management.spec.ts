@@ -932,6 +932,108 @@ test('administrator sees terminal analysis failures with lifecycle details', asy
   await expect(lifecycleCard).toContainText('1')
 })
 
+test('administrator receives bounded live updates without losing the current console', async ({ page }) => {
+  let eventRequests = 0
+
+  await page.clock.install({ time: new Date('2026-08-19T00:00:00Z') })
+  await mockLogin(page)
+  await mockManagementData(page)
+  await page.route('**/api/admin/events', async (route) => {
+    eventRequests += 1
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify(eventRequests === 1 ? [] : [{
+        event_id: 99,
+        event_type: 'worker_reconciliation_snapshot',
+        payload: {},
+        occurred_at: '2026-08-19T00:00:30Z',
+      }]),
+    })
+  })
+
+  await page.goto('http://127.0.0.1:4173/')
+  await page.getByLabel('Administrator account').fill('ABCDEF')
+  await page.getByLabel('Password').fill('A-secure-admin-password!')
+  await page.getByRole('button', { name: 'Sign in' }).click()
+
+  await expect(page.getByText('Live updates active — checking every 30 seconds.', { exact: true })).toBeVisible()
+  await page.clock.fastForward(30_000)
+  await expect(page.getByText('worker_reconciliation_snapshot')).toBeVisible()
+  expect(eventRequests).toBe(2)
+})
+
+test('administrator sees stale-connection feedback and retains prior management data after a live refresh fails', async ({ page }) => {
+  let eventRequests = 0
+  const worker = buildWorker({ worker_id: 'worker-1', login: 123456, server: 'Broker-Demo' })
+
+  await page.clock.install({ time: new Date('2026-08-19T00:00:00Z') })
+  await mockLogin(page)
+  await mockManagementData(page, { workers: [worker] })
+  await page.route('**/api/admin/events', async (route) => {
+    eventRequests += 1
+    if (eventRequests === 1) {
+      await route.fulfill({ contentType: 'application/json', body: JSON.stringify([]) })
+      return
+    }
+    await route.fulfill({ status: 503, contentType: 'application/json', body: JSON.stringify({ detail: 'unavailable' }) })
+  })
+
+  await page.goto('http://127.0.0.1:4173/')
+  await page.getByLabel('Administrator account').fill('ABCDEF')
+  await page.getByLabel('Password').fill('A-secure-admin-password!')
+  await page.getByRole('button', { name: 'Sign in' }).click()
+
+  await page.clock.fastForward(30_000)
+  await expect(page.getByRole('alert')).toContainText('Management data could not be loaded. Your previous data is still shown.')
+  await expect(page.getByText('Live updates interrupted — retry manually when the connection is available.', { exact: true })).toBeVisible()
+  await expect(page.getByLabel('Fleet health by account').getByRole('listitem').filter({ hasText: '123456 on Broker-Demo' })).toBeVisible()
+})
+
+test('administrator actions defer live refresh until the action is complete', async ({ page }) => {
+  let enrollmentRequests = 0
+  let releaseApproval: (() => void) | undefined
+
+  await page.clock.install({ time: new Date('2026-08-19T00:00:00Z') })
+  await mockLogin(page)
+  await mockManagementData(page, {
+    enrollments: [buildEnrollment()],
+    alerts: [{
+      alert_id: 1,
+      worker_id: null,
+      enrollment_id: 'enrollment-1',
+      priority: 'high',
+      alert_type: 'worker_enrollment_pending_approval',
+      reason: 'administrator_approval_required',
+      occurred_at: '2026-08-19T00:00:00Z',
+    }],
+  })
+  await page.route('**/api/admin/enrollments', async (route) => {
+    enrollmentRequests += 1
+    await route.fulfill({ contentType: 'application/json', body: JSON.stringify([buildEnrollment()]) })
+  })
+  await page.route('**/api/admin/enrollments/enrollment-1/approve', async (route) => {
+    await new Promise<void>((resolve) => {
+      releaseApproval = resolve
+    })
+    await route.fulfill({ status: 200 })
+  })
+
+  await page.goto('http://127.0.0.1:4173/')
+  await page.getByLabel('Administrator account').fill('ABCDEF')
+  await page.getByLabel('Password').fill('A-secure-admin-password!')
+  await page.getByRole('button', { name: 'Sign in' }).click()
+
+  const approveButton = page.getByRole('button', { name: 'Approve registration for 12345678 on Broker-Demo' }).first()
+  await approveButton.click()
+  await expect(approveButton).toBeDisabled()
+  await page.clock.fastForward(30_000)
+  expect(enrollmentRequests).toBe(1)
+
+  releaseApproval?.()
+  await expect(approveButton).toBeEnabled()
+  expect(enrollmentRequests).toBe(2)
+})
+
 async function mockSessionResume(page: Parameters<typeof test>[0]['page']) {
   await page.route('**/api/admin/session', async (route) => {
     await route.fulfill({ contentType: 'application/json', body: JSON.stringify({ csrf_token: 'resumed-csrf-token' }) })

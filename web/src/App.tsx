@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import type { FormEvent } from 'react'
 import { AppShell } from '@astryxdesign/core/AppShell'
 import { Collapsible } from '@astryxdesign/core/Collapsible'
@@ -455,6 +455,10 @@ const POLICY_EVALUATION_LABELS: Record<string, string> = {
   hard_block_differences_passed: 'Hard-block differences passed',
 }
 
+const LIVE_REFRESH_INTERVAL_MS = 30_000
+const LIVE_REFRESH_TIMEOUT_MS = 10_000
+const LIVE_REFRESH_STALE_AFTER_MS = LIVE_REFRESH_INTERVAL_MS * 2
+
 function App() {
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
@@ -478,6 +482,8 @@ function App() {
   const [analysisError, setAnalysisError] = useState<string | null>(null)
   const [isLaunchingAnalysis, setIsLaunchingAnalysis] = useState(false)
   const [isLoadingAnalysis, setIsLoadingAnalysis] = useState(false)
+  const refreshInFlight = useRef(false)
+  const operatorActionInProgress = useRef(false)
 
   const eligibleWorkers = useMemo(
     () => workers.filter((worker) => workerEligibilityReason(worker) === null),
@@ -600,16 +606,51 @@ function App() {
     return () => window.clearTimeout(timer)
   }, [analysis?.analysis_id, analysis?.status])
 
+  useEffect(() => {
+    operatorActionInProgress.current = processingEnrollmentId !== null || isLaunchingAnalysis
+  }, [isLaunchingAnalysis, processingEnrollmentId])
+
+  useEffect(() => {
+    if (!csrfToken) {
+      return
+    }
+
+    const refreshWhenSafe = () => {
+      if (document.visibilityState === 'hidden' || operatorActionInProgress.current) {
+        return
+      }
+      void refreshManagementData().catch(() => undefined)
+    }
+    const timer = window.setInterval(refreshWhenSafe, LIVE_REFRESH_INTERVAL_MS)
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        refreshWhenSafe()
+      }
+    }
+
+    document.addEventListener('visibilitychange', handleVisibilityChange)
+    return () => {
+      window.clearInterval(timer)
+      document.removeEventListener('visibilitychange', handleVisibilityChange)
+    }
+  }, [csrfToken])
+
   async function refreshManagementData() {
+    if (refreshInFlight.current) {
+      return
+    }
+    refreshInFlight.current = true
     setIsRefreshing(true)
     setRefreshError(null)
+    const controller = new AbortController()
+    const timeout = window.setTimeout(() => controller.abort(), LIVE_REFRESH_TIMEOUT_MS)
     try {
       const [eventsResponse, enrollmentsResponse, workersResponse, alertsResponse, productPairsResponse] = await Promise.all([
-        fetch('/api/admin/events', { credentials: 'same-origin' }),
-        fetch('/api/admin/enrollments', { credentials: 'same-origin' }),
-        fetch('/api/admin/workers', { credentials: 'same-origin' }),
-        fetch('/api/admin/alerts', { credentials: 'same-origin' }),
-        fetch('/api/admin/product-pairs', { credentials: 'same-origin' }),
+        fetch('/api/admin/events', { credentials: 'same-origin', signal: controller.signal }),
+        fetch('/api/admin/enrollments', { credentials: 'same-origin', signal: controller.signal }),
+        fetch('/api/admin/workers', { credentials: 'same-origin', signal: controller.signal }),
+        fetch('/api/admin/alerts', { credentials: 'same-origin', signal: controller.signal }),
+        fetch('/api/admin/product-pairs', { credentials: 'same-origin', signal: controller.signal }),
       ])
       if ([eventsResponse, enrollmentsResponse, workersResponse, alertsResponse, productPairsResponse].some((response) => response.status === 401)) {
         setCsrfToken(null)
@@ -633,9 +674,17 @@ function App() {
       setProductPairs(productPairPayload)
       setLastUpdatedAt(new Date().toISOString())
     } catch (refreshFailure) {
-      setRefreshError(refreshFailure instanceof Error ? refreshFailure.message : 'Management data could not be refreshed.')
+      setRefreshError(
+        refreshFailure instanceof DOMException && refreshFailure.name === 'AbortError'
+          ? 'Live refresh timed out. Your previous data is still shown.'
+          : refreshFailure instanceof Error
+            ? refreshFailure.message
+            : 'Management data could not be refreshed.',
+      )
       throw refreshFailure
     } finally {
+      window.clearTimeout(timeout)
+      refreshInFlight.current = false
       setIsRefreshing(false)
     }
   }
@@ -727,6 +776,7 @@ function App() {
     }
 
     setError(null)
+    operatorActionInProgress.current = true
     setProcessingEnrollmentId(enrollmentId)
     try {
       const response = await fetch(`/api/admin/enrollments/${enrollmentId}/${action}`, {
@@ -743,6 +793,7 @@ function App() {
       const detail = reviewError instanceof Error ? reviewError.message : 'Enrollment review failed.'
       setError(`Could not ${action} this worker registration: ${detail}`)
     } finally {
+      operatorActionInProgress.current = false
       setProcessingEnrollmentId(null)
     }
   }
@@ -762,6 +813,7 @@ function App() {
     }
 
     setAnalysisError(null)
+    operatorActionInProgress.current = true
     setIsLaunchingAnalysis(true)
     try {
       const response = await fetch('/api/admin/product-catalog-analyses', {
@@ -788,6 +840,7 @@ function App() {
     } catch (launchError) {
       setAnalysisError(launchError instanceof Error ? launchError.message : 'The analysis could not be launched.')
     } finally {
+      operatorActionInProgress.current = false
       setIsLaunchingAnalysis(false)
     }
   }
@@ -810,9 +863,14 @@ function App() {
             <h1>Management console</h1>
             <p>Launch and inspect cross-server product-pair analyses alongside worker health and audit events.</p>
             <div className="refresh-status">
-              <p aria-live="polite">
-                {lastUpdatedAt ? `Last updated ${formatDateTime(lastUpdatedAt)}` : 'Loading management data…'}
-              </p>
+              <div>
+                <p aria-live="polite">
+                  {lastUpdatedAt ? `Last updated ${formatDateTime(lastUpdatedAt)}` : 'Loading management data…'}
+                </p>
+                <p className={`live-refresh-state ${refreshError ? 'live-refresh-interrupted' : isDashboardDataStale(lastUpdatedAt) ? 'live-refresh-stale' : 'live-refresh-active'}`} role="status">
+                  {describeLiveRefreshState(lastUpdatedAt, isRefreshing, refreshError)}
+                </p>
+              </div>
               <button disabled={isRefreshing} onClick={() => void refreshManagementData().catch(() => undefined)} type="button">
                 {isRefreshing ? 'Refreshing…' : 'Refresh'}
               </button>
@@ -2773,6 +2831,34 @@ function humanizeToken(value: string) {
 
 function formatDateTime(value: string) {
   return value.replace('T', ' ')
+}
+
+function isDashboardDataStale(lastUpdatedAt: string | null) {
+  if (lastUpdatedAt === null) {
+    return false
+  }
+  const timestamp = Date.parse(lastUpdatedAt)
+  return !Number.isFinite(timestamp) || Date.now() - timestamp > LIVE_REFRESH_STALE_AFTER_MS
+}
+
+function describeLiveRefreshState(
+  lastUpdatedAt: string | null,
+  isRefreshing: boolean,
+  refreshError: string | null,
+) {
+  if (isRefreshing) {
+    return 'Checking for live updates…'
+  }
+  if (refreshError) {
+    return 'Live updates interrupted — retry manually when the connection is available.'
+  }
+  if (lastUpdatedAt === null) {
+    return 'Waiting for the first management-data refresh.'
+  }
+  if (isDashboardDataStale(lastUpdatedAt)) {
+    return 'Live data may be stale — retry manually to restore updates.'
+  }
+  return 'Live updates active — checking every 30 seconds.'
 }
 
 function formatRatio(value: number | null) {

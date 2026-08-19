@@ -54,6 +54,21 @@
   margin: 0;
 }
 
+.refresh-status .live-refresh-state {
+  font-size: 0.85rem;
+  font-weight: 700;
+  margin-top: 0.2rem;
+}
+
+.live-refresh-active {
+  color: #166534;
+}
+
+.live-refresh-stale,
+.live-refresh-interrupted {
+  color: #9a3412;
+}
+
 form {
   display: grid;
   gap: 1.25rem;
