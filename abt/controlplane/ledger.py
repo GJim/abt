@@ -527,16 +527,20 @@ class ControlLedger:
                 [_utc_now(), session_id],
             )
 
-    def mark_trader_session_stale(self, session_id: str) -> None:
+    def sweep_stale_trader_sessions(self) -> int:
+        """Durably mark every disconnected/silent Trader session stale."""
+
         with self._transaction():
+            now = _utc_now()
             changed = self._connection.execute(
                 """UPDATE trader_sessions SET status = 'stale', stale_at = ?
-                   WHERE session_id = ? AND status = 'connected'
-                     AND last_valid_signal_at <= ? RETURNING trader_id""",
-                [ _utc_now(), session_id, _utc_now() - timedelta(minutes=5)],
-            ).fetchone()
-            if changed is not None:
-                self._event("trader_session_stale", {"trader_id": changed[0], "session_id": session_id})
+                   WHERE status = 'connected' AND last_valid_signal_at <= ?
+                   RETURNING trader_id, session_id""",
+                [now, now - timedelta(minutes=5)],
+            ).fetchall()
+            for trader_id, session_id in changed:
+                self._event("trader_session_stale", {"trader_id": trader_id, "session_id": session_id})
+            return len(changed)
 
     def submit_trader_command(self, trader_id: str, command_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         """Persist idempotency and the minimal accepted/cancel lifecycle event."""
@@ -571,8 +575,56 @@ class ControlLedger:
             )
             return result
 
-    def acknowledge_trader_events(self, trader_id: str, cursor: int) -> None:
+    def reject_trader_command(
+        self, trader_id: str, command_id: str, payload: dict[str, Any], reason: str, preflight: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        """Durably record a non-executable intent without ever accepting it."""
+
+        canonical_payload = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+        payload_hash = _hash(canonical_payload)
         with self._transaction():
+            existing = self._connection.execute(
+                "SELECT payload_hash, result FROM trader_commands WHERE trader_id = ? AND command_id = ?",
+                [trader_id, command_id],
+            ).fetchone()
+            if existing is not None:
+                if existing[0] != payload_hash:
+                    raise LedgerError("Trader command ID was reused with a different payload.")
+                return json.loads(existing[1])
+            event_id = self._event(
+                "rejected_preflight",
+                {"trader_id": trader_id, "command_id": command_id, "command": payload, "reason": reason, "preflight": preflight},
+            )
+            self._connection.execute("INSERT INTO trader_events (trader_id, event_id) VALUES (?, ?)", [trader_id, event_id])
+            result = {"type": "command_result", "command_id": command_id, "status": "rejected_preflight", "event_id": event_id}
+            self._connection.execute(
+                "INSERT INTO trader_commands (trader_id, command_id, payload_hash, result, created_at) VALUES (?, ?, ?, ?, ?)",
+                [trader_id, command_id, payload_hash, json.dumps(result, sort_keys=True), _utc_now()],
+            )
+            return result
+
+    def trader_command_result(self, trader_id: str, command_id: str, payload: dict[str, Any]) -> dict[str, Any] | None:
+        payload_hash = _hash(json.dumps(payload, separators=(",", ":"), sort_keys=True))
+        with self._lock:
+            existing = self._connection.execute(
+                "SELECT payload_hash, result FROM trader_commands WHERE trader_id = ? AND command_id = ?",
+                [trader_id, command_id],
+            ).fetchone()
+        if existing is None:
+            return None
+        if existing[0] != payload_hash:
+            raise LedgerError("Trader command ID was reused with a different payload.")
+        return json.loads(existing[1])
+
+    def acknowledge_trader_events(self, trader_id: str, cursor: int, delivered_high_water: int) -> None:
+        if cursor < 0 or cursor > delivered_high_water:
+            raise LedgerError("Trader event ACK cursor was not delivered by this session.")
+        with self._transaction():
+            if cursor and self._connection.execute(
+                "SELECT 1 FROM trader_events WHERE trader_id = ? AND event_id = ?",
+                [trader_id, cursor],
+            ).fetchone() is None:
+                raise LedgerError("Trader event ACK cursor is not a Trader event.")
             self._connection.execute(
                 """INSERT INTO trader_event_cursors (trader_id, cursor, acknowledged_at) VALUES (?, ?, ?)
                    ON CONFLICT (trader_id) DO UPDATE SET cursor = greatest(trader_event_cursors.cursor, excluded.cursor),

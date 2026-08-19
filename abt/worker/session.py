@@ -48,6 +48,7 @@ class AuthenticatedWorkerSession:
     socket: WorkerWebSocket
     reconciliation_cursor: int
     _analysis_requests: deque[dict[str, object]] = field(default_factory=deque, init=False, repr=False)
+    _order_check_requests: deque[dict[str, object]] = field(default_factory=deque, init=False, repr=False)
 
     def __enter__(self) -> Self:
         return self
@@ -105,11 +106,28 @@ class AuthenticatedWorkerSession:
             _raise_closed_connection(error, "analysis request")
         return self._parse_product_catalog_analysis(response)
 
+    def receive_order_check(self, timeout: float | None = None) -> dict[str, object] | None:
+        if self._order_check_requests:
+            return self._parse_order_check(self._order_check_requests.popleft())
+        try:
+            response = _message(self.socket, timeout=timeout)
+        except TimeoutError:
+            return None
+        except Exception as error:
+            _raise_closed_connection(error, "order-check request")
+        if response.get("type") != "order_check_request":
+            self._analysis_requests.append(response)
+            return None
+        return self._parse_order_check(response)
+
     def _response(self) -> dict[str, object]:
         while True:
             response = _message(self.socket)
             if response.get("type") == "product_catalog_analysis_request":
                 self._analysis_requests.append(response)
+                continue
+            if response.get("type") == "order_check_request":
+                self._order_check_requests.append(response)
                 continue
             return response
 
@@ -136,6 +154,37 @@ class AuthenticatedWorkerSession:
                 }
             )
         return result
+
+    def _parse_order_check(self, response: dict[str, object]) -> dict[str, object]:
+        if set(response) != {"type", "analysis_id", "request_id", "order"} or response.get("type") != "order_check_request":
+            raise WorkerEnrollmentError("The controller returned an invalid order-check request.")
+        if response.get("analysis_id") != "order_check":
+            raise WorkerEnrollmentError("The controller returned an invalid order-check request.")
+        return {"request_id": _required_text(response, "request_id"), "order": response["order"]}
+
+    def send_order_check(self, *, request_id: str, order: dict[str, object], accepted: bool) -> None:
+        try:
+            _send(
+                self.socket,
+                {
+                    "type": "order_check_response",
+                    "analysis_id": "order_check",
+                    "request_id": request_id,
+                    "accepted": accepted,
+                    "order": order,
+                },
+            )
+        except Exception as error:
+            _raise_closed_connection(error, "order-check response")
+
+    def send_order_check_error(self, *, request_id: str, reason: str) -> None:
+        try:
+            _send(
+                self.socket,
+                {"type": "order_check_error", "analysis_id": "order_check", "request_id": request_id, "reason": reason},
+            )
+        except Exception as error:
+            _raise_closed_connection(error, "order-check error response")
 
     def send_product_catalog_analysis(
         self,

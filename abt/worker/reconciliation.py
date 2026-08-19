@@ -24,6 +24,8 @@ class ReadOnlyMT5(Protocol):
 
     def positions_get(self) -> object: ...
 
+    def order_check(self, request: dict[str, object]) -> object: ...
+
 
 class AuthenticatedReconciliationSession(Protocol):
     reconciliation_cursor: int
@@ -64,6 +66,12 @@ class AnalysisWorkerSession(Protocol):
         reason: str,
         timeframe: str | None = None,
     ) -> None: ...
+
+    def receive_order_check(self, timeout: float | None = None) -> dict[str, object] | None: ...
+
+    def send_order_check(self, *, request_id: str, order: dict[str, object], accepted: bool) -> None: ...
+
+    def send_order_check_error(self, *, request_id: str, reason: str) -> None: ...
 
 
 class WorkerSafetyAdapter:
@@ -309,6 +317,11 @@ def _run_reconciliation_with_analysis(
             request = session.receive_product_catalog_analysis(timeout=30.0)
             if request is not None:
                 _serve_product_catalog_analysis(mt5, session, request, now)
+            receive_order_check = getattr(session, "receive_order_check", None)
+            if callable(receive_order_check):
+                order_check = receive_order_check(timeout=0.0)
+                if order_check is not None:
+                    _serve_order_check(mt5, session, order_check)
             if safety is not None:
                 safety.heartbeat(now())
 
@@ -391,6 +404,24 @@ def _serve_product_catalog_analysis(
         period_start_utc=period_start_utc,
         period_end_utc=period_end_utc,
     )
+
+
+def _serve_order_check(mt5: ReadOnlyMT5, session: AnalysisWorkerSession, request: dict[str, object]) -> None:
+    request_id = _request_text(request, "request_id")
+    order = request.get("order")
+    if not isinstance(order, dict):
+        session.send_order_check_error(request_id=request_id, reason="The controller requested an invalid order check.")
+        return
+    try:
+        result = mt5.order_check(order)
+        retcode = getattr(result, "retcode", None)
+        if not isinstance(retcode, int):
+            raise WorkerEnrollmentError("The local MT5 terminal returned an invalid order check result.")
+        session.send_order_check(request_id=request_id, order=order, accepted=retcode == 0)
+    except WorkerEnrollmentError as error:
+        session.send_order_check_error(request_id=request_id, reason=str(error))
+    except Exception:
+        session.send_order_check_error(request_id=request_id, reason="The local MT5 order check failed.")
 
 
 def _send_product_catalog_analysis_error(

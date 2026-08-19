@@ -94,6 +94,9 @@ class MetaTrader5Adapter:
     def symbol_info_tick(self, symbol: str) -> object:
         return self._mt5.symbol_info_tick(symbol)
 
+    def order_check(self, request: dict[str, object]) -> object:
+        return self._mt5.order_check(request)
+
     def __getattr__(self, name: str) -> object:
         if name.startswith("TIMEFRAME_"):
             return getattr(self._mt5, name)

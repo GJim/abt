@@ -6,7 +6,7 @@ outbound WSS channel for Trader commands and personal lifecycle events.
 
 **Blocked by:** 01 — Admit workers and Traders with registration invites.
 
-**Status:** in_progress
+**Status:** ready-for-human
 
 - [x] Trader enrollment accepts only a `trader` invite, P-256 public-key proof,
   strategy name, and claimed public IP; it records no observed client IP.
@@ -18,7 +18,8 @@ outbound WSS channel for Trader commands and personal lifecycle events.
 - [x] WSS uses 30-second heartbeats, marks stale after five minutes, and never
   pauses or cancels accepted intents because of staleness.
 - [x] Event delivery is at least once with immutable event IDs, ACK cursors,
-  and reconnect replay; a Trader can receive only its own events.
+  and reconnect replay; ACKs are limited to events delivered on that session
+  and a Trader can receive only its own events.
 - [x] Revocation ends active WSS and blocks new commands without changing
   accepted intents.
 
@@ -32,3 +33,9 @@ outbound WSS channel for Trader commands and personal lifecycle events.
 - [x] Add administrator rejection for pending Trader registrations.
 - [x] Add durable WSS command idempotency plus per-Trader immutable events,
   ACK cursors, and reconnect replay.
+- [x] Replace the rotation challenge tuple with a named immutable record and
+  use role-neutral WSS protocol helpers for both Workers and Traders.
+- [x] Sweep persisted Trader sessions to `stale` after five minutes without a
+  valid signal, including sessions whose sockets disconnected.
+- [x] Restrict WSS intent acceptance to the complete active-pair contract and
+  two exact connected-worker `order_check` preflights before durable acceptance.

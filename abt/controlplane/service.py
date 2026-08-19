@@ -10,6 +10,7 @@ import logging
 import math
 import queue
 from contextlib import asynccontextmanager
+from decimal import Decimal
 from pathlib import Path
 import secrets
 from statistics import median
@@ -21,7 +22,7 @@ from fastapi import Cookie, FastAPI, Header, HTTPException, Query, Response, Web
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from .backup import BackupManager
 from .crypto import (
@@ -94,11 +95,40 @@ class TraderRotationChallengeRequest(BaseModel):
     attestation_jwt: str = Field(min_length=1)
 
 
+@dataclass(frozen=True)
+class _TraderRotationChallenge:
+    nonce: str
+    replacement_public_key_pem: str
+    attestation_provider: str
+    expires_at: datetime
+
+
 class TraderRotationRequest(BaseModel):
     trader_id: str = Field(min_length=1)
     public_key_pem: str = Field(min_length=1)
     old_key_signature: str = Field(min_length=1)
     replacement_key_signature: str = Field(min_length=1)
+
+
+class TraderIntentPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["intent"]
+    pair_id: str = Field(min_length=1)
+    primary_direction: Literal["LONG", "SHORT"]
+    lots: Decimal = Field(gt=0)
+    entry_price: Decimal = Field(gt=0)
+    stop_loss_pips: Decimal = Field(gt=0)
+    take_profit_pips: Decimal = Field(gt=0)
+    filling_mode: Literal["FOK", "IOC"]
+    expires_at: datetime
+
+    @field_validator("expires_at")
+    @classmethod
+    def require_absolute_expiry(cls, value: datetime) -> datetime:
+        if value.tzinfo is None:
+            raise ValueError("expires_at must include a timezone.")
+        return value.astimezone(UTC)
 
 
 class ProductCatalogAnalysisPolicy(BaseModel):
@@ -266,6 +296,7 @@ def create_app(
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         cleanup_task = asyncio.create_task(_expire_pending_secrets(ledger, secret_store))
+        trader_session_sweep_task = asyncio.create_task(_sweep_stale_trader_sessions(ledger))
         backup_task = (
             asyncio.create_task(_create_hourly_backups(backup_manager)) if backup_manager is not None else None
         )
@@ -273,7 +304,8 @@ def create_app(
             yield
         finally:
             cleanup_task.cancel()
-            tasks = [cleanup_task]
+            trader_session_sweep_task.cancel()
+            tasks = [cleanup_task, trader_session_sweep_task]
             if backup_task is not None:
                 backup_task.cancel()
                 tasks.append(backup_task)
@@ -283,7 +315,7 @@ def create_app(
     app = FastAPI(title="abt control plane", version="0.1.0", lifespan=lifespan)
     app.state.ledger = ledger
     app.state.trader_certificate_challenges = {}
-    app.state.trader_rotation_challenges = {}
+    app.state.trader_rotation_challenges: dict[str, _TraderRotationChallenge] = {}
     admin_notification_connections: set[WebSocket] = set()
     worker_connections: dict[str, set[_WorkerSessionConnection]] = {}
     trader_connections: dict[str, set[WebSocket]] = {}
@@ -506,8 +538,11 @@ def create_app(
                 trust_root_public_key_pem=trader_attestation_trust_root,
             )
             nonce = secrets.token_urlsafe(32)
-            app.state.trader_rotation_challenges[body.trader_id] = (
-                nonce, body.public_key_pem, provider, datetime.now(UTC) + timedelta(minutes=2)
+            app.state.trader_rotation_challenges[body.trader_id] = _TraderRotationChallenge(
+                nonce=nonce,
+                replacement_public_key_pem=body.public_key_pem,
+                attestation_provider=provider,
+                expires_at=datetime.now(UTC) + timedelta(minutes=2),
             )
             return {"purpose": "trader_certificate_rotation", "trader_id": trader.trader_id, "nonce": nonce}
         except (LedgerError, ProofError) as error:
@@ -518,9 +553,15 @@ def create_app(
         try:
             trader = ledger.active_trader(body.trader_id)
             challenge = app.state.trader_rotation_challenges.pop(body.trader_id, None)
-            if challenge is None or challenge[1] != body.public_key_pem or datetime.now(UTC) >= challenge[3]:
+            if (
+                challenge is None
+                or challenge.replacement_public_key_pem != body.public_key_pem
+                or datetime.now(UTC) >= challenge.expires_at
+            ):
                 raise ProofError("The Trader rotation challenge is invalid or expired.")
-            nonce, replacement_public_key_pem, provider, _expires_at = challenge
+            nonce = challenge.nonce
+            replacement_public_key_pem = challenge.replacement_public_key_pem
+            provider = challenge.attestation_provider
             verify_trader_rotation_proof(
                 trader.public_key_pem, body.old_key_signature, trader_id=trader.trader_id,
                 replacement_public_key_pem=replacement_public_key_pem, nonce=nonce,
@@ -1153,14 +1194,14 @@ def create_app(
     async def deliver_certificate(websocket: WebSocket) -> None:
         await websocket.accept()
         try:
-            request = await _worker_message(websocket, {"enrollment_id"})
+            request = await _receive_exact_message(websocket, {"enrollment_id"})
             enrollment_id = _required_text(request, "enrollment_id")
             worker = ledger.active_worker_for_enrollment(enrollment_id)
             nonce = secrets.token_urlsafe(32)
             await websocket.send_json(
                 {"purpose": "certificate_delivery", "worker_id": worker.worker_id, "nonce": nonce}
             )
-            proof = await _worker_message(websocket, {"signature"})
+            proof = await _receive_exact_message(websocket, {"signature"})
             verify_worker_proof(
                 worker.public_key_pem,
                 _required_text(proof, "signature"),
@@ -1171,13 +1212,13 @@ def create_app(
             await websocket.send_json({"worker_id": worker.worker_id, "certificate": worker.certificate})
         except WebSocketDisconnect as error:
             _LOGGER.info("Worker certificate delivery disconnected with code %s.", error.code)
-            await _reject_worker(websocket)
+            await _close_policy_violation(websocket)
         except (LedgerError, ProofError, ValueError) as error:
             _LOGGER.warning("Worker certificate delivery failed: %s", error)
-            await _reject_worker(websocket)
+            await _close_policy_violation(websocket)
         except Exception:
             _LOGGER.exception("Worker certificate delivery failed unexpectedly.")
-            await _reject_worker(websocket)
+            await _close_policy_violation(websocket)
 
     @app.websocket("/api/traders/session")
     async def trader_session(websocket: WebSocket) -> None:
@@ -1185,7 +1226,7 @@ def create_app(
         trader_id: str | None = None
         session_id: str | None = None
         try:
-            request = await _worker_message(websocket, {"trader_id", "certificate"})
+            request = await _receive_exact_message(websocket, {"trader_id", "certificate"})
             trader_id = _required_text(request, "trader_id")
             trader = ledger.active_trader(trader_id)
             certificate = _required_text(request, "certificate")
@@ -1202,7 +1243,7 @@ def create_app(
                 raise ProofError("The Trader certificate does not match this Trader.")
             nonce = secrets.token_urlsafe(32)
             await websocket.send_json({"purpose": "trader_session", "trader_id": trader.trader_id, "nonce": nonce})
-            proof = await _worker_message(websocket, {"signature"})
+            proof = await _receive_exact_message(websocket, {"signature"})
             verify_trader_proof(
                 trader.public_key_pem,
                 _required_text(proof, "signature"),
@@ -1215,8 +1256,10 @@ def create_app(
             session_id = ledger.open_trader_session(trader.trader_id)
             cursor = ledger.trader_event_cursor(trader.trader_id)
             await websocket.send_json({"type": "authenticated", "trader_id": trader.trader_id, "cursor": cursor})
+            delivered_high_water = cursor
             for event in ledger.trader_events_after(trader.trader_id, cursor):
                 await websocket.send_json({"type": "event", **jsonable_encoder(event)})
+                delivered_high_water = event["event_id"]
             last_controller_heartbeat = monotonic()
             while True:
                 try:
@@ -1224,7 +1267,6 @@ def create_app(
                 except asyncio.TimeoutError:
                     await websocket.send_json({"type": "heartbeat"})
                     last_controller_heartbeat = monotonic()
-                    ledger.mark_trader_session_stale(session_id)
                     continue
                 if not isinstance(message, dict) or not isinstance(message.get("type"), str):
                     raise ValueError("Invalid Trader message.")
@@ -1237,12 +1279,13 @@ def create_app(
                     await websocket.send_json({"type": "heartbeat_ack"})
                 elif message_type == "ack" and set(message) == {"type", "cursor"} and isinstance(message["cursor"], int):
                     ledger.record_trader_signal(session_id)
-                    ledger.acknowledge_trader_events(trader.trader_id, message["cursor"])
+                    ledger.acknowledge_trader_events(trader.trader_id, message["cursor"], delivered_high_water)
                     await websocket.send_json({"type": "acknowledged", "cursor": message["cursor"]})
                 elif message_type == "resume" and set(message) == {"type", "cursor"} and isinstance(message["cursor"], int):
                     ledger.record_trader_signal(session_id)
                     for event in ledger.trader_events_after(trader.trader_id, message["cursor"]):
                         await websocket.send_json({"type": "event", **jsonable_encoder(event)})
+                        delivered_high_water = event["event_id"]
                 elif (
                     message_type == "command"
                     and set(message) == {"type", "command_id", "payload"}
@@ -1251,20 +1294,32 @@ def create_app(
                 ):
                     ledger.active_trader(trader.trader_id)
                     ledger.record_trader_signal(session_id)
-                    result = ledger.submit_trader_command(trader.trader_id, message["command_id"], message["payload"])
+                    payload = cast(dict[str, Any], message["payload"])
+                    if payload.get("type") == "intent":
+                        result = await _preflight_trader_intent(
+                            ledger,
+                            worker_connections,
+                            worker_execution_locks,
+                            trader.trader_id,
+                            message["command_id"],
+                            payload,
+                        )
+                    else:
+                        result = ledger.submit_trader_command(trader.trader_id, message["command_id"], payload)
                     await websocket.send_json(result)
                     for event in ledger.trader_events_after(trader.trader_id, result["event_id"] - 1):
                         await websocket.send_json({"type": "event", **jsonable_encoder(event)})
+                        delivered_high_water = event["event_id"]
                 else:
                     raise ValueError("Invalid Trader message.")
         except WebSocketDisconnect as error:
             _LOGGER.info("Trader session disconnected with code %s.", error.code)
         except (LedgerError, ProofError, SecretStoreError, ValueError) as error:
             _LOGGER.warning("Trader session authentication or request failed: %s", error)
-            await _reject_worker(websocket)
+            await _close_policy_violation(websocket)
         except Exception:
             _LOGGER.exception("Trader session authentication or request failed unexpectedly.")
-            await _reject_worker(websocket)
+            await _close_policy_violation(websocket)
         finally:
             if trader_id is not None:
                 connections = trader_connections.get(trader_id)
@@ -1277,7 +1332,7 @@ def create_app(
     async def mediate_password(websocket: WebSocket) -> None:
         await websocket.accept()
         try:
-            request = await _worker_message(websocket, {"worker_id", "certificate"})
+            request = await _receive_exact_message(websocket, {"worker_id", "certificate"})
             worker = ledger.active_worker(_required_text(request, "worker_id"))
             certificate = _required_text(request, "certificate")
             claims = parse_device_certificate(certificate)
@@ -1296,7 +1351,7 @@ def create_app(
             await websocket.send_json(
                 {"purpose": "password_request", "worker_id": worker.worker_id, "nonce": nonce}
             )
-            proof = await _worker_message(websocket, {"signature"})
+            proof = await _receive_exact_message(websocket, {"signature"})
             verify_worker_proof(
                 worker.public_key_pem,
                 _required_text(proof, "signature"),
@@ -1309,20 +1364,20 @@ def create_app(
             await websocket.send_json({"password": secret_store.read_password(worker.password_secret_ref)})
         except WebSocketDisconnect as error:
             _LOGGER.info("Worker password mediation disconnected with code %s.", error.code)
-            await _reject_worker(websocket)
+            await _close_policy_violation(websocket)
         except (LedgerError, ProofError, SecretStoreError, ValueError) as error:
             _LOGGER.warning("Worker password mediation failed: %s", error)
-            await _reject_worker(websocket)
+            await _close_policy_violation(websocket)
         except Exception:
             _LOGGER.exception("Worker password mediation failed unexpectedly.")
-            await _reject_worker(websocket)
+            await _close_policy_violation(websocket)
 
     @app.websocket("/api/worker/session")
     async def worker_session(websocket: WebSocket) -> None:
         await websocket.accept()
         sender_task: asyncio.Task[None] | None = None
         try:
-            request = await _worker_message(websocket, {"worker_id", "certificate"})
+            request = await _receive_exact_message(websocket, {"worker_id", "certificate"})
             worker = ledger.active_worker(_required_text(request, "worker_id"))
             certificate = _required_text(request, "certificate")
             claims = parse_device_certificate(certificate)
@@ -1339,7 +1394,7 @@ def create_app(
                 raise ProofError("The device certificate does not match this worker.")
             nonce = secrets.token_urlsafe(32)
             await websocket.send_json({"purpose": "worker_session", "worker_id": worker.worker_id, "nonce": nonce})
-            proof = await _worker_message(websocket, {"signature"})
+            proof = await _receive_exact_message(websocket, {"signature"})
             verify_worker_proof(
                 worker.public_key_pem,
                 _required_text(proof, "signature"),
@@ -1357,7 +1412,7 @@ def create_app(
             while True:
                 request = await websocket.receive_json()
                 if not isinstance(request, dict):
-                    raise ValueError("Invalid worker message.")
+                    raise ValueError("Invalid protocol message.")
                 message_type = request.get("type")
                 if message_type == "password_request" and set(request) == {"type"} and secret_store is not None:
                     await websocket.send_json(
@@ -1385,17 +1440,21 @@ def create_app(
                     _record_product_catalog_analysis_response(connection, request)
                 elif message_type == "product_catalog_analysis_error":
                     _record_product_catalog_analysis_error(connection, request)
+                elif message_type == "order_check_response":
+                    _record_order_check_response(connection, request)
+                elif message_type == "order_check_error":
+                    _record_order_check_error(connection, request)
                 else:
-                    raise ValueError("Invalid worker message.")
+                    raise ValueError("Invalid protocol message.")
         except WebSocketDisconnect as error:
             _LOGGER.info("Worker session disconnected with code %s.", error.code)
-            await _reject_worker(websocket)
+            await _close_policy_violation(websocket)
         except (LedgerError, ProofError, SecretStoreError, ValueError) as error:
             _LOGGER.warning("Worker session authentication or request failed: %s", error)
-            await _reject_worker(websocket)
+            await _close_policy_violation(websocket)
         except Exception:
             _LOGGER.exception("Worker session authentication or request failed unexpectedly.")
-            await _reject_worker(websocket)
+            await _close_policy_violation(websocket)
         finally:
             if sender_task is not None:
                 connection.outbound.put(None)
@@ -1450,6 +1509,12 @@ def _delete_expired_pending_secrets(ledger: ControlLedger, secret_store: SecretS
     for secret_ref in ledger.expire_pending_enrollments():
         secret_store.delete_password(secret_ref)
         ledger.mark_pending_password_deleted(secret_ref)
+
+
+async def _sweep_stale_trader_sessions(ledger: ControlLedger) -> None:
+    while True:
+        ledger.sweep_stale_trader_sessions()
+        await asyncio.sleep(30)
 
 
 def _ledger_error_status(error: LedgerError) -> int:
@@ -1633,6 +1698,29 @@ def _record_product_catalog_analysis_error(
             reason,
         )
         pending.future.set_exception(LedgerError(reason))
+
+
+def _record_order_check_response(connection: _WorkerSessionConnection, request: dict[str, object]) -> None:
+    request_id = _required_text(request, "request_id")
+    pending = connection.pending.pop(request_id, None)
+    if pending is None:
+        return
+    if pending.stage != "order_check" or request.get("analysis_id") != "order_check":
+        raise ValueError("Invalid worker order-check response.")
+    if not pending.future.done():
+        pending.future.set_result(request)
+
+
+def _record_order_check_error(connection: _WorkerSessionConnection, request: dict[str, object]) -> None:
+    request_id = _required_text(request, "request_id")
+    pending = connection.pending.pop(request_id, None)
+    if pending is None:
+        return
+    if pending.stage != "order_check" or request.get("analysis_id") != "order_check":
+        raise ValueError("Invalid worker order-check error.")
+    if set(request) != {"type", "analysis_id", "request_id", "reason"}:
+        raise ValueError("Invalid worker order-check error.")
+    pending.future.set_exception(LedgerError(_required_text(request, "reason")))
 
 
 def _fail_pending_worker_analysis_requests(connection: _WorkerSessionConnection, reason: str) -> None:
@@ -1928,6 +2016,115 @@ async def _pair_worker_execution(
     finally:
         ordered[1][1].release()
         ordered[0][1].release()
+
+
+async def _preflight_trader_intent(
+    ledger: ControlLedger,
+    worker_connections: dict[str, set[_WorkerSessionConnection]],
+    worker_execution_locks: dict[str, asyncio.Lock],
+    trader_id: str,
+    command_id: str,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Accept an intent only after both selected brokers validate its exact orders."""
+
+    existing = ledger.trader_command_result(trader_id, command_id, payload)
+    if existing is not None:
+        return existing
+    try:
+        intent = TraderIntentPayload.model_validate(payload)
+        remaining_seconds = (intent.expires_at - datetime.now(UTC)).total_seconds()
+        if remaining_seconds <= 0:
+            raise LedgerError("Intent expiry has passed.")
+        deadline = monotonic() + remaining_seconds
+        pair = next((item for item in ledger.product_pairs() if item["product_pair_id"] == intent.pair_id), None)
+        if pair is None or pair["status"] != "active":
+            raise LedgerError("Active product pair does not exist.")
+        specifications = cast(list[dict[str, Any]], pair["reference_specifications"])
+        if len(specifications) != 2 or any(intent.filling_mode not in item["specification"]["filling_modes"] for item in specifications):
+            raise LedgerError("Intent filling mode is not supported by both endpoints.")
+        if any(
+            intent.primary_direction not in item["specification"]["allowed_directions"]
+            or intent.stop_loss_pips < Decimal(str(item["specification"]["trade_stops_level"]))
+            or intent.take_profit_pips < Decimal(str(item["specification"]["trade_stops_level"]))
+            for item in specifications
+        ):
+            raise LedgerError("Intent direction or protective prices violate endpoint constraints.")
+        if any(not _valid_intent_volume(intent.lots, item["specification"]) for item in specifications):
+            raise LedgerError("Intent lots are not exactly valid for both endpoints.")
+        sources = cast(dict[str, dict[str, Any]], pair["source_workers"])
+        workers = [sources["first_worker"], sources["second_worker"]]
+        endpoint_by_server = {str(item["server"]): item for item in specifications}
+        if set(endpoint_by_server) != {str(worker["server"]) for worker in workers}:
+            raise LedgerError("Product pair source workers do not match its endpoints.")
+        connections = [
+            _connected_worker_session(worker_connections, str(worker["worker_id"]), reason="Selected worker is disconnected.")
+            for worker in workers
+        ]
+        orders = [
+            _intent_order(intent, endpoint_by_server[str(worker["server"])], primary=index == 0)
+            for index, worker in enumerate(workers)
+        ]
+        if monotonic() >= deadline:
+            raise LedgerError("Intent expiry passed before broker preflight.")
+        async with _pair_worker_execution(worker_execution_locks, str(workers[0]["worker_id"]), str(workers[1]["worker_id"])):
+            responses = await asyncio.gather(
+                *(_request_order_check(connection, order) for connection, order in zip(connections, orders, strict=True))
+            )
+        if monotonic() >= deadline:
+            raise LedgerError("Intent expiry passed during broker preflight.")
+        if not all(_validated_order_check_response(response, order) for response, order in zip(responses, orders, strict=True)):
+            raise LedgerError("A broker rejected the intent order check.")
+    except (LedgerError, ValidationError, ValueError, asyncio.TimeoutError) as error:
+        return ledger.reject_trader_command(
+            trader_id, command_id, payload, str(error), [{"status": "rejected", "reason": str(error)}]
+        )
+    return ledger.submit_trader_command(trader_id, command_id, cast(dict[str, Any], intent.model_dump(mode="json")))
+
+
+def _valid_intent_volume(lots: Decimal, specification: dict[str, Any]) -> bool:
+    minimum, maximum, step = (Decimal(str(specification[name])) for name in ("volume_min", "volume_max", "volume_step"))
+    return minimum <= lots <= maximum and (lots - minimum) % step == 0
+
+
+def _intent_order(intent: TraderIntentPayload, reference: dict[str, Any], *, primary: bool) -> dict[str, object]:
+    specification = cast(dict[str, Any], reference["specification"])
+    point = Decimal(str(specification["point"]))
+    direction = intent.primary_direction if primary else ("SHORT" if intent.primary_direction == "LONG" else "LONG")
+    entry = intent.entry_price
+    stop_loss = entry - intent.stop_loss_pips * point if direction == "LONG" else entry + intent.stop_loss_pips * point
+    take_profit = entry + intent.take_profit_pips * point if direction == "LONG" else entry - intent.take_profit_pips * point
+    return {
+        "action": "pending_limit",
+        "symbol": reference["symbol"],
+        "volume": str(intent.lots),
+        "direction": direction,
+        "price": str(entry),
+        "sl": str(stop_loss),
+        "tp": str(take_profit),
+        "filling_mode": intent.filling_mode,
+    }
+
+
+async def _request_order_check(connection: _WorkerSessionConnection, order: dict[str, object]) -> dict[str, object]:
+    request_id = str(uuid4())
+    return await _request_worker_analysis(
+        connection,
+        analysis_id="order_check",
+        stage="order_check",
+        timeout=5,
+        message={"type": "order_check_request", "analysis_id": "order_check", "request_id": request_id, "order": order},
+    )
+
+
+def _validated_order_check_response(response: dict[str, object], order: dict[str, object]) -> bool:
+    return (
+        set(response) == {"type", "analysis_id", "request_id", "accepted", "order"}
+        and response["type"] == "order_check_response"
+        and response["analysis_id"] == "order_check"
+        and response["accepted"] is True
+        and response["order"] == order
+    )
 
 
 def _previous_complete_utc_week(now: datetime | None = None) -> dict[str, str]:
@@ -2285,28 +2482,28 @@ async def _broadcast_pending_enrollment(
             connections.discard(connection)
 
 
-async def _worker_message(websocket: WebSocket, expected_fields: set[str]) -> dict[str, object]:
+async def _receive_exact_message(websocket: WebSocket, expected_fields: set[str]) -> dict[str, object]:
     message = await websocket.receive_json()
     if not isinstance(message, dict) or set(message) != expected_fields:
-        raise ValueError("Invalid worker message.")
+        raise ValueError("Invalid protocol message.")
     return message
 
 
 def _required_text(message: dict[str, object], field: str) -> str:
     value = message.get(field)
     if not isinstance(value, str) or not value:
-        raise ValueError("Invalid worker message.")
+        raise ValueError("Invalid protocol message.")
     return value
 
 
 def _record_snapshot(ledger: ControlLedger, worker_id: str, message: dict[str, object]) -> None:
     required = {"type", "cursor", "observed_at", "account", "terminal", "orders", "positions"}
     if set(message) != required or not isinstance(message["cursor"], int) or isinstance(message["cursor"], bool):
-        raise ValueError("Invalid worker message.")
+        raise ValueError("Invalid protocol message.")
     if not isinstance(message["observed_at"], str) or not isinstance(message["account"], dict) or not isinstance(message["terminal"], dict):
-        raise ValueError("Invalid worker message.")
+        raise ValueError("Invalid protocol message.")
     if not isinstance(message["orders"], list) or not isinstance(message["positions"], list):
-        raise ValueError("Invalid worker message.")
+        raise ValueError("Invalid protocol message.")
     ledger.record_snapshot(
         worker_id, message["cursor"], message["observed_at"], message["account"], message["terminal"],
         message["orders"], message["positions"],
@@ -2316,21 +2513,21 @@ def _record_snapshot(ledger: ControlLedger, worker_id: str, message: dict[str, o
 def _record_delta(ledger: ControlLedger, worker_id: str, message: dict[str, object]) -> None:
     required = {"type", "cursor", "observed_at", "entity", "ticket", "change", "record"}
     if set(message) != required or not isinstance(message["cursor"], int) or isinstance(message["cursor"], bool):
-        raise ValueError("Invalid worker message.")
+        raise ValueError("Invalid protocol message.")
     if not all(isinstance(message[field], str) and message[field] for field in ("observed_at", "entity", "ticket", "change")):
-        raise ValueError("Invalid worker message.")
+        raise ValueError("Invalid protocol message.")
     if message["entity"] not in {"order", "position"} or message["change"] not in {
         "created", "state_changed", "volume_changed", "modified", "closed"
     }:
-        raise ValueError("Invalid worker message.")
+        raise ValueError("Invalid protocol message.")
     if not isinstance(message["record"], dict):
-        raise ValueError("Invalid worker message.")
+        raise ValueError("Invalid protocol message.")
     ledger.record_delta(
         worker_id, message["cursor"], message["observed_at"], message["entity"], message["ticket"],
         message["change"], message["record"],
     )
 
 
-async def _reject_worker(websocket: WebSocket) -> None:
+async def _close_policy_violation(websocket: WebSocket) -> None:
     if websocket.client_state.name != "DISCONNECTED":
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)

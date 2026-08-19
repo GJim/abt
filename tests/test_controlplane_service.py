@@ -539,7 +539,7 @@ class ControlPlaneServiceTests(unittest.TestCase):
             automatically_replayed = reconnected.receive_json()
 
         self.assertEqual({"type": "authenticated", "trader_id": approval["trader_id"], "cursor": 0}, authenticated)
-        self.assertEqual("accepted", result["status"])
+        self.assertEqual("rejected_preflight", result["status"])
         self.assertEqual(result["event_id"], event["event_id"])
         self.assertEqual(event["event_id"], resumed["cursor"])
         self.assertEqual(unacknowledged_event["event_id"], automatically_replayed["event_id"])
