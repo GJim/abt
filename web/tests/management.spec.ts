@@ -76,6 +76,8 @@ test('administrator can review and approve a pending worker registration', async
   await page.getByLabel('Password').fill('A-secure-admin-password!')
   await page.getByRole('button', { name: 'Sign in' }).click()
 
+  await expect(page.getByRole('heading', { name: 'Needs attention' })).toBeVisible()
+  await expect(page.getByText('Pending approval')).toBeVisible()
   await expect(page.getByRole('heading', { name: 'Pending worker registrations' })).toBeVisible()
   await expect(page.getByText('12345678')).toBeVisible()
   await expect(page.getByText('Broker-Demo')).toBeVisible()
@@ -97,8 +99,9 @@ test('administrator can review and approve a pending worker registration', async
   expect(actionsBox).not.toBeNull()
   expect(evidenceBox!.y).toBeGreaterThan(metadataBox!.y + metadataBox!.height)
   expect(actionsBox!.y).toBeGreaterThan(evidenceBox!.y + evidenceBox!.height)
-  await page.getByRole('button', { name: 'Approve registration for 12345678 on Broker-Demo' }).click()
+  await page.getByRole('button', { name: 'Approve registration for 12345678 on Broker-Demo' }).first().click()
 
+  await expect(page.getByText('No operator action is needed.')).toBeVisible()
   await expect(page.getByText('No worker registrations are awaiting review.')).toBeVisible()
   await expect(page.getByText('worker_enrollment_approved')).toBeVisible()
   expect(enrollmentRequests).toBe(2)

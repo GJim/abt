@@ -74,6 +74,24 @@ type WorkerAlert = {
   occurred_at: string
 }
 
+type InterventionItem =
+  | {
+    id: string
+    kind: string
+    reason: string
+    occurredAt: string
+    priorityRank: number
+    enrollment: Enrollment
+  }
+  | {
+    id: string
+    kind: string
+    reason: string
+    occurredAt: string
+    priorityRank: number
+    alert: WorkerAlert
+  }
+
 type ProductCatalogAnalysisPolicy = {
   label: string
   require_equal_base_currency: boolean
@@ -490,6 +508,29 @@ function App() {
       : events.filter((event) => event.payload?.analysis_id === analysis.analysis_id),
     [analysis, events],
   )
+  const interventionQueue = useMemo<InterventionItem[]>(
+    () => [
+      ...enrollments.map((enrollment) => ({
+        id: `enrollment-${enrollment.enrollment_id}`,
+        kind: 'Pending approval',
+        reason: 'Worker registration needs operator approval before it can receive a device certificate.',
+        occurredAt: enrollment.created_at,
+        priorityRank: 2,
+        enrollment,
+      })),
+      ...alerts
+        .filter((alert) => alert.priority === 'high' || alert.priority === 'critical')
+        .map((alert) => ({
+          id: `alert-${alert.alert_id}`,
+          kind: `${alert.priority} priority alert`,
+          reason: alert.reason,
+          occurredAt: alert.occurred_at,
+          priorityRank: alert.priority === 'critical' ? 3 : 2,
+          alert,
+        })),
+    ].sort((first, second) => second.priorityRank - first.priorityRank || second.occurredAt.localeCompare(first.occurredAt)),
+    [alerts, enrollments],
+  )
 
   useEffect(() => {
     if (eligibleWorkers.length === 0) {
@@ -764,6 +805,55 @@ function App() {
           {error && <p className="error" role="alert">{error}</p>}
           {refreshError && <p className="error" role="alert">{refreshError}</p>}
 
+          <section aria-labelledby="intervention-queue-heading" className="intervention-queue">
+            <div className="section-header">
+              <div>
+                <h2 id="intervention-queue-heading">Needs attention</h2>
+                <p>Only control-plane conditions that need an operator action appear here.</p>
+              </div>
+              <span className="status-badge status-failed">{interventionQueue.length} open</span>
+            </div>
+            {interventionQueue.length === 0 ? (
+              <p>No operator action is needed.</p>
+            ) : (
+              <ul aria-label="Intervention queue">
+                {interventionQueue.map((item) => (
+                  <li key={item.id} className="intervention-item">
+                    <div>
+                      <strong>{item.kind}</strong>
+                      <p>{item.reason}</p>
+                      <time dateTime={item.occurredAt}>{formatDateTime(item.occurredAt)}</time>
+                    </div>
+                    {'enrollment' in item ? (
+                      <div className="enrollment-actions">
+                        <button
+                          aria-label={`Approve registration for ${item.enrollment.login} on ${item.enrollment.server}`}
+                          disabled={processingEnrollmentId === item.enrollment.enrollment_id}
+                          onClick={() => void reviewEnrollment(item.enrollment!.enrollment_id, 'approve')}
+                          type="button"
+                        >
+                          Approve
+                        </button>
+                        <button
+                          aria-label={`Reject registration for ${item.enrollment.login} on ${item.enrollment.server}`}
+                          className="reject-button"
+                          disabled={processingEnrollmentId === item.enrollment.enrollment_id}
+                          onClick={() => void reviewEnrollment(item.enrollment!.enrollment_id, 'reject')}
+                          type="button"
+                        >
+                          Reject
+                        </button>
+                      </div>
+                    ) : (
+                      <a href="#account-workers-heading">Review worker</a>
+                    )}
+                    {'enrollment' in item && <a href={`#enrollment-${item.enrollment.enrollment_id}`}>Review evidence</a>}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </section>
+
           <section aria-labelledby="analysis-heading" className="analysis-section">
             <div className="section-header">
               <div>
@@ -975,7 +1065,7 @@ function App() {
                   const registrationName = `${enrollment.login} on ${enrollment.server}`
 
                   return (
-                    <li key={enrollment.enrollment_id} className="enrollment">
+                    <li id={`enrollment-${enrollment.enrollment_id}`} key={enrollment.enrollment_id} className="enrollment">
                       <dl>
                         <div><dt>Login</dt><dd>{enrollment.login}</dd></div>
                         <div><dt>Server</dt><dd>{enrollment.server}</dd></div>

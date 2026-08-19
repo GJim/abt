@@ -144,6 +144,24 @@ li {
   gap: 1rem;
 }
 
+.intervention-queue {
+  background: #fff7ed;
+  border: 1px solid #fdba74;
+  border-radius: 0.75rem;
+  display: grid;
+  gap: 1rem;
+  padding: 1rem;
+}
+
+.intervention-item {
+  align-items: center;
+  gap: 1rem;
+}
+
+.intervention-item p {
+  margin: 0.25rem 0;
+}
+
 .analysis-layout,
 .summary-grid,
 .result-grid,
