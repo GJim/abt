@@ -134,6 +134,32 @@ def verify_enrollment_proof(
     )
 
 
+def trader_enrollment_payload(*, registration_invite: str, strategy_name: str, claimed_public_ip: str) -> bytes:
+    return json.dumps(
+        {
+            "claimed_public_ip": claimed_public_ip,
+            "registration_invite": registration_invite,
+            "strategy_name": strategy_name,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def verify_trader_enrollment_proof(
+    public_key_pem: str, signature_base64: str, *, registration_invite: str, strategy_name: str, claimed_public_ip: str
+) -> None:
+    _verify_p256_signature(
+        public_key_pem,
+        signature_base64,
+        trader_enrollment_payload(
+            registration_invite=registration_invite, strategy_name=strategy_name, claimed_public_ip=claimed_public_ip
+        ),
+        malformed_message="The trader enrollment proof is malformed.",
+        invalid_message="The trader enrollment proof signature is invalid.",
+    )
+
+
 def _verify_p256_signature(
     public_key_pem: str,
     signature_base64: str,

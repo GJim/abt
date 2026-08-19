@@ -289,6 +289,33 @@ class ControlPlaneServiceTests(unittest.TestCase):
         self.assertTrue(issued.json()["invite"])
         self.assertNotIn("invite", self.client.get("/api/admin/registration-invites").json()[0])
 
+    def test_trader_enrollment_requires_a_trader_invite_and_p256_proof(self) -> None:
+        private_key = ec.generate_private_key(ec.SECP256R1())
+        public_key_pem = private_key.public_key().public_bytes(
+            serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
+        ).decode("utf-8")
+        invite = self.app.state.ledger.create_registration_invite("ABCDEF", "trader")
+        payload = json.dumps(
+            {"claimed_public_ip": "203.0.113.4", "registration_invite": invite, "strategy_name": "mean-reversion"},
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        signature = private_key.sign(payload, ec.ECDSA(hashes.SHA256()))
+
+        response = self.client.post(
+            "/api/traders/enrollments",
+            json={
+                "registration_invite": invite,
+                "strategy_name": "mean-reversion",
+                "claimed_public_ip": "203.0.113.4",
+                "public_key_pem": public_key_pem,
+                "proof_signature": base64.b64encode(signature).decode("ascii"),
+            },
+        )
+
+        self.assertEqual(201, response.status_code)
+        self.assertTrue(response.json()["registration_id"])
+
     def test_admin_session_resumes_with_a_rotated_csrf_token(self) -> None:
         login_response = self.client.post(
             "/api/admin/login",

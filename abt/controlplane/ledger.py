@@ -325,6 +325,23 @@ class ControlLedger:
             )
         return enrollment
 
+    def create_trader_enrollment(
+        self, *, strategy_name: str, claimed_public_ip: str, public_key_pem: str
+    ) -> dict[str, Any]:
+        now = _utc_now()
+        registration_id = str(uuid4())
+        with self._transaction():
+            self._connection.execute(
+                """
+                INSERT INTO trader_enrollments
+                    (registration_id, strategy_name, claimed_public_ip, public_key_pem, status, created_at, expires_at)
+                VALUES (?, ?, ?, ?, 'pending', ?, ?)
+                """,
+                [registration_id, strategy_name, claimed_public_ip, public_key_pem, now, now + timedelta(minutes=15)],
+            )
+            self._event("trader_enrollment_requested", {"registration_id": registration_id, "strategy_name": strategy_name})
+        return {"registration_id": registration_id, "expires_at": now + timedelta(minutes=15)}
+
     def issue_enrollment_challenge(self) -> tuple[str, datetime]:
         challenge = secrets.token_urlsafe(32)
         now = _utc_now()
@@ -2183,6 +2200,15 @@ class ControlLedger:
                     status VARCHAR NOT NULL,
                     used_at TIMESTAMPTZ,
                     revoked_at TIMESTAMPTZ
+                );
+                CREATE TABLE IF NOT EXISTS trader_enrollments (
+                    registration_id VARCHAR PRIMARY KEY,
+                    strategy_name VARCHAR NOT NULL,
+                    claimed_public_ip VARCHAR NOT NULL,
+                    public_key_pem VARCHAR NOT NULL,
+                    status VARCHAR NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL,
+                    expires_at TIMESTAMPTZ NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS enrollment_challenges (
                     challenge_hash VARCHAR PRIMARY KEY,

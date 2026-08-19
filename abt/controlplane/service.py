@@ -24,7 +24,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
 from .backup import BackupManager
-from .crypto import ProofError, parse_device_certificate, verify_enrollment_proof, verify_worker_proof
+from .crypto import ProofError, parse_device_certificate, verify_enrollment_proof, verify_trader_enrollment_proof, verify_worker_proof
 from .ledger import AuthenticationError, ControlLedger, LedgerError, _hash
 from .secrets import DeviceCertificateIssuer, DeviceCertificateVerifier, SecretStore, SecretStoreError
 
@@ -58,6 +58,14 @@ class EnrollmentRequest(BaseModel):
 
 class RegistrationInviteRequest(BaseModel):
     role: Literal["worker", "trader"]
+
+
+class TraderEnrollmentRequest(BaseModel):
+    registration_invite: str = Field(min_length=1, max_length=512)
+    strategy_name: str = Field(min_length=1, max_length=128)
+    claimed_public_ip: str = Field(min_length=1, max_length=64)
+    public_key_pem: str = Field(min_length=1)
+    proof_signature: str = Field(min_length=1)
 
 
 class ProductCatalogAnalysisPolicy(BaseModel):
@@ -351,6 +359,27 @@ def create_app(
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
         except SecretStoreError as error:
             raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(error)) from error
+
+    @app.post("/api/traders/enrollments", status_code=status.HTTP_201_CREATED)
+    def create_trader_enrollment(body: TraderEnrollmentRequest) -> dict[str, object]:
+        try:
+            verify_trader_enrollment_proof(
+                body.public_key_pem,
+                body.proof_signature,
+                registration_invite=body.registration_invite,
+                strategy_name=body.strategy_name,
+                claimed_public_ip=body.claimed_public_ip,
+            )
+            ledger.consume_registration_invite(body.registration_invite, "trader")
+            return ledger.create_trader_enrollment(
+                strategy_name=body.strategy_name,
+                claimed_public_ip=body.claimed_public_ip,
+                public_key_pem=body.public_key_pem,
+            )
+        except ProofError as error:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(error)) from error
+        except LedgerError as error:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
 
     @app.get("/api/enrollment-challenge")
     def enrollment_challenge() -> dict[str, str]:

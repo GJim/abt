@@ -6,9 +6,9 @@ outbound WSS channel for Trader commands and personal lifecycle events.
 
 **Blocked by:** 01 — Admit workers and Traders with registration invites.
 
-**Status:** ready-for-agent
+**Status:** in_progress
 
-- [ ] Trader enrollment accepts only a `trader` invite, P-256 public-key proof,
+- [x] Trader enrollment accepts only a `trader` invite, P-256 public-key proof,
   strategy name, and claimed public IP; it records no observed client IP.
 - [ ] Approval issues a Trader certificate bound to one Trader ID and
   non-exportable CNG/TPM/PKCS#11 P-256 key; rotation and revocation follow the
@@ -21,4 +21,3 @@ outbound WSS channel for Trader commands and personal lifecycle events.
   and reconnect replay; a Trader can receive only its own events.
 - [ ] Revocation ends active WSS and blocks new commands without changing
   accepted intents.
-
