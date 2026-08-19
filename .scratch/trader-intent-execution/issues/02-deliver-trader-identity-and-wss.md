@@ -27,3 +27,8 @@ outbound WSS channel for Trader commands and personal lifecycle events.
 - [ ] Add certificate rotation and administrator revocation for approved Traders.
 - [ ] Make Trader heartbeats bidirectional every 30 seconds and persist a stale
   state after five minutes without a valid signal.
+- [ ] Require verifiable CNG/TPM/PKCS#11 key attestation; PEM proof alone does
+  not establish non-exportability.
+- [ ] Add administrator rejection for pending Trader registrations.
+- [ ] Add durable WSS command idempotency plus per-Trader immutable events,
+  ACK cursors, and reconnect replay.

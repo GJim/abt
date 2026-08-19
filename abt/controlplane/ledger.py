@@ -425,6 +425,23 @@ class ControlLedger:
             )
             return trader_id
 
+    def reject_trader_enrollment(self, registration_id: str, rejected_by: str) -> None:
+        with self._transaction():
+            changed = self._connection.execute(
+                """
+                UPDATE trader_enrollments SET status = 'rejected', approved_by = ?, approved_at = ?
+                WHERE registration_id = ? AND status = 'pending' AND expires_at > ?
+                RETURNING registration_id
+                """,
+                [rejected_by, _utc_now(), registration_id, _utc_now()],
+            ).fetchone()
+            if changed is None:
+                raise LedgerError("Trader enrollment is no longer pending.")
+            self._event(
+                "trader_enrollment_rejected",
+                {"registration_id": registration_id, "rejected_by": rejected_by},
+            )
+
     def active_trader_for_enrollment(self, registration_id: str) -> ActiveTrader:
         return self._active_trader(
             """

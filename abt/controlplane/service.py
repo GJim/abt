@@ -431,6 +431,19 @@ def create_app(
             _LOGGER.warning("Trader enrollment approval failed for %s: %s", registration_id, error)
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
 
+    @app.post("/api/admin/traders/enrollments/{registration_id}/reject", status_code=status.HTTP_204_NO_CONTENT)
+    def reject_trader_enrollment(
+        registration_id: str,
+        abt_admin_session: Annotated[str | None, Cookie()] = None,
+        x_csrf_token: Annotated[str | None, Header()] = None,
+    ) -> Response:
+        username = _require_admin(ledger, abt_admin_session, x_csrf_token, require_csrf=True)
+        try:
+            ledger.reject_trader_enrollment(registration_id, username)
+        except LedgerError as error:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
     @app.post("/api/traders/certificates/challenge")
     def issue_trader_certificate_challenge(body: TraderCertificateChallengeRequest) -> dict[str, str]:
         try:
