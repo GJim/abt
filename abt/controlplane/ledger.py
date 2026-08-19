@@ -203,32 +203,35 @@ class ControlLedger:
     def consume_registration_invite(self, invite: str, role: str) -> str:
         now = _utc_now()
         with self._transaction():
-            row = self._connection.execute(
-                "SELECT role, status, expires_at FROM registration_invites WHERE invite_hash = ?",
-                [_hash(invite)],
-            ).fetchone()
-            if row is None:
-                raise LedgerError("Registration invite is invalid.")
-            invite_role, status, expires_at = row
-            if invite_role != role:
-                raise LedgerError("Registration invite role does not match.")
-            if status == "used":
-                raise LedgerError("Registration invite is already used.")
-            if status != "active":
-                raise LedgerError("Registration invite is no longer active.")
-            if now >= expires_at:
-                self._connection.execute(
-                    "UPDATE registration_invites SET status = 'expired' WHERE invite_hash = ?",
-                    [_hash(invite)],
-                )
-                self._event("registration_invite_expired", {"role": role})
-                raise LedgerError("Registration invite is expired.")
-            self._connection.execute(
-                "UPDATE registration_invites SET status = 'used', used_at = ? WHERE invite_hash = ?",
-                [now, _hash(invite)],
-            )
-            self._event("registration_invite_used", {"role": role})
+            self._consume_registration_invite(invite, role, now)
         return role
+
+    def _consume_registration_invite(self, invite: str, role: str, now: datetime) -> None:
+        row = self._connection.execute(
+            "SELECT role, status, expires_at FROM registration_invites WHERE invite_hash = ?",
+            [_hash(invite)],
+        ).fetchone()
+        if row is None:
+            raise LedgerError("Registration invite is invalid.")
+        invite_role, status, expires_at = row
+        if invite_role != role:
+            raise LedgerError("Registration invite role does not match.")
+        if status == "used":
+            raise LedgerError("Registration invite is already used.")
+        if status != "active":
+            raise LedgerError("Registration invite is no longer active.")
+        if now >= expires_at:
+            self._connection.execute(
+                "UPDATE registration_invites SET status = 'expired' WHERE invite_hash = ?",
+                [_hash(invite)],
+            )
+            self._event("registration_invite_expired", {"role": role})
+            raise LedgerError("Registration invite is expired.")
+        self._connection.execute(
+            "UPDATE registration_invites SET status = 'used', used_at = ? WHERE invite_hash = ?",
+            [now, _hash(invite)],
+        )
+        self._event("registration_invite_used", {"role": role})
 
     def registration_invites(self) -> list[dict[str, Any]]:
         with self._lock:
@@ -277,6 +280,7 @@ class ControlLedger:
         terminal_info: dict[str, object],
         password_secret_ref: str,
         enrollment_challenge: str,
+        registration_invite: str | None = None,
         registration_invite_hash: str | None = None,
     ) -> Enrollment:
         now = _utc_now()
@@ -290,6 +294,9 @@ class ControlLedger:
             status="pending",
         )
         with self._transaction():
+            if registration_invite is not None:
+                self._consume_registration_invite(registration_invite, "worker", now)
+                registration_invite_hash = _hash(registration_invite)
             self._consume_enrollment_challenge(enrollment_challenge, now)
             self._connection.execute(
                 """
@@ -2406,12 +2413,16 @@ class ControlLedger:
                 """
             )
             self._connection.execute("ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS registration_invite_hash VARCHAR")
-            self._connection.execute(
-                """
-                UPDATE enrollments SET status = 'expired'
-                WHERE status = 'pending' AND registration_invite_hash IS NULL
-                """
-            )
+            enrollment_columns = {
+                row[1] for row in self._connection.execute("PRAGMA table_info('enrollments')").fetchall()
+            }
+            if "status" in enrollment_columns:
+                self._connection.execute(
+                    """
+                    UPDATE enrollments SET status = 'expired'
+                    WHERE status = 'pending' AND registration_invite_hash IS NULL
+                    """
+                )
             self._connection.execute("ALTER TABLE alerts ADD COLUMN IF NOT EXISTS product_pair_id VARCHAR")
             self._connection.execute("ALTER TABLE enrollments DROP COLUMN IF EXISTS pairing_code")
             self._connection.execute(

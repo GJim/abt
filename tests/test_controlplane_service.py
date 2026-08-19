@@ -232,6 +232,40 @@ class ControlPlaneServiceTests(unittest.TestCase):
         )
         self.assertEqual(422, response.status_code)
 
+    def test_worker_enrollment_does_not_consume_its_invite_when_registration_fails(self) -> None:
+        private_key = ec.generate_private_key(ec.SECP256R1())
+        public_key_pem = private_key.public_key().public_bytes(
+            serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
+        ).decode("utf-8")
+        account_info = {"login": 123456, "server": "Broker-Demo"}
+        terminal_info = {"name": "MetaTrader 5"}
+        invite = self.app.state.ledger.create_registration_invite("ABCDEF", "worker")
+        invalid_challenge = "already-expired-challenge"
+        invalid_signature = private_key.sign(
+            enrollment_payload(
+                123456, "Broker-Demo", account_info, terminal_info, "worker-memory-only-password", invalid_challenge
+            ),
+            ec.ECDSA(hashes.SHA256()),
+        )
+
+        rejected = self.client.post(
+            "/api/enrollments",
+            json={
+                "registration_invite": invite,
+                "login": 123456,
+                "server": "Broker-Demo",
+                "account_info": account_info,
+                "terminal_info": terminal_info,
+                "mt5_password": "worker-memory-only-password",
+                "enrollment_challenge": invalid_challenge,
+                "public_key_pem": public_key_pem,
+                "proof_signature": base64.b64encode(invalid_signature).decode("ascii"),
+            },
+        )
+
+        self.assertEqual(409, rejected.status_code)
+        self.assertEqual("active", self.app.state.ledger.registration_invites()[0]["status"])
+
     def test_enrollment_challenge_rejects_replay_and_password_substitution(self) -> None:
         private_key = ec.generate_private_key(ec.SECP256R1())
         public_key_pem = private_key.public_key().public_bytes(
@@ -246,6 +280,7 @@ class ControlPlaneServiceTests(unittest.TestCase):
             ec.ECDSA(hashes.SHA256()),
         )
         request = {
+            "registration_invite": self.app.state.ledger.create_registration_invite("ABCDEF", "worker"),
             "login": 123456, "server": "Broker-Demo",
             "account_info": account_info, "terminal_info": terminal_info, "mt5_password": password,
             "enrollment_challenge": challenge, "public_key_pem": public_key_pem,
@@ -529,6 +564,7 @@ class ControlPlaneServiceTests(unittest.TestCase):
         enrollment = self.client.post(
             "/api/enrollments",
             json={
+                "registration_invite": self.app.state.ledger.create_registration_invite("ABCDEF", "worker"),
                 "login": 123456,
                 "server": "Broker-Demo",
                 "account_info": account_info,
@@ -2487,6 +2523,7 @@ class ControlPlaneServiceTests(unittest.TestCase):
             "/api/enrollments",
             headers={"CF-Connecting-IP": "203.0.113.11"},
             json={
+                "registration_invite": self.app.state.ledger.create_registration_invite("ABCDEF", "worker"),
                 "login": login, "server": server,
                 "account_info": account_info, "terminal_info": terminal_info, "mt5_password": password,
                 "enrollment_challenge": challenge, "public_key_pem": public_key_pem,
@@ -2522,6 +2559,7 @@ class _LiveCatalogAnalysisHarness:
         response = httpx.post(
             f"{self._base_url}/api/enrollments",
             json={
+                "registration_invite": self._app.state.ledger.create_registration_invite("ABCDEF", "worker"),
                 "login": login,
                 "server": server,
                 "account_info": account_info,

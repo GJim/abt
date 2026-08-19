@@ -150,6 +150,7 @@ class TwoWorkerReleaseExerciseTests(unittest.TestCase):
         response = client.post(
             "/api/enrollments",
             json={
+                "registration_invite": client.app.state.ledger.create_registration_invite("ABCDEF", "worker"),
                 "login": login, "server": "Broker-Demo", "account_info": account,
                 "terminal_info": terminal, "mt5_password": password, "enrollment_challenge": challenge,
                 "public_key_pem": public_key, "proof_signature": base64.b64encode(signature).decode("ascii"),
@@ -593,6 +594,7 @@ class ProductCatalogReleaseGateTests(unittest.TestCase):
         response = client.post(
             "/api/enrollments",
             json={
+                "registration_invite": client.app.state.ledger.create_registration_invite("ABCDEF", "worker"),
                 "login": login, "server": server, "account_info": account,
                 "terminal_info": terminal, "mt5_password": password, "enrollment_challenge": challenge,
                 "public_key_pem": public_key, "proof_signature": base64.b64encode(signature).decode("ascii"),
@@ -803,6 +805,7 @@ class _SymbolSpec:
         self.currency_margin = currency_profit
         self.swap_long = -1.5
         self.swap_short = 0.5
+        self.swap_mode = 0
         self.swap_rollover3days = 3
         self.filling_modes = ["FOK", "IOC"]
         self.allowed_directions = ["LONG", "SHORT"]

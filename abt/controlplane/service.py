@@ -326,7 +326,6 @@ def create_app(
                 mt5_password=body.mt5_password,
                 enrollment_challenge=body.enrollment_challenge,
             )
-            ledger.consume_registration_invite(body.registration_invite, "worker")
             if secret_store is None:
                 raise SecretStoreError("The MT5 credential mediator is unavailable.")
             secret_ref = f"abt/data/mt5/pending/{uuid4()}"
@@ -340,7 +339,7 @@ def create_app(
                     terminal_info=body.terminal_info,
                     password_secret_ref=secret_ref,
                     enrollment_challenge=body.enrollment_challenge,
-                    registration_invite_hash=_hash(body.registration_invite),
+                    registration_invite=body.registration_invite,
                 )
             except LedgerError:
                 secret_store.delete_password(secret_ref)
