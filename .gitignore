@@ -11,6 +11,8 @@ __pycache__/
 htmlcov/
 build/
 dist/
+.env
+web/test-results/
 
 # Raw browser/source captures are reproducibility aids, not publishable research.
 .scratch/futures-prop-firm-rules/sources/
