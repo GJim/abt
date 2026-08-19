@@ -156,6 +156,8 @@ test('administrator can view connected worker health and reconciliation', async 
   await page.getByRole('button', { name: 'Sign in' }).click()
 
   await expect(page.getByRole('heading', { name: 'Fleet health' })).toBeVisible()
+  await expect(page.getByLabel('Worker summary').getByText('Stale', { exact: true })).toBeVisible()
+  await page.getByRole('button', { name: 'Show worker actions and reconciliation' }).click()
   const workerCard = page.getByRole('listitem').filter({ hasText: '123456 on Broker-Demo' })
   await expect(workerCard.getByText('Stale data', { exact: true })).toBeVisible()
   await expect(workerCard.getByText('"balance": 1000')).not.toBeVisible()
@@ -194,6 +196,8 @@ test('administrator can scan a realistic fleet, including stale and human-action
   await page.getByRole('button', { name: 'Sign in' }).click()
 
   const fleet = page.getByLabel('Fleet health by account')
+  await expect(page.getByLabel('Worker summary').getByRole('row')).toHaveCount(9)
+  await page.getByRole('button', { name: 'Show worker actions and reconciliation' }).click()
   await expect(fleet.getByRole('listitem')).toHaveCount(8)
   await expect(fleet.getByText('Healthy', { exact: true })).toHaveCount(4)
   await expect(fleet.getByText('Idle — no snapshot', { exact: true })).toBeVisible()
@@ -213,7 +217,7 @@ test('administrator sees a useful fleet-health empty state', async ({ page }) =>
   await page.getByRole('button', { name: 'Sign in' }).click()
 
   await expect(page.getByRole('heading', { name: 'Fleet health' })).toBeVisible()
-  await expect(page.getByText('No approved account workers have reported yet. Approved workers will appear here after their first connection.')).toBeVisible()
+  await expect(page.getByLabel('Worker summary')).toContainText('No account workers have reported yet.')
 })
 
 test('administrator can launch an analysis with CSRF protection and inspect passing, failing, and exception evidence', async ({ page }) => {
@@ -986,6 +990,7 @@ test('administrator sees stale-connection feedback and retains prior management 
   await page.clock.fastForward(30_000)
   await expect(page.getByRole('alert')).toContainText('Management data could not be loaded. Your previous data is still shown.')
   await expect(page.getByText('Live updates interrupted — retry manually when the connection is available.', { exact: true })).toBeVisible()
+  await page.getByRole('button', { name: 'Show worker actions and reconciliation' }).click()
   await expect(page.getByLabel('Fleet health by account').getByRole('listitem').filter({ hasText: '123456 on Broker-Demo' })).toBeVisible()
 })
 
