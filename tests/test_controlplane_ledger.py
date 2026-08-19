@@ -101,3 +101,10 @@ class ControlLedgerTests(unittest.TestCase):
         worker_invite = self.ledger.create_registration_invite("ABCDEF", "worker")
         with self.assertRaisesRegex(LedgerError, "role"):
             self.ledger.consume_registration_invite(worker_invite, "trader")
+
+    def test_registration_invite_can_be_revoked_only_before_use(self) -> None:
+        invite = self.ledger.create_registration_invite("ABCDEF", "worker")
+
+        self.ledger.revoke_registration_invite(invite, "ABCDEF")
+        with self.assertRaisesRegex(LedgerError, "no longer active"):
+            self.ledger.consume_registration_invite(invite, "worker")

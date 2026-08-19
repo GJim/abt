@@ -25,7 +25,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from .backup import BackupManager
 from .crypto import ProofError, parse_device_certificate, verify_enrollment_proof, verify_worker_proof
-from .ledger import AuthenticationError, ControlLedger, LedgerError
+from .ledger import AuthenticationError, ControlLedger, LedgerError, _hash
 from .secrets import DeviceCertificateIssuer, DeviceCertificateVerifier, SecretStore, SecretStoreError
 
 _LOGGER = logging.getLogger(__name__)
@@ -293,6 +293,18 @@ def create_app(
         _require_admin(ledger, abt_admin_session)
         return ledger.registration_invites()
 
+    @app.post("/api/admin/registration-invites/{invite}/revoke", status_code=status.HTTP_204_NO_CONTENT)
+    def revoke_registration_invite(
+        invite: str,
+        abt_admin_session: Annotated[str | None, Cookie()] = None,
+        x_csrf_token: Annotated[str | None, Header()] = None,
+    ) -> None:
+        username = _require_admin(ledger, abt_admin_session, x_csrf_token, require_csrf=True)
+        try:
+            ledger.revoke_registration_invite(invite, username)
+        except LedgerError as error:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
+
     @app.post("/api/enrollments", status_code=status.HTTP_201_CREATED)
     async def create_enrollment(body: EnrollmentRequest) -> dict[str, str]:
         try:
@@ -320,6 +332,7 @@ def create_app(
                     terminal_info=body.terminal_info,
                     password_secret_ref=secret_ref,
                     enrollment_challenge=body.enrollment_challenge,
+                    registration_invite_hash=_hash(body.registration_invite),
                 )
             except LedgerError:
                 secret_store.delete_password(secret_ref)

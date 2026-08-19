@@ -252,6 +252,21 @@ class ControlLedger:
             for row in rows
         ]
 
+    def revoke_registration_invite(self, invite: str, revoked_by: str) -> None:
+        with self._transaction():
+            changed = self._connection.execute(
+                """
+                UPDATE registration_invites
+                SET status = 'revoked', revoked_at = ?
+                WHERE invite_hash = ? AND status = 'active' AND expires_at > ?
+                RETURNING invite_hash
+                """,
+                [_utc_now(), _hash(invite), _utc_now()],
+            ).fetchone()
+            if changed is None:
+                raise LedgerError("Registration invite is no longer active.")
+            self._event("registration_invite_revoked", {"revoked_by": revoked_by})
+
     def create_enrollment(
         self,
         *,
@@ -262,6 +277,7 @@ class ControlLedger:
         terminal_info: dict[str, object],
         password_secret_ref: str,
         enrollment_challenge: str,
+        registration_invite_hash: str | None = None,
     ) -> Enrollment:
         now = _utc_now()
         expires_at = now + timedelta(minutes=15)
@@ -279,8 +295,8 @@ class ControlLedger:
                 """
                 INSERT INTO enrollments (
                     enrollment_id, login, server, public_key_pem, source_ip, account_info, terminal_info, password_secret_ref,
-                    status, created_at, expires_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+                    status, created_at, expires_at, registration_invite_hash
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
                 """,
                 [
                     enrollment.enrollment_id,
@@ -293,6 +309,7 @@ class ControlLedger:
                     password_secret_ref,
                     now,
                     expires_at,
+                    registration_invite_hash,
                 ],
             )
             self._event(
@@ -2336,6 +2353,13 @@ class ControlLedger:
                     m1_verified_at TIMESTAMPTZ,
                     completed_at TIMESTAMPTZ
                 );
+                """
+            )
+            self._connection.execute("ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS registration_invite_hash VARCHAR")
+            self._connection.execute(
+                """
+                UPDATE enrollments SET status = 'expired'
+                WHERE status = 'pending' AND registration_invite_hash IS NULL
                 """
             )
             self._connection.execute("ALTER TABLE alerts ADD COLUMN IF NOT EXISTS product_pair_id VARCHAR")
