@@ -938,7 +938,7 @@ class ControlLedger:
                 ORDER BY created_at, product_pair_id
                 """
             ).fetchall()
-        return [self._product_pair_with_worker_applicability(self._product_pair_from_row(row)) for row in rows]
+            return [self._product_pair_with_worker_applicability(self._product_pair_from_row(row)) for row in rows]
 
     def product_pair_worker_reference(self, product_pair_id: str, worker_id: str) -> dict[str, Any]:
         with self._lock:

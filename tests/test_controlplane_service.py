@@ -1676,6 +1676,33 @@ class ControlPlaneServiceTests(unittest.TestCase):
             self.assertIsNotNone(after_check["latest_compatibility_check"])
             self.assertIsNone(after_check["exclusion"])
 
+            ledger = harness._app.state.ledger
+            original_applicability = ledger._product_pair_with_worker_applicability
+            applicability_started = threading.Event()
+            allow_applicability = threading.Event()
+            events_completed = threading.Event()
+
+            def block_applicability(pair: dict[str, object]) -> dict[str, object]:
+                applicability_started.set()
+                self.assertTrue(allow_applicability.wait(timeout=5))
+                return original_applicability(pair)
+
+            ledger._product_pair_with_worker_applicability = block_applicability
+            try:
+                pairs_thread = threading.Thread(target=ledger.product_pairs)
+                events_thread = threading.Thread(
+                    target=lambda: (ledger.events(), events_completed.set()),
+                )
+                pairs_thread.start()
+                self.assertTrue(applicability_started.wait(timeout=5))
+                events_thread.start()
+                self.assertFalse(events_completed.wait(timeout=0.2))
+            finally:
+                allow_applicability.set()
+                pairs_thread.join(timeout=5)
+                events_thread.join(timeout=5)
+                ledger._product_pair_with_worker_applicability = original_applicability
+
             exclusion = harness.exclude_product_pair_worker(built_pair["product_pair_id"], third_worker)
             self.assertEqual("excluded", exclusion["applicability_status"])
             self.assertEqual("ABCDEF", exclusion["exclusion"]["excluded_by"])
