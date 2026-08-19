@@ -1154,7 +1154,8 @@ test('administrator can filter analysis history and open its analysis workspace'
   await expect(page.getByText('FX catalog v2')).toBeVisible()
   await page.getByRole('button', { name: 'Open' }).click()
   await expect(page.getByRole('heading', { name: 'Cross-server product-pair analyses' })).toBeVisible()
-  await expect(page).toHaveURL(/analysis=analysis-1/)
+  await expect(page).toHaveURL(/analysis=analysis-1.*#launch/)
+  await expect(page.getByRole('heading', { name: 'Fleet health' })).not.toBeVisible()
 })
 
 test('administrator can browse current and retired product-pair lists', async ({ page }) => {

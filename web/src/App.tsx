@@ -907,7 +907,7 @@ function App() {
           {refreshError && <p className="error" role="alert">{refreshError}</p>}
           {consolePage === 'audit' ? <AuditEventsPage /> : consolePage === 'snapshots' ? <WorkerSnapshotsPage /> : consolePage === 'history' ? (
             <AnalysisHistoryPage onOpenAnalysis={(analysisId) => {
-              window.location.hash = '#analysis-heading'
+              window.location.hash = '#launch'
               void loadAnalysisById(analysisId)
             }} />
           ) : consolePage === 'active-pairs' || consolePage === 'retired-pairs' ? (
