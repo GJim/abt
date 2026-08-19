@@ -5,6 +5,7 @@ import { Collapsible } from '@astryxdesign/core/Collapsible'
 import { TopNav } from '@astryxdesign/core/TopNav'
 import { AuditEventsPage } from './AuditEventsPage'
 import { AnalysisHistoryPage } from './AnalysisHistoryPage'
+import { ProductPairsListPage } from './ProductPairsListPage'
 import { WorkerSnapshotsPage } from './WorkerSnapshotsPage'
 import './App.css'
 import './Console.css'
@@ -462,7 +463,7 @@ const POLICY_EVALUATION_LABELS: Record<string, string> = {
 const LIVE_REFRESH_INTERVAL_MS = 30_000
 const LIVE_REFRESH_TIMEOUT_MS = 10_000
 const LIVE_REFRESH_STALE_AFTER_MS = LIVE_REFRESH_INTERVAL_MS * 2
-type ConsolePage = 'main' | 'audit' | 'snapshots' | 'history'
+type ConsolePage = 'main' | 'audit' | 'snapshots' | 'history' | 'active-pairs' | 'retired-pairs'
 
 function App() {
   const [username, setUsername] = useState('')
@@ -877,8 +878,8 @@ function App() {
               <a aria-current={consolePage === 'main' ? 'page' : undefined} href="#main">Main</a>
               <a href="#analysis-heading">Launch analysis</a>
               <a aria-current={consolePage === 'history' ? 'page' : undefined} href="#history">Analysis history</a>
-              <a href="#product-pairs-heading">Current pairs</a>
-              <a href="#retired-product-pairs-heading">Retired pairs</a>
+              <a aria-current={consolePage === 'active-pairs' ? 'page' : undefined} href="#active-pairs">Current pairs</a>
+              <a aria-current={consolePage === 'retired-pairs' ? 'page' : undefined} href="#retired-pairs">Retired pairs</a>
               <a href="#snapshots">Workers</a>
               <a aria-current={consolePage === 'audit' ? 'page' : undefined} href="#audit">Audit events</a>
             </nav>
@@ -908,6 +909,13 @@ function App() {
               window.location.hash = '#analysis-heading'
               void loadAnalysisById(analysisId)
             }} />
+          ) : consolePage === 'active-pairs' || consolePage === 'retired-pairs' ? (
+            <ProductPairsListPage
+              status={consolePage === 'active-pairs' ? 'active' : 'retired'}
+              onOpenPair={() => {
+                window.location.hash = '#product-pairs-heading'
+              }}
+            />
           ) : <>
 
           <section aria-labelledby="intervention-queue-heading" className="intervention-queue">
@@ -2739,6 +2747,10 @@ function readConsolePage(): ConsolePage {
       return 'snapshots'
     case '#history':
       return 'history'
+    case '#active-pairs':
+      return 'active-pairs'
+    case '#retired-pairs':
+      return 'retired-pairs'
     default:
       return 'main'
   }
