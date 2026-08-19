@@ -267,6 +267,7 @@ test('administrator can launch an analysis with CSRF protection and inspect pass
   await page.getByLabel('Administrator account').fill('ABCDEF')
   await page.getByLabel('Password').fill('A-secure-admin-password!')
   await page.getByRole('button', { name: 'Sign in' }).click()
+  await page.getByRole('link', { name: 'Launch analysis' }).click()
 
   await page.getByLabel('First analysis worker').selectOption('worker-a')
   await page.getByLabel('Second analysis worker').selectOption('worker-b')
@@ -329,6 +330,7 @@ test('administrator sees the worker-provided analysis failure reason as an alert
   await page.getByLabel('Administrator account').fill('ABCDEF')
   await page.getByLabel('Password').fill('A-secure-admin-password!')
   await page.getByRole('button', { name: 'Sign in' }).click()
+  await page.getByRole('link', { name: 'Launch analysis' }).click()
   await page.getByLabel('First analysis worker').selectOption('worker-a')
   await page.getByLabel('Second analysis worker').selectOption('worker-b')
   await page.getByRole('button', { name: 'Launch analysis' }).click()
@@ -392,6 +394,7 @@ test('administrator can inspect immutable evidence, build a pair, and retire it 
   await page.getByLabel('Administrator account').fill('ABCDEF')
   await page.getByLabel('Password').fill('A-secure-admin-password!')
   await page.getByRole('button', { name: 'Sign in' }).click()
+  await page.getByRole('link', { name: 'Launch analysis' }).click()
   await page.getByLabel('First analysis worker').selectOption('worker-a')
   await page.getByLabel('Second analysis worker').selectOption('worker-b')
   await page.getByRole('button', { name: 'Launch analysis' }).click()
@@ -415,6 +418,7 @@ test('administrator can inspect immutable evidence, build a pair, and retire it 
   await buildButton.click()
 
   expect(buildHeaders?.['x-csrf-token']).toBe('csrf-token')
+  await page.getByRole('link', { name: 'Main' }).click()
   await expect(page.getByRole('heading', { name: 'Active product pairs' })).toBeVisible()
   const pairCard = page.locator('.product-pair-card').filter({ hasText: 'pair-1' })
   await expect(pairCard.getByRole('heading', { name: 'Broker-A:EURUSD.a ↔ Broker-B:EURUSD' })).toBeVisible()
@@ -546,10 +550,12 @@ test('administrator hides a final candidate already represented by an active pai
   await page.getByLabel('Administrator account').fill('ABCDEF')
   await page.getByLabel('Password').fill('A-secure-admin-password!')
   await page.getByRole('button', { name: 'Sign in' }).click()
+  await page.getByRole('link', { name: 'Launch analysis' }).click()
   await page.getByRole('button', { name: 'Launch analysis' }).click()
 
   await expect(page.locator('.buildable-result-card')).toHaveCount(0)
   await expect(page.getByText('1 final passing candidate(s) already have an active product pair')).toBeVisible()
+  await page.getByRole('link', { name: 'Main' }).click()
   await expect(page.locator('.product-pair-card').first()).toContainText('pair-existing')
 })
 
@@ -873,6 +879,7 @@ test('administrator sees validation feedback when no cross-server pair is availa
   await page.getByLabel('Administrator account').fill('ABCDEF')
   await page.getByLabel('Password').fill('A-secure-admin-password!')
   await page.getByRole('button', { name: 'Sign in' }).click()
+  await page.getByRole('link', { name: 'Launch analysis' }).click()
 
   await expect(page.getByText('Pick two eligible workers on different exact MT5 servers before launching.')).toBeVisible()
   await expect(page.getByRole('button', { name: 'Launch analysis' })).toBeDisabled()
@@ -925,6 +932,7 @@ test('administrator sees terminal analysis failures with lifecycle details', asy
   await page.getByLabel('Administrator account').fill('ABCDEF')
   await page.getByLabel('Password').fill('A-secure-admin-password!')
   await page.getByRole('button', { name: 'Sign in' }).click()
+  await page.getByRole('link', { name: 'Launch analysis' }).click()
 
   await page.getByRole('button', { name: 'Launch analysis' }).click()
 
@@ -1038,6 +1046,161 @@ test('administrator actions defer live refresh until the action is complete', as
   await expect(approveButton).toBeEnabled()
   expect(enrollmentRequests).toBe(2)
 })
+
+test('administrator can search, paginate, and disclose audit evidence', async ({ page }) => {
+  await mockLogin(page)
+  await mockManagementData(page)
+  await page.route('**/api/admin/events?**', async (route) => {
+    const query = new URL(route.request().url()).searchParams
+    expect(query.get('limit')).toBe('50')
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify(query.get('cursor') ? {
+        items: [{ event_id: 2, event_type: 'worker_reconciled', payload: {}, occurred_at: '2026-08-16T00:01:00Z' }],
+        next_cursor: null,
+      } : {
+        items: [{ event_id: 1, event_type: 'worker_enrollment_approved', payload: { reason: 'administrator_approval_required' }, occurred_at: '2026-08-16T00:00:00Z' }],
+        next_cursor: 'next-events',
+      }),
+    })
+  })
+
+  await signIn(page)
+  await page.getByRole('link', { name: 'Audit events' }).click()
+  await expect(page.getByRole('heading', { name: 'Audit events' })).toBeVisible()
+  await expect(page.getByText('administrator_approval_required', { exact: true })).toBeVisible()
+  await page.getByText('View raw payload').click()
+  await expect(page.getByText('"reason": "administrator_approval_required"')).toBeVisible()
+  await page.getByRole('button', { name: 'Load more' }).click()
+  await expect(page.getByText('Worker Reconciled', { exact: true }).first()).toBeVisible()
+  await page.getByLabel('Search audit events').fill('reconciled')
+  await page.getByRole('button', { name: 'Search' }).click()
+  await expect(page.getByText('Worker Enrollment Approved', { exact: true }).first()).toBeVisible()
+})
+
+test('administrator can search worker snapshots and retrieve raw evidence on demand', async ({ page }) => {
+  await mockLogin(page)
+  await mockManagementData(page)
+  await page.route('**/api/admin/worker-snapshots/snapshot-1', async (route) => {
+    await route.fulfill({ contentType: 'application/json', body: JSON.stringify({ account: { currency: 'USD' }, positions: [] }) })
+  })
+  await page.route('**/api/admin/worker-snapshots?**', async (route) => {
+    const query = new URL(route.request().url()).searchParams
+    expect(query.get('limit')).toBe('50')
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({
+        items: [{
+          snapshot_id: 'snapshot-1',
+          server: 'Broker-A',
+          login: 123456,
+          balance: 1000,
+          equity: 1005,
+          trade_allowed: true,
+          trade_expert: false,
+          tradeapi_disabled: false,
+          timestamp: '2026-08-16T00:00:00Z',
+        }],
+        next_cursor: null,
+      }),
+    })
+  })
+
+  await signIn(page)
+  await page.getByRole('link', { name: 'Workers' }).click()
+  await expect(page.getByRole('heading', { name: 'Worker snapshots' })).toBeVisible()
+  await expect(page.getByText('Broker-A')).toBeVisible()
+  await expect(page.getByText('1,000')).toBeVisible()
+  await page.getByRole('button', { name: 'View raw JSON' }).click()
+  await expect(page.getByText('"currency": "USD"')).toBeVisible()
+  await page.getByLabel('Search worker snapshots').fill('Broker-A')
+  await page.getByRole('button', { name: 'Search' }).click()
+  await expect(page.getByText('Broker-A')).toBeVisible()
+})
+
+test('administrator can filter analysis history and open its analysis workspace', async ({ page }) => {
+  await mockLogin(page)
+  await mockManagementData(page)
+  await page.route('**/api/admin/product-catalog-analyses/analysis-1', async (route) => {
+    await route.fulfill({ contentType: 'application/json', body: JSON.stringify(buildAnalysis()) })
+  })
+  await page.route('**/api/admin/product-catalog-analyses?**', async (route) => {
+    const query = new URL(route.request().url()).searchParams
+    expect(query.get('limit')).toBe('50')
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({
+        items: [{
+          analysis_id: 'analysis-1',
+          requested_by: 'ABCDEF',
+          first_worker: { worker_id: 'worker-a', login: 111111, server: 'Broker-A' },
+          second_worker: { worker_id: 'worker-b', login: 222222, server: 'Broker-B' },
+          policy_label: 'FX catalog v2',
+          status: 'succeeded',
+          current_stage: 'completed',
+          retry_count: 0,
+          requested_at: '2026-08-16T00:00:00Z',
+          completed_at: '2026-08-16T00:08:00Z',
+        }],
+        next_cursor: null,
+      }),
+    })
+  })
+
+  await signIn(page)
+  await page.getByRole('link', { name: 'Analysis history' }).click()
+  await expect(page.getByRole('heading', { name: 'Analysis history' })).toBeVisible()
+  await page.getByLabel('Status').selectOption('succeeded')
+  await expect(page.getByText('FX catalog v2')).toBeVisible()
+  await page.getByRole('button', { name: 'Open' }).click()
+  await expect(page.getByRole('heading', { name: 'Cross-server product-pair analyses' })).toBeVisible()
+  await expect(page).toHaveURL(/analysis=analysis-1/)
+})
+
+test('administrator can browse current and retired product-pair lists', async ({ page }) => {
+  await mockLogin(page)
+  await mockManagementData(page)
+  await page.route('**/api/admin/product-pairs?**', async (route) => {
+    const query = new URL(route.request().url()).searchParams
+    const retired = query.get('status') === 'retired'
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({
+        items: [buildProductPair(retired ? { product_pair_id: 'pair-retired', status: 'retired', retired_reason: 'policy_replaced' } : {})],
+        next_cursor: null,
+      }),
+    })
+  })
+
+  await signIn(page)
+  await page.getByRole('link', { name: 'Current pairs' }).click()
+  await expect(page.getByRole('heading', { name: 'Active product pairs' })).toBeVisible()
+  await expect(page.getByText('Broker-A · EURUSD.a / Broker-B · EURUSD')).toBeVisible()
+  await page.getByLabel('Search product pairs').fill('EURUSD')
+  await page.getByRole('button', { name: 'Search' }).click()
+  await page.getByRole('link', { name: 'Retired pairs' }).click()
+  await expect(page.getByRole('heading', { name: 'Retired product pairs' })).toBeVisible()
+  await expect(page.getByText('Policy Replaced')).toBeVisible()
+})
+
+test('launch analysis is isolated from main-page operational summaries', async ({ page }) => {
+  await mockLogin(page)
+  await mockManagementData(page, { workers: [buildWorker({})] })
+
+  await signIn(page)
+  await page.getByRole('link', { name: 'Launch analysis' }).click()
+
+  await expect(page.getByRole('heading', { name: 'Cross-server product-pair analyses' })).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'Fleet health' })).not.toBeVisible()
+  await expect(page.getByRole('heading', { name: 'Needs attention' })).not.toBeVisible()
+})
+
+async function signIn(page: Parameters<typeof test>[0]['page']) {
+  await page.goto('http://127.0.0.1:4173/')
+  await page.getByLabel('Administrator account').fill('ABCDEF')
+  await page.getByLabel('Password').fill('A-secure-admin-password!')
+  await page.getByRole('button', { name: 'Sign in' }).click()
+}
 
 async function mockSessionResume(page: Parameters<typeof test>[0]['page']) {
   await page.route('**/api/admin/session', async (route) => {

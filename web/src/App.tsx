@@ -464,7 +464,7 @@ const POLICY_EVALUATION_LABELS: Record<string, string> = {
 const LIVE_REFRESH_INTERVAL_MS = 30_000
 const LIVE_REFRESH_TIMEOUT_MS = 10_000
 const LIVE_REFRESH_STALE_AFTER_MS = LIVE_REFRESH_INTERVAL_MS * 2
-type ConsolePage = 'main' | 'audit' | 'snapshots' | 'history' | 'active-pairs' | 'retired-pairs'
+type ConsolePage = 'main' | 'launch' | 'audit' | 'snapshots' | 'history' | 'active-pairs' | 'retired-pairs'
 
 function App() {
   const [username, setUsername] = useState('')
@@ -877,7 +877,7 @@ function App() {
             <strong>ABT console</strong>
             <nav aria-label="Console sections" className="console-nav">
               <a aria-current={consolePage === 'main' ? 'page' : undefined} href="#main">Main</a>
-              <a href="#analysis-heading">Launch analysis</a>
+              <a aria-current={consolePage === 'launch' ? 'page' : undefined} href="#launch">Launch analysis</a>
               <a aria-current={consolePage === 'history' ? 'page' : undefined} href="#history">Analysis history</a>
               <a aria-current={consolePage === 'active-pairs' ? 'page' : undefined} href="#active-pairs">Current pairs</a>
               <a aria-current={consolePage === 'retired-pairs' ? 'page' : undefined} href="#retired-pairs">Retired pairs</a>
@@ -919,6 +919,7 @@ function App() {
             />
           ) : <>
 
+          {consolePage !== 'launch' && <>
           <section aria-labelledby="intervention-queue-heading" className="intervention-queue">
             <div className="section-header">
               <div>
@@ -967,6 +968,7 @@ function App() {
               </ul>
             )}
           </section>
+          </>}
 
           <section aria-labelledby="analysis-heading" className="analysis-section">
             <div className="section-header">
@@ -1146,6 +1148,7 @@ function App() {
             )}
           </section>
 
+          {consolePage !== 'launch' && <>
           <ProductPairsSection
             alerts={alerts}
             csrfToken={csrfToken}
@@ -1318,6 +1321,7 @@ function App() {
               ))}
             </ul>
           </section>
+          </>}
           </>}
           </main>
         </div>
@@ -2747,6 +2751,8 @@ function readConsolePage(): ConsolePage {
   switch (window.location.hash) {
     case '#audit':
       return 'audit'
+    case '#launch':
+      return 'launch'
     case '#snapshots':
       return 'snapshots'
     case '#history':
