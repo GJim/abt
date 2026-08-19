@@ -66,8 +66,9 @@ type AccountWorker = {
 
 type WorkerAlert = {
   alert_id: number
-  worker_id: string
+  worker_id: string | null
   product_pair_id?: string | null
+  enrollment_id?: string | null
   priority: string
   alert_type: string
   reason: string
@@ -510,24 +511,30 @@ function App() {
   )
   const interventionQueue = useMemo<InterventionItem[]>(
     () => [
-      ...enrollments.map((enrollment) => ({
-        id: `enrollment-${enrollment.enrollment_id}`,
-        kind: 'Pending approval',
-        reason: 'Worker registration needs operator approval before it can receive a device certificate.',
-        occurredAt: enrollment.created_at,
-        priorityRank: 2,
-        enrollment,
-      })),
       ...alerts
         .filter((alert) => alert.priority === 'high' || alert.priority === 'critical')
-        .map((alert) => ({
-          id: `alert-${alert.alert_id}`,
-          kind: `${alert.priority} priority alert`,
-          reason: alert.reason,
-          occurredAt: alert.occurred_at,
-          priorityRank: alert.priority === 'critical' ? 3 : 2,
-          alert,
-        })),
+        .map((alert) => {
+          const enrollment = alert.enrollment_id
+            ? enrollments.find((candidate) => candidate.enrollment_id === alert.enrollment_id)
+            : undefined
+          return enrollment
+            ? {
+              id: `alert-${alert.alert_id}`,
+              kind: 'Pending approval',
+              reason: 'Worker registration needs operator approval before it can receive a device certificate.',
+              occurredAt: alert.occurred_at,
+              priorityRank: alert.priority === 'critical' ? 3 : 2,
+              enrollment,
+            }
+            : {
+              id: `alert-${alert.alert_id}`,
+              kind: `${alert.priority} priority alert`,
+              reason: alert.reason,
+              occurredAt: alert.occurred_at,
+              priorityRank: alert.priority === 'critical' ? 3 : 2,
+              alert,
+            }
+        }),
     ].sort((first, second) => second.priorityRank - first.priorityRank || second.occurredAt.localeCompare(first.occurredAt)),
     [alerts, enrollments],
   )

@@ -36,6 +36,7 @@ test('administrator can sign in and view audit events', async ({ page }) => {
 
 test('administrator can review and approve a pending worker registration', async ({ page }) => {
   let enrollmentRequests = 0
+  let alertRequests = 0
 
   await page.setViewportSize({ width: 900, height: 800 })
   await mockLogin(page)
@@ -65,7 +66,19 @@ test('administrator can review and approve a pending worker registration', async
     await route.fulfill({ contentType: 'application/json', body: JSON.stringify([]) })
   })
   await page.route('**/api/admin/alerts', async (route) => {
-    await route.fulfill({ contentType: 'application/json', body: JSON.stringify([]) })
+    alertRequests += 1
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify(alertRequests === 1 ? [{
+        alert_id: 1,
+        worker_id: null,
+        enrollment_id: 'enrollment-1',
+        priority: 'high',
+        alert_type: 'worker_enrollment_pending_approval',
+        reason: 'administrator_approval_required',
+        occurred_at: '2026-08-15T00:00:00Z',
+      }] : []),
+    })
   })
   await page.route('**/api/admin/product-pairs', async (route) => {
     await route.fulfill({ contentType: 'application/json', body: JSON.stringify([]) })

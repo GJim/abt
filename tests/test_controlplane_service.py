@@ -560,8 +560,15 @@ class ControlPlaneServiceTests(unittest.TestCase):
             dashboard["paired_trade_lifecycle"]["reason"],
         )
         self.assertEqual([], dashboard["product_pairs"])
-        self.assertEqual("intervention_required", dashboard["alerts"][0]["category"])
-        self.assertEqual("controller_signal_lost", dashboard["alerts"][0]["classification_reason"])
+        enrollment_alert = next(
+            alert for alert in dashboard["alerts"] if alert["alert_type"] == "worker_enrollment_pending_approval"
+        )
+        safety_alert = next(alert for alert in dashboard["alerts"] if alert["alert_type"] == "lost_link_safety")
+        self.assertEqual("intervention_required", enrollment_alert["category"])
+        self.assertEqual("administrator_approval_required", enrollment_alert["classification_reason"])
+        self.assertEqual(pending_enrollment_id, enrollment_alert["enrollment_id"])
+        self.assertEqual("intervention_required", safety_alert["category"])
+        self.assertEqual("controller_signal_lost", safety_alert["classification_reason"])
         self.assertEqual("intervention_required", dashboard["pending_enrollments"][0]["category"])
         self.assertEqual("approval_required", dashboard["pending_enrollments"][0]["classification_reason"])
         enrollment_intervention = next(
@@ -584,7 +591,7 @@ class ControlPlaneServiceTests(unittest.TestCase):
         self.assertEqual(
             {
                 "item_type": "worker_alert",
-                "item_id": dashboard["alerts"][0]["alert_id"],
+                "item_id": safety_alert["alert_id"],
                 "category": "intervention_required",
                 "reason": "controller_signal_lost",
             },

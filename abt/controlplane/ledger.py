@@ -233,6 +233,13 @@ class ControlLedger:
                 "worker_enrollment_requested",
                 {"enrollment_id": enrollment.enrollment_id, "login": login, "server": server},
             )
+            self._alert(
+                None,
+                "high",
+                "worker_enrollment_pending_approval",
+                "administrator_approval_required",
+                enrollment_id=enrollment.enrollment_id,
+            )
         return enrollment
 
     def issue_enrollment_challenge(self) -> tuple[str, datetime]:
@@ -1693,14 +1700,14 @@ class ControlLedger:
         with self._lock:
             rows = self._connection.execute(
                 """
-                SELECT alert_id, worker_id, product_pair_id, priority, alert_type, reason, occurred_at
+                SELECT alert_id, worker_id, product_pair_id, enrollment_id, priority, alert_type, reason, occurred_at
                 FROM alerts
                 ORDER BY alert_id
                 """
             ).fetchall()
         return [
-            {"alert_id": row[0], "worker_id": row[1], "product_pair_id": row[2], "priority": row[3], "alert_type": row[4],
-             "reason": row[5], "occurred_at": row[6]}
+            {"alert_id": row[0], "worker_id": row[1], "product_pair_id": row[2], "enrollment_id": row[3], "priority": row[4], "alert_type": row[5],
+             "reason": row[6], "occurred_at": row[7]}
             for row in rows
         ]
 
@@ -1828,19 +1835,20 @@ class ControlLedger:
 
     def _alert(
         self,
-        worker_id: str,
+        worker_id: str | None,
         priority: str,
         alert_type: str,
         reason: str,
         *,
         product_pair_id: str | None = None,
+        enrollment_id: str | None = None,
     ) -> None:
         self._connection.execute(
             """
-            INSERT INTO alerts (worker_id, product_pair_id, priority, alert_type, reason, occurred_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO alerts (worker_id, product_pair_id, enrollment_id, priority, alert_type, reason, occurred_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            [worker_id, product_pair_id, priority, alert_type, reason, _utc_now()],
+            [worker_id, product_pair_id, enrollment_id, priority, alert_type, reason, _utc_now()],
         )
 
     def _initialize(self) -> None:
@@ -1941,8 +1949,9 @@ class ControlLedger:
                 CREATE SEQUENCE IF NOT EXISTS alerts_sequence START 1;
                 CREATE TABLE IF NOT EXISTS alerts (
                     alert_id BIGINT PRIMARY KEY DEFAULT nextval('alerts_sequence'),
-                    worker_id VARCHAR NOT NULL,
+                    worker_id VARCHAR,
                     product_pair_id VARCHAR,
+                    enrollment_id VARCHAR,
                     priority VARCHAR NOT NULL,
                     alert_type VARCHAR NOT NULL,
                     reason VARCHAR NOT NULL,
@@ -2122,7 +2131,21 @@ class ControlLedger:
             self._connection.execute(
                 "UPDATE product_catalog_analyses SET m1_verification_results = '[]' WHERE m1_verification_results IS NULL"
             )
+            self._migrate_alert_enrollment_reference()
             self._migrate_reconciliation_snapshots()
+
+    def _migrate_alert_enrollment_reference(self) -> None:
+        columns = {
+            row[1]
+            for row in self._connection.execute("PRAGMA table_info('alerts')").fetchall()
+        }
+        if "enrollment_id" not in columns:
+            self._connection.execute("ALTER TABLE alerts ADD COLUMN enrollment_id VARCHAR")
+        worker_column = next(
+            row for row in self._connection.execute("PRAGMA table_info('alerts')").fetchall() if row[1] == "worker_id"
+        )
+        if worker_column[3]:
+            self._connection.execute("ALTER TABLE alerts ALTER worker_id DROP NOT NULL")
 
     def _migrate_reconciliation_snapshots(self) -> None:
         columns = {
