@@ -14,10 +14,10 @@ from pathlib import Path
 import secrets
 from statistics import median
 from time import monotonic
-from typing import Annotated, Any, Callable, cast
+from typing import Annotated, Any, Callable, Literal, cast
 from uuid import uuid4
 
-from fastapi import Cookie, FastAPI, Header, HTTPException, Response, WebSocket, WebSocketDisconnect, status
+from fastapi import Cookie, FastAPI, Header, HTTPException, Query, Response, WebSocket, WebSocketDisconnect, status
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
@@ -328,10 +328,41 @@ def create_app(
 
     @app.get("/api/admin/events")
     def list_events(
+        limit: Annotated[int, Query(ge=1, le=50)] = 50,
+        cursor: Annotated[str | None, Query(min_length=1, max_length=512)] = None,
+        event_type: Annotated[str | None, Query(min_length=1, max_length=128)] = None,
+        q: Annotated[str | None, Query(min_length=1, max_length=256)] = None,
         abt_admin_session: Annotated[str | None, Cookie()] = None,
-    ) -> list[dict[str, object]]:
+    ) -> dict[str, object]:
         _require_admin(ledger, abt_admin_session)
-        return ledger.events()
+        try:
+            return ledger.event_page(limit=limit, cursor=cursor, event_type=event_type, query=q)
+        except LedgerError as error:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(error)) from error
+
+    @app.get("/api/admin/worker-snapshots")
+    def list_worker_snapshots(
+        limit: Annotated[int, Query(ge=1, le=50)] = 50,
+        cursor: Annotated[str | None, Query(min_length=1, max_length=512)] = None,
+        q: Annotated[str | None, Query(min_length=1, max_length=256)] = None,
+        abt_admin_session: Annotated[str | None, Cookie()] = None,
+    ) -> dict[str, object]:
+        _require_admin(ledger, abt_admin_session)
+        try:
+            return ledger.worker_snapshot_page(limit=limit, cursor=cursor, query=q)
+        except LedgerError as error:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(error)) from error
+
+    @app.get("/api/admin/worker-snapshots/{snapshot_id}")
+    def get_worker_snapshot(
+        snapshot_id: str,
+        abt_admin_session: Annotated[str | None, Cookie()] = None,
+    ) -> dict[str, object]:
+        _require_admin(ledger, abt_admin_session)
+        try:
+            return ledger.worker_snapshot(snapshot_id)
+        except LedgerError as error:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
 
     @app.get("/api/admin/workers")
     def list_workers(
@@ -481,6 +512,20 @@ def create_app(
         except LedgerError as error:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
 
+    @app.get("/api/admin/product-catalog-analyses")
+    def list_product_catalog_analyses(
+        limit: Annotated[int, Query(ge=1, le=50)] = 50,
+        cursor: Annotated[str | None, Query(min_length=1, max_length=512)] = None,
+        status_filter: Annotated[str | None, Query(alias="status", min_length=1, max_length=32)] = None,
+        q: Annotated[str | None, Query(min_length=1, max_length=256)] = None,
+        abt_admin_session: Annotated[str | None, Cookie()] = None,
+    ) -> dict[str, object]:
+        _require_admin(ledger, abt_admin_session)
+        try:
+            return ledger.product_catalog_analysis_page(limit=limit, cursor=cursor, status=status_filter, query=q)
+        except LedgerError as error:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(error)) from error
+
     @app.get("/api/admin/product-catalog-analyses/{analysis_id}")
     def get_product_catalog_analysis(
         analysis_id: str,
@@ -512,10 +557,17 @@ def create_app(
 
     @app.get("/api/admin/product-pairs")
     def list_product_pairs(
+        status_filter: Annotated[Literal["active", "retired", "all"], Query(alias="status")] = "all",
+        limit: Annotated[int, Query(ge=1, le=50)] = 50,
+        cursor: Annotated[str | None, Query(min_length=1, max_length=512)] = None,
+        q: Annotated[str | None, Query(min_length=1, max_length=256)] = None,
         abt_admin_session: Annotated[str | None, Cookie()] = None,
-    ) -> list[dict[str, object]]:
+    ) -> dict[str, object]:
         _require_admin(ledger, abt_admin_session)
-        return ledger.product_pairs()
+        try:
+            return ledger.product_pairs_page(limit=limit, cursor=cursor, status=status_filter, query=q)
+        except LedgerError as error:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(error)) from error
 
     @app.post("/api/admin/product-pairs/{product_pair_id}/workers/{worker_id}/compatibility-check")
     async def check_product_pair_worker_compatibility(

@@ -6,6 +6,8 @@ import secrets
 import shutil
 import tarfile
 import threading
+from base64 import urlsafe_b64decode, urlsafe_b64encode
+from binascii import Error as Base64Error
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -498,6 +500,79 @@ class ControlLedger:
                 )
         return result
 
+    def worker_snapshot_page(self, *, limit: int, cursor: str | None, query: str | None) -> dict[str, Any]:
+        cursor_values = _decode_page_cursor(cursor, "worker_snapshots")
+        clauses: list[str] = []
+        parameters: list[Any] = []
+        if query is not None:
+            clauses.append(
+                """lower(concat_ws(' ', s.worker_id, w.server, CAST(w.login AS VARCHAR),
+                   CAST(s.account AS VARCHAR), CAST(s.terminal AS VARCHAR))) LIKE ?"""
+            )
+            parameters.append(f"%{query.lower()}%")
+        if cursor_values is not None:
+            clauses.append("(s.received_at < ? OR (s.received_at = ? AND s.snapshot_id < ?))")
+            parameters.extend([cursor_values["timestamp"], cursor_values["timestamp"], cursor_values["id"]])
+        where = "" if not clauses else f"WHERE {' AND '.join(clauses)}"
+        with self._lock:
+            rows = self._connection.execute(
+                f"""
+                SELECT s.snapshot_id, s.worker_id, s.cursor, s.observed_at, s.account, s.terminal, s.received_at,
+                       w.login, w.server
+                FROM reconciliation_snapshots s
+                JOIN workers w ON w.worker_id = s.worker_id
+                {where}
+                ORDER BY s.received_at DESC, s.snapshot_id DESC
+                LIMIT ?
+                """,
+                [*parameters, limit + 1],
+            ).fetchall()
+        has_more = len(rows) > limit
+        items = []
+        for row in rows[:limit]:
+            account = json.loads(row[4])
+            terminal = json.loads(row[5])
+            items.append(
+                {
+                    "snapshot_id": row[0],
+                    "worker_id": row[1],
+                    "cursor": row[2],
+                    "timestamp": row[3],
+                    "server": _summary_string(account.get("server")) or row[8],
+                    "login": _summary_number(account.get("login")) or row[7],
+                    "balance": _summary_number(account.get("balance")),
+                    "equity": _summary_number(account.get("equity")),
+                    "trade_allowed": _summary_boolean(terminal.get("trade_allowed")),
+                    "trade_expert": _summary_boolean(terminal.get("trade_expert")),
+                    "tradeapi_disabled": _summary_boolean(terminal.get("tradeapi_disabled")),
+                    "received_at": row[6],
+                }
+            )
+        return _page(items, has_more, "worker_snapshots", "received_at", "snapshot_id")
+
+    def worker_snapshot(self, snapshot_id: str) -> dict[str, Any]:
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT snapshot_id, worker_id, cursor, observed_at, account, terminal, orders, positions, received_at
+                FROM reconciliation_snapshots WHERE snapshot_id = ?
+                """,
+                [snapshot_id],
+            ).fetchone()
+        if row is None:
+            raise LedgerError("Worker snapshot does not exist.")
+        return {
+            "snapshot_id": row[0],
+            "worker_id": row[1],
+            "cursor": row[2],
+            "timestamp": row[3],
+            "account": json.loads(row[4]),
+            "terminal": json.loads(row[5]),
+            "orders": json.loads(row[6]),
+            "positions": json.loads(row[7]),
+            "received_at": row[8],
+        }
+
     def create_product_catalog_analysis(
         self,
         *,
@@ -741,6 +816,56 @@ class ControlLedger:
             "completed_at": row[24],
         }
 
+    def product_catalog_analysis_page(
+        self, *, limit: int, cursor: str | None, status: str | None, query: str | None
+    ) -> dict[str, Any]:
+        cursor_values = _decode_page_cursor(cursor, "product_catalog_analyses")
+        clauses: list[str] = []
+        parameters: list[Any] = []
+        if status is not None:
+            clauses.append("status = ?")
+            parameters.append(status)
+        if query is not None:
+            clauses.append(
+                """lower(concat_ws(' ', analysis_id, requested_by, first_worker_id, first_server,
+                   second_worker_id, second_server, CAST(first_login AS VARCHAR), CAST(second_login AS VARCHAR),
+                   CAST(policy AS VARCHAR))) LIKE ?"""
+            )
+            parameters.append(f"%{query.lower()}%")
+        if cursor_values is not None:
+            clauses.append("(requested_at < ? OR (requested_at = ? AND analysis_id < ?))")
+            parameters.extend([cursor_values["timestamp"], cursor_values["timestamp"], cursor_values["id"]])
+        where = "" if not clauses else f"WHERE {' AND '.join(clauses)}"
+        with self._lock:
+            rows = self._connection.execute(
+                f"""
+                SELECT analysis_id, requested_by, first_worker_id, first_login, first_server,
+                       second_worker_id, second_login, second_server, policy, status, current_stage,
+                       retry_count, requested_at, completed_at
+                FROM product_catalog_analyses {where}
+                ORDER BY requested_at DESC, analysis_id DESC
+                LIMIT ?
+                """,
+                [*parameters, limit + 1],
+            ).fetchall()
+        has_more = len(rows) > limit
+        items = [
+            {
+                "analysis_id": row[0],
+                "requested_by": row[1],
+                "first_worker": {"worker_id": row[2], "login": row[3], "server": row[4]},
+                "second_worker": {"worker_id": row[5], "login": row[6], "server": row[7]},
+                "policy_label": json.loads(row[8]).get("label"),
+                "status": row[9],
+                "current_stage": row[10],
+                "retry_count": row[11],
+                "requested_at": row[12],
+                "completed_at": row[13],
+            }
+            for row in rows[:limit]
+        ]
+        return _page(items, has_more, "product_catalog_analyses", "requested_at", "analysis_id")
+
     def create_product_pair_build_confirmation(
         self,
         analysis_id: str,
@@ -939,6 +1064,43 @@ class ControlLedger:
                 """
             ).fetchall()
             return [self._product_pair_with_worker_applicability(self._product_pair_from_row(row)) for row in rows]
+
+    def product_pairs_page(self, *, limit: int, cursor: str | None, status: str, query: str | None) -> dict[str, Any]:
+        cursor_values = _decode_page_cursor(cursor, "product_pairs")
+        clauses: list[str] = []
+        parameters: list[Any] = []
+        if status != "all":
+            clauses.append("status = ?")
+            parameters.append(status)
+        if query is not None:
+            clauses.append(
+                """lower(concat_ws(' ', product_pair_id, status, endpoint_a_server, endpoint_a_symbol,
+                   endpoint_b_server, endpoint_b_symbol, built_from_analysis_id)) LIKE ?"""
+            )
+            parameters.append(f"%{query.lower()}%")
+        if cursor_values is not None:
+            clauses.append("(created_at < ? OR (created_at = ? AND product_pair_id < ?))")
+            parameters.extend([cursor_values["timestamp"], cursor_values["timestamp"], cursor_values["id"]])
+        where = "" if not clauses else f"WHERE {' AND '.join(clauses)}"
+        with self._lock:
+            rows = self._connection.execute(
+                f"""
+                SELECT product_pair_id, status, endpoint_a_server, endpoint_a_symbol, endpoint_b_server, endpoint_b_symbol,
+                       lot_relationship, policy_snapshot, analysis_period, reference_specifications, approval_evidence,
+                       source_workers, built_from_analysis_id, built_from_confirmation_id, built_by, created_at,
+                       retired_at, retired_by, retired_reason, replaced_by_product_pair_id, replaces_product_pair_id
+                FROM product_pairs {where}
+                ORDER BY created_at DESC, product_pair_id DESC
+                LIMIT ?
+                """,
+                [*parameters, limit + 1],
+            ).fetchall()
+            has_more = len(rows) > limit
+            items = [
+                self._product_pair_with_worker_applicability(self._product_pair_from_row(row))
+                for row in rows[:limit]
+            ]
+        return _page(items, has_more, "product_pairs", "created_at", "product_pair_id")
 
     def product_pair_worker_reference(self, product_pair_id: str, worker_id: str) -> dict[str, Any]:
         with self._lock:
@@ -1827,6 +1989,36 @@ class ControlLedger:
             for row in rows
         ]
 
+    def event_page(self, *, limit: int, cursor: str | None, event_type: str | None, query: str | None) -> dict[str, Any]:
+        cursor_values = _decode_page_cursor(cursor, "events")
+        clauses: list[str] = []
+        parameters: list[Any] = []
+        if event_type is not None:
+            clauses.append("event_type = ?")
+            parameters.append(event_type)
+        if query is not None:
+            clauses.append("lower(concat_ws(' ', event_type, CAST(payload AS VARCHAR))) LIKE ?")
+            parameters.append(f"%{query.lower()}%")
+        if cursor_values is not None:
+            clauses.append("(occurred_at < ? OR (occurred_at = ? AND event_id < ?))")
+            parameters.extend([cursor_values["timestamp"], cursor_values["timestamp"], cursor_values["id"]])
+        where = "" if not clauses else f"WHERE {' AND '.join(clauses)}"
+        with self._lock:
+            rows = self._connection.execute(
+                f"""
+                SELECT event_id, event_type, payload, occurred_at FROM events {where}
+                ORDER BY occurred_at DESC, event_id DESC
+                LIMIT ?
+                """,
+                [*parameters, limit + 1],
+            ).fetchall()
+        has_more = len(rows) > limit
+        items = [
+            {"event_id": row[0], "event_type": row[1], "payload": json.loads(row[2]), "occurred_at": row[3]}
+            for row in rows[:limit]
+        ]
+        return _page(items, has_more, "events", "occurred_at", "event_id")
+
     def _event(self, event_type: str, payload: dict[str, Any]) -> None:
         self._connection.execute(
             "INSERT INTO events (event_type, payload, occurred_at) VALUES (?, ?, ?)",
@@ -2218,6 +2410,50 @@ def _active_product_pair_key(endpoints: list[dict[str, Any]]) -> str:
         ],
         separators=(",", ":"),
     )
+
+
+def _page(
+    items: list[dict[str, Any]], has_more: bool, resource: str, timestamp_key: str, identifier_key: str
+) -> dict[str, Any]:
+    next_cursor = None
+    if has_more and items:
+        next_cursor = _encode_page_cursor(resource, items[-1][timestamp_key], items[-1][identifier_key])
+    return {"items": items, "next_cursor": next_cursor}
+
+
+def _encode_page_cursor(resource: str, timestamp: datetime, identifier: str | int) -> str:
+    payload = json.dumps(
+        {"resource": resource, "timestamp": timestamp.isoformat(), "id": identifier},
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+
+
+def _decode_page_cursor(cursor: str | None, resource: str) -> dict[str, Any] | None:
+    if cursor is None:
+        return None
+    try:
+        padded = cursor + "=" * (-len(cursor) % 4)
+        payload = json.loads(urlsafe_b64decode(padded.encode("ascii")))
+        timestamp = datetime.fromisoformat(payload["timestamp"])
+        identifier = payload["id"]
+        if payload["resource"] != resource or timestamp.tzinfo is None or not isinstance(identifier, (str, int)):
+            raise ValueError
+    except (Base64Error, KeyError, TypeError, ValueError, UnicodeDecodeError):
+        raise LedgerError("Invalid pagination cursor.") from None
+    return {"timestamp": timestamp, "id": identifier}
+
+
+def _summary_string(value: object) -> str | None:
+    return value if isinstance(value, str) else None
+
+
+def _summary_number(value: object) -> int | float | None:
+    return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+def _summary_boolean(value: object) -> bool | None:
+    return value if isinstance(value, bool) else None
 
 
 def _hash(value: str) -> str:

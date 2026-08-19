@@ -266,7 +266,7 @@ class ControlPlaneServiceTests(unittest.TestCase):
 
         events_response = self.client.get("/api/admin/events")
         self.assertEqual(200, events_response.status_code)
-        self.assertIn("admin_login_succeeded", [event["event_type"] for event in events_response.json()])
+        self.assertIn("admin_login_succeeded", [event["event_type"] for event in events_response.json()["items"]])
 
         logout_response = self.client.post("/api/admin/logout", headers={"X-CSRF-Token": csrf_token})
         self.assertEqual(204, logout_response.status_code)
@@ -533,6 +533,74 @@ class ControlPlaneServiceTests(unittest.TestCase):
         self.assertEqual({"balance": 1000}, workers[0]["latest_snapshot"]["account"])
         self.assertEqual(["volume_changed", "modified"], [delta["change"] for delta in workers[0]["deltas"]])
 
+    def test_admin_read_models_paginate_search_and_keep_snapshot_payloads_in_detail(self) -> None:
+        _key, worker_id, _certificate = self._approved_worker(123456, "Broker-Search")
+        ledger = self.app.state.ledger
+        ledger.record_snapshot(
+            worker_id, 0, "2026-08-16T00:00:00+00:00",
+            {"login": 123456, "server": "Broker-Search", "balance": 1000, "equity": 1010},
+            {"trade_allowed": False, "trade_expert": True, "tradeapi_disabled": False},
+            [{"ticket": 1}], [],
+        )
+        ledger.record_snapshot(
+            worker_id, 0, "2026-08-16T00:01:00+00:00",
+            {"login": 123456, "server": "Broker-Search", "balance": 1001, "equity": 1011},
+            {"trade_allowed": True, "trade_expert": True, "tradeapi_disabled": False},
+            [{"ticket": 2}], [],
+        )
+        snapshots = self.client.get("/api/admin/worker-snapshots", params={"limit": 1, "q": "broker-search"})
+        self.assertEqual(200, snapshots.status_code)
+        first_page = snapshots.json()
+        self.assertEqual(1, len(first_page["items"]))
+        self.assertNotIn("account", first_page["items"][0])
+        self.assertNotIn("orders", first_page["items"][0])
+        self.assertIsNotNone(first_page["next_cursor"])
+        second_page = self.client.get(
+            "/api/admin/worker-snapshots", params={"limit": 1, "cursor": first_page["next_cursor"]}
+        ).json()
+        self.assertEqual(1, len(second_page["items"]))
+        detail = self.client.get(f"/api/admin/worker-snapshots/{first_page['items'][0]['snapshot_id']}")
+        self.assertEqual([{"ticket": 2}], detail.json()["orders"])
+        self.assertEqual(422, self.client.get("/api/admin/worker-snapshots", params={"cursor": "invalid"}).status_code)
+
+        ledger._event("read_model_match", {"worker_id": worker_id, "marker": "searchable"})
+        ledger._event("read_model_match", {"worker_id": worker_id, "marker": "newer"})
+        events = self.client.get("/api/admin/events", params={"limit": 1, "event_type": "read_model_match", "q": "newer"})
+        self.assertEqual(["read_model_match"], [item["event_type"] for item in events.json()["items"]])
+        self.assertIsNone(events.json()["next_cursor"])
+        self.assertEqual(422, self.client.get("/api/admin/events", params={"limit": 51}).status_code)
+
+        ledger._connection.execute(
+            """
+            INSERT INTO product_catalog_analyses (
+                analysis_id, requested_by, first_worker_id, first_login, first_server, second_worker_id, second_login,
+                second_server, policy, status, requested_at
+            ) VALUES ('analysis-search', 'ABCDEF', 'worker-a', 1, 'Broker-Search', 'worker-b', 2,
+                      'Broker-Other', '{"label":"Search catalog"}', 'succeeded', ?)
+            """,
+            [datetime.now(UTC)],
+        )
+        analyses = self.client.get(
+            "/api/admin/product-catalog-analyses", params={"status": "succeeded", "q": "search catalog"}
+        ).json()
+        self.assertEqual(["analysis-search"], [item["analysis_id"] for item in analyses["items"]])
+        self.assertEqual(422, self.client.get("/api/admin/product-catalog-analyses", params={"limit": 0}).status_code)
+
+        ledger._connection.execute(
+            """
+            INSERT INTO product_pairs (
+                product_pair_id, status, endpoint_a_server, endpoint_a_symbol, endpoint_b_server, endpoint_b_symbol,
+                lot_relationship, policy_snapshot, analysis_period, reference_specifications, approval_evidence,
+                source_workers, built_from_analysis_id, built_from_confirmation_id, built_by, created_at
+            ) VALUES ('pair-search', 'active', 'Broker-Search', 'EURUSD', 'Broker-Other', 'EURUSD.a',
+                      '{}', '{}', '{}', '[]', '{}', '[]', 'analysis-search', 'confirmation-search', 'ABCDEF', ?)
+            """,
+            [datetime.now(UTC)],
+        )
+        pairs = self.client.get("/api/admin/product-pairs", params={"status": "active", "q": "eurusd.a"}).json()
+        self.assertEqual(["pair-search"], [item["product_pair_id"] for item in pairs["items"]])
+        self.assertEqual(422, self.client.get("/api/admin/product-pairs", params={"status": "unknown"}).status_code)
+
     def test_operations_dashboard_requires_an_admin_and_classifies_current_operational_state(self) -> None:
         self.assertEqual(401, self.client.get("/api/admin/operations-dashboard").status_code)
 
@@ -728,7 +796,7 @@ class ControlPlaneServiceTests(unittest.TestCase):
 
         self.assertEqual("revoked", self.client.get("/api/admin/workers").json()[0]["connectivity"])
         self.assertIn("worker_certificate_revoked", [
-            event["event_type"] for event in self.client.get("/api/admin/events").json()
+            event["event_type"] for event in self.client.get("/api/admin/events").json()["items"]
         ])
         with self.client.websocket_connect("/api/worker/session") as websocket:
             websocket.send_json({"worker_id": worker_id, "certificate": certificate})
@@ -2391,7 +2459,7 @@ class _LiveCatalogAnalysisHarness:
             timeout=5,
         )
         self._case.assertEqual(200, response.status_code)
-        return response.json()
+        return response.json()["items"]
 
     def launch_product_pair_retest(
         self,
@@ -2451,7 +2519,7 @@ class _LiveCatalogAnalysisHarness:
             timeout=5,
         )
         self._case.assertEqual(200, response.status_code)
-        return response.json()
+        return response.json()["items"]
 
     def list_alerts(self) -> list[dict[str, object]]:
         session_cookie, _csrf = self._admin_session()
