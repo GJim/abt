@@ -80,6 +80,7 @@ test('administrator can review and approve a pending worker registration', async
   await expect(page.getByText('12345678')).toBeVisible()
   await expect(page.getByText('Broker-Demo')).toBeVisible()
   await expect(page.getByText('87654321')).toBeVisible()
+  await page.getByRole('button', { name: 'View registration evidence' }).click()
   await expect(page.getByRole('region', { name: 'Account information for 12345678 on Broker-Demo' })
     .getByText('"currency": "USD"')).toBeVisible()
   await expect(page.getByRole('region', { name: 'Terminal information for 12345678 on Broker-Demo' })

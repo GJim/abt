@@ -1,5 +1,8 @@
 import { useEffect, useMemo, useState } from 'react'
 import type { FormEvent } from 'react'
+import { AppShell } from '@astryxdesign/core/AppShell'
+import { Collapsible } from '@astryxdesign/core/Collapsible'
+import { TopNav } from '@astryxdesign/core/TopNav'
 import './App.css'
 
 type LoginResponse = {
@@ -433,6 +436,9 @@ function App() {
   const [workers, setWorkers] = useState<AccountWorker[]>([])
   const [alerts, setAlerts] = useState<WorkerAlert[]>([])
   const [productPairs, setProductPairs] = useState<ProductPair[]>([])
+  const [isRefreshing, setIsRefreshing] = useState(false)
+  const [lastUpdatedAt, setLastUpdatedAt] = useState<string | null>(null)
+  const [refreshError, setRefreshError] = useState<string | null>(null)
   const [processingEnrollmentId, setProcessingEnrollmentId] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [policy, setPolicy] = useState<ProductCatalogAnalysisPolicy>(DEFAULT_POLICY)
@@ -538,29 +544,43 @@ function App() {
   }, [analysis?.analysis_id, analysis?.status])
 
   async function refreshManagementData() {
-    const [eventsResponse, enrollmentsResponse, workersResponse, alertsResponse, productPairsResponse] = await Promise.all([
-      fetch('/api/admin/events', { credentials: 'same-origin' }),
-      fetch('/api/admin/enrollments', { credentials: 'same-origin' }),
-      fetch('/api/admin/workers', { credentials: 'same-origin' }),
-      fetch('/api/admin/alerts', { credentials: 'same-origin' }),
-      fetch('/api/admin/product-pairs', { credentials: 'same-origin' }),
-    ])
-    if (!eventsResponse.ok || !enrollmentsResponse.ok || !workersResponse.ok || !alertsResponse.ok || !productPairsResponse.ok) {
-      throw new Error('Management data could not be loaded.')
-    }
+    setIsRefreshing(true)
+    setRefreshError(null)
+    try {
+      const [eventsResponse, enrollmentsResponse, workersResponse, alertsResponse, productPairsResponse] = await Promise.all([
+        fetch('/api/admin/events', { credentials: 'same-origin' }),
+        fetch('/api/admin/enrollments', { credentials: 'same-origin' }),
+        fetch('/api/admin/workers', { credentials: 'same-origin' }),
+        fetch('/api/admin/alerts', { credentials: 'same-origin' }),
+        fetch('/api/admin/product-pairs', { credentials: 'same-origin' }),
+      ])
+      if ([eventsResponse, enrollmentsResponse, workersResponse, alertsResponse, productPairsResponse].some((response) => response.status === 401)) {
+        setCsrfToken(null)
+        throw new Error('Your session has expired. Please sign in again.')
+      }
+      if (!eventsResponse.ok || !enrollmentsResponse.ok || !workersResponse.ok || !alertsResponse.ok || !productPairsResponse.ok) {
+        throw new Error('Management data could not be loaded. Your previous data is still shown.')
+      }
 
-    const [eventPayload, enrollmentPayload, workerPayload, alertPayload, productPairPayload] = await Promise.all([
-      eventsResponse.json() as Promise<AuditEvent[]>,
-      enrollmentsResponse.json() as Promise<Enrollment[]>,
-      workersResponse.json() as Promise<AccountWorker[]>,
-      alertsResponse.json() as Promise<WorkerAlert[]>,
-      productPairsResponse.json() as Promise<ProductPair[]>,
-    ])
-    setEvents(eventPayload)
-    setEnrollments(enrollmentPayload)
-    setWorkers(workerPayload)
-    setAlerts(alertPayload)
-    setProductPairs(productPairPayload)
+      const [eventPayload, enrollmentPayload, workerPayload, alertPayload, productPairPayload] = await Promise.all([
+        eventsResponse.json() as Promise<AuditEvent[]>,
+        enrollmentsResponse.json() as Promise<Enrollment[]>,
+        workersResponse.json() as Promise<AccountWorker[]>,
+        alertsResponse.json() as Promise<WorkerAlert[]>,
+        productPairsResponse.json() as Promise<ProductPair[]>,
+      ])
+      setEvents(eventPayload)
+      setEnrollments(enrollmentPayload)
+      setWorkers(workerPayload)
+      setAlerts(alertPayload)
+      setProductPairs(productPairPayload)
+      setLastUpdatedAt(new Date().toISOString())
+    } catch (refreshFailure) {
+      setRefreshError(refreshFailure instanceof Error ? refreshFailure.message : 'Management data could not be refreshed.')
+      throw refreshFailure
+    } finally {
+      setIsRefreshing(false)
+    }
   }
 
   async function loadAnalysisById(
@@ -722,14 +742,27 @@ function App() {
 
   if (csrfToken) {
     return (
-      <main className="management">
+      <AppShell
+        contentPadding={4}
+        height="auto"
+        topNav={<TopNav heading={<strong>ABT control plane</strong>} label="Control-plane navigation" />}
+        variant="section"
+      >
         <div className="management-content">
           <header>
-            <p className="eyebrow">ABT control plane</p>
             <h1>Management console</h1>
             <p>Launch and inspect cross-server product-pair analyses alongside worker health and audit events.</p>
+            <div className="refresh-status">
+              <p aria-live="polite">
+                {lastUpdatedAt ? `Last updated ${formatDateTime(lastUpdatedAt)}` : 'Loading management data…'}
+              </p>
+              <button disabled={isRefreshing} onClick={() => void refreshManagementData().catch(() => undefined)} type="button">
+                {isRefreshing ? 'Refreshing…' : 'Refresh'}
+              </button>
+            </div>
           </header>
           {error && <p className="error" role="alert">{error}</p>}
+          {refreshError && <p className="error" role="alert">{refreshError}</p>}
 
           <section aria-labelledby="analysis-heading" className="analysis-section">
             <div className="section-header">
@@ -760,8 +793,7 @@ function App() {
                   </ul>
                 )}
                 {ineligibleWorkers.length > 0 && (
-                  <details>
-                    <summary>Show blocked workers</summary>
+                  <Collapsible defaultIsOpen={false} trigger="Show blocked workers">
                     <ul className="worker-status-list" aria-label="Blocked analysis workers">
                       {ineligibleWorkers.map(({ worker, reason }) => (
                         <li key={worker.worker_id}>
@@ -770,7 +802,7 @@ function App() {
                         </li>
                       ))}
                     </ul>
-                  </details>
+                  </Collapsible>
                 )}
               </article>
 
@@ -951,16 +983,18 @@ function App() {
                         <div><dt>Created</dt><dd><time dateTime={enrollment.created_at}>{enrollment.created_at}</time></dd></div>
                         <div><dt>Expires</dt><dd><time dateTime={enrollment.expires_at}>{enrollment.expires_at}</time></dd></div>
                       </dl>
-                      <div className="enrollment-evidence">
-                        <section aria-label={`Account information for ${registrationName}`}>
-                          <h3>Account information</h3>
-                          <pre>{JSON.stringify(enrollment.account_info, null, 2)}</pre>
-                        </section>
-                        <section aria-label={`Terminal information for ${registrationName}`}>
-                          <h3>Terminal information</h3>
-                          <pre>{JSON.stringify(enrollment.terminal_info, null, 2)}</pre>
-                        </section>
-                      </div>
+                      <Collapsible defaultIsOpen={false} trigger="View registration evidence">
+                        <div className="enrollment-evidence">
+                          <section aria-label={`Account information for ${registrationName}`}>
+                            <h3>Account information</h3>
+                            <pre>{JSON.stringify(enrollment.account_info, null, 2)}</pre>
+                          </section>
+                          <section aria-label={`Terminal information for ${registrationName}`}>
+                            <h3>Terminal information</h3>
+                            <pre>{JSON.stringify(enrollment.terminal_info, null, 2)}</pre>
+                          </section>
+                        </div>
+                      </Collapsible>
                       <div className="enrollment-actions">
                         <button
                           aria-label={`Approve registration for ${registrationName}`}
@@ -1051,7 +1085,7 @@ function App() {
             </ul>
           </section>
         </div>
-      </main>
+      </AppShell>
     )
   }
 
