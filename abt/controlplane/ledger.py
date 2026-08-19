@@ -2574,6 +2574,12 @@ class ControlLedger:
                 "UPDATE product_catalog_analyses SET m15_screening_results = '[]' WHERE m15_screening_results IS NULL"
             )
             self._connection.execute(
+                "ALTER TABLE trader_enrollments ADD COLUMN IF NOT EXISTS approved_by VARCHAR"
+            )
+            self._connection.execute(
+                "ALTER TABLE trader_enrollments ADD COLUMN IF NOT EXISTS approved_at TIMESTAMPTZ"
+            )
+            self._connection.execute(
                 "UPDATE product_catalog_analyses SET m1_verification_results = '[]' WHERE m1_verification_results IS NULL"
             )
             self._migrate_alert_enrollment_reference()
