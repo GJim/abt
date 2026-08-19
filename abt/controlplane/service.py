@@ -30,7 +30,9 @@ from .crypto import (
     parse_trader_certificate,
     verify_enrollment_proof,
     verify_trader_enrollment_proof,
+    verify_trader_attestation,
     verify_trader_proof,
+    verify_trader_rotation_proof,
     verify_worker_proof,
 )
 from .ledger import AuthenticationError, ControlLedger, LedgerError, _hash
@@ -74,6 +76,7 @@ class TraderEnrollmentRequest(BaseModel):
     claimed_public_ip: str = Field(min_length=1, max_length=64)
     public_key_pem: str = Field(min_length=1)
     proof_signature: str = Field(min_length=1)
+    attestation_jwt: str = Field(min_length=1)
 
 
 class TraderCertificateChallengeRequest(BaseModel):
@@ -83,6 +86,19 @@ class TraderCertificateChallengeRequest(BaseModel):
 class TraderCertificateRequest(BaseModel):
     registration_id: str = Field(min_length=1)
     signature: str = Field(min_length=1)
+
+
+class TraderRotationChallengeRequest(BaseModel):
+    trader_id: str = Field(min_length=1)
+    public_key_pem: str = Field(min_length=1)
+    attestation_jwt: str = Field(min_length=1)
+
+
+class TraderRotationRequest(BaseModel):
+    trader_id: str = Field(min_length=1)
+    public_key_pem: str = Field(min_length=1)
+    old_key_signature: str = Field(min_length=1)
+    replacement_key_signature: str = Field(min_length=1)
 
 
 class ProductCatalogAnalysisPolicy(BaseModel):
@@ -231,6 +247,7 @@ def create_app(
     backup_directory: Path | None = None,
     openbao_raft_directory: Path | None = None,
     softhsm_tokens_directory: Path | None = None,
+    trader_attestation_trust_root: str | None = None,
 ) -> FastAPI:
     ledger = ControlLedger(ledger_path)
     backup_paths = (backup_directory, openbao_raft_directory, softhsm_tokens_directory)
@@ -266,6 +283,7 @@ def create_app(
     app = FastAPI(title="abt control plane", version="0.1.0", lifespan=lifespan)
     app.state.ledger = ledger
     app.state.trader_certificate_challenges = {}
+    app.state.trader_rotation_challenges = {}
     admin_notification_connections: set[WebSocket] = set()
     worker_connections: dict[str, set[_WorkerSessionConnection]] = {}
     trader_connections: dict[str, set[WebSocket]] = {}
@@ -388,11 +406,17 @@ def create_app(
                 strategy_name=body.strategy_name,
                 claimed_public_ip=body.claimed_public_ip,
             )
+            provider = verify_trader_attestation(
+                body.attestation_jwt,
+                public_key_pem=body.public_key_pem,
+                trust_root_public_key_pem=trader_attestation_trust_root,
+            )
             ledger.consume_registration_invite(body.registration_invite, "trader")
             return ledger.create_trader_enrollment(
                 strategy_name=body.strategy_name,
                 claimed_public_ip=body.claimed_public_ip,
                 public_key_pem=body.public_key_pem,
+                attestation_provider=provider,
             )
         except ProofError as error:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(error)) from error
@@ -470,6 +494,51 @@ def create_app(
             )
             return {"trader_id": trader.trader_id, "certificate": trader.certificate}
         except (LedgerError, ProofError) as error:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
+
+    @app.post("/api/traders/certificates/rotation-challenge")
+    def issue_trader_rotation_challenge(body: TraderRotationChallengeRequest) -> dict[str, str]:
+        try:
+            trader = ledger.active_trader(body.trader_id)
+            provider = verify_trader_attestation(
+                body.attestation_jwt,
+                public_key_pem=body.public_key_pem,
+                trust_root_public_key_pem=trader_attestation_trust_root,
+            )
+            nonce = secrets.token_urlsafe(32)
+            app.state.trader_rotation_challenges[body.trader_id] = (
+                nonce, body.public_key_pem, provider, datetime.now(UTC) + timedelta(minutes=2)
+            )
+            return {"purpose": "trader_certificate_rotation", "trader_id": trader.trader_id, "nonce": nonce}
+        except (LedgerError, ProofError) as error:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
+
+    @app.post("/api/traders/certificates/rotate")
+    def rotate_trader_certificate(body: TraderRotationRequest) -> dict[str, str]:
+        try:
+            trader = ledger.active_trader(body.trader_id)
+            challenge = app.state.trader_rotation_challenges.pop(body.trader_id, None)
+            if challenge is None or challenge[1] != body.public_key_pem or datetime.now(UTC) >= challenge[3]:
+                raise ProofError("The Trader rotation challenge is invalid or expired.")
+            nonce, replacement_public_key_pem, provider, _expires_at = challenge
+            verify_trader_rotation_proof(
+                trader.public_key_pem, body.old_key_signature, trader_id=trader.trader_id,
+                replacement_public_key_pem=replacement_public_key_pem, nonce=nonce,
+            )
+            verify_trader_rotation_proof(
+                replacement_public_key_pem, body.replacement_key_signature, trader_id=trader.trader_id,
+                replacement_public_key_pem=replacement_public_key_pem, nonce=nonce,
+            )
+            if certificate_issuer is None:
+                raise SecretStoreError("The device certificate issuer is unavailable.")
+            certificate = ledger.rotate_trader_certificate(
+                trader.trader_id, replacement_public_key_pem, provider,
+                lambda trader_id, strategy_name, public_key_pem: certificate_issuer.issue_trader(
+                    trader_id=trader_id, strategy_name=strategy_name, public_key_pem=public_key_pem
+                ),
+            )
+            return {"trader_id": trader.trader_id, "certificate": certificate}
+        except (LedgerError, ProofError, SecretStoreError) as error:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
 
     @app.get("/api/enrollment-challenge")
@@ -1109,6 +1178,7 @@ def create_app(
     async def trader_session(websocket: WebSocket) -> None:
         await websocket.accept()
         trader_id: str | None = None
+        session_id: str | None = None
         try:
             request = await _worker_message(websocket, {"trader_id", "certificate"})
             trader_id = _required_text(request, "trader_id")
@@ -1137,12 +1207,48 @@ def create_app(
             )
             ledger.active_trader(trader.trader_id)
             trader_connections.setdefault(trader.trader_id, set()).add(websocket)
+            session_id = ledger.open_trader_session(trader.trader_id)
             await websocket.send_json({"type": "authenticated", "trader_id": trader.trader_id, "cursor": 0})
+            last_controller_heartbeat = monotonic()
             while True:
-                message = await websocket.receive_json()
-                if not isinstance(message, dict) or set(message) != {"type"} or message.get("type") != "heartbeat":
+                try:
+                    message = await asyncio.wait_for(websocket.receive_json(), timeout=30)
+                except asyncio.TimeoutError:
+                    await websocket.send_json({"type": "heartbeat"})
+                    last_controller_heartbeat = monotonic()
+                    ledger.mark_trader_session_stale(session_id)
+                    continue
+                if not isinstance(message, dict) or not isinstance(message.get("type"), str):
                     raise ValueError("Invalid Trader message.")
-                await websocket.send_json({"type": "heartbeat_ack"})
+                if monotonic() - last_controller_heartbeat >= 30:
+                    await websocket.send_json({"type": "heartbeat"})
+                    last_controller_heartbeat = monotonic()
+                message_type = message["type"]
+                if message_type == "heartbeat" and set(message) == {"type"}:
+                    ledger.record_trader_signal(session_id)
+                    await websocket.send_json({"type": "heartbeat_ack"})
+                elif message_type == "ack" and set(message) == {"type", "cursor"} and isinstance(message["cursor"], int):
+                    ledger.record_trader_signal(session_id)
+                    ledger.acknowledge_trader_events(trader.trader_id, message["cursor"])
+                    await websocket.send_json({"type": "acknowledged", "cursor": message["cursor"]})
+                elif message_type == "resume" and set(message) == {"type", "cursor"} and isinstance(message["cursor"], int):
+                    ledger.record_trader_signal(session_id)
+                    for event in ledger.trader_events_after(trader.trader_id, message["cursor"]):
+                        await websocket.send_json({"type": "event", **jsonable_encoder(event)})
+                elif (
+                    message_type == "command"
+                    and set(message) == {"type", "command_id", "payload"}
+                    and isinstance(message["command_id"], str)
+                    and isinstance(message["payload"], dict)
+                ):
+                    ledger.active_trader(trader.trader_id)
+                    ledger.record_trader_signal(session_id)
+                    result = ledger.submit_trader_command(trader.trader_id, message["command_id"], message["payload"])
+                    await websocket.send_json(result)
+                    for event in ledger.trader_events_after(trader.trader_id, result["event_id"] - 1):
+                        await websocket.send_json({"type": "event", **jsonable_encoder(event)})
+                else:
+                    raise ValueError("Invalid Trader message.")
         except WebSocketDisconnect as error:
             _LOGGER.info("Trader session disconnected with code %s.", error.code)
         except (LedgerError, ProofError, SecretStoreError, ValueError) as error:

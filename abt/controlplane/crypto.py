@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
 
 
 class ProofError(ValueError):
@@ -209,6 +210,76 @@ def trader_enrollment_payload(*, registration_invite: str, strategy_name: str, c
     ).encode("utf-8")
 
 
+def trader_rotation_payload(*, trader_id: str, replacement_public_key_pem: str, nonce: str) -> bytes:
+    """Return the payload signed by both keys during a Trader key rotation."""
+
+    return json.dumps(
+        {
+            "nonce": nonce,
+            "purpose": "trader_certificate_rotation",
+            "replacement_public_key_pem": replacement_public_key_pem,
+            "trader_id": trader_id,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def verify_trader_attestation(
+    attestation_jwt: str, *, public_key_pem: str, trust_root_public_key_pem: str | None
+) -> str:
+    """Verify a signed hardware-key attestation bound to the enrollment key.
+
+    The trust root is deliberately explicit: a supplied JWT is never useful
+    unless its ES256 signature chains to the configured platform root.
+    """
+
+    if trust_root_public_key_pem is None:
+        raise ProofError("Trader attestation trust root is not configured.")
+    try:
+        header_part, claims_part, signature_part = attestation_jwt.split(".")
+        header = json.loads(_base64url_decode(header_part))
+        claims = json.loads(_base64url_decode(claims_part))
+        raw_signature = _base64url_decode(signature_part)
+        trust_root = serialization.load_pem_public_key(trust_root_public_key_pem.encode("utf-8"))
+    except (TypeError, ValueError, json.JSONDecodeError) as error:
+        raise ProofError("The Trader attestation JWT is malformed.") from error
+    if (
+        not isinstance(header, dict)
+        or header.get("alg") != "ES256"
+        or set(header) - {"alg", "typ", "kid"}
+        or not isinstance(claims, dict)
+        or len(raw_signature) != 64
+        or not isinstance(trust_root, ec.EllipticCurvePublicKey)
+        or not isinstance(trust_root.curve, ec.SECP256R1)
+    ):
+        raise ProofError("The Trader attestation JWT is invalid.")
+    provider = claims.get("provider")
+    exp = claims.get("exp")
+    issued_at = claims.get("iat")
+    if (
+        provider not in {"CNG", "TPM", "PKCS11"}
+        or claims.get("public_key_pem") != public_key_pem
+        or claims.get("non_exportable") is not True
+        or not isinstance(exp, (int, float))
+        or isinstance(exp, bool)
+        or not isinstance(issued_at, (int, float))
+        or isinstance(issued_at, bool)
+        or issued_at > datetime.now(UTC).timestamp() + 300
+        or exp <= datetime.now(UTC).timestamp()
+    ):
+        raise ProofError("The Trader attestation claims are invalid.")
+    try:
+        trust_root.verify(
+            encode_dss_signature(int.from_bytes(raw_signature[:32]), int.from_bytes(raw_signature[32:])),
+            f"{header_part}.{claims_part}".encode("ascii"),
+            ec.ECDSA(hashes.SHA256()),
+        )
+    except InvalidSignature as error:
+        raise ProofError("The Trader attestation signature is invalid.") from error
+    return provider
+
+
 def verify_trader_enrollment_proof(
     public_key_pem: str, signature_base64: str, *, registration_invite: str, strategy_name: str, claimed_public_ip: str
 ) -> None:
@@ -221,6 +292,31 @@ def verify_trader_enrollment_proof(
         malformed_message="The trader enrollment proof is malformed.",
         invalid_message="The trader enrollment proof signature is invalid.",
     )
+
+
+def verify_trader_rotation_proof(
+    public_key_pem: str,
+    signature_base64: str,
+    *,
+    trader_id: str,
+    replacement_public_key_pem: str,
+    nonce: str,
+) -> None:
+    _verify_p256_signature(
+        public_key_pem,
+        signature_base64,
+        trader_rotation_payload(
+            trader_id=trader_id, replacement_public_key_pem=replacement_public_key_pem, nonce=nonce
+        ),
+        malformed_message="The Trader rotation proof is malformed.",
+        invalid_message="The Trader rotation proof signature is invalid.",
+    )
+
+
+def _base64url_decode(value: str) -> bytes:
+    if not isinstance(value, str) or not value:
+        raise ValueError
+    return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
 
 
 def _verify_p256_signature(

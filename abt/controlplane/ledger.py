@@ -61,6 +61,7 @@ class ActiveTrader:
     strategy_name: str
     certificate: str
     public_key_pem: str
+    attestation_provider: str
 
 
 class ControlLedger:
@@ -342,7 +343,7 @@ class ControlLedger:
         return enrollment
 
     def create_trader_enrollment(
-        self, *, strategy_name: str, claimed_public_ip: str, public_key_pem: str
+        self, *, strategy_name: str, claimed_public_ip: str, public_key_pem: str, attestation_provider: str
     ) -> dict[str, Any]:
         now = _utc_now()
         registration_id = str(uuid4())
@@ -350,10 +351,10 @@ class ControlLedger:
             self._connection.execute(
                 """
                 INSERT INTO trader_enrollments
-                    (registration_id, strategy_name, claimed_public_ip, public_key_pem, status, created_at, expires_at)
-                VALUES (?, ?, ?, ?, 'pending', ?, ?)
+                    (registration_id, strategy_name, claimed_public_ip, public_key_pem, attestation_provider, status, created_at, expires_at)
+                VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)
                 """,
-                [registration_id, strategy_name, claimed_public_ip, public_key_pem, now, now + timedelta(minutes=15)],
+                [registration_id, strategy_name, claimed_public_ip, public_key_pem, attestation_provider, now, now + timedelta(minutes=15)],
             )
             self._event("trader_enrollment_requested", {"registration_id": registration_id, "strategy_name": strategy_name})
         return {"registration_id": registration_id, "expires_at": now + timedelta(minutes=15)}
@@ -445,7 +446,7 @@ class ControlLedger:
     def active_trader_for_enrollment(self, registration_id: str) -> ActiveTrader:
         return self._active_trader(
             """
-            SELECT t.trader_id, t.registration_id, t.strategy_name, t.certificate, e.public_key_pem
+            SELECT t.trader_id, t.registration_id, t.strategy_name, t.certificate, e.public_key_pem, e.attestation_provider
             FROM traders t JOIN trader_enrollments e ON e.registration_id = t.registration_id
             WHERE t.registration_id = ? AND t.status = 'active'
             """,
@@ -455,7 +456,7 @@ class ControlLedger:
     def active_trader(self, trader_id: str) -> ActiveTrader:
         return self._active_trader(
             """
-            SELECT t.trader_id, t.registration_id, t.strategy_name, t.certificate, e.public_key_pem
+            SELECT t.trader_id, t.registration_id, t.strategy_name, t.certificate, e.public_key_pem, e.attestation_provider
             FROM traders t JOIN trader_enrollments e ON e.registration_id = t.registration_id
             WHERE t.trader_id = ? AND t.status = 'active'
             """,
@@ -482,6 +483,112 @@ class ControlLedger:
             if changed is None:
                 raise LedgerError("Trader is not active.")
             self._event("trader_certificate_revoked", {"trader_id": trader_id, "revoked_by": revoked_by})
+
+    def rotate_trader_certificate(
+        self, trader_id: str, public_key_pem: str, attestation_provider: str, issue_certificate: Callable[[str, str, str], str]
+    ) -> str:
+        """Replace an active Trader's key only after the service verified both proofs."""
+
+        with self._transaction():
+            row = self._connection.execute(
+                "SELECT registration_id, strategy_name FROM traders WHERE trader_id = ? AND status = 'active'", [trader_id]
+            ).fetchone()
+            if row is None:
+                raise LedgerError("Trader is not active.")
+            registration_id, strategy_name = row
+            certificate = issue_certificate(trader_id, strategy_name, public_key_pem)
+            self._connection.execute(
+                "UPDATE trader_enrollments SET public_key_pem = ?, attestation_provider = ? WHERE registration_id = ?",
+                [public_key_pem, attestation_provider, registration_id],
+            )
+            self._connection.execute("UPDATE traders SET certificate = ? WHERE trader_id = ?", [certificate, trader_id])
+            self._event(
+                "trader_certificate_rotated",
+                {"trader_id": trader_id, "attestation_provider": attestation_provider},
+            )
+            return certificate
+
+    def open_trader_session(self, trader_id: str) -> str:
+        session_id = str(uuid4())
+        now = _utc_now()
+        with self._transaction():
+            self._connection.execute(
+                """INSERT INTO trader_sessions (session_id, trader_id, status, last_valid_signal_at, opened_at)
+                   VALUES (?, ?, 'connected', ?, ?)""",
+                [session_id, trader_id, now, now],
+            )
+            self._event("trader_session_authenticated", {"trader_id": trader_id, "session_id": session_id})
+        return session_id
+
+    def record_trader_signal(self, session_id: str) -> None:
+        with self._transaction():
+            self._connection.execute(
+                "UPDATE trader_sessions SET status = 'connected', last_valid_signal_at = ? WHERE session_id = ?",
+                [_utc_now(), session_id],
+            )
+
+    def mark_trader_session_stale(self, session_id: str) -> None:
+        with self._transaction():
+            changed = self._connection.execute(
+                """UPDATE trader_sessions SET status = 'stale', stale_at = ?
+                   WHERE session_id = ? AND status = 'connected'
+                     AND last_valid_signal_at <= ? RETURNING trader_id""",
+                [ _utc_now(), session_id, _utc_now() - timedelta(minutes=5)],
+            ).fetchone()
+            if changed is not None:
+                self._event("trader_session_stale", {"trader_id": changed[0], "session_id": session_id})
+
+    def submit_trader_command(self, trader_id: str, command_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """Persist idempotency and the minimal accepted/cancel lifecycle event."""
+
+        canonical_payload = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+        payload_hash = _hash(canonical_payload)
+        command_type = payload.get("type")
+        if command_type not in {"intent", "cancel"}:
+            raise LedgerError("Trader command type is invalid.")
+        with self._transaction():
+            if self._connection.execute(
+                "SELECT 1 FROM traders WHERE trader_id = ? AND status = 'active'", [trader_id]
+            ).fetchone() is None:
+                raise LedgerError("Trader is not active.")
+            existing = self._connection.execute(
+                "SELECT payload_hash, result FROM trader_commands WHERE trader_id = ? AND command_id = ?",
+                [trader_id, command_id],
+            ).fetchone()
+            if existing is not None:
+                if existing[0] != payload_hash:
+                    raise LedgerError("Trader command ID was reused with a different payload.")
+                return json.loads(existing[1])
+            event_type = "intent_accepted" if command_type == "intent" else "cancel_accepted"
+            event_id = self._event(event_type, {"trader_id": trader_id, "command_id": command_id, "command": payload})
+            self._connection.execute(
+                "INSERT INTO trader_events (trader_id, event_id) VALUES (?, ?)", [trader_id, event_id]
+            )
+            result = {"type": "command_result", "command_id": command_id, "status": "accepted", "event_id": event_id}
+            self._connection.execute(
+                "INSERT INTO trader_commands (trader_id, command_id, payload_hash, result, created_at) VALUES (?, ?, ?, ?, ?)",
+                [trader_id, command_id, payload_hash, json.dumps(result, sort_keys=True), _utc_now()],
+            )
+            return result
+
+    def acknowledge_trader_events(self, trader_id: str, cursor: int) -> None:
+        with self._transaction():
+            self._connection.execute(
+                """INSERT INTO trader_event_cursors (trader_id, cursor, acknowledged_at) VALUES (?, ?, ?)
+                   ON CONFLICT (trader_id) DO UPDATE SET cursor = greatest(trader_event_cursors.cursor, excluded.cursor),
+                       acknowledged_at = excluded.acknowledged_at""",
+                [trader_id, cursor, _utc_now()],
+            )
+
+    def trader_events_after(self, trader_id: str, cursor: int) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._connection.execute(
+                """SELECT e.event_id, e.event_type, e.payload, e.occurred_at FROM trader_events te
+                   JOIN events e ON e.event_id = te.event_id
+                   WHERE te.trader_id = ? AND e.event_id > ? ORDER BY e.event_id""",
+                [trader_id, cursor],
+            ).fetchall()
+        return [{"event_id": row[0], "event_type": row[1], "payload": json.loads(row[2]), "occurred_at": row[3]} for row in rows]
 
     def issue_enrollment_challenge(self) -> tuple[str, datetime]:
         challenge = secrets.token_urlsafe(32)
@@ -2262,11 +2369,13 @@ class ControlLedger:
         ]
         return _page(items, has_more, "events", "occurred_at", "event_id")
 
-    def _event(self, event_type: str, payload: dict[str, Any]) -> None:
-        self._connection.execute(
-            "INSERT INTO events (event_type, payload, occurred_at) VALUES (?, ?, ?)",
+    def _event(self, event_type: str, payload: dict[str, Any]) -> int:
+        row = self._connection.execute(
+            "INSERT INTO events (event_type, payload, occurred_at) VALUES (?, ?, ?) RETURNING event_id",
             [event_type, json.dumps(payload, sort_keys=True), _utc_now()],
-        )
+        ).fetchone()
+        assert row is not None
+        return int(row[0])
 
     def _alert(
         self,
@@ -2342,11 +2451,37 @@ class ControlLedger:
                     used_at TIMESTAMPTZ,
                     revoked_at TIMESTAMPTZ
                 );
+                CREATE TABLE IF NOT EXISTS trader_sessions (
+                    session_id VARCHAR PRIMARY KEY,
+                    trader_id VARCHAR NOT NULL,
+                    status VARCHAR NOT NULL,
+                    last_valid_signal_at TIMESTAMPTZ NOT NULL,
+                    opened_at TIMESTAMPTZ NOT NULL,
+                    stale_at TIMESTAMPTZ
+                );
+                CREATE TABLE IF NOT EXISTS trader_commands (
+                    trader_id VARCHAR NOT NULL,
+                    command_id VARCHAR NOT NULL,
+                    payload_hash VARCHAR NOT NULL,
+                    result JSON NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL,
+                    PRIMARY KEY (trader_id, command_id)
+                );
+                CREATE TABLE IF NOT EXISTS trader_events (
+                    trader_id VARCHAR NOT NULL,
+                    event_id BIGINT PRIMARY KEY
+                );
+                CREATE TABLE IF NOT EXISTS trader_event_cursors (
+                    trader_id VARCHAR PRIMARY KEY,
+                    cursor BIGINT NOT NULL,
+                    acknowledged_at TIMESTAMPTZ NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS trader_enrollments (
                     registration_id VARCHAR PRIMARY KEY,
                     strategy_name VARCHAR NOT NULL,
                     claimed_public_ip VARCHAR NOT NULL,
                     public_key_pem VARCHAR NOT NULL,
+                    attestation_provider VARCHAR NOT NULL DEFAULT 'unverified',
                     status VARCHAR NOT NULL,
                     created_at TIMESTAMPTZ NOT NULL,
                     expires_at TIMESTAMPTZ NOT NULL,
@@ -2609,6 +2744,9 @@ class ControlLedger:
             )
             self._connection.execute(
                 "ALTER TABLE trader_enrollments ADD COLUMN IF NOT EXISTS approved_at TIMESTAMPTZ"
+            )
+            self._connection.execute(
+                "ALTER TABLE trader_enrollments ADD COLUMN IF NOT EXISTS attestation_provider VARCHAR DEFAULT 'unverified'"
             )
             self._connection.execute(
                 "UPDATE product_catalog_analyses SET m1_verification_results = '[]' WHERE m1_verification_results IS NULL"

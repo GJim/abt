@@ -49,4 +49,5 @@ app = create_app(
     softhsm_tokens_directory=(
         Path(os.environ["ABT_SOFTHSM_TOKENS_DIRECTORY"]) if "ABT_SOFTHSM_TOKENS_DIRECTORY" in os.environ else None
     ),
+    trader_attestation_trust_root=os.environ.get("ABT_TRADER_ATTESTATION_TRUST_ROOT"),
 )
