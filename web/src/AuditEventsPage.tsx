@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import type { FormEvent } from 'react'
+import { Pagination } from '@astryxdesign/core/Pagination'
 import './Console.css'
 
 export type AuditEvent = {
@@ -20,40 +20,38 @@ type AuditEventsPageProps = {
 
 type EventRequest = {
   cursor: string
-  append: boolean
+  pageIndex: number
+  query: string
 }
+
+const PAGE_SIZE = 50
 
 export function AuditEventsPage({ csrfToken }: AuditEventsPageProps) {
   const [search, setSearch] = useState('')
-  const [appliedSearch, setAppliedSearch] = useState('')
-  const [events, setEvents] = useState<AuditEvent[]>([])
-  const [nextCursor, setNextCursor] = useState<string | null>(null)
+  const [pages, setPages] = useState<AuditEventsResponse[]>([])
+  const [pageIndex, setPageIndex] = useState(0)
   const [isLoading, setIsLoading] = useState(true)
-  const [isLoadingMore, setIsLoadingMore] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const abortControllerRef = useRef<AbortController | null>(null)
-  const failedRequestRef = useRef<EventRequest>({ cursor: '', append: false })
+  const failedRequestRef = useRef<EventRequest | null>(null)
 
   void csrfToken
 
-  const loadEvents = useCallback(async (request: EventRequest, query: string) => {
+  const loadPage = useCallback(async (request: EventRequest) => {
     abortControllerRef.current?.abort()
     const controller = new AbortController()
     abortControllerRef.current = controller
     failedRequestRef.current = request
     setError(null)
+    setIsLoading(true)
 
-    if (request.append) {
-      setIsLoadingMore(true)
-    } else {
-      setIsLoading(true)
+    const parameters = new URLSearchParams({ limit: String(PAGE_SIZE) })
+    if (request.query) {
+      parameters.set('q', request.query)
     }
-
-    const parameters = new URLSearchParams({
-      limit: '50',
-      q: query,
-      cursor: request.cursor,
-    })
+    if (request.cursor) {
+      parameters.set('cursor', request.cursor)
+    }
 
     try {
       const response = await fetch(`/api/admin/events?${parameters}`, {
@@ -69,56 +67,74 @@ export function AuditEventsPage({ csrfToken }: AuditEventsPageProps) {
         throw new Error('Audit events returned an invalid response.')
       }
 
-      setEvents((current) => request.append ? [...current, ...payload.items] : payload.items)
-      setNextCursor(payload.next_cursor)
+      setPages((current) => [...current.slice(0, request.pageIndex), payload])
+      setPageIndex(request.pageIndex)
     } catch (caughtError) {
-      if (controller.signal.aborted) {
-        return
+      if (!controller.signal.aborted) {
+        setError(caughtError instanceof Error ? caughtError.message : 'Audit events could not be loaded.')
       }
-      setError(caughtError instanceof Error ? caughtError.message : 'Audit events could not be loaded.')
     } finally {
       if (abortControllerRef.current === controller) {
         setIsLoading(false)
-        setIsLoadingMore(false)
       }
     }
   }, [])
 
+  const normalizedSearch = search.trim()
   useEffect(() => {
-    void loadEvents({ cursor: '', append: false }, appliedSearch)
-    return () => abortControllerRef.current?.abort()
-  }, [appliedSearch, loadEvents])
-
-  function submitSearch(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault()
-    setAppliedSearch(search.trim())
-  }
+    const delay = window.setTimeout(() => {
+      setPages([])
+      setPageIndex(0)
+      void loadPage({ cursor: '', pageIndex: 0, query: normalizedSearch })
+    }, 250)
+    return () => {
+      window.clearTimeout(delay)
+      abortControllerRef.current?.abort()
+    }
+  }, [loadPage, normalizedSearch])
 
   function retry() {
-    void loadEvents(failedRequestRef.current, appliedSearch)
+    if (failedRequestRef.current) {
+      void loadPage(failedRequestRef.current)
+    }
   }
 
-  return (
-    <section aria-labelledby="audit-events-heading">
-      <header className="console-page-header">
-        <div>
-          <h1 id="audit-events-heading">Audit events</h1>
-          <p>Review the immutable operational record, newest events first.</p>
-        </div>
-      </header>
+  function changePage(nextPage: number) {
+    const nextPageIndex = nextPage - 1
+    if (nextPageIndex === pageIndex) {
+      return
+    }
+    if (pages[nextPageIndex]) {
+      setPageIndex(nextPageIndex)
+      return
+    }
+    const cursor = pages[pageIndex]?.next_cursor
+    if (cursor) {
+      setPageIndex(nextPageIndex)
+      void loadPage({ cursor, pageIndex: nextPageIndex, query: normalizedSearch })
+    }
+  }
 
-      <form className="console-table-actions" role="search" onSubmit={submitSearch}>
-        <label htmlFor="audit-events-search">Search audit events</label>
+  const currentPage = pages[pageIndex]
+  const events = currentPage?.items ?? []
+  const hasNextPage = Boolean(currentPage?.next_cursor || pages[pageIndex + 1])
+
+  return (
+    <section aria-label="Audit events">
+      <div className="console-table-actions analysis-history-filters" role="search">
+        <label htmlFor="audit-events-search">Search</label>
         <input
           id="audit-events-search"
           name="q"
           type="search"
           value={search}
-          onChange={(event) => setSearch(event.target.value)}
+          onChange={(event) => {
+            setSearch(event.target.value)
+            setIsLoading(true)
+          }}
           placeholder="Event type, reason, or identifier"
         />
-        <button type="submit" disabled={isLoading || isLoadingMore}>Search</button>
-      </form>
+      </div>
 
       {isLoading && events.length === 0 ? (
         <p className="console-empty-state" role="status">Loading audit events…</p>
@@ -138,15 +154,14 @@ export function AuditEventsPage({ csrfToken }: AuditEventsPageProps) {
       {!isLoading && !error && events.length === 0 ? (
         <div className="console-empty-state">
           <strong>No audit events found.</strong>
-          <span>{appliedSearch ? 'Try a different search term.' : 'New operational activity will appear here.'}</span>
+          <span>{normalizedSearch ? 'Try a different search term.' : 'New operational activity will appear here.'}</span>
         </div>
       ) : null}
 
       {events.length > 0 ? (
         <>
           <div className="console-table-scroll">
-            <table className="console-table">
-              <caption className="visually-hidden">Audit events</caption>
+            <table aria-label="Audit events" className="console-table">
               <thead>
                 <tr>
                   <th scope="col">Timestamp</th>
@@ -174,18 +189,17 @@ export function AuditEventsPage({ csrfToken }: AuditEventsPageProps) {
             </table>
           </div>
 
-          {nextCursor ? (
-            <div className="console-table-actions">
-              <button
-                type="button"
-                onClick={() => void loadEvents({ cursor: nextCursor, append: true }, appliedSearch)}
-                disabled={isLoadingMore}
-              >
-                {isLoadingMore ? 'Loading more events…' : 'Load more'}
-              </button>
-              {isLoadingMore ? <span role="status">Loading more audit events…</span> : null}
-            </div>
-          ) : null}
+          <div className="console-pagination">
+            <Pagination
+              hasMore={hasNextPage}
+              isDisabled={isLoading}
+              label="Audit event pages"
+              onChange={changePage}
+              page={pageIndex + 1}
+              pageSize={PAGE_SIZE}
+              size="sm"
+            />
+          </div>
         </>
       ) : null}
     </section>
@@ -194,7 +208,11 @@ export function AuditEventsPage({ csrfToken }: AuditEventsPageProps) {
 
 function formatDateTime(value: string) {
   const date = new Date(value)
-  return Number.isNaN(date.getTime()) ? value : date.toLocaleString()
+  if (Number.isNaN(date.getTime())) {
+    return value
+  }
+  const pad = (part: number) => String(part).padStart(2, '0')
+  return `${date.getUTCFullYear()}-${pad(date.getUTCMonth() + 1)}-${pad(date.getUTCDate())} ${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}:${pad(date.getUTCSeconds())}`
 }
 
 function humanize(value: string) {

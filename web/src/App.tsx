@@ -1,8 +1,14 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { FormEvent } from 'react'
 import { AppShell } from '@astryxdesign/core/AppShell'
+import { Badge } from '@astryxdesign/core/Badge'
 import { Collapsible } from '@astryxdesign/core/Collapsible'
+import { StatusDot } from '@astryxdesign/core/StatusDot'
+import { Tab, TabList } from '@astryxdesign/core/TabList'
 import { TopNav } from '@astryxdesign/core/TopNav'
+import { useToast } from '@astryxdesign/core/Toast'
+import { Tooltip } from '@astryxdesign/core/Tooltip'
+import { Link, useLocation, useNavigate } from 'react-router-dom'
 import { AuditEventsPage } from './AuditEventsPage'
 import { AnalysisHistoryPage } from './AnalysisHistoryPage'
 import { ProductPairsListPage } from './ProductPairsListPage'
@@ -141,12 +147,6 @@ type AnalysisCandidate = {
   second_point: number
 }
 
-type AnalysisException = AnalysisCandidate & {
-  reason: string
-  first_trade_calc_mode: string
-  second_trade_calc_mode: string
-}
-
 type AnalysisDifference = {
   field: string
   first_value: unknown
@@ -188,6 +188,7 @@ type ScreeningResult = AnalysisCandidate & {
 type VerificationResult = ScreeningResult & {
   verification_status: string
   hard_block_differences: AnalysisDifference[]
+  supported_filling_modes: string[]
   warning_differences: AnalysisDifference[]
 }
 
@@ -205,7 +206,6 @@ type ProductCatalogAnalysis = {
   first_catalog_evidence: CatalogEvidence | null
   second_catalog_evidence: CatalogEvidence | null
   eligible_candidates: AnalysisCandidate[]
-  exceptions: AnalysisException[]
   m15_screening_results: ScreeningResult[]
   m1_verification_results: VerificationResult[]
   requested_at: string
@@ -363,22 +363,16 @@ const DEFAULT_POLICY: ProductCatalogAnalysisPolicy = {
   maximum_m1_median_price_difference_points: 2,
 }
 
-const BOOLEAN_POLICY_FIELDS: Array<{
-  key: keyof ProductCatalogAnalysisPolicy
-  label: string
-  description: string
-}> = [
-  {
-    key: 'require_equal_base_currency',
-    label: 'Require equal base currency',
-    description: 'Keep pairs on the same base currency.',
-  },
-  {
-    key: 'require_equal_profit_currency',
-    label: 'Require equal profit currency',
-    description: 'Keep pairs on the same profit currency.',
-  },
-]
+function shortPolicyFieldLabel(key: keyof ProductCatalogAnalysisPolicy) {
+  const labels: Partial<Record<keyof ProductCatalogAnalysisPolicy, string>> = {
+    minimum_m15_common_coverage: 'M15 coverage',
+    minimum_m15_return_correlation: 'M15 correlation',
+    minimum_m1_common_coverage: 'M1 coverage',
+    minimum_m1_return_correlation: 'M1 correlation',
+    maximum_m1_median_price_difference_points: 'Max M1 delta',
+  }
+  return labels[key] ?? String(key)
+}
 
 const NUMBER_POLICY_FIELDS: Array<{
   key: keyof ProductCatalogAnalysisPolicy
@@ -397,18 +391,18 @@ const NUMBER_POLICY_FIELDS: Array<{
     step: 0.01,
   },
   {
-    key: 'minimum_m1_common_coverage',
-    label: 'Minimum M1 common coverage',
-    description: 'Minimum overlapping M1 bar coverage ratio.',
-    min: 0,
-    max: 1,
-    step: 0.01,
-  },
-  {
     key: 'minimum_m15_return_correlation',
     label: 'Minimum M15 return correlation',
     description: 'Minimum return correlation during M15 screening.',
     min: -1,
+    max: 1,
+    step: 0.01,
+  },
+  {
+    key: 'minimum_m1_common_coverage',
+    label: 'Minimum M1 common coverage',
+    description: 'Minimum overlapping M1 bar coverage ratio.',
+    min: 0,
     max: 1,
     step: 0.01,
   },
@@ -439,71 +433,46 @@ const STAGE_LABELS: Record<string, string> = {
   m1_failed: 'M1 verification failed',
 }
 
-const EVENT_LABELS: Record<string, string> = {
-  product_catalog_analysis_requested: 'Queued',
-  product_catalog_analysis_catalog_completed: 'Catalog evidence recorded',
-  product_catalog_analysis_m15_completed: 'M15 screening completed',
-  product_catalog_analysis_m1_completed: 'M1 verification completed',
-  product_catalog_analysis_retry: 'Retry requested',
-  product_catalog_analysis_succeeded: 'Succeeded',
-  product_catalog_analysis_failed: 'Failed',
-}
-
-const POLICY_EVALUATION_LABELS: Record<string, string> = {
-  minimum_m15_common_coverage: 'Minimum M15 common coverage',
-  minimum_m1_common_coverage: 'Minimum M1 common coverage',
-  minimum_m15_return_correlation: 'Minimum M15 return correlation',
-  minimum_m1_return_correlation: 'Minimum M1 return correlation',
-  maximum_m1_median_price_difference_points: 'Maximum M1 median difference',
-  coverage_passed: 'Coverage passed',
-  return_correlation_passed: 'Return correlation passed',
-  median_price_difference_passed: 'Median difference passed',
-  hard_block_differences_passed: 'Hard-block differences passed',
-}
-
 const LIVE_REFRESH_INTERVAL_MS = 30_000
 const LIVE_REFRESH_TIMEOUT_MS = 10_000
-const LIVE_REFRESH_STALE_AFTER_MS = LIVE_REFRESH_INTERVAL_MS * 2
 type ConsolePage = 'main' | 'launch' | 'audit' | 'snapshots' | 'history' | 'active-pairs' | 'retired-pairs'
 
 function App() {
+  const location = useLocation()
+  const navigate = useNavigate()
+  const analysisRouteId = readAnalysisRouteId(location.pathname)
+  const isAnalysisRoute = location.pathname === '/analysis' || analysisRouteId !== null
+  const consolePage = isAnalysisRoute ? 'launch' : readConsolePage(location.pathname)
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
   const [csrfToken, setCsrfToken] = useState<string | null>(null)
   const [events, setEvents] = useState<AuditEvent[]>([])
   const [enrollments, setEnrollments] = useState<Enrollment[]>([])
+  const [notificationEnrollments, setNotificationEnrollments] = useState<Enrollment[]>([])
+  const [isNotificationListOpen, setIsNotificationListOpen] = useState(false)
+  const [selectedNotificationEnrollment, setSelectedNotificationEnrollment] = useState<Enrollment | null>(null)
+  const [notificationConnection, setNotificationConnection] = useState<'connecting' | 'live' | 'reconnecting'>('connecting')
   const [workers, setWorkers] = useState<AccountWorker[]>([])
   const [alerts, setAlerts] = useState<WorkerAlert[]>([])
   const [productPairs, setProductPairs] = useState<ProductPair[]>([])
-  const [isRefreshing, setIsRefreshing] = useState(false)
-  const [lastUpdatedAt, setLastUpdatedAt] = useState<string | null>(null)
   const [refreshError, setRefreshError] = useState<string | null>(null)
   const [processingEnrollmentId, setProcessingEnrollmentId] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [policy, setPolicy] = useState<ProductCatalogAnalysisPolicy>(DEFAULT_POLICY)
   const [firstWorkerId, setFirstWorkerId] = useState('')
   const [secondWorkerId, setSecondWorkerId] = useState('')
-  const [initialAnalysisLookupId] = useState(() => readAnalysisQuery())
-  const [analysisLookupId, setAnalysisLookupId] = useState(initialAnalysisLookupId)
   const [analysis, setAnalysis] = useState<ProductCatalogAnalysis | null>(null)
   const [analysisError, setAnalysisError] = useState<string | null>(null)
   const [isLaunchingAnalysis, setIsLaunchingAnalysis] = useState(false)
   const [isLoadingAnalysis, setIsLoadingAnalysis] = useState(false)
-  const [consolePage, setConsolePage] = useState<ConsolePage>(() => readConsolePage())
   const refreshInFlight = useRef(false)
   const operatorActionInProgress = useRef(false)
+  const notificationRetryTimer = useRef<number | null>(null)
 
   const eligibleWorkers = useMemo(
     () => workers.filter((worker) => workerEligibilityReason(worker) === null),
     [workers],
   )
-  const ineligibleWorkers = useMemo(
-    () => workers
-      .map((worker) => ({ worker, reason: workerEligibilityReason(worker) }))
-      .filter((entry): entry is { worker: AccountWorker; reason: string } => entry.reason !== null),
-    [workers],
-  )
-
   const selectedFirstWorker = useMemo(
     () => eligibleWorkers.find((worker) => worker.worker_id === firstWorkerId) ?? null,
     [eligibleWorkers, firstWorkerId],
@@ -525,12 +494,6 @@ function App() {
   const pairValidationError = useMemo(
     () => validateAnalysisPair(selectedFirstWorker, selectedSecondWorker),
     [selectedFirstWorker, selectedSecondWorker],
-  )
-  const analysisEvents = useMemo(
-    () => analysis === null
-      ? []
-      : events.filter((event) => event.payload?.analysis_id === analysis.analysis_id),
-    [analysis, events],
   )
   const interventionQueue = useMemo<InterventionItem[]>(
     () => [
@@ -563,12 +526,6 @@ function App() {
   )
 
   useEffect(() => {
-    const updatePage = () => setConsolePage(readConsolePage())
-    window.addEventListener('hashchange', updatePage)
-    return () => window.removeEventListener('hashchange', updatePage)
-  }, [])
-
-  useEffect(() => {
     if (eligibleWorkers.length === 0) {
       setFirstWorkerId('')
       setSecondWorkerId('')
@@ -599,8 +556,8 @@ function App() {
         const payload = (await response.json()) as LoginResponse
         setCsrfToken(payload.csrf_token)
         await refreshManagementData()
-        if (initialAnalysisLookupId) {
-          await loadAnalysisById(initialAnalysisLookupId, { replaceUrl: false })
+        if (analysisRouteId) {
+          await loadAnalysisById(analysisRouteId, { replaceUrl: false })
         }
       } catch {
         setError('Your session could not be restored. Please sign in again.')
@@ -608,7 +565,67 @@ function App() {
     }
 
     void resumeSession()
-  }, [initialAnalysisLookupId])
+  }, [analysisRouteId])
+
+  useEffect(() => {
+    if (!csrfToken) {
+      return
+    }
+
+    let socket: WebSocket | null = null
+    let disposed = false
+    let reconnectDelay = 1_000
+
+    const mergeEnrollment = (incoming: Enrollment) => {
+      setNotificationEnrollments((current) => [
+        incoming,
+        ...current.filter((enrollment) => enrollment.enrollment_id !== incoming.enrollment_id),
+      ])
+    }
+    const connect = () => {
+      if (disposed) return
+      setNotificationConnection(socket ? 'reconnecting' : 'connecting')
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+      const nextSocket = new WebSocket(`${protocol}//${window.location.host}/api/admin/notifications`)
+      socket = nextSocket
+      nextSocket.onopen = () => {
+        reconnectDelay = 1_000
+        setNotificationConnection('live')
+      }
+      nextSocket.onmessage = (event) => {
+        try {
+          const message = JSON.parse(String(event.data)) as { type?: string; items?: Enrollment[]; item?: Enrollment }
+          if (message.type === 'pending_enrollments' && Array.isArray(message.items)) {
+            setNotificationEnrollments(message.items)
+          } else if (message.type === 'pending_enrollment' && message.item) {
+            mergeEnrollment(message.item)
+          }
+        } catch {
+          // REST-seeded data remains available when a push message is malformed.
+        }
+      }
+      nextSocket.onclose = () => {
+        if (disposed || socket !== nextSocket) return
+        setNotificationConnection('reconnecting')
+        notificationRetryTimer.current = window.setTimeout(() => {
+          reconnectDelay = Math.min(reconnectDelay * 2, 30_000)
+          connect()
+        }, reconnectDelay)
+      }
+      nextSocket.onerror = () => nextSocket.close()
+    }
+    connect()
+
+    return () => {
+      disposed = true
+      if (notificationRetryTimer.current !== null) window.clearTimeout(notificationRetryTimer.current)
+      socket?.close()
+    }
+  }, [csrfToken])
+
+  useEffect(() => {
+    document.title = isAnalysisRoute ? 'Analysis | ABT control plane' : 'ABT control plane'
+  }, [isAnalysisRoute])
 
   useEffect(() => {
     if (analysis?.status !== 'running') {
@@ -654,7 +671,6 @@ function App() {
       return
     }
     refreshInFlight.current = true
-    setIsRefreshing(true)
     setRefreshError(null)
     const controller = new AbortController()
     const timeout = window.setTimeout(() => controller.abort(), LIVE_REFRESH_TIMEOUT_MS)
@@ -683,10 +699,10 @@ function App() {
       ])
       setEvents(Array.isArray(eventPayload) ? eventPayload : eventPayload.items)
       setEnrollments(enrollmentPayload)
+      setNotificationEnrollments(enrollmentPayload)
       setWorkers(workerPayload)
       setAlerts(alertPayload)
       setProductPairs(Array.isArray(productPairPayload) ? productPairPayload : productPairPayload.items)
-      setLastUpdatedAt(new Date().toISOString())
     } catch (refreshFailure) {
       setRefreshError(
         refreshFailure instanceof DOMException && refreshFailure.name === 'AbortError'
@@ -699,7 +715,6 @@ function App() {
     } finally {
       window.clearTimeout(timeout)
       refreshInFlight.current = false
-      setIsRefreshing(false)
     }
   }
 
@@ -725,9 +740,8 @@ function App() {
       }
       const payload = (await response.json()) as ProductCatalogAnalysis
       setAnalysis(payload)
-      setAnalysisLookupId(payload.analysis_id)
       if (options?.replaceUrl !== false) {
-        writeAnalysisQuery(payload.analysis_id)
+        navigate(`/analysis/${encodeURIComponent(payload.analysis_id)}`)
       }
     } catch (loadError) {
       if (!options?.silent) {
@@ -776,8 +790,8 @@ function App() {
       const payload = (await response.json()) as LoginResponse
       setCsrfToken(payload.csrf_token)
       await refreshManagementData()
-      if (analysisLookupId) {
-        await loadAnalysisById(analysisLookupId, { replaceUrl: false })
+      if (analysisRouteId) {
+        await loadAnalysisById(analysisRouteId, { replaceUrl: false })
       }
     } catch {
       setError('Signed in, but management data could not be loaded.')
@@ -802,6 +816,9 @@ function App() {
         const detail = await readResponseDetail(response, 'Enrollment review failed.')
         throw new Error(detail)
       }
+      setEnrollments((current) => current.filter((enrollment) => enrollment.enrollment_id !== enrollmentId))
+      setNotificationEnrollments((current) => current.filter((enrollment) => enrollment.enrollment_id !== enrollmentId))
+      setSelectedNotificationEnrollment((current) => current?.enrollment_id === enrollmentId ? null : current)
       await refreshManagementData()
     } catch (reviewError) {
       const detail = reviewError instanceof Error ? reviewError.message : 'Enrollment review failed.'
@@ -848,8 +865,7 @@ function App() {
       }
       const payload = (await response.json()) as ProductCatalogAnalysis
       setAnalysis(payload)
-      setAnalysisLookupId(payload.analysis_id)
-      writeAnalysisQuery(payload.analysis_id)
+      navigate(`/analysis/${encodeURIComponent(payload.analysis_id)}`)
       await refreshManagementData()
     } catch (launchError) {
       setAnalysisError(launchError instanceof Error ? launchError.message : 'The analysis could not be launched.')
@@ -859,62 +875,114 @@ function App() {
     }
   }
 
-  async function submitAnalysisLookup(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault()
-    await loadAnalysisById(analysisLookupId)
-  }
-
   if (csrfToken) {
     return (
       <AppShell
         contentPadding={4}
         height="auto"
-        topNav={<TopNav heading={<strong>ABT control plane</strong>} label="Control-plane navigation" />}
+        topNav={
+          <TopNav
+            endContent={
+              <div className="console-notifications">
+                <button
+                  aria-controls="pending-enrollment-notifications"
+                  aria-expanded={isNotificationListOpen}
+                  aria-label={`Pending enrollment notifications: ${notificationEnrollments.length}`}
+                  className="console-notification-button"
+                  onClick={() => setIsNotificationListOpen((isOpen) => !isOpen)}
+                  type="button"
+                >
+                  <svg aria-hidden="true" fill="none" viewBox="0 0 24 24"><path d="M18 9a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9M10 21h4" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.75" /></svg>
+                  {notificationEnrollments.length > 0 && <span className="console-notification-badge">{notificationEnrollments.length}</span>}
+                </button>
+                <span className="console-notification-connection" role="status">
+                  {notificationConnection === 'live' ? 'Updates live' : 'Updates reconnecting — showing latest loaded registrations.'}
+                </span>
+                {isNotificationListOpen && (
+                  <section aria-label="Pending enrollment notifications" className="console-notification-popover" id="pending-enrollment-notifications">
+                    <header><strong>Pending enrollments</strong><span>{notificationEnrollments.length}</span></header>
+                    {notificationEnrollments.length === 0 ? <p>No pending registrations.</p> : (
+                      <ul>
+                        {notificationEnrollments.map((enrollment) => (
+                          <li key={enrollment.enrollment_id}>
+                            <button onClick={() => setSelectedNotificationEnrollment(enrollment)} type="button">
+                              <strong>{enrollment.login} on {enrollment.server}</strong>
+                              <span>Review registration</span>
+                            </button>
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </section>
+                )}
+              </div>
+            }
+            heading={<strong>ABT control plane</strong>}
+            label="Control-plane navigation"
+          />
+        }
         variant="section"
       >
         <div className="console-app-frame">
           <aside className="console-sidebar">
             <strong>ABT console</strong>
             <nav aria-label="Console sections" className="console-nav">
-              <a aria-current={consolePage === 'main' ? 'page' : undefined} href="#main">Main</a>
-              <a aria-current={consolePage === 'launch' ? 'page' : undefined} href="#launch">Launch analysis</a>
-              <a aria-current={consolePage === 'history' ? 'page' : undefined} href="#history">Analysis history</a>
-              <a aria-current={consolePage === 'active-pairs' ? 'page' : undefined} href="#active-pairs">Current pairs</a>
-              <a aria-current={consolePage === 'retired-pairs' ? 'page' : undefined} href="#retired-pairs">Retired pairs</a>
-              <a href="#snapshots">Workers</a>
-              <a aria-current={consolePage === 'audit' ? 'page' : undefined} href="#audit">Audit events</a>
+              <Link aria-current={consolePage === 'main' ? 'page' : undefined} to="/">Main</Link>
+              <Link aria-current={isAnalysisRoute ? 'page' : undefined} to="/analysis">Analysis</Link>
+              <Link aria-current={consolePage === 'history' ? 'page' : undefined} to="/analysis/history">Analysis history</Link>
+              <Link aria-current={consolePage === 'active-pairs' ? 'page' : undefined} to="/pairs/active">Current pairs</Link>
+              <Link aria-current={consolePage === 'retired-pairs' ? 'page' : undefined} to="/pairs/retired">Retired pairs</Link>
+              <Link aria-current={consolePage === 'snapshots' ? 'page' : undefined} to="/workers">Workers</Link>
+              <Link aria-current={consolePage === 'audit' ? 'page' : undefined} to="/audit">Audit events</Link>
             </nav>
           </aside>
           <main className="console-main management-content">
-          <header>
-            <h1>Management console</h1>
-            <p>Launch and inspect cross-server product-pair analyses alongside worker health and audit events.</p>
-            <div className="refresh-status">
-              <div>
-                <p aria-live="polite">
-                  {lastUpdatedAt ? `Last updated ${formatDateTime(lastUpdatedAt)}` : 'Loading management data…'}
-                </p>
-                <p className={`live-refresh-state ${refreshError ? 'live-refresh-interrupted' : isDashboardDataStale(lastUpdatedAt) ? 'live-refresh-stale' : 'live-refresh-active'}`} role="status">
-                  {describeLiveRefreshState(lastUpdatedAt, isRefreshing, refreshError)}
-                </p>
-              </div>
-              <button disabled={isRefreshing} onClick={() => void refreshManagementData().catch(() => undefined)} type="button">
-                {isRefreshing ? 'Refreshing…' : 'Refresh'}
-              </button>
-            </div>
+          <header className={isAnalysisRoute ? 'analysis-page-header' : undefined}>
+            {consolePage === 'main' && <h1>Management console</h1>}
+            {consolePage === 'main' && <p>Launch and inspect cross-server product-pair analyses alongside worker health and audit events.</p>}
+            {isAnalysisRoute && analysisRouteId && <Link className="new-analysis-button" to="/analysis">+ New</Link>}
           </header>
           {error && <p className="error" role="alert">{error}</p>}
           {refreshError && <p className="error" role="alert">{refreshError}</p>}
+          {selectedNotificationEnrollment && (
+            <div className="snapshot-json-dialog-backdrop" onMouseDown={() => setSelectedNotificationEnrollment(null)}>
+              <section
+                aria-labelledby="enrollment-notification-dialog-title"
+                aria-modal="true"
+                className="snapshot-json-dialog enrollment-notification-dialog"
+                onMouseDown={(event) => event.stopPropagation()}
+                role="dialog"
+              >
+                <header className="snapshot-json-dialog-header">
+                  <h2 id="enrollment-notification-dialog-title">
+                    Registration for {selectedNotificationEnrollment.login} on {selectedNotificationEnrollment.server}
+                  </h2>
+                  <button aria-label="Close enrollment notification" className="console-icon-button" onClick={() => setSelectedNotificationEnrollment(null)} type="button">×</button>
+                </header>
+                <section aria-label="Account parameters">
+                  <h3>Account parameters</h3>
+                  <pre className="console-raw-detail">{JSON.stringify(selectedNotificationEnrollment.account_info, null, 2)}</pre>
+                </section>
+                <section aria-label="Terminal parameters">
+                  <h3>Terminal parameters</h3>
+                  <pre className="console-raw-detail">{JSON.stringify(selectedNotificationEnrollment.terminal_info, null, 2)}</pre>
+                </section>
+                <div className="enrollment-actions">
+                  <button disabled={processingEnrollmentId === selectedNotificationEnrollment.enrollment_id} onClick={() => void reviewEnrollment(selectedNotificationEnrollment.enrollment_id, 'approve')} type="button">Approve</button>
+                  <button className="reject-button" disabled={processingEnrollmentId === selectedNotificationEnrollment.enrollment_id} onClick={() => void reviewEnrollment(selectedNotificationEnrollment.enrollment_id, 'reject')} type="button">Reject</button>
+                </div>
+              </section>
+            </div>
+          )}
           {consolePage === 'audit' ? <AuditEventsPage /> : consolePage === 'snapshots' ? <WorkerSnapshotsPage /> : consolePage === 'history' ? (
             <AnalysisHistoryPage onOpenAnalysis={(analysisId) => {
-              window.location.hash = '#launch'
-              void loadAnalysisById(analysisId)
+              navigate(`/analysis/${encodeURIComponent(analysisId)}`)
             }} />
           ) : consolePage === 'active-pairs' || consolePage === 'retired-pairs' ? (
             <ProductPairsListPage
               status={consolePage === 'active-pairs' ? 'active' : 'retired'}
               onOpenPair={() => {
-                window.location.hash = '#product-pairs-heading'
+                navigate('/pairs/active')
               }}
             />
           ) : <>
@@ -970,53 +1038,26 @@ function App() {
           </section>
           </>}
 
-          <section aria-labelledby="analysis-heading" className="analysis-section">
-            <div className="section-header">
+          {isAnalysisRoute && <section aria-label={analysisRouteId ? 'Analysis result' : 'Launch'} className="analysis-section">
+            {!analysisRouteId && <div className="section-header">
               <div>
-                <h2 id="analysis-heading">Cross-server product-pair analyses</h2>
-                <p>Select two eligible workers, capture the policy snapshot, and inspect lifecycle evidence.</p>
+                <h2 id="analysis-heading">Launch</h2>
               </div>
               {(isLaunchingAnalysis || isLoadingAnalysis) && (
                 <span className="status-badge status-queued" role="status">
                   {isLaunchingAnalysis ? 'Queued request' : 'Loading analysis'}
                 </span>
               )}
-            </div>
+            </div>}
             {analysisError && <p className="error" role="alert">{analysisError}</p>}
-            <div className="analysis-layout">
-              <article className="panel">
-                <h3>Eligible workers</h3>
-                {eligibleWorkers.length === 0 ? (
-                  <p>No healthy, connected workers are currently eligible for analysis.</p>
-                ) : (
-                  <ul className="worker-status-list" aria-label="Eligible analysis workers">
-                    {eligibleWorkers.map((worker) => (
-                      <li key={worker.worker_id}>
-                        <strong>{worker.login} on {worker.server}</strong>
-                        <span>{worker.connectivity} / {worker.safety_state}</span>
-                      </li>
-                    ))}
-                  </ul>
-                )}
-                {ineligibleWorkers.length > 0 && (
-                  <Collapsible defaultIsOpen={false} trigger="Show blocked workers">
-                    <ul className="worker-status-list" aria-label="Blocked analysis workers">
-                      {ineligibleWorkers.map(({ worker, reason }) => (
-                        <li key={worker.worker_id}>
-                          <strong>{worker.login} on {worker.server}</strong>
-                          <span>{reason}</span>
-                        </li>
-                      ))}
-                    </ul>
-                  </Collapsible>
-                )}
-              </article>
-
-              <article className="panel">
-                <h3>Launch analysis</h3>
-                <form className="analysis-form" onSubmit={submitAnalysis}>
+            {!analysisRouteId && <div className="analysis-layout">
+              <article className="panel launch-panel">
+                <h3>Launch</h3>
+                <form className="analysis-form launch-form" onSubmit={submitAnalysis}>
                   <label>
-                    First worker
+                    <Tooltip content="The first healthy worker whose symbol catalog and market data will be compared.">
+                      <span>Source A</span>
+                    </Tooltip>
                     <select
                       aria-label="First analysis worker"
                       onChange={(event) => setFirstWorkerId(event.target.value)}
@@ -1031,7 +1072,9 @@ function App() {
                     </select>
                   </label>
                   <label>
-                    Second worker
+                    <Tooltip content="A healthy worker on a different MT5 server. It is compared against Source A.">
+                      <span>Source B</span>
+                    </Tooltip>
                     <select
                       aria-label="Second analysis worker"
                       onChange={(event) => setSecondWorkerId(event.target.value)}
@@ -1047,16 +1090,13 @@ function App() {
                   </label>
                   {pairValidationError ? (
                     <p className="hint error" id="analysis-pair-hint">{pairValidationError}</p>
-                  ) : (
-                    <p className="hint" id="analysis-pair-hint">
-                      Only approved, healthy, connected workers on different exact MT5 servers can be submitted.
-                    </p>
-                  )}
+                  ) : null}
 
-                  <fieldset className="policy-fieldset">
-                    <legend>Policy</legend>
+                  <section className="policy-summary" aria-label="Analysis policy">
                     <label>
-                      Policy label
+                      <Tooltip content="The name stored with this analysis and its immutable policy snapshot.">
+                        <span>Policy</span>
+                      </Tooltip>
                       <input
                         aria-label="Policy label"
                         maxLength={128}
@@ -1065,88 +1105,56 @@ function App() {
                         value={policy.label}
                       />
                     </label>
-                    <div className="policy-grid">
-                      {BOOLEAN_POLICY_FIELDS.map((field) => (
-                        <label key={field.key} className="checkbox-field">
-                          <input
-                            checked={Boolean(policy[field.key])}
-                            onChange={(event) => {
-                              setPolicy((current) => ({ ...current, [field.key]: event.target.checked }))
-                            }}
-                            type="checkbox"
-                          />
-                          <span>
-                            <strong>{field.label}</strong>
-                            <small>{field.description}</small>
-                          </span>
-                        </label>
-                      ))}
-                    </div>
-                    <div className="policy-grid">
-                      {NUMBER_POLICY_FIELDS.map((field) => (
-                        <label key={field.key}>
-                          {field.label}
-                          <input
-                            aria-label={field.label}
-                            max={field.max}
-                            min={field.min}
-                            onChange={(event) => {
-                              const nextValue = Number(event.target.value)
-                              setPolicy((current) => ({ ...current, [field.key]: Number.isFinite(nextValue) ? nextValue : 0 }))
-                            }}
-                            required
-                            step={field.step}
-                            type="number"
-                            value={String(policy[field.key])}
-                          />
-                          <small>{field.description}</small>
-                        </label>
-                      ))}
-                    </div>
-                  </fieldset>
+                    <Collapsible defaultIsOpen={false} trigger="Advanced policy">
+                      <fieldset className="policy-fieldset">
+                        <legend>Advanced policy</legend>
+                        <div className="policy-grid">
+                          {NUMBER_POLICY_FIELDS.map((field) => (
+                            <label key={field.key}>
+                              <Tooltip content={field.description}><span>{shortPolicyFieldLabel(field.key)}</span></Tooltip>
+                              <input
+                                aria-label={field.label}
+                                max={field.max}
+                                min={field.min}
+                                onChange={(event) => {
+                                  const nextValue = Number(event.target.value)
+                                  setPolicy((current) => ({ ...current, [field.key]: Number.isFinite(nextValue) ? nextValue : 0 }))
+                                }}
+                                required
+                                step={field.step}
+                                type="number"
+                                value={String(policy[field.key])}
+                              />
+                            </label>
+                          ))}
+                        </div>
+                      </fieldset>
+                    </Collapsible>
+                  </section>
 
                   <button
                     aria-describedby="analysis-pair-hint"
                     disabled={isLaunchingAnalysis || pairValidationError !== null}
                     type="submit"
                   >
-                    {isLaunchingAnalysis ? 'Launching analysis…' : 'Launch analysis'}
+                    {isLaunchingAnalysis && <span aria-hidden="true" className="button-spinner" />}
+                    {isLaunchingAnalysis ? 'Launching…' : 'Launch'}
                   </button>
                 </form>
-              </article>
-
-              <article className="panel">
-                <h3>View analysis</h3>
-                <form className="analysis-form compact-form" onSubmit={submitAnalysisLookup}>
-                  <label>
-                    Analysis ID
-                    <input
-                      aria-label="Analysis ID"
-                      onChange={(event) => setAnalysisLookupId(event.target.value)}
-                      placeholder="Paste an analysis ID"
-                      value={analysisLookupId}
-                    />
-                  </label>
-                  <button disabled={isLoadingAnalysis} type="submit">
-                    {isLoadingAnalysis ? 'Loading analysis…' : 'Load analysis'}
-                  </button>
-                </form>
-                <p className="hint">
-                  Use this when another operator has already launched an analysis and you want to inspect its live state.
-                </p>
               </article>
             </div>
+            }
 
-            {analysis && (
+            {analysisRouteId && analysis && (
               <AnalysisDetails
                 analysis={analysis}
                 csrfToken={csrfToken}
-                events={analysisEvents}
                 onProductPairsChanged={refreshManagementData}
                 productPairs={productPairs}
               />
             )}
           </section>
+          }
 
           {consolePage !== 'launch' && <>
           <ProductPairsSection
@@ -1165,7 +1173,7 @@ function App() {
                   <li key={alert.alert_id}>
                     <strong>{alert.priority}: {alert.alert_type}</strong>
                     <span>{alert.reason}</span>
-                    <time dateTime={alert.occurred_at}>{alert.occurred_at}</time>
+                    <time dateTime={alert.occurred_at}>{formatDateTime(alert.occurred_at)}</time>
                   </li>
                 ))}
               </ul>
@@ -1187,8 +1195,8 @@ function App() {
                         <div><dt>Login</dt><dd>{enrollment.login}</dd></div>
                         <div><dt>Server</dt><dd>{enrollment.server}</dd></div>
                         <div><dt>Pairing code</dt><dd>{enrollment.pairing_code}</dd></div>
-                        <div><dt>Created</dt><dd><time dateTime={enrollment.created_at}>{enrollment.created_at}</time></dd></div>
-                        <div><dt>Expires</dt><dd><time dateTime={enrollment.expires_at}>{enrollment.expires_at}</time></dd></div>
+                        <div><dt>Created</dt><dd><time dateTime={enrollment.created_at}>{formatDateTime(enrollment.created_at)}</time></dd></div>
+                        <div><dt>Expires</dt><dd><time dateTime={enrollment.expires_at}>{formatDateTime(enrollment.expires_at)}</time></dd></div>
                       </dl>
                       <Collapsible defaultIsOpen={false} trigger="View registration evidence">
                         <div className="enrollment-evidence">
@@ -1235,7 +1243,7 @@ function App() {
               </div>
               <span className="fleet-count">{workers.length} {workers.length === 1 ? 'worker' : 'workers'}</span>
             </div>
-            <WorkerSummaryTable workers={workers} onOpenSnapshots={() => { window.location.hash = '#snapshots' }} />
+            <WorkerSummaryTable workers={workers} onOpenSnapshots={() => navigate('/workers')} />
             <Collapsible defaultIsOpen={false} trigger="Show worker actions and reconciliation">
             {workers.length === 0 ? (
               <p className="empty-state">No approved account workers have reported yet. Approved workers will appear here after their first connection.</p>
@@ -1316,7 +1324,7 @@ function App() {
               {events.map((event) => (
                 <li key={event.event_id}>
                   <strong>{event.event_type}</strong>
-                  <time dateTime={event.occurred_at}>{event.occurred_at}</time>
+                  <time dateTime={event.occurred_at}>{formatDateTime(event.occurred_at)}</time>
                 </li>
               ))}
             </ul>
@@ -1370,13 +1378,11 @@ function App() {
 function AnalysisDetails({
   analysis,
   csrfToken,
-  events,
   onProductPairsChanged,
   productPairs,
 }: {
   analysis: ProductCatalogAnalysis
   csrfToken: string
-  events: AuditEvent[]
   onProductPairsChanged: () => Promise<void>
   productPairs: ProductPair[]
 }) {
@@ -1384,136 +1390,75 @@ function AnalysisDetails({
   const failingCandidates = analysis.m1_verification_results.filter((result) => result.verification_status !== 'passed')
   const failedScreening = analysis.m15_screening_results.filter((result) => result.screening_status !== 'passed')
   const passedScreening = analysis.m15_screening_results.filter((result) => result.screening_status === 'passed')
-  const availableCandidates = passingCandidates.filter(
-    (result) => findMatchingActiveProductPair(productPairs, candidateEndpoints(result, analysis)) === null,
-  )
-  const builtCandidates = passingCandidates.length - availableCandidates.length
   const runtimeStatus = analysis.status === 'running' ? 'running' : analysis.status
-
+  const [activeView, setActiveView] = useState('overview')
   return (
     <section aria-labelledby="analysis-results-heading" className="analysis-results">
-      <div className="section-header">
+      <header className="analysis-workspace-header">
         <div>
           <h3 id="analysis-results-heading">Analysis {analysis.analysis_id}</h3>
           <p>
             {analysis.first_worker.login} on {analysis.first_worker.server} ↔ {analysis.second_worker.login} on {analysis.second_worker.server}
           </p>
         </div>
-        <span className={`status-badge status-${runtimeStatus}`}>
-          {humanizeLifecycleStatus(runtimeStatus)}
-        </span>
+        <div className="analysis-status">
+          <StatusDot
+            isPulsing={runtimeStatus === 'running'}
+            label={humanizeLifecycleStatus(runtimeStatus)}
+            variant={analysisStatusDotVariant(runtimeStatus)}
+          />
+          <Badge label={humanizeLifecycleStatus(runtimeStatus)} variant={analysisStatusBadgeVariant(runtimeStatus)} />
+        </div>
+      </header>
+
+      <div className="analysis-stage-strip" aria-label="Analysis decision summary">
+        <div><span>Catalog</span><strong>{analysis.eligible_candidates.length} matched</strong></div>
+        <div><span>M15 screen</span><strong>{passedScreening.length} passed</strong></div>
+        <div><span>Final verification</span><strong>{passingCandidates.length} passed</strong></div>
+      </div>
+      <div className="analysis-tabs">
+        <TabList aria-label="Analysis workspace" hasDivider value={activeView} onChange={setActiveView}>
+          <Tab label="Overview" value="overview" />
+          <Tab endContent={<Badge label={passingCandidates.length + failingCandidates.length} variant="neutral" />} label="Candidates" value="candidates" />
+          <Tab endContent={<Badge label={analysis.m15_screening_results.length} variant="neutral" />} label="M15 screen" value="screening" />
+        </TabList>
       </div>
 
-      <div className="summary-grid">
-        <article className="panel">
-          <h4>Lifecycle</h4>
-          <dl className="compact-list">
-            <div><dt>Status</dt><dd>{humanizeLifecycleStatus(runtimeStatus)}</dd></div>
-            <div><dt>Current stage</dt><dd>{humanizeStage(analysis.current_stage)}</dd></div>
-            <div><dt>Retry count</dt><dd>{analysis.retry_count}</dd></div>
+      {activeView === 'overview' && (
+        <section className="analysis-overview" aria-label="Analysis overview">
+          <dl className="analysis-facts">
+            <div><dt>Stage</dt><dd>{humanizeStage(analysis.current_stage)}</dd></div>
             <div><dt>Requested</dt><dd><time dateTime={analysis.requested_at}>{formatDateTime(analysis.requested_at)}</time></dd></div>
-            <div><dt>Completed</dt><dd>{analysis.completed_at ? <time dateTime={analysis.completed_at}>{formatDateTime(analysis.completed_at)}</time> : '—'}</dd></div>
-            <div><dt>Failure reason</dt><dd>{analysis.failure_reason ?? '—'}</dd></div>
+            <div><dt>Policy</dt><dd>{analysis.policy.label}</dd></div>
+            {NUMBER_POLICY_FIELDS.map((field) => (
+              <div key={field.key}><dt>{shortPolicyFieldLabel(field.key)}</dt><dd>{String(analysis.policy[field.key])}</dd></div>
+            ))}
           </dl>
           {analysis.failure_reason && <p className="error" role="alert">Analysis failed: {analysis.failure_reason}</p>}
-        </article>
+        </section>
+      )}
 
-        <article className="panel">
-          <h4>UTC period</h4>
-          <dl className="compact-list">
-            <div><dt>Timeframe</dt><dd>{analysis.analysis_period.timeframe}</dd></div>
-            <div><dt>Started</dt><dd><time dateTime={analysis.analysis_period.started_at_utc}>{formatDateTime(analysis.analysis_period.started_at_utc)}</time></dd></div>
-            <div><dt>Ended</dt><dd><time dateTime={analysis.analysis_period.ended_at_utc}>{formatDateTime(analysis.analysis_period.ended_at_utc)}</time></dd></div>
-          </dl>
-        </article>
-
-        <article className="panel">
-          <h4>Policy snapshot</h4>
-          <dl className="compact-list">
-            <div><dt>Label</dt><dd>{analysis.policy.label}</dd></div>
-            {BOOLEAN_POLICY_FIELDS.map((field) => (
-              <div key={field.key}>
-                <dt>{field.label}</dt>
-                <dd>{analysis.policy[field.key] ? 'Yes' : 'No'}</dd>
-              </div>
-            ))}
-            {NUMBER_POLICY_FIELDS.map((field) => (
-              <div key={field.key}>
-                <dt>{field.label}</dt>
-                <dd>{String(analysis.policy[field.key])}</dd>
-              </div>
-            ))}
-          </dl>
-        </article>
-
-        <article className="panel">
-          <h4>Candidate totals</h4>
-          <dl className="compact-list">
-            <div><dt>Eligible catalog candidates</dt><dd>{analysis.eligible_candidates.length}</dd></div>
-            <div><dt>Calculation-mode exceptions</dt><dd>{analysis.exceptions.length}</dd></div>
-            <div><dt>M15 passed</dt><dd>{analysis.m15_screening_results.filter((result) => result.screening_status === 'passed').length}</dd></div>
-            <div><dt>Final passing candidates</dt><dd>{passingCandidates.length}</dd></div>
-            <div><dt>Available to build</dt><dd>{availableCandidates.length}</dd></div>
-            <div><dt>Already built</dt><dd>{builtCandidates}</dd></div>
-            <div><dt>Final failing candidates</dt><dd>{failingCandidates.length}</dd></div>
-          </dl>
-        </article>
-      </div>
-
-      <section aria-labelledby="analysis-timeline-heading">
-        <h4 id="analysis-timeline-heading">Lifecycle and retry events</h4>
-        {events.length === 0 ? (
-          <p>No analysis-specific audit events have been recorded yet.</p>
-        ) : (
-          <ol className="timeline" aria-label="Analysis lifecycle events">
-            {events.map((event) => (
-              <li key={event.event_id}>
-                <div>
-                  <strong>{EVENT_LABELS[event.event_type] ?? humanizeToken(event.event_type)}</strong>
-                  <p>{describeAnalysisEvent(event)}</p>
-                </div>
-                <time dateTime={event.occurred_at}>{formatDateTime(event.occurred_at)}</time>
-              </li>
-            ))}
-          </ol>
-        )}
-      </section>
-
-      <section aria-labelledby="catalog-evidence-heading">
-        <h4 id="catalog-evidence-heading">Catalog evidence</h4>
-        <div className="summary-grid">
-          <CatalogEvidenceCard evidence={analysis.first_catalog_evidence} worker={analysis.first_worker} />
-          <CatalogEvidenceCard evidence={analysis.second_catalog_evidence} worker={analysis.second_worker} />
-        </div>
-      </section>
-
-      <section aria-labelledby="m15-results-heading">
+      {activeView === 'screening' && <section aria-labelledby="m15-results-heading">
         <h4 id="m15-results-heading">M15 screening results</h4>
         {analysis.m15_screening_results.length === 0 ? (
           <p>No M15 screening results were recorded.</p>
         ) : (
           <>
-            <div className="result-grid">
+            <div className="analysis-candidate-list">
               {passedScreening.map((result) => (
-              <AnalysisResultCard
-                key={`${result.first_symbol}:${result.second_symbol}:m15`}
-                firstWorker={analysis.first_worker}
-                result={result}
-                secondWorker={analysis.second_worker}
-              />
+                <CandidateDisclosure key={`${result.first_symbol}:${result.second_symbol}:m15`} result={result}>
+                  <AnalysisResultCard result={result} />
+                </CandidateDisclosure>
               ))}
             </div>
             {failedScreening.length > 0 && (
               <details>
               <summary>Show {failedScreening.length} failed M15 candidate(s)</summary>
-              <div className="result-grid">
+              <div className="analysis-candidate-list">
                 {failedScreening.map((result) => (
-                  <AnalysisResultCard
-                    key={`${result.first_symbol}:${result.second_symbol}:m15`}
-                    firstWorker={analysis.first_worker}
-                    result={result}
-                    secondWorker={analysis.second_worker}
-                  />
+                  <CandidateDisclosure key={`${result.first_symbol}:${result.second_symbol}:m15`} result={result}>
+                    <AnalysisResultCard result={result} />
+                  </CandidateDisclosure>
                 ))}
               </div>
               </details>
@@ -1523,30 +1468,26 @@ function AnalysisDetails({
         {failedScreening.length > 0 && (
           <p className="hint">{failedScreening.length} candidate(s) stopped at M15 and never reached final verification.</p>
         )}
-      </section>
+      </section>}
 
+      {activeView === 'candidates' && <>
       <section aria-labelledby="final-passing-heading">
         <h4 id="final-passing-heading">Final passing candidates</h4>
-        {availableCandidates.length === 0 ? (
+        {passingCandidates.length === 0 ? (
           <p>No final passing candidates are available to build.</p>
         ) : (
-          <div className="result-grid">
-            {availableCandidates.map((result) => (
+          <div className="analysis-candidate-list">
+            {passingCandidates.map((result) => (
               <BuildableVerificationCard
-              analysis={analysis}
-              csrfToken={csrfToken}
-              key={`${result.first_symbol}:${result.second_symbol}:passed`}
-              firstWorker={analysis.first_worker}
-              onProductPairsChanged={onProductPairsChanged}
-              productPairs={productPairs}
-              result={result}
-              secondWorker={analysis.second_worker}
+                analysis={analysis}
+                csrfToken={csrfToken}
+                key={`${result.first_symbol}:${result.second_symbol}:passed`}
+                onProductPairsChanged={onProductPairsChanged}
+                productPairs={productPairs}
+                result={result}
               />
             ))}
           </div>
-        )}
-        {builtCandidates > 0 && (
-          <p className="hint">{builtCandidates} final passing candidate(s) already have an active product pair; view them below in Active product pairs.</p>
         )}
       </section>
 
@@ -1557,73 +1498,70 @@ function AnalysisDetails({
         ) : (
           <details>
             <summary>Show {failingCandidates.length} failed final candidate(s)</summary>
-            <div className="result-grid">
+            <div className="analysis-candidate-list">
               {failingCandidates.map((result) => (
-              <AnalysisResultCard
-                key={`${result.first_symbol}:${result.second_symbol}:failed`}
-                firstWorker={analysis.first_worker}
-                result={result}
-                secondWorker={analysis.second_worker}
-              />
+                <CandidateDisclosure key={`${result.first_symbol}:${result.second_symbol}:failed`} result={result}>
+                  <AnalysisResultCard result={result} />
+                </CandidateDisclosure>
               ))}
             </div>
           </details>
         )}
       </section>
+      </>}
 
-      <section aria-labelledby="analysis-exceptions-heading">
-        <h4 id="analysis-exceptions-heading">Calculation-mode exceptions</h4>
-        {analysis.exceptions.length === 0 ? (
-          <p>No catalog exceptions were recorded.</p>
-        ) : (
-          <ul className="exception-list" aria-label="Analysis exceptions">
-            {analysis.exceptions.map((exception) => (
-              <li key={`${exception.first_symbol}:${exception.second_symbol}`}>
-                <strong>{exception.first_symbol} ↔ {exception.second_symbol}</strong>
-                <span>{humanizeToken(exception.reason)}</span>
-                <span>{exception.first_trade_calc_mode} / {exception.second_trade_calc_mode}</span>
-              </li>
-            ))}
-          </ul>
-        )}
-      </section>
     </section>
+  )
+}
+
+function CandidateDisclosure({
+  children,
+  result,
+}: {
+  children: React.ReactNode
+  result: ScreeningResult | VerificationResult
+}) {
+  const status = 'verification_status' in result ? result.verification_status : result.screening_status
+  return (
+    <Collapsible
+      defaultIsOpen={false}
+      trigger={
+        <span className="analysis-candidate-summary">
+          <strong>{result.first_symbol} ↔ {result.second_symbol}</strong>
+          <span>{formatRatio(result.statistics.coverage_ratio)} coverage</span>
+          <span>{formatDecimal(result.statistics.return_correlation)} correlation</span>
+          <Badge label={humanizeLifecycleStatus(status)} variant={analysisStatusBadgeVariant(status)} />
+        </span>
+      }
+    >
+      {children}
+    </Collapsible>
   )
 }
 
 function BuildableVerificationCard({
   analysis,
   csrfToken,
-  firstWorker,
   onProductPairsChanged,
   productPairs,
   result,
-  secondWorker,
 }: {
   analysis: ProductCatalogAnalysis
   csrfToken: string
-  firstWorker: WorkerReference
   onProductPairsChanged: () => Promise<void>
   productPairs: ProductPair[]
   result: VerificationResult
-  secondWorker: WorkerReference
 }) {
-  const [confirmation, setConfirmation] = useState<ProductPairBuildConfirmation | null>(null)
+  const [pendingReplacement, setPendingReplacement] = useState<{
+    confirmation: ProductPairBuildConfirmation
+    pair: ProductPair
+  } | null>(null)
   const [isPreparing, setIsPreparing] = useState(false)
   const [isApplying, setIsApplying] = useState(false)
-  const [confirmationAccepted, setConfirmationAccepted] = useState(false)
-  const [feedback, setFeedback] = useState<{ error: string | null; success: string | null }>({
-    error: null,
-    success: null,
-  })
-  const conflictPair = useMemo(
-    () => confirmation === null ? null : findMatchingActiveProductPair(productPairs, confirmation.endpoints),
-    [confirmation, productPairs],
-  )
+  const toast = useToast()
   const candidateId = `${result.first_symbol}:${result.second_symbol}`
 
-  async function requestBuildConfirmation() {
-    setFeedback({ error: null, success: null })
+  async function createProductPair() {
     setIsPreparing(true)
     try {
       const response = await fetch(
@@ -1645,32 +1583,36 @@ function BuildableVerificationCard({
         throw new Error(await readResponseDetail(response, 'The Build confirmation could not be prepared.'))
       }
       const payload = (await response.json()) as ProductPairBuildConfirmation
-      setConfirmation(payload)
-      setConfirmationAccepted(false)
+      const conflictPair = findMatchingActiveProductPair(productPairs, payload.endpoints)
+      if (conflictPair) {
+        setPendingReplacement({ confirmation: payload, pair: conflictPair })
+        return
+      }
+      await applyBuildAction(payload, 'build')
     } catch (buildError) {
-      setFeedback({
-        error: buildError instanceof Error ? buildError.message : 'The Build confirmation could not be prepared.',
-        success: null,
+      toast({
+        body: buildError instanceof Error ? buildError.message : 'The Build confirmation could not be prepared.',
+        type: 'error',
+        uniqueID: `product-pair-${candidateId}`,
       })
     } finally {
       setIsPreparing(false)
     }
   }
 
-  async function applyBuildAction(mode: 'build' | 'replace') {
-    if (confirmation === null || !confirmationAccepted) {
-      return
-    }
-    const targetPair = mode === 'replace' ? conflictPair : null
+  async function applyBuildAction(
+    confirmation: ProductPairBuildConfirmation,
+    mode: 'build' | 'replace',
+    targetPair: ProductPair | null = null,
+  ) {
     if (mode === 'replace' && targetPair === null) {
-      setFeedback({
-        error: 'Reload product pairs before replacing the conflicting active pair.',
-        success: null,
+      toast({
+        body: 'The active product pair to replace is no longer available. Refresh and try again.',
+        type: 'error',
+        uniqueID: `product-pair-${candidateId}`,
       })
       return
     }
-
-    setFeedback({ error: null, success: null })
     setIsApplying(true)
     try {
       const response = await fetch(
@@ -1695,20 +1637,22 @@ function BuildableVerificationCard({
       }
       const payload = (await response.json()) as ProductPair
       await onProductPairsChanged()
-      setFeedback({
-        error: null,
-        success: mode === 'build'
-          ? `Built active product pair ${payload.product_pair_id}.`
+      toast({
+        body: mode === 'build'
+          ? `Created active product pair ${payload.product_pair_id}.`
           : `Replaced the active pair with ${payload.product_pair_id}.`,
+        uniqueID: `product-pair-${candidateId}`,
       })
+      setPendingReplacement(null)
     } catch (buildError) {
-      setFeedback({
-        error: buildError instanceof Error
+      toast({
+        body: buildError instanceof Error
           ? buildError.message
           : mode === 'build'
             ? 'The product pair could not be built.'
             : 'The active product pair could not be replaced.',
-        success: null,
+        type: 'error',
+        uniqueID: `product-pair-${candidateId}`,
       })
     } finally {
       setIsApplying(false)
@@ -1716,127 +1660,48 @@ function BuildableVerificationCard({
   }
 
   return (
-    <div className="buildable-result-card">
-      <AnalysisResultCard
-        firstWorker={firstWorker}
-        result={result}
-        secondWorker={secondWorker}
-      />
-      <article className="panel build-panel" aria-labelledby={`build-panel-${candidateId}`}>
-        <div className="section-header">
-          <div>
-            <h6 id={`build-panel-${candidateId}`}>Build candidate confirmation</h6>
-            <p>Build only records a control-plane product pair. It never places, modifies, or closes broker orders.</p>
-          </div>
-          <button disabled={isPreparing || isApplying} onClick={() => void requestBuildConfirmation()} type="button">
-            {isPreparing ? 'Preparing confirmation…' : 'Prepare Build confirmation'}
-          </button>
+    <div className="buildable-candidate">
+      <CandidateDisclosure result={result}>
+        <div className="buildable-result-card">
+          <AnalysisResultCard result={result} />
         </div>
-
-        {feedback.error && <p className="error" role="alert">{feedback.error}</p>}
-        {feedback.success && <p className="success" role="status">{feedback.success}</p>}
-
-        {confirmation ? (
-          <>
-            <div className="summary-grid">
-              <article className="panel">
-                <h6>Approval summary</h6>
-                <dl className="compact-list">
-                  <div><dt>Lot relationship</dt><dd>{confirmation.lot_relationship.ratio}</dd></div>
-                  <div><dt>UTC timeframe</dt><dd>{confirmation.analysis_period.timeframe}</dd></div>
-                  <div><dt>UTC started</dt><dd><time dateTime={confirmation.analysis_period.started_at_utc}>{formatDateTime(confirmation.analysis_period.started_at_utc)}</time></dd></div>
-                  <div><dt>UTC ended</dt><dd><time dateTime={confirmation.analysis_period.ended_at_utc}>{formatDateTime(confirmation.analysis_period.ended_at_utc)}</time></dd></div>
-                  <div><dt>Coverage</dt><dd>{formatRatio(confirmation.approval_evidence.statistics.coverage_ratio)}</dd></div>
-                  <div><dt>M1 return correlation</dt><dd>{formatDecimal(confirmation.approval_evidence.statistics.return_correlation)}</dd></div>
-                </dl>
-              </article>
-
-              <article className="panel">
-                <h6>Source workers</h6>
-                <dl className="compact-list">
-                  <div><dt>First source</dt><dd>{formatWorkerReference(confirmation.source_workers.first_worker)}</dd></div>
-                  <div><dt>Second source</dt><dd>{formatWorkerReference(confirmation.source_workers.second_worker)}</dd></div>
-                  <div><dt>Endpoints</dt><dd>{formatEndpointPair(confirmation.endpoints)}</dd></div>
-                  <div><dt>Policy label</dt><dd>{confirmation.policy_snapshot.label}</dd></div>
-                </dl>
-              </article>
-
-              <article className="panel">
-                <h6>Policy snapshot</h6>
-                <dl className="compact-list">
-                  {BOOLEAN_POLICY_FIELDS.map((field) => (
-                    <div key={field.key}>
-                      <dt>{field.label}</dt>
-                      <dd>{confirmation.policy_snapshot[field.key] ? 'Yes' : 'No'}</dd>
-                    </div>
-                  ))}
-                  {NUMBER_POLICY_FIELDS.map((field) => (
-                    <div key={field.key}>
-                      <dt>{field.label}</dt>
-                      <dd>{String(confirmation.policy_snapshot[field.key])}</dd>
-                    </div>
-                  ))}
-                </dl>
-              </article>
-            </div>
-
-            <div className="summary-grid">
-              {confirmation.reference_specifications.map((reference) => (
-                <ReferenceSpecificationCard key={`${reference.server}:${reference.symbol}`} reference={reference} />
-              ))}
-            </div>
-
-            <details>
-              <summary>View immutable approval evidence</summary>
-              <pre>{JSON.stringify({
-                approval_evidence: confirmation.approval_evidence,
-                policy_snapshot: confirmation.policy_snapshot,
-                reference_specifications: confirmation.reference_specifications,
-              }, null, 2)}</pre>
-            </details>
-
-            {conflictPair && (
-              <div className="conflict-panel" role="status">
-                <strong>Build conflict:</strong> an active product pair already exists for {formatEndpointPair(conflictPair.endpoints)}.
-              </div>
-            )}
-
-            <label className="checkbox-field confirmation-check">
-              <input
-                checked={confirmationAccepted}
-                onChange={(event) => setConfirmationAccepted(event.target.checked)}
-                type="checkbox"
-              />
-              <span>
-                <strong>Explicit Build confirmation</strong>
-                <small>I verified the immutable evidence and want this candidate to become the active cross-server product pair.</small>
-              </span>
-            </label>
-
+      </CandidateDisclosure>
+      <button
+        aria-label={`Create product pair for ${result.first_symbol} and ${result.second_symbol}`}
+        className="candidate-create-action"
+        disabled={isPreparing || isApplying}
+        onClick={() => void createProductPair()}
+        type="button"
+      >
+        {isPreparing || isApplying ? 'Creating…' : 'Create'}
+      </button>
+      {pendingReplacement && (
+        <div className="confirmation-dialog-backdrop" role="presentation">
+          <section
+            aria-describedby={`replace-pair-description-${candidateId}`}
+            aria-labelledby={`replace-pair-title-${candidateId}`}
+            aria-modal="true"
+            className="confirmation-dialog"
+            role="dialog"
+          >
+            <h6 id={`replace-pair-title-${candidateId}`}>Replace active product pair?</h6>
+            <p id={`replace-pair-description-${candidateId}`}>
+              This retires {pendingReplacement.pair.product_pair_id} and creates a new pair for {formatEndpointPair(pendingReplacement.confirmation.endpoints)}.
+            </p>
             <div className="action-row">
+              <button disabled={isApplying} onClick={() => setPendingReplacement(null)} type="button">Cancel</button>
               <button
-                disabled={isApplying || !confirmationAccepted}
-                onClick={() => void applyBuildAction('build')}
+                className="secondary-button"
+                disabled={isApplying}
+                onClick={() => void applyBuildAction(pendingReplacement.confirmation, 'replace', pendingReplacement.pair)}
                 type="button"
               >
-                {isApplying ? 'Saving…' : 'Build product pair'}
+                {isApplying ? 'Replacing…' : 'Retire and create pair'}
               </button>
-              {conflictPair && (
-                <button
-                  className="secondary-button"
-                  disabled={isApplying || !confirmationAccepted}
-                  onClick={() => void applyBuildAction('replace')}
-                  type="button"
-                >
-                  {isApplying ? 'Saving…' : 'Replace active pair'}
-                </button>
-              )}
             </div>
-          </>
-        ) : (
-          <p className="hint">Prepare the Build confirmation to review immutable reference specifications, source workers, and the 1:1 lot relationship before Build is enabled.</p>
-        )}
-      </article>
+          </section>
+        </div>
+      )}
     </div>
   )
 }
@@ -2308,15 +2173,9 @@ function ProductPairCard({
             <h5>Original policy snapshot</h5>
             <dl className="compact-list">
               <div><dt>Policy label</dt><dd>{pair.policy_snapshot.label}</dd></div>
-              {BOOLEAN_POLICY_FIELDS.map((field) => (
-                <div key={field.key}>
-                  <dt>{field.label}</dt>
-                  <dd>{pair.policy_snapshot[field.key] ? 'Yes' : 'No'}</dd>
-                </div>
-              ))}
               {NUMBER_POLICY_FIELDS.map((field) => (
                 <div key={field.key}>
-                  <dt>{field.label}</dt>
+                  <dt>{shortPolicyFieldLabel(field.key)}</dt>
                   <dd>{String(pair.policy_snapshot[field.key])}</dd>
                 </div>
               ))}
@@ -2495,37 +2354,10 @@ function RetestSummary({ retest }: { retest: ProductPairRetest }) {
   )
 }
 
-function CatalogEvidenceCard({ evidence, worker }: { evidence: CatalogEvidence | null; worker: WorkerReference }) {
-  return (
-    <article className="panel">
-      <h5>{worker.login} on {worker.server}</h5>
-      {evidence === null ? (
-        <p>Catalog evidence is not available yet.</p>
-      ) : (
-        <>
-          <dl className="compact-list">
-            <div><dt>Collected</dt><dd>{evidence.collected_at ? <time dateTime={evidence.collected_at}>{formatDateTime(evidence.collected_at)}</time> : '—'}</dd></div>
-            <div><dt>Symbols</dt><dd>{evidence.symbols.length}</dd></div>
-            <div><dt>Sample</dt><dd>{evidence.symbols.slice(0, 3).map((symbol) => String(symbol.symbol ?? 'unknown')).join(', ') || '—'}</dd></div>
-          </dl>
-          <details>
-            <summary>View raw catalog evidence</summary>
-            <pre>{JSON.stringify(evidence, null, 2)}</pre>
-          </details>
-        </>
-      )}
-    </article>
-  )
-}
-
 function AnalysisResultCard({
   result,
-  firstWorker,
-  secondWorker,
 }: {
   result: ScreeningResult | VerificationResult
-  firstWorker: WorkerReference
-  secondWorker: WorkerReference
 }) {
   const verificationStatus = 'verification_status' in result ? result.verification_status : null
   const badgeStatus = verificationStatus ?? result.screening_status
@@ -2534,7 +2366,12 @@ function AnalysisResultCard({
     <article className="result-card">
       <div className="section-header">
         <div>
-          <h5>{result.first_symbol} ↔ {result.second_symbol}</h5>
+          <div className="candidate-title">
+            <h5>{result.first_symbol} ↔ {result.second_symbol}</h5>
+            {'supported_filling_modes' in result && result.supported_filling_modes.map((mode) => (
+              <Badge key={mode} label={mode} variant="neutral" />
+            ))}
+          </div>
           <p>{result.currency_base}/{result.currency_profit} · calibration {result.first_point} / {result.second_point}</p>
         </div>
         <span className={`status-badge status-${badgeStatus === 'passed' ? 'succeeded' : 'failed'}`}>
@@ -2542,60 +2379,22 @@ function AnalysisResultCard({
         </span>
       </div>
 
-      <div className="summary-grid">
-        <article className="panel">
+      <div className="candidate-summary-evidence">
+        <section className="candidate-statistics" aria-label="Candidate statistics">
           <h6>Statistics</h6>
           <dl className="compact-list">
-            <div><dt>Aligned bars</dt><dd>{result.statistics.aligned_bar_count}</dd></div>
-            <div><dt>First bars</dt><dd>{result.statistics.first_bar_count}</dd></div>
-            <div><dt>Second bars</dt><dd>{result.statistics.second_bar_count}</dd></div>
+            <div><dt>Bars</dt><dd>{result.statistics.first_bar_count} / {result.statistics.second_bar_count}</dd></div>
+            <div><dt>Aligned</dt><dd>{result.statistics.aligned_bar_count}</dd></div>
             <div><dt>Coverage</dt><dd>{formatRatio(result.statistics.coverage_ratio)}</dd></div>
-            <div><dt>Return correlation</dt><dd>{formatDecimal(result.statistics.return_correlation)}</dd></div>
-            <div><dt>Median diff (points)</dt><dd>{formatDecimal(result.statistics.median_price_difference_points)}</dd></div>
-            <div><dt>P99 diff (points)</dt><dd>{formatDecimal(result.statistics.p99_price_difference_points)}</dd></div>
-            <div><dt>Target point</dt><dd>{formatDecimal(result.statistics.target_point)}</dd></div>
+            <div><dt>Correlation</dt><dd>{formatDecimal(result.statistics.return_correlation)}</dd></div>
+            <div><dt>Median Δ</dt><dd>{formatDecimal(result.statistics.median_price_difference_points)}</dd></div>
+            <div><dt>P99 Δ</dt><dd>{formatDecimal(result.statistics.p99_price_difference_points)}</dd></div>
           </dl>
-        </article>
-
-        <article className="panel">
-          <h6>Policy evaluation</h6>
-          <dl className="compact-list">
-            {Object.entries(result.policy_evaluation).map(([key, value]) => (
-              <div key={key}>
-                <dt>{POLICY_EVALUATION_LABELS[key] ?? humanizeToken(key)}</dt>
-                <dd>{typeof value === 'boolean' ? (value ? 'Passed' : 'Failed') : formatDecimal(value)}</dd>
-              </div>
-            ))}
-          </dl>
-        </article>
-      </div>
-
-      <div className="summary-grid">
-        <MarketDataCard marketData={result.first_market_data} worker={firstWorker} />
-        <MarketDataCard marketData={result.second_market_data} worker={secondWorker} />
-      </div>
-
-      {'verification_status' in result && (
-        <div className="summary-grid">
-          <DifferenceCard differences={result.hard_block_differences} title="Hard-block differences" />
+        </section>
+        {'verification_status' in result && (
           <DifferenceCard differences={result.warning_differences} title="Warning differences" />
-        </div>
-      )}
-    </article>
-  )
-}
-
-function MarketDataCard({ marketData, worker }: { marketData: MarketDataSummary; worker: WorkerReference }) {
-  return (
-    <article className="panel">
-      <h6>{worker.server} market data</h6>
-      <dl className="compact-list">
-        <div><dt>Symbol</dt><dd>{marketData.symbol}</dd></div>
-        <div><dt>Bars</dt><dd>{marketData.bar_count}</dd></div>
-        <div><dt>First UTC</dt><dd><time dateTime={marketData.first_utc}>{formatDateTime(marketData.first_utc)}</time></dd></div>
-        <div><dt>Last UTC</dt><dd><time dateTime={marketData.last_utc}>{formatDateTime(marketData.last_utc)}</time></dd></div>
-        <div><dt>Content hash</dt><dd className="mono">{marketData.content_hash}</dd></div>
-      </dl>
+        )}
+      </div>
     </article>
   )
 }
@@ -2626,16 +2425,6 @@ function findMatchingActiveProductPair(
 ) {
   const targetKey = endpointPairKey(endpoints)
   return productPairs.find((pair) => pair.status === 'active' && endpointPairKey(pair.endpoints) === targetKey) ?? null
-}
-
-function candidateEndpoints(
-  candidate: VerificationResult,
-  analysis: ProductCatalogAnalysis,
-) {
-  return [
-    { server: analysis.first_worker.server, symbol: candidate.first_symbol },
-    { server: analysis.second_worker.server, symbol: candidate.second_symbol },
-  ]
 }
 
 function getApplicabilityCompatibilityResult(applicability: WorkerApplicability | null) {
@@ -2742,38 +2531,29 @@ function endpointPairKey(endpoints: Array<{ server: string; symbol: string }>) {
     .join('\u0001')
 }
 
-function readAnalysisQuery() {
-  const params = new URLSearchParams(window.location.search)
-  return params.get('analysis') ?? ''
+function readAnalysisRouteId(pathname: string) {
+  if (pathname === '/analysis' || pathname === '/analysis/history') {
+    return null
+  }
+  const match = /^\/analysis\/([^/]+)\/?$/.exec(pathname)
+  return match ? decodeURIComponent(match[1]) : null
 }
 
-function readConsolePage(): ConsolePage {
-  switch (window.location.hash) {
-    case '#audit':
+function readConsolePage(pathname: string): ConsolePage {
+  switch (pathname) {
+    case '/audit':
       return 'audit'
-    case '#launch':
-      return 'launch'
-    case '#snapshots':
+    case '/workers':
       return 'snapshots'
-    case '#history':
+    case '/analysis/history':
       return 'history'
-    case '#active-pairs':
+    case '/pairs/active':
       return 'active-pairs'
-    case '#retired-pairs':
+    case '/pairs/retired':
       return 'retired-pairs'
     default:
       return 'main'
   }
-}
-
-function writeAnalysisQuery(analysisId: string) {
-  const url = new URL(window.location.href)
-  if (analysisId) {
-    url.searchParams.set('analysis', analysisId)
-  } else {
-    url.searchParams.delete('analysis')
-  }
-  window.history.replaceState({}, '', url)
 }
 
 function workerEligibilityReason(worker: AccountWorker) {
@@ -2811,21 +2591,6 @@ async function readResponseDetail(response: Response, fallback: string) {
   }
 }
 
-function describeAnalysisEvent(event: AuditEvent) {
-  const stage = typeof event.payload?.stage === 'string' ? humanizeStage(event.payload.stage) : null
-  const reason = typeof event.payload?.reason === 'string' ? event.payload.reason : null
-  if (stage && reason) {
-    return `${stage}: ${reason}`
-  }
-  if (stage) {
-    return stage
-  }
-  if (reason) {
-    return reason
-  }
-  return 'Analysis event recorded.'
-}
-
 function humanizeLifecycleStatus(status: string) {
   switch (status) {
     case 'queued':
@@ -2839,6 +2604,32 @@ function humanizeLifecycleStatus(status: string) {
     default:
       return humanizeToken(status)
   }
+}
+
+function analysisStatusBadgeVariant(status: string): 'success' | 'warning' | 'error' | 'info' {
+  if (status === 'succeeded') {
+    return 'success'
+  }
+  if (status === 'failed') {
+    return 'error'
+  }
+  if (status === 'running') {
+    return 'info'
+  }
+  return 'warning'
+}
+
+function analysisStatusDotVariant(status: string): 'success' | 'warning' | 'error' | 'accent' {
+  if (status === 'succeeded') {
+    return 'success'
+  }
+  if (status === 'failed') {
+    return 'error'
+  }
+  if (status === 'running') {
+    return 'accent'
+  }
+  return 'warning'
 }
 
 function humanizePairStatus(status: string) {
@@ -2898,35 +2689,11 @@ function humanizeToken(value: string) {
 }
 
 function formatDateTime(value: string) {
-  return value.replace('T', ' ')
-}
-
-function isDashboardDataStale(lastUpdatedAt: string | null) {
-  if (lastUpdatedAt === null) {
-    return false
+  const timestamp = Date.parse(value)
+  if (!Number.isFinite(timestamp)) {
+    return value
   }
-  const timestamp = Date.parse(lastUpdatedAt)
-  return !Number.isFinite(timestamp) || Date.now() - timestamp > LIVE_REFRESH_STALE_AFTER_MS
-}
-
-function describeLiveRefreshState(
-  lastUpdatedAt: string | null,
-  isRefreshing: boolean,
-  refreshError: string | null,
-) {
-  if (isRefreshing) {
-    return 'Checking for live updates…'
-  }
-  if (refreshError) {
-    return 'Live updates interrupted — retry manually when the connection is available.'
-  }
-  if (lastUpdatedAt === null) {
-    return 'Waiting for the first management-data refresh.'
-  }
-  if (isDashboardDataStale(lastUpdatedAt)) {
-    return 'Live data may be stale — retry manually to restore updates.'
-  }
-  return 'Live updates active — checking every 30 seconds.'
+  return new Date(timestamp).toISOString().slice(0, 19).replace('T', ' ')
 }
 
 function formatRatio(value: number | null) {

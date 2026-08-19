@@ -13,7 +13,7 @@ from websockets.frames import Close
 from abt.controlplane.crypto import enrollment_payload
 from abt.worker.cli import HTTPEnrollmentTransport, MetaTrader5Adapter, _print_diagnostic, main
 from abt.worker.credentials import retrieve_mt5_password
-from abt.worker.enrollment import WorkerEnrollmentError, register_worker
+from abt.worker.enrollment import WorkerEnrollmentError, WorkerSessionDisconnected, register_worker
 from abt.worker.session import AuthenticatedWorkerSession, open_authenticated_worker_session
 
 
@@ -92,7 +92,6 @@ class WorkerEnrollmentTests(unittest.TestCase):
             mt5=mt5,
             transport=transport,
             password_prompt=lambda _: password,
-            pairing_code_factory=lambda: "01234567",
         )
         print(result.display(), file=output)
 
@@ -103,7 +102,6 @@ class WorkerEnrollmentTests(unittest.TestCase):
             enrollment_payload(
                 123456,
                 "Broker-Demo",
-                "01234567",
                 {"login": 123456, "server": "Broker-Demo", "trade_mode": 0},
                 {"build": 5000, "company": "MetaQuotes", "name": "MetaTrader 5"},
                 password,
@@ -164,7 +162,7 @@ class WorkerEnrollmentTests(unittest.TestCase):
         self.assertEqual("", errors.getvalue())
         displayed = json.loads(output.getvalue())
         self.assertEqual(
-            {"account_info", "expires_at", "pairing_code", "registration_id", "terminal_info"},
+            {"account_info", "expires_at", "registration_id", "terminal_info"},
             displayed.keys(),
         )
         self.assertNotIn(password, output.getvalue())
@@ -186,8 +184,7 @@ class WorkerEnrollmentTests(unittest.TestCase):
 
         with (
             patch("abt.worker.cli.sys.platform", "win32"),
-            patch("abt.worker.cli.open_authenticated_worker_session", return_value=session),
-            patch("abt.worker.cli.reconcile_with_safety", side_effect=KeyboardInterrupt),
+            patch("abt.worker.cli.reconnect_worker_session", side_effect=KeyboardInterrupt),
         ):
             exit_code = main(
                 [
@@ -207,7 +204,6 @@ class WorkerEnrollmentTests(unittest.TestCase):
             )
 
         self.assertEqual(130, exit_code)
-        self.assertTrue(session.closed)
         self.assertIn("Worker reconciliation stopped.", errors.getvalue())
 
     def test_cli_does_not_print_a_password_when_submission_fails(self) -> None:
@@ -610,6 +606,12 @@ class WorkerCredentialTests(unittest.TestCase):
         self.assertIn("password request", errors.getvalue())
         self.assertIn("code 1011", errors.getvalue())
 
+    def test_marks_reconciliation_send_disconnects_for_session_reconnect(self) -> None:
+        session = AuthenticatedWorkerSession(socket=ClosingWebSocket(), reconciliation_cursor=0)
+
+        with self.assertRaisesRegex(WorkerSessionDisconnected, "reconciliation"):
+            session.send_reconciliation({"type": "snapshot", "cursor": 0})
+
 
 class FakeWebSocket:
     def __init__(self, responses: list[dict[str, str]]) -> None:
@@ -638,6 +640,9 @@ class ClosingWebSocket(FakeWebSocket):
 
     def recv(self, timeout: float | None = None) -> str:
         raise ConnectionClosedError(Close(1011, ""), None)
+
+    def send(self, message: str) -> None:
+        raise ConnectionClosedError(None, Close(1011, ""))
 
 
 def _connect(

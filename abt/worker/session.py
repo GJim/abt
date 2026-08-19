@@ -24,7 +24,7 @@ from .credentials import (
     _send_proof,
     _worker_endpoint,
 )
-from .enrollment import WorkerEnrollmentError
+from .enrollment import WorkerEnrollmentError, WorkerSessionDisconnected
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -53,7 +53,10 @@ class AuthenticatedWorkerSession:
         return self
 
     def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
-        self.socket.__exit__(exc_type, exc_value, traceback)
+        try:
+            self.socket.__exit__(exc_type, exc_value, traceback)
+        except Exception as error:
+            _raise_closed_connection(error, "authenticated worker session")
 
     def request_password(self) -> str:
         try:
@@ -66,21 +69,30 @@ class AuthenticatedWorkerSession:
             _raise_closed_connection(error, "password request")
 
     def send_reconciliation(self, message: dict[str, object]) -> None:
-        _send(self.socket, message)
-        response = self._response()
-        if response.get("type") != "accepted" or response.get("cursor") != message.get("cursor"):
-            raise WorkerEnrollmentError("The controller rejected worker reconciliation.")
+        try:
+            _send(self.socket, message)
+            response = self._response()
+            if response.get("type") != "accepted" or response.get("cursor") != message.get("cursor"):
+                raise WorkerEnrollmentError("The controller rejected worker reconciliation.")
+        except Exception as error:
+            _raise_closed_connection(error, "reconciliation")
 
     def heartbeat(self) -> bool:
-        _send(self.socket, {"type": "heartbeat"})
-        response = self._response()
-        return response == {"type": "heartbeat_ack"}
+        try:
+            _send(self.socket, {"type": "heartbeat"})
+            response = self._response()
+            return response == {"type": "heartbeat_ack"}
+        except Exception as error:
+            _raise_closed_connection(error, "heartbeat")
 
     def send_safety_state(self, state: str, reason: str) -> None:
-        _send(self.socket, {"type": "safety_state", "state": state, "reason": reason})
-        response = self._response()
-        if response != {"type": "accepted", "state": state}:
-            raise WorkerEnrollmentError("The controller rejected the worker safety state.")
+        try:
+            _send(self.socket, {"type": "safety_state", "state": state, "reason": reason})
+            response = self._response()
+            if response != {"type": "accepted", "state": state}:
+                raise WorkerEnrollmentError("The controller rejected the worker safety state.")
+        except Exception as error:
+            _raise_closed_connection(error, "safety-state update")
 
     def receive_product_catalog_analysis(self, timeout: float | None = None) -> dict[str, object] | None:
         if self._analysis_requests:
@@ -89,6 +101,8 @@ class AuthenticatedWorkerSession:
             response = _message(self.socket, timeout=timeout)
         except TimeoutError:
             return None
+        except Exception as error:
+            _raise_closed_connection(error, "analysis request")
         return self._parse_product_catalog_analysis(response)
 
     def _response(self) -> dict[str, object]:
@@ -153,10 +167,10 @@ class AuthenticatedWorkerSession:
                     "period_end_utc": period_end_utc,
                 }
             )
-        _send(
-            self.socket,
-            response,
-        )
+        try:
+            _send(self.socket, response)
+        except Exception as error:
+            _raise_closed_connection(error, "analysis response")
 
     def send_product_catalog_analysis_error(
         self,
@@ -180,7 +194,10 @@ class AuthenticatedWorkerSession:
             if not isinstance(timeframe, str) or not timeframe:
                 raise WorkerEnrollmentError("Market-data analysis errors must include a timeframe.")
             response["timeframe"] = timeframe
-        _send(self.socket, response)
+        try:
+            _send(self.socket, response)
+        except Exception as error:
+            _raise_closed_connection(error, "analysis error response")
 
 
 def collect_product_catalog_evidence(
@@ -564,6 +581,8 @@ def open_authenticated_worker_session(
 
 
 def _raise_closed_connection(error: Exception, phase: str) -> None:
-    if isinstance(getattr(getattr(error, "rcvd", None), "code", None), int):
-        raise WorkerEnrollmentError(f"The controller closed the {phase} WebSocket.") from error
+    received_code = getattr(getattr(error, "rcvd", None), "code", None)
+    sent_code = getattr(getattr(error, "sent", None), "code", None)
+    if isinstance(received_code, int) or isinstance(sent_code, int):
+        raise WorkerSessionDisconnected(f"The controller closed the {phase} WebSocket.") from error
     raise error

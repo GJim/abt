@@ -4,11 +4,12 @@ from collections import namedtuple
 from datetime import UTC, datetime, timedelta
 import unittest
 
-from abt.worker.enrollment import WorkerEnrollmentError
+from abt.worker.enrollment import WorkerEnrollmentError, WorkerSessionDisconnected
 from abt.worker.reconciliation import (
     AccountMismatchError,
     MT5ReconciliationAdapter,
     WorkerSafetyAdapter,
+    reconnect_worker_session,
     reconcile_authenticated_worker,
 )
 from abt.worker.session import collect_market_data_evidence, collect_product_catalog_evidence
@@ -43,6 +44,56 @@ class ReadOnlyMT5:
 
 
 class WorkerReconciliationTests(unittest.TestCase):
+    def test_reconnects_disconnected_wss_sessions_with_exponential_backoff(self) -> None:
+        opened = 0
+        waits: list[float] = []
+        runs = 0
+
+        def open_session() -> ReconnectSession:
+            nonlocal opened
+            opened += 1
+            return ReconnectSession()
+
+        def run_reconciliation(**_: object) -> None:
+            nonlocal runs
+            runs += 1
+            if runs < 3:
+                raise WorkerSessionDisconnected("controller disconnected")
+
+        reconnect_worker_session(
+            open_session=open_session,
+            mt5=ReadOnlyMT5(),
+            login=123456,
+            server="Broker-Demo",
+            sleep=waits.append,
+            run_reconciliation=run_reconciliation,
+        )
+
+        self.assertEqual(3, opened)
+        self.assertEqual([5.0, 10.0], waits)
+
+    def test_stops_reconnecting_after_ten_wss_retry_attempts(self) -> None:
+        opened = 0
+        waits: list[float] = []
+
+        def open_session() -> ReconnectSession:
+            nonlocal opened
+            opened += 1
+            return ReconnectSession()
+
+        with self.assertRaisesRegex(WorkerSessionDisconnected, "controller disconnected"):
+            reconnect_worker_session(
+                open_session=open_session,
+                mt5=ReadOnlyMT5(),
+                login=123456,
+                server="Broker-Demo",
+                sleep=waits.append,
+                run_reconciliation=lambda **_: (_ for _ in ()).throw(WorkerSessionDisconnected("controller disconnected")),
+            )
+
+        self.assertEqual(11, opened)
+        self.assertEqual([float(5 * 2 ** attempt) for attempt in range(10)], waits)
+
     def test_enters_read_only_lost_link_safety_after_five_missed_minutes_and_recovers(self) -> None:
         session = SafetySession([False, False, False, True])
         adapter = WorkerSafetyAdapter(session)
@@ -346,6 +397,14 @@ class MemoryOnlySession:
 
     def send_reconciliation(self, message: dict[str, object]) -> None:
         self._emitted.append(message)
+
+
+class ReconnectSession:
+    def __enter__(self) -> ReconnectSession:
+        return self
+
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
+        pass
 
 
 class SafetySession:

@@ -18,6 +18,8 @@ from typing import Annotated, Any, Callable, Literal, cast
 from uuid import uuid4
 
 from fastapi import Cookie, FastAPI, Header, HTTPException, Query, Response, WebSocket, WebSocketDisconnect, status
+from fastapi.encoders import jsonable_encoder
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
@@ -38,7 +40,6 @@ class LoginRequest(BaseModel):
 class EnrollmentRequest(BaseModel):
     login: int = Field(gt=0)
     server: str = Field(min_length=1, max_length=128)
-    pairing_code: str = Field(pattern=r"^\d{8}$")
     account_info: dict[str, object]
     terminal_info: dict[str, object]
     mt5_password: str = Field(min_length=1)
@@ -234,6 +235,7 @@ def create_app(
 
     app = FastAPI(title="abt control plane", version="0.1.0", lifespan=lifespan)
     app.state.ledger = ledger
+    admin_notification_connections: set[WebSocket] = set()
     worker_connections: dict[str, set[_WorkerSessionConnection]] = {}
     worker_execution_locks: dict[str, asyncio.Lock] = {}
 
@@ -269,14 +271,13 @@ def create_app(
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(error)) from error
 
     @app.post("/api/enrollments", status_code=status.HTTP_201_CREATED)
-    def create_enrollment(body: EnrollmentRequest) -> dict[str, str]:
+    async def create_enrollment(body: EnrollmentRequest) -> dict[str, str]:
         try:
             verify_enrollment_proof(
                 body.public_key_pem,
                 body.proof_signature,
                 login=body.login,
                 server=body.server,
-                pairing_code=body.pairing_code,
                 account_info=body.account_info,
                 terminal_info=body.terminal_info,
                 mt5_password=body.mt5_password,
@@ -290,7 +291,6 @@ def create_app(
                 enrollment = ledger.create_enrollment(
                     login=body.login,
                     server=body.server,
-                    pairing_code=body.pairing_code,
                     public_key_pem=body.public_key_pem,
                     account_info=body.account_info,
                     terminal_info=body.terminal_info,
@@ -300,6 +300,13 @@ def create_app(
             except LedgerError:
                 secret_store.delete_password(secret_ref)
                 raise
+            enrollment_summary = next(
+                item for item in ledger.pending_enrollments() if item["enrollment_id"] == enrollment.enrollment_id
+            )
+            await _broadcast_pending_enrollment(
+                admin_notification_connections,
+                cast(dict[str, object], jsonable_encoder(enrollment_summary)),
+            )
             return {"enrollment_id": enrollment.enrollment_id, "expires_at": enrollment.expires_at.isoformat()}
         except ProofError as error:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(error)) from error
@@ -312,6 +319,25 @@ def create_app(
     def enrollment_challenge() -> dict[str, str]:
         challenge, expires_at = ledger.issue_enrollment_challenge()
         return {"challenge": challenge, "expires_at": expires_at.isoformat()}
+
+    @app.websocket("/api/admin/notifications")
+    async def admin_notifications(websocket: WebSocket) -> None:
+        try:
+            _require_admin(ledger, websocket.cookies.get("abt_admin_session"))
+        except HTTPException:
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+            return
+
+        await websocket.accept()
+        admin_notification_connections.add(websocket)
+        try:
+            await websocket.send_json(
+                {"type": "pending_enrollments", "items": jsonable_encoder(ledger.pending_enrollments())}
+            )
+            while (await websocket.receive())["type"] != "websocket.disconnect":
+                pass
+        finally:
+            admin_notification_connections.discard(websocket)
 
     @app.get("/api/admin/enrollments")
     def list_enrollments(
@@ -425,7 +451,7 @@ def create_app(
                     )
                     first_evidence = _validated_product_catalog_response(first_result, analysis_id)
                     second_evidence = _validated_product_catalog_response(second_result, analysis_id)
-                    eligible_candidates, exceptions = _analyze_product_catalogs(
+                    eligible_candidates = _analyze_product_catalogs(
                         first_evidence["symbols"], second_evidence["symbols"]
                     )
                     ledger.record_product_catalog_analysis_catalog(
@@ -433,7 +459,6 @@ def create_app(
                         first_evidence=first_evidence,
                         second_evidence=second_evidence,
                         eligible_candidates=eligible_candidates,
-                        exceptions=exceptions,
                     )
                     m1_verification_results: list[dict[str, object]] = []
                     if eligible_candidates:
@@ -1040,6 +1065,12 @@ def create_app(
                     worker_connections.pop(worker.worker_id, None)
 
     if spa_directory is not None:
+        def management_spa_route() -> FileResponse:
+            return FileResponse(spa_directory / "index.html")
+
+        for spa_route in ("/analysis", "/analysis/{analysis_path:path}", "/audit", "/workers", "/pairs/{pair_status:path}"):
+            app.add_api_route(spa_route, management_spa_route, methods=["GET"], include_in_schema=False)
+
         app.mount("/", StaticFiles(directory=spa_directory, html=True), name="management-spa")
 
     return app
@@ -1434,7 +1465,7 @@ def _validated_market_data_symbol(value: object) -> dict[str, object]:
 def _analyze_product_catalogs(
     first_symbols: list[dict[str, object]],
     second_symbols: list[dict[str, object]],
-) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+) -> list[dict[str, object]]:
     first_index: dict[tuple[str, str], list[dict[str, object]]] = {}
     second_index: dict[tuple[str, str], list[dict[str, object]]] = {}
     for symbol in first_symbols:
@@ -1442,7 +1473,6 @@ def _analyze_product_catalogs(
     for symbol in second_symbols:
         second_index.setdefault((str(symbol["currency_base"]), str(symbol["currency_profit"])), []).append(symbol)
     candidates: list[dict[str, object]] = []
-    exceptions: list[dict[str, object]] = []
     for currencies in sorted(set(first_index) & set(second_index)):
         for first in first_index[currencies]:
             for second in second_index[currencies]:
@@ -1457,19 +1487,7 @@ def _analyze_product_catalogs(
                             "second_point": second["point"],
                         }
                     )
-                else:
-                    exceptions.append(
-                        {
-                            "first_symbol": first["symbol"],
-                            "second_symbol": second["symbol"],
-                            "currency_base": first["currency_base"],
-                            "currency_profit": first["currency_profit"],
-                            "reason": "trade_calc_mode_mismatch",
-                            "first_trade_calc_mode": first["trade_calc_mode"],
-                            "second_trade_calc_mode": second["trade_calc_mode"],
-                        }
-                    )
-    return candidates, exceptions
+    return candidates
 
 
 def _candidate_symbols(candidates: list[dict[str, object]], field: str) -> list[str]:
@@ -1503,7 +1521,7 @@ def _product_pair_retest_candidate(
     )
     if first_specification is None or second_specification is None:
         raise ValueError("Worker returned incomplete product catalog evidence for the active product pair.")
-    eligible_candidates, _exceptions = _analyze_product_catalogs([first_specification], [second_specification])
+    eligible_candidates = _analyze_product_catalogs([first_specification], [second_specification])
     candidate = next(
         (
             item
@@ -1910,6 +1928,17 @@ def _require_admin(
         return ledger.validate_session(token, csrf_token, require_csrf=require_csrf)
     except AuthenticationError as error:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(error)) from error
+
+
+async def _broadcast_pending_enrollment(
+    connections: set[WebSocket],
+    enrollment: dict[str, object],
+) -> None:
+    for connection in tuple(connections):
+        try:
+            await connection.send_json({"type": "pending_enrollment", "item": enrollment})
+        except (RuntimeError, WebSocketDisconnect):
+            connections.discard(connection)
 
 
 async def _worker_message(websocket: WebSocket, expected_fields: set[str]) -> dict[str, object]:

@@ -20,6 +20,7 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 import uvicorn
 from websockets.exceptions import ConnectionClosed
 from websockets.sync.client import connect as websocket_connect
@@ -180,16 +181,14 @@ class ControlPlaneServiceTests(unittest.TestCase):
         password = "worker-memory-only-password"
         challenge = self._enrollment_challenge()
         signature = private_key.sign(
-            enrollment_payload(123456, "Broker-Demo", "12345678", account_info, terminal_info, password, challenge),
+            enrollment_payload(123456, "Broker-Demo", account_info, terminal_info, password, challenge),
             ec.ECDSA(hashes.SHA256()),
         )
         enrollment_response = self.client.post(
             "/api/enrollments",
-            headers={"CF-Connecting-IP": "203.0.113.11"},
             json={
                 "login": 123456,
                 "server": "Broker-Demo",
-                "pairing_code": "12345678",
                 "account_info": account_info,
                 "terminal_info": terminal_info,
                 "mt5_password": password,
@@ -211,6 +210,7 @@ class ControlPlaneServiceTests(unittest.TestCase):
         pending_response = self.client.get("/api/admin/enrollments")
         self.assertEqual(200, pending_response.status_code)
         self.assertEqual(1, len(pending_response.json()))
+        self.assertNotIn("pairing_code", pending_response.json()[0])
 
         approval = self.client.post(
             f"/api/admin/enrollments/{enrollment_response.json()['enrollment_id']}/approve",
@@ -225,7 +225,6 @@ class ControlPlaneServiceTests(unittest.TestCase):
             json={
                 "login": 123456,
                 "server": "Broker-Demo",
-                "pairing_code": "12345678",
                 "public_key_pem": "not a key",
                 "proof_signature": "not-a-signature",
             },
@@ -242,11 +241,11 @@ class ControlPlaneServiceTests(unittest.TestCase):
         password = "worker-memory-only-password"
         challenge = self._enrollment_challenge()
         signature = private_key.sign(
-            enrollment_payload(123456, "Broker-Demo", "12345678", account_info, terminal_info, password, challenge),
+            enrollment_payload(123456, "Broker-Demo", account_info, terminal_info, password, challenge),
             ec.ECDSA(hashes.SHA256()),
         )
         request = {
-            "login": 123456, "server": "Broker-Demo", "pairing_code": "12345678",
+            "login": 123456, "server": "Broker-Demo",
             "account_info": account_info, "terminal_info": terminal_info, "mt5_password": password,
             "enrollment_challenge": challenge, "public_key_pem": public_key_pem,
             "proof_signature": base64.b64encode(signature).decode("ascii"),
@@ -288,6 +287,43 @@ class ControlPlaneServiceTests(unittest.TestCase):
             204,
             self.client.post("/api/admin/logout", headers={"X-CSRF-Token": resumed_csrf}).status_code,
         )
+
+    def test_admin_notification_websocket_rejects_unauthenticated_clients(self) -> None:
+        with self.assertRaises(WebSocketDisconnect) as error:
+            with self.http_client.websocket_connect("/api/admin/notifications"):
+                pass
+        self.assertEqual(1008, error.exception.code)
+
+    def test_admin_notification_websocket_sends_pending_enrollment_snapshot(self) -> None:
+        enrollment_id = self._create_pending_enrollment()
+        self.client.post(
+            "/api/admin/login",
+            json={"username": "ABCDEF", "password": "A-secure-admin-password!"},
+        )
+
+        with self.client.websocket_connect("/api/admin/notifications", headers=self._admin_websocket_headers()) as websocket:
+            notification = websocket.receive_json()
+
+        self.assertEqual("pending_enrollments", notification["type"])
+        self.assertEqual([enrollment_id], [item["enrollment_id"] for item in notification["items"]])
+        self.assertNotIn("pairing_code", notification["items"][0])
+
+    def test_admin_notification_websocket_broadcasts_new_pending_enrollment(self) -> None:
+        self.client.post(
+            "/api/admin/login",
+            json={"username": "ABCDEF", "password": "A-secure-admin-password!"},
+        )
+
+        with self.client.websocket_connect("/api/admin/notifications", headers=self._admin_websocket_headers()) as first:
+            self.assertEqual({"type": "pending_enrollments", "items": []}, first.receive_json())
+            with self.client.websocket_connect("/api/admin/notifications", headers=self._admin_websocket_headers()) as second:
+                self.assertEqual({"type": "pending_enrollments", "items": []}, second.receive_json())
+                enrollment_id = self._create_pending_enrollment()
+                notifications = [first.receive_json(), second.receive_json()]
+
+        self.assertEqual(["pending_enrollment", "pending_enrollment"], [item["type"] for item in notifications])
+        self.assertEqual([enrollment_id, enrollment_id], [item["item"]["enrollment_id"] for item in notifications])
+        self.assertNotIn("pairing_code", notifications[0]["item"])
 
     def test_approval_logs_a_sanitized_openbao_signing_failure(self) -> None:
         enrollment_id = self._create_pending_enrollment()
@@ -361,7 +397,7 @@ class ControlPlaneServiceTests(unittest.TestCase):
         password = "worker-memory-only-password"
         challenge = self._enrollment_challenge()
         enrollment_signature = private_key.sign(
-            enrollment_payload(123456, "Broker-Demo", "12345678", account_info, terminal_info, password, challenge),
+            enrollment_payload(123456, "Broker-Demo", account_info, terminal_info, password, challenge),
             ec.ECDSA(hashes.SHA256()),
         )
         enrollment = self.client.post(
@@ -369,7 +405,6 @@ class ControlPlaneServiceTests(unittest.TestCase):
             json={
                 "login": 123456,
                 "server": "Broker-Demo",
-                "pairing_code": "12345678",
                 "account_info": account_info,
                 "terminal_info": terminal_info,
                 "mt5_password": password,
@@ -538,13 +573,19 @@ class ControlPlaneServiceTests(unittest.TestCase):
         ledger = self.app.state.ledger
         ledger.record_snapshot(
             worker_id, 0, "2026-08-16T00:00:00+00:00",
-            {"login": 123456, "server": "Broker-Search", "balance": 1000, "equity": 1010},
+            {
+                "login": 123456, "server": "Broker-Search", "balance": 1000, "equity": 1010,
+                "trade_allowed": False, "trade_expert": True,
+            },
             {"trade_allowed": False, "trade_expert": True, "tradeapi_disabled": False},
             [{"ticket": 1}], [],
         )
         ledger.record_snapshot(
             worker_id, 0, "2026-08-16T00:01:00+00:00",
-            {"login": 123456, "server": "Broker-Search", "balance": 1001, "equity": 1011},
+            {
+                "login": 123456, "server": "Broker-Search", "balance": 1001, "equity": 1011,
+                "trade_allowed": True, "trade_expert": False,
+            },
             {"trade_allowed": True, "trade_expert": True, "tradeapi_disabled": False},
             [{"ticket": 2}], [],
         )
@@ -554,6 +595,8 @@ class ControlPlaneServiceTests(unittest.TestCase):
         self.assertEqual(1, len(first_page["items"]))
         self.assertNotIn("account", first_page["items"][0])
         self.assertNotIn("orders", first_page["items"][0])
+        self.assertTrue(first_page["items"][0]["trade_allowed"])
+        self.assertFalse(first_page["items"][0]["trade_expert"])
         self.assertIsNotNone(first_page["next_cursor"])
         second_page = self.client.get(
             "/api/admin/worker-snapshots", params={"limit": 1, "cursor": first_page["next_cursor"]}
@@ -578,12 +621,16 @@ class ControlPlaneServiceTests(unittest.TestCase):
             ) VALUES ('analysis-search', 'ABCDEF', 'worker-a', 1, 'Broker-Search', 'worker-b', 2,
                       'Broker-Other', '{"label":"Search catalog"}', 'succeeded', ?)
             """,
-            [datetime.now(UTC)],
+            [datetime(2026, 8, 19, tzinfo=UTC)],
         )
         analyses = self.client.get(
             "/api/admin/product-catalog-analyses", params={"status": "succeeded", "q": "search catalog"}
         ).json()
         self.assertEqual(["analysis-search"], [item["analysis_id"] for item in analyses["items"]])
+        date_analyses = self.client.get(
+            "/api/admin/product-catalog-analyses", params={"status": "succeeded", "q": "20260819"}
+        ).json()
+        self.assertEqual(["analysis-search"], [item["analysis_id"] for item in date_analyses["items"]])
         self.assertEqual(422, self.client.get("/api/admin/product-catalog-analyses", params={"limit": 0}).status_code)
 
         ledger._connection.execute(
@@ -960,7 +1007,7 @@ class ControlPlaneServiceTests(unittest.TestCase):
         self.assertEqual("succeeded", outcome["status"])
         self.assertEqual(policy, outcome["policy"])
         self.assertEqual(3, len(outcome["eligible_candidates"]))
-        self.assertEqual("trade_calc_mode_mismatch", outcome["exceptions"][0]["reason"])
+        self.assertNotIn("exceptions", outcome)
         self.assertEqual(["failed", "passed", "passed"], [
             result["screening_status"] for result in outcome["m15_screening_results"]
         ])
@@ -1048,26 +1095,16 @@ class ControlPlaneServiceTests(unittest.TestCase):
         first = self._forex_symbol("EURUSD.a", 100.0, trade_calc_mode=0)
         second = self._forex_symbol("EURUSD", 100.0, trade_calc_mode=0)
 
-        candidates, exceptions = _analyze_product_catalogs([first], [second])
+        candidates = _analyze_product_catalogs([first], [second])
 
         self.assertEqual([("EURUSD.a", "EURUSD")], [
             (candidate["first_symbol"], candidate["second_symbol"]) for candidate in candidates
         ])
-        self.assertEqual([], exceptions)
-
-        _candidates, exceptions = _analyze_product_catalogs(
+        candidates = _analyze_product_catalogs(
             [first],
             [self._forex_symbol("EURUSD", 100.0, trade_calc_mode=1)],
         )
-        self.assertEqual([{
-            "first_symbol": "EURUSD.a",
-            "second_symbol": "EURUSD",
-            "currency_base": "EUR",
-            "currency_profit": "USD",
-            "reason": "trade_calc_mode_mismatch",
-            "first_trade_calc_mode": 0,
-            "second_trade_calc_mode": 1,
-        }], exceptions)
+        self.assertEqual([], candidates)
 
     def test_verification_accepts_shared_ioc_when_filling_capabilities_differ(self) -> None:
         self.assertEqual(["IOC"], _shared_supported_filling_modes(["FOK", "IOC"], ["IOC"]))
@@ -1463,7 +1500,7 @@ class ControlPlaneServiceTests(unittest.TestCase):
 
         self.assertEqual("failed", outcome["status"])
         self.assertEqual([], outcome["eligible_candidates"])
-        self.assertEqual([], outcome["exceptions"])
+        self.assertNotIn("exceptions", outcome)
         self.assertIn("incomplete", outcome["failure_reason"])
 
     def test_catalog_analysis_uses_two_live_reconciliation_workers_without_broker_writes(self) -> None:
@@ -2016,6 +2053,9 @@ class ControlPlaneServiceTests(unittest.TestCase):
         self.assertEqual(201, response.status_code)
         return response.json()["enrollment_id"]
 
+    def _admin_websocket_headers(self) -> dict[str, str]:
+        return {"Cookie": f"abt_admin_session={self.client.cookies['abt_admin_session']}"}
+
     def _enrollment_challenge(self) -> str:
         response = self.client.get("/api/enrollment-challenge")
         self.assertEqual(200, response.status_code)
@@ -2314,14 +2354,14 @@ class ControlPlaneServiceTests(unittest.TestCase):
     ):
         challenge = self._enrollment_challenge()
         signature = private_key.sign(
-            enrollment_payload(login, server, "12345678", account_info, terminal_info, password, challenge),
+            enrollment_payload(login, server, account_info, terminal_info, password, challenge),
             ec.ECDSA(hashes.SHA256()),
         )
         return self.client.post(
             "/api/enrollments",
             headers={"CF-Connecting-IP": "203.0.113.11"},
             json={
-                "login": login, "server": server, "pairing_code": "12345678",
+                "login": login, "server": server,
                 "account_info": account_info, "terminal_info": terminal_info, "mt5_password": password,
                 "enrollment_challenge": challenge, "public_key_pem": public_key_pem,
                 "proof_signature": base64.b64encode(signature).decode("ascii"),
@@ -2350,7 +2390,7 @@ class _LiveCatalogAnalysisHarness:
         terminal_info = {"name": "MetaTrader 5"}
         password = f"worker-{login}-memory-only-password"
         signature = private_key.sign(
-            enrollment_payload(login, server, "12345678", account_info, terminal_info, password, challenge),
+            enrollment_payload(login, server, account_info, terminal_info, password, challenge),
             ec.ECDSA(hashes.SHA256()),
         )
         response = httpx.post(
@@ -2358,7 +2398,6 @@ class _LiveCatalogAnalysisHarness:
             json={
                 "login": login,
                 "server": server,
-                "pairing_code": "12345678",
                 "account_info": account_info,
                 "terminal_info": terminal_info,
                 "mt5_password": password,

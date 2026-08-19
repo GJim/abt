@@ -39,7 +39,6 @@ class Enrollment:
     enrollment_id: str
     login: int
     server: str
-    pairing_code: str
     public_key_pem: str
     expires_at: datetime
     status: str
@@ -190,7 +189,6 @@ class ControlLedger:
         *,
         login: int,
         server: str,
-        pairing_code: str,
         public_key_pem: str,
         account_info: dict[str, object],
         terminal_info: dict[str, object],
@@ -203,7 +201,6 @@ class ControlLedger:
             enrollment_id=str(uuid4()),
             login=login,
             server=server,
-            pairing_code=pairing_code,
             public_key_pem=public_key_pem,
             expires_at=expires_at,
             status="pending",
@@ -213,15 +210,14 @@ class ControlLedger:
             self._connection.execute(
                 """
                 INSERT INTO enrollments (
-                    enrollment_id, login, server, pairing_code, public_key_pem, source_ip, account_info, terminal_info, password_secret_ref,
+                    enrollment_id, login, server, public_key_pem, source_ip, account_info, terminal_info, password_secret_ref,
                     status, created_at, expires_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
                 """,
                 [
                     enrollment.enrollment_id,
                     login,
                     server,
-                    pairing_code,
                     public_key_pem,
                     "not-collected",
                     json.dumps(account_info, sort_keys=True),
@@ -542,8 +538,8 @@ class ControlLedger:
                     "login": _summary_number(account.get("login")) or row[7],
                     "balance": _summary_number(account.get("balance")),
                     "equity": _summary_number(account.get("equity")),
-                    "trade_allowed": _summary_boolean(terminal.get("trade_allowed")),
-                    "trade_expert": _summary_boolean(terminal.get("trade_expert")),
+                    "trade_allowed": _summary_boolean(account.get("trade_allowed")),
+                    "trade_expert": _summary_boolean(account.get("trade_expert")),
                     "tradeapi_disabled": _summary_boolean(terminal.get("tradeapi_disabled")),
                     "received_at": row[6],
                 }
@@ -648,18 +644,16 @@ class ControlLedger:
         first_evidence: dict[str, object],
         second_evidence: dict[str, object],
         eligible_candidates: list[dict[str, object]],
-        exceptions: list[dict[str, object]],
     ) -> None:
         with self._transaction():
             self._require_running_product_catalog_analysis(analysis_id)
             self._connection.execute(
                 """
                 UPDATE product_catalog_analyses
-                SET first_catalog_evidence = ?,
-                    second_catalog_evidence = ?,
-                    eligible_candidates = ?,
-                    exceptions = ?,
-                    current_stage = 'm15_screening',
+                SET                 first_catalog_evidence = ?,
+                second_catalog_evidence = ?,
+                eligible_candidates = ?,
+                current_stage = 'm15_screening',
                     catalog_completed_at = ?
                 WHERE analysis_id = ?
                 """,
@@ -667,7 +661,6 @@ class ControlLedger:
                     json.dumps(first_evidence, sort_keys=True),
                     json.dumps(second_evidence, sort_keys=True),
                     json.dumps(eligible_candidates, sort_keys=True),
-                    json.dumps(exceptions, sort_keys=True),
                     _utc_now(),
                     analysis_id,
                 ],
@@ -783,7 +776,7 @@ class ControlLedger:
                 SELECT analysis_id, requested_by, first_worker_id, first_login, first_server,
                        second_worker_id, second_login, second_server, policy, status, failure_reason,
                        current_stage, retry_count, analysis_period, first_catalog_evidence, second_catalog_evidence,
-                       eligible_candidates, exceptions, m15_screening_results, m1_verification_results, requested_at,
+                       eligible_candidates, m15_screening_results, m1_verification_results, requested_at,
                        catalog_completed_at, m15_screened_at, m1_verified_at, completed_at
                 FROM product_catalog_analyses
                 WHERE analysis_id = ?
@@ -806,14 +799,13 @@ class ControlLedger:
             "first_catalog_evidence": None if row[14] is None else json.loads(row[14]),
             "second_catalog_evidence": None if row[15] is None else json.loads(row[15]),
             "eligible_candidates": json.loads(row[16]),
-            "exceptions": json.loads(row[17]),
-            "m15_screening_results": json.loads(row[18]),
-            "m1_verification_results": json.loads(row[19]),
-            "requested_at": row[20],
-            "catalog_completed_at": row[21],
-            "m15_screened_at": row[22],
-            "m1_verified_at": row[23],
-            "completed_at": row[24],
+            "m15_screening_results": json.loads(row[17]),
+            "m1_verification_results": json.loads(row[18]),
+            "requested_at": row[19],
+            "catalog_completed_at": row[20],
+            "m15_screened_at": row[21],
+            "m1_verified_at": row[22],
+            "completed_at": row[23],
         }
 
     def product_catalog_analysis_page(
@@ -826,12 +818,22 @@ class ControlLedger:
             clauses.append("status = ?")
             parameters.append(status)
         if query is not None:
-            clauses.append(
-                """lower(concat_ws(' ', analysis_id, requested_by, first_worker_id, first_server,
-                   second_worker_id, second_server, CAST(first_login AS VARCHAR), CAST(second_login AS VARCHAR),
-                   CAST(policy AS VARCHAR))) LIKE ?"""
-            )
-            parameters.append(f"%{query.lower()}%")
+            normalized_date_query = "".join(character for character in query if character.isdigit())
+            if normalized_date_query:
+                clauses.append(
+                    """(lower(concat_ws(' ', analysis_id, requested_by, first_worker_id, first_server,
+                       second_worker_id, second_server, CAST(first_login AS VARCHAR), CAST(second_login AS VARCHAR),
+                       CAST(policy AS VARCHAR))) LIKE ?
+                       OR strftime(requested_at, '%Y%m%d') LIKE ?)"""
+                )
+                parameters.extend([f"%{query.lower()}%", f"%{normalized_date_query}%"])
+            else:
+                clauses.append(
+                    """lower(concat_ws(' ', analysis_id, requested_by, first_worker_id, first_server,
+                       second_worker_id, second_server, CAST(first_login AS VARCHAR), CAST(second_login AS VARCHAR),
+                       CAST(policy AS VARCHAR))) LIKE ?"""
+                )
+                parameters.append(f"%{query.lower()}%")
         if cursor_values is not None:
             clauses.append("(requested_at < ? OR (requested_at = ? AND analysis_id < ?))")
             parameters.extend([cursor_values["timestamp"], cursor_values["timestamp"], cursor_values["id"]])
@@ -1507,7 +1509,7 @@ class ControlLedger:
             SELECT analysis_id, requested_by, first_worker_id, first_login, first_server,
                    second_worker_id, second_login, second_server, policy, status, failure_reason,
                    current_stage, retry_count, analysis_period, first_catalog_evidence, second_catalog_evidence,
-                   eligible_candidates, exceptions, m15_screening_results, m1_verification_results, requested_at,
+                   eligible_candidates, m15_screening_results, m1_verification_results, requested_at,
                    catalog_completed_at, m15_screened_at, m1_verified_at, completed_at
             FROM product_catalog_analyses
             WHERE analysis_id = ?
@@ -1530,14 +1532,13 @@ class ControlLedger:
             "first_catalog_evidence": None if row[14] is None else json.loads(row[14]),
             "second_catalog_evidence": None if row[15] is None else json.loads(row[15]),
             "eligible_candidates": json.loads(row[16]),
-            "exceptions": json.loads(row[17]),
-            "m15_screening_results": json.loads(row[18]),
-            "m1_verification_results": json.loads(row[19]),
-            "requested_at": row[20],
-            "catalog_completed_at": row[21],
-            "m15_screened_at": row[22],
-            "m1_verified_at": row[23],
-            "completed_at": row[24],
+            "m15_screening_results": json.loads(row[17]),
+            "m1_verification_results": json.loads(row[18]),
+            "requested_at": row[19],
+            "catalog_completed_at": row[20],
+            "m15_screened_at": row[21],
+            "m1_verified_at": row[22],
+            "completed_at": row[23],
         }
 
     def _analysis_symbol_specification(
@@ -1961,7 +1962,7 @@ class ControlLedger:
         with self._transaction():
             rows = self._connection.execute(
                 """
-                SELECT enrollment_id, login, server, pairing_code, account_info, terminal_info, created_at, expires_at
+                SELECT enrollment_id, login, server, account_info, terminal_info, created_at, expires_at
                 FROM enrollments WHERE status = 'pending' ORDER BY created_at
                 """
             ).fetchall()
@@ -1970,11 +1971,10 @@ class ControlLedger:
                     "enrollment_id": row[0],
                     "login": row[1],
                     "server": row[2],
-                    "pairing_code": row[3],
-                    "account_info": json.loads(row[4]),
-                    "terminal_info": json.loads(row[5]),
-                    "created_at": row[6],
-                    "expires_at": row[7],
+                    "account_info": json.loads(row[3]),
+                    "terminal_info": json.loads(row[4]),
+                    "created_at": row[5],
+                    "expires_at": row[6],
                 }
                 for row in rows
             ]
@@ -2073,7 +2073,6 @@ class ControlLedger:
                     enrollment_id VARCHAR PRIMARY KEY,
                     login BIGINT NOT NULL,
                     server VARCHAR NOT NULL,
-                    pairing_code VARCHAR NOT NULL,
                     public_key_pem VARCHAR NOT NULL,
                     source_ip VARCHAR NOT NULL,
                     account_info JSON NOT NULL,
@@ -2167,7 +2166,6 @@ class ControlLedger:
                     first_catalog_evidence JSON,
                     second_catalog_evidence JSON,
                     eligible_candidates JSON NOT NULL DEFAULT '[]',
-                    exceptions JSON NOT NULL DEFAULT '[]',
                     m15_screening_results JSON NOT NULL DEFAULT '[]',
                     m1_verification_results JSON NOT NULL DEFAULT '[]',
                     requested_at TIMESTAMPTZ NOT NULL,
@@ -2263,6 +2261,7 @@ class ControlLedger:
                 """
             )
             self._connection.execute("ALTER TABLE alerts ADD COLUMN IF NOT EXISTS product_pair_id VARCHAR")
+            self._connection.execute("ALTER TABLE enrollments DROP COLUMN IF EXISTS pairing_code")
             self._connection.execute(
                 "ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS password_secret_deleted_at TIMESTAMPTZ"
             )
@@ -2289,6 +2288,7 @@ class ControlLedger:
             self._connection.execute("UPDATE workers SET safety_state = 'connected' WHERE safety_state IS NULL")
             self._connection.execute("ALTER TABLE product_catalog_analyses ADD COLUMN IF NOT EXISTS current_stage VARCHAR DEFAULT 'catalog'")
             self._connection.execute("ALTER TABLE product_catalog_analyses ADD COLUMN IF NOT EXISTS retry_count INTEGER DEFAULT 0")
+            self._connection.execute("ALTER TABLE product_catalog_analyses DROP COLUMN IF EXISTS exceptions")
             self._connection.execute(
                 """ALTER TABLE product_catalog_analyses
                 ADD COLUMN IF NOT EXISTS analysis_period JSON DEFAULT '{"ended_at_utc":"","started_at_utc":"","timeframe":"M15"}'"""

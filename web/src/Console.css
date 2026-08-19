@@ -17,10 +17,10 @@
 
 .console-sidebar {
   position: sticky;
-  top: 0;
+  top: 2.5rem;
   display: flex;
   flex-direction: column;
-  height: 100dvh;
+  height: calc(100dvh - 2.5rem);
   padding: 1rem 0.75rem;
   background: var(--console-surface);
   border-right: 1px solid var(--console-rule);
@@ -182,6 +182,34 @@
   padding: 0.5rem 0;
 }
 
+.analysis-history-filters input {
+  flex: 1 1 24rem;
+  max-width: 36rem;
+}
+
+.analysis-history-filters select {
+  min-width: 10rem;
+}
+
+.console-clickable-row {
+  cursor: pointer;
+}
+
+.console-clickable-row:focus-visible {
+  position: relative;
+  z-index: 1;
+  outline: 2px solid var(--console-accent);
+  outline-offset: -2px;
+}
+
+.console-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  min-height: 2.75rem;
+  padding-top: 0.5rem;
+}
+
 .console-status,
 .console-tag {
   display: inline-flex;
@@ -253,8 +281,128 @@
   cursor: not-allowed;
 }
 
+.console-notifications {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.console-notification-button {
+  position: relative;
+  display: grid;
+  width: 2.25rem;
+  height: 2.25rem;
+  place-items: center;
+  padding: 0;
+  color: var(--console-muted);
+  background: var(--console-surface);
+  border: 1px solid var(--console-rule);
+  border-radius: 0.25rem;
+}
+
+.console-notification-button:hover,
+.console-notification-button[aria-expanded="true"] {
+  color: var(--console-accent);
+  border-color: color-mix(in srgb, var(--console-accent) 50%, var(--console-rule));
+}
+
+.console-notification-button svg {
+  width: 1.25rem;
+  height: 1.25rem;
+}
+
+.console-notification-badge {
+  position: absolute;
+  top: -0.4rem;
+  right: -0.4rem;
+  display: grid;
+  min-width: 1.15rem;
+  height: 1.15rem;
+  place-items: center;
+  padding-inline: 0.2rem;
+  color: white;
+  background: var(--console-danger);
+  border: 2px solid var(--console-surface);
+  border-radius: 999px;
+  font-size: 0.625rem;
+  font-weight: 750;
+  font-variant-numeric: tabular-nums;
+}
+
+.console-notification-connection {
+  color: var(--console-muted);
+  font-size: 0.75rem;
+  white-space: nowrap;
+}
+
+.console-notification-popover {
+  position: absolute;
+  z-index: 12;
+  top: calc(100% + 0.5rem);
+  right: 0;
+  display: grid;
+  width: min(24rem, calc(100vw - 2rem));
+  max-height: min(30rem, calc(100dvh - 5rem));
+  overflow: auto;
+  background: var(--console-surface);
+  border: 1px solid var(--console-rule);
+  border-radius: 0.5rem;
+  box-shadow: var(--shadow);
+}
+
+.console-notification-popover > header,
+.console-notification-popover > p {
+  margin: 0;
+  padding: 0.75rem;
+}
+
+.console-notification-popover > header {
+  display: flex;
+  justify-content: space-between;
+  border-bottom: 1px solid var(--console-rule);
+}
+
+.console-notification-popover ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.console-notification-popover li + li {
+  border-top: 1px solid var(--console-rule);
+}
+
+.console-notification-popover li button {
+  display: grid;
+  width: 100%;
+  gap: 0.2rem;
+  padding: 0.75rem;
+  color: var(--console-ink);
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  text-align: left;
+}
+
+.console-notification-popover li button:hover {
+  background: color-mix(in srgb, var(--console-accent) 6%, transparent);
+}
+
+.console-notification-popover li button span {
+  color: var(--console-muted);
+  font-size: 0.75rem;
+  font-weight: 500;
+}
+
+.enrollment-notification-dialog h3 {
+  margin: 0 0 0.5rem;
+  font-size: 0.875rem;
+}
+
 .console-nav :focus-visible,
 .console-icon-button:focus-visible,
+.console-notification-button:focus-visible,
 .console-table :focus-visible {
   outline: 2px solid var(--console-accent);
   outline-offset: 2px;
@@ -306,6 +454,46 @@
   line-height: 1.55;
   overflow: auto;
   tab-size: 2;
+}
+
+.snapshot-json-dialog-backdrop {
+  position: fixed;
+  z-index: 10;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 1rem;
+  background: rgb(15 23 42 / 32%);
+}
+
+.snapshot-json-dialog {
+  display: grid;
+  width: min(48rem, 100%);
+  max-height: min(42rem, calc(100dvh - 2rem));
+  gap: 1rem;
+  padding: 1rem;
+  overflow: hidden;
+  background: var(--console-surface);
+  border: 1px solid var(--console-rule);
+  border-radius: 0.75rem;
+  box-shadow: var(--shadow);
+}
+
+.snapshot-json-dialog-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.snapshot-json-dialog-header h2 {
+  margin: 0;
+  font-size: 1rem;
+}
+
+.snapshot-json-dialog .console-raw-detail {
+  min-height: 0;
+  margin: 0;
 }
 
 .console-empty-state {
@@ -373,11 +561,12 @@
   .console-sidebar {
     position: sticky;
     z-index: 2;
-    top: 0;
+    top: 2.5rem;
     flex-direction: row;
+    flex-wrap: wrap;
     width: 100%;
     height: auto;
-    min-height: 3.5rem;
+    min-height: 5.75rem;
     padding: 0.25rem 0.5rem;
     border-right: 0;
     border-bottom: 1px solid var(--console-rule);
@@ -386,11 +575,23 @@
   }
 
   .console-sidebar > :first-child {
+    flex: 0 0 100%;
     margin: 0 0.5rem 0 0;
+    white-space: nowrap;
   }
 
   .console-nav {
     display: flex;
+    flex: 0 0 100%;
+    gap: 0.125rem;
+    overflow-x: auto;
+  }
+
+  .console-nav a,
+  .console-nav button {
+    flex: 0 0 auto;
+    width: auto;
+    white-space: nowrap;
   }
 
   .console-page-header {
@@ -403,6 +604,10 @@
 
   .console-fact-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .console-notification-connection {
+    display: none;
   }
 }
 

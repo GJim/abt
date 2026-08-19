@@ -4,7 +4,6 @@ import json
 from base64 import b64encode
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from secrets import randbelow
 from typing import Protocol
 
 from abt.controlplane.crypto import enrollment_payload
@@ -14,6 +13,10 @@ from .keystore import HardwareKeyStore
 
 class WorkerEnrollmentError(RuntimeError):
     """Raised when local worker enrollment cannot safely complete."""
+
+
+class WorkerSessionDisconnected(WorkerEnrollmentError):
+    """Raised when an established controller WebSocket disconnects."""
 
 
 class MT5Client(Protocol):
@@ -41,7 +44,6 @@ class EnrollmentTransport(Protocol):
 @dataclass(frozen=True)
 class EnrollmentResult:
     registration_id: str
-    pairing_code: str
     account_info: dict[str, object]
     terminal_info: dict[str, object]
     expires_at: str
@@ -53,7 +55,6 @@ class EnrollmentResult:
             {
                 "account_info": self.account_info,
                 "expires_at": self.expires_at,
-                "pairing_code": self.pairing_code,
                 "registration_id": self.registration_id,
                 "terminal_info": self.terminal_info,
             },
@@ -61,11 +62,6 @@ class EnrollmentResult:
             sort_keys=True,
         )
 
-
-def generate_pairing_code() -> str:
-    """Generate a uniformly distributed eight-digit pairing code."""
-
-    return f"{randbelow(100_000_000):08d}"
 
 
 def register_worker(
@@ -77,7 +73,6 @@ def register_worker(
     mt5: MT5Client,
     transport: EnrollmentTransport,
     password_prompt: Callable[[str], str],
-    pairing_code_factory: Callable[[], str] = generate_pairing_code,
 ) -> EnrollmentResult:
     """Log in locally, prove that evidence, and submit a signed enrollment."""
 
@@ -98,15 +93,11 @@ def register_worker(
         terminal_info = _evidence(mt5.terminal_info(), "terminal")
         _verify_account_evidence(account_info, login, server)
 
-        pairing_code = pairing_code_factory()
-        if not isinstance(pairing_code, str) or not pairing_code.isascii() or not pairing_code.isdigit() or len(pairing_code) != 8:
-            raise WorkerEnrollmentError("Unable to generate a valid pairing code.")
         challenge = _required_response_text(transport.enrollment_challenge(controller_url), "challenge")
 
         signed_payload = enrollment_payload(
             login,
             server,
-            pairing_code,
             account_info,
             terminal_info,
             password,
@@ -122,7 +113,6 @@ def register_worker(
         request = {
             "login": login,
             "server": server,
-            "pairing_code": pairing_code,
             "account_info": account_info,
             "terminal_info": terminal_info,
             "mt5_password": password,
@@ -133,7 +123,6 @@ def register_worker(
         response = transport.enroll(controller_url, request)
         return EnrollmentResult(
             registration_id=_required_response_text(response, "enrollment_id"),
-            pairing_code=pairing_code,
             account_info=account_info,
             terminal_info=terminal_info,
             expires_at=_required_response_text(response, "expires_at"),

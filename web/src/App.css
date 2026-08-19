@@ -18,6 +18,7 @@
 }
 
 .management-content {
+  align-content: start;
   background: var(--card);
   border: 1px solid var(--border);
   border-radius: 0.75rem;
@@ -58,6 +59,44 @@
   font-size: 0.85rem;
   font-weight: 700;
   margin-top: 0.2rem;
+}
+
+.new-analysis-button {
+  background: var(--accent);
+  border-radius: 0.4rem;
+  color: white;
+  font-weight: 700;
+  padding: 0.75rem 1rem;
+  text-decoration: none;
+}
+
+.analysis-page-header {
+  align-items: center;
+  display: flex;
+  gap: 1rem;
+  justify-content: space-between;
+}
+
+.analysis-page-header h1 {
+  margin: 0;
+}
+
+.button-spinner {
+  animation: button-spinner 0.8s linear infinite;
+  border: 2px solid rgb(255 255 255 / 45%);
+  border-radius: 50%;
+  border-top-color: white;
+  display: inline-block;
+  height: 0.9rem;
+  margin-right: 0.45rem;
+  vertical-align: -0.12rem;
+  width: 0.9rem;
+}
+
+@keyframes button-spinner {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .live-refresh-active {
@@ -157,6 +196,7 @@ li {
 .analysis-results {
   display: grid;
   gap: 1rem;
+  min-width: 0;
 }
 
 .intervention-queue {
@@ -190,8 +230,210 @@ li {
   gap: 1rem;
 }
 
+.analysis-workspace-header,
+.analysis-status,
+.analysis-stage-strip,
+.analysis-facts,
+.analysis-policy {
+  display: flex;
+}
+
+.analysis-workspace-header {
+  align-items: flex-start;
+  flex-wrap: wrap;
+  gap: 1rem;
+  justify-content: space-between;
+}
+
+.analysis-workspace-header h3,
+.analysis-workspace-header p {
+  margin: 0;
+}
+
+.analysis-workspace-header > :first-child {
+  min-width: 0;
+}
+
+.analysis-workspace-header p {
+  color: var(--text);
+  margin-top: 0.25rem;
+}
+
+.analysis-status {
+  align-items: center;
+  flex: 0 0 auto;
+  gap: 0.5rem;
+}
+
+.analysis-stage-strip {
+  border-block: 1px solid var(--border);
+  min-width: 0;
+}
+
+.analysis-stage-strip > div {
+  display: grid;
+  flex: 1 1 0;
+  gap: 0.2rem;
+  min-width: 0;
+  padding: 0.75rem 1rem;
+}
+
+.analysis-stage-strip > div + div {
+  border-inline-start: 1px solid var(--border);
+}
+
+.analysis-stage-strip span,
+.analysis-facts dt,
+.analysis-policy dt {
+  color: var(--text);
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.analysis-stage-strip strong {
+  color: var(--text-h);
+  font-size: 0.875rem;
+  font-variant-numeric: tabular-nums;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.analysis-overview {
+  display: grid;
+  gap: 1rem;
+}
+
+.analysis-tabs {
+  overflow: visible;
+}
+
+.analysis-tabs button {
+  background: transparent !important;
+  color: var(--text) !important;
+}
+
+.analysis-candidate-list {
+  border-block: 1px solid var(--border);
+}
+
+.analysis-candidate-list > * + * {
+  border-top: 1px solid var(--border);
+}
+
+.analysis-candidate-list > div > button {
+  background: transparent;
+  border-radius: 0;
+  color: var(--text-h);
+  padding: 0.75rem 1rem;
+}
+
+.buildable-candidate > div > button {
+  background: transparent;
+  border-radius: 0;
+  color: var(--text-h);
+  padding: 0.75rem 1rem;
+}
+
+.analysis-candidate-list > div > button:hover {
+  background: color-mix(in srgb, var(--accent) 6%, transparent);
+}
+
+.buildable-candidate > div > button:hover {
+  background: color-mix(in srgb, var(--accent) 6%, transparent);
+}
+
+.buildable-candidate {
+  position: relative;
+}
+
+.candidate-create-action {
+  background: var(--accent) !important;
+  color: white !important;
+  font-size: 0.8125rem;
+  min-height: 1.75rem;
+  padding: 0.2rem 0.5rem !important;
+  position: absolute;
+  right: 3.25rem;
+  top: 0.4rem;
+  z-index: 1;
+}
+
+.analysis-candidate-summary {
+  align-items: center;
+  display: grid;
+  gap: 0.75rem;
+  grid-template-columns: minmax(12rem, 1.5fr) minmax(7rem, 1fr) minmax(7rem, 1fr) auto;
+  width: 100%;
+}
+
+.analysis-candidate-summary > span {
+  color: var(--text);
+  font-size: 0.875rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.analysis-candidate-summary strong {
+  color: var(--text-h);
+}
+
+.analysis-facts,
+.analysis-policy {
+  flex-wrap: wrap;
+  margin: 0;
+}
+
+.analysis-facts > div,
+.analysis-policy > div {
+  display: grid;
+  flex: 1 1 12rem;
+  gap: 0.25rem;
+  min-width: 0;
+  padding: 0.75rem 1rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.analysis-facts dd,
+.analysis-policy dd {
+  color: var(--text-h);
+  font-size: 0.875rem;
+  font-variant-numeric: tabular-nums;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
 .analysis-layout {
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: minmax(0, 46rem);
+}
+
+.launch-panel {
+  width: 100%;
+}
+
+.launch-form {
+  align-items: end;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.875rem;
+}
+
+.launch-form > .hint,
+.launch-form > .policy-summary,
+.launch-form > button {
+  grid-column: 1 / -1;
+}
+
+.launch-form input,
+.launch-form select {
+  min-height: 2.25rem;
+  padding: 0.4rem 0.625rem;
+}
+
+.launch-form button {
+  justify-self: end;
+  min-height: 2.25rem;
+  padding: 0.4rem 0.875rem;
 }
 
 .summary-grid {
@@ -220,8 +462,74 @@ li {
   background: white;
 }
 
+.candidate-summary-evidence {
+  display: grid;
+  gap: 1rem;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.15fr);
+}
+
+.candidate-statistics,
+.candidate-summary-evidence .panel {
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  gap: 0.5rem;
+  padding: 0;
+}
+
+.candidate-statistics h6,
+.candidate-summary-evidence .panel h6 {
+  margin: 0;
+}
+
+.candidate-title {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.candidate-title h5 {
+  margin: 0;
+}
+
+.candidate-statistics .compact-list {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.candidate-summary-evidence .difference-list li {
+  padding-block: 0.4rem;
+}
+
 .build-panel {
   background: #f8fafc;
+}
+
+.confirmation-dialog-backdrop {
+  align-items: center;
+  background: rgb(15 23 42 / 32%);
+  display: flex;
+  inset: 0;
+  justify-content: center;
+  padding: 1rem;
+  position: fixed;
+  z-index: 10;
+}
+
+.confirmation-dialog {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 0.75rem;
+  box-shadow: var(--shadow);
+  display: grid;
+  gap: 1rem;
+  max-width: 32rem;
+  padding: 1.25rem;
+}
+
+.confirmation-dialog h6,
+.confirmation-dialog p {
+  margin: 0;
 }
 
 .worker-status-list li,
@@ -240,6 +548,15 @@ li {
 
 .policy-fieldset {
   gap: 1rem;
+}
+
+.policy-summary {
+  display: grid;
+  gap: 0.625rem;
+}
+
+.policy-summary .hint {
+  margin: -0.25rem 0 0;
 }
 
 .checkbox-field {
@@ -544,6 +861,7 @@ pre {
 
 .hedge-overview {
   grid-template-columns: repeat(2, minmax(0, 1fr));
+  min-width: 0;
 }
 
 .hedge-overview .panel {
@@ -615,6 +933,7 @@ time {
   }
 
   .compact-form,
+  .launch-form,
   .enrollment dl,
   .enrollment-evidence,
   .worker-facts,
@@ -624,8 +943,39 @@ time {
 
   .section-header,
   .worker-summary,
-  .worker-actions {
+  .worker-actions,
+  .analysis-workspace-header {
     flex-direction: column;
+  }
+
+  .analysis-stage-strip {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .analysis-stage-strip > div:nth-child(odd) {
+    border-inline-start: 0;
+  }
+
+  .analysis-stage-strip > div:nth-child(n + 3) {
+    border-top: 1px solid var(--border);
+  }
+
+  .analysis-candidate-summary {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .candidate-create-action {
+    right: 2.5rem;
+  }
+
+  .candidate-summary-evidence,
+  .candidate-statistics .compact-list {
+    grid-template-columns: 1fr;
+  }
+
+  .analysis-candidate-summary > span:not(:last-child) {
+    display: none;
   }
 
   .refresh-status {

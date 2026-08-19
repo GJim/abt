@@ -4,6 +4,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import duckdb
+
 from abt.controlplane.ledger import AuthenticationError, ControlLedger, LedgerError
 
 
@@ -26,12 +28,26 @@ class ControlLedgerTests(unittest.TestCase):
         session = self.ledger.authenticate_admin("ABCDEF", "long-admin-password")
         self.assertEqual("ABCDEF", self.ledger.validate_session(session.token, session.csrf_token, require_csrf=True))
 
+    def test_migration_removes_legacy_pairing_code_column(self) -> None:
+        self.ledger.close()
+        path = Path(self._directory.name) / "ledger.duckdb"
+        connection = duckdb.connect(str(path))
+        try:
+            connection.execute("DROP TABLE enrollments")
+            connection.execute("CREATE TABLE enrollments (pairing_code VARCHAR, source_ip VARCHAR)")
+        finally:
+            connection.close()
+
+        self.ledger = ControlLedger(path)
+
+        columns = {row[1] for row in self.ledger._connection.execute("PRAGMA table_info('enrollments')").fetchall()}
+        self.assertNotIn("pairing_code", columns)
+
     def test_approved_enrollment_exclusively_binds_an_mt5_account(self) -> None:
         first_challenge, _ = self.ledger.issue_enrollment_challenge()
         first = self.ledger.create_enrollment(
             login=123456,
             server="Broker-Demo",
-            pairing_code="12345678",
             public_key_pem="public-key-one",
             account_info={"login": 123456},
             terminal_info={"name": "MetaTrader 5"},
@@ -47,7 +63,6 @@ class ControlLedgerTests(unittest.TestCase):
         second = self.ledger.create_enrollment(
             login=123456,
             server="Broker-Demo",
-            pairing_code="87654321",
             public_key_pem="public-key-two",
             account_info={"login": 123456},
             terminal_info={"name": "MetaTrader 5"},
@@ -64,7 +79,6 @@ class ControlLedgerTests(unittest.TestCase):
         enrollment = self.ledger.create_enrollment(
             login=123456,
             server="Broker-Demo",
-            pairing_code="12345678",
             public_key_pem="public-key",
             account_info={"login": 123456},
             terminal_info={"name": "MetaTrader 5"},

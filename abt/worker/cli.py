@@ -11,7 +11,7 @@ import httpx
 
 from .enrollment import EnrollmentTransport, MT5Client, WorkerEnrollmentError, register_worker
 from .keystore import HardwareKeyStore, WindowsCNGKeyStore
-from .reconciliation import reconcile_with_safety
+from .reconciliation import reconnect_worker_session
 from .session import open_authenticated_worker_session
 
 
@@ -138,17 +138,16 @@ def main(
         key_store = key_store_factory(arguments.key_name)
         try:
             if arguments.command == "reconcile":
-                with open_authenticated_worker_session(
-                    controller_url=arguments.controller_url,
-                    enrollment_id=arguments.enrollment_id,
-                    key_store=key_store,
-                ) as session:
-                    reconcile_with_safety(
-                        mt5=mt5,
-                        session=session,
-                        login=arguments.login,
-                        server=arguments.server,
-                    )
+                reconnect_worker_session(
+                    open_session=lambda: open_authenticated_worker_session(
+                        controller_url=arguments.controller_url,
+                        enrollment_id=arguments.enrollment_id,
+                        key_store=key_store,
+                    ),
+                    mt5=mt5,
+                    login=arguments.login,
+                    server=arguments.server,
+                )
                 return 0
             transport = transport_factory()
             try:

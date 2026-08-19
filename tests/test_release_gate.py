@@ -144,13 +144,13 @@ class TwoWorkerReleaseExerciseTests(unittest.TestCase):
         password = f"worker-{login}-memory-only-password"
         challenge = client.get("/api/enrollment-challenge").json()["challenge"]
         signature = private_key.sign(
-            enrollment_payload(login, "Broker-Demo", "12345678", account, terminal, password, challenge),
+            enrollment_payload(login, "Broker-Demo", account, terminal, password, challenge),
             ec.ECDSA(hashes.SHA256()),
         )
         response = client.post(
             "/api/enrollments",
             json={
-                "login": login, "server": "Broker-Demo", "pairing_code": "12345678", "account_info": account,
+                "login": login, "server": "Broker-Demo", "account_info": account,
                 "terminal_info": terminal, "mt5_password": password, "enrollment_challenge": challenge,
                 "public_key_pem": public_key, "proof_signature": base64.b64encode(signature).decode("ascii"),
             },
@@ -587,13 +587,13 @@ class ProductCatalogReleaseGateTests(unittest.TestCase):
         password = f"worker-{login}-memory-only-password"
         challenge = client.get("/api/enrollment-challenge").json()["challenge"]
         signature = private_key.sign(
-            enrollment_payload(login, server, "12345678", account, terminal, password, challenge),
+            enrollment_payload(login, server, account, terminal, password, challenge),
             ec.ECDSA(hashes.SHA256()),
         )
         response = client.post(
             "/api/enrollments",
             json={
-                "login": login, "server": server, "pairing_code": "12345678", "account_info": account,
+                "login": login, "server": server, "account_info": account,
                 "terminal_info": terminal, "mt5_password": password, "enrollment_challenge": challenge,
                 "public_key_pem": public_key, "proof_signature": base64.b64encode(signature).decode("ascii"),
             },
@@ -634,7 +634,6 @@ class ProductCatalogReleaseGateTests(unittest.TestCase):
                 "first_point": 0.00001,
                 "second_point": 0.00001,
             }],
-            exceptions=[],
         )
         app.state.ledger.complete_product_catalog_analysis(
             analysis_id,

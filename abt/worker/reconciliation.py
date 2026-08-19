@@ -4,9 +4,9 @@ from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
 import logging
 from time import monotonic, sleep as _sleep
-from typing import Protocol
+from typing import ContextManager, Protocol
 
-from .enrollment import WorkerEnrollmentError
+from .enrollment import WorkerEnrollmentError, WorkerSessionDisconnected
 from .session import collect_market_data_evidence, collect_product_catalog_evidence
 
 
@@ -82,6 +82,8 @@ class WorkerSafetyAdapter:
             self._last_controller_signal = observed_at
         try:
             received = self._session.heartbeat()
+        except WorkerSessionDisconnected:
+            raise
         except WorkerEnrollmentError:
             received = False
         if received:
@@ -104,6 +106,8 @@ class WorkerSafetyAdapter:
             try:
                 operation()
                 return
+            except WorkerSessionDisconnected:
+                raise
             except AccountMismatchError:
                 self._needs_human("account_mismatch")
                 raise
@@ -265,6 +269,30 @@ def reconcile_with_safety(
         ),
         sleep=sleep,
     )
+
+
+def reconnect_worker_session(
+    *,
+    open_session: Callable[[], ContextManager[AuthenticatedReconciliationSession & WorkerSafetySession]],
+    mt5: ReadOnlyMT5,
+    login: int,
+    server: str,
+    sleep: Callable[[float], None] = _sleep,
+    run_reconciliation: Callable[..., None] = reconcile_with_safety,
+) -> None:
+    """Reconnect an interrupted proved WSS session with a bounded exponential backoff."""
+
+    attempts = 0
+    while True:
+        try:
+            with open_session() as session:
+                run_reconciliation(mt5=mt5, session=session, login=login, server=server, sleep=sleep)
+            return
+        except WorkerSessionDisconnected:
+            if attempts >= 10:
+                raise
+            sleep(float(5 * 2 ** attempts))
+            attempts += 1
 
 
 def _run_reconciliation_with_analysis(

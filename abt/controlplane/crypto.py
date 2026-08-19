@@ -16,7 +16,6 @@ class ProofError(ValueError):
 def enrollment_payload(
     login: int,
     server: str,
-    pairing_code: str,
     account_info: dict[str, object] | None = None,
     terminal_info: dict[str, object] | None = None,
     mt5_password: str = "",
@@ -27,7 +26,6 @@ def enrollment_payload(
             "account_info": account_info or {},
             "login": login,
             "mt5_password": mt5_password,
-            "pairing_code": pairing_code,
             "enrollment_challenge": enrollment_challenge,
             "server": server,
             "terminal_info": terminal_info or {},
@@ -120,7 +118,6 @@ def verify_enrollment_proof(
     *,
     login: int,
     server: str,
-    pairing_code: str,
     account_info: dict[str, object] | None = None,
     terminal_info: dict[str, object] | None = None,
     mt5_password: str = "",
@@ -130,7 +127,7 @@ def verify_enrollment_proof(
         public_key_pem,
         signature_base64,
         enrollment_payload(
-            login, server, pairing_code, account_info, terminal_info, mt5_password, enrollment_challenge
+            login, server, account_info, terminal_info, mt5_password, enrollment_challenge
         ),
         malformed_message="The enrollment proof is malformed.",
         invalid_message="The enrollment proof signature is invalid.",

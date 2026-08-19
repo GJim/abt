@@ -8,6 +8,25 @@ test('administrator can reach the management login', async ({ page }) => {
   await expect(page.getByLabel('Password')).toBeVisible()
 })
 
+test('analysis history route is not treated as an analysis ID', async ({ page }) => {
+  await mockLogin(page)
+  await mockManagementData(page)
+  await page.route('**/api/admin/product-catalog-analyses**', async (route) => {
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({ items: [], next_cursor: null }),
+    })
+  })
+
+  await page.goto('http://127.0.0.1:4173/analysis/history')
+  await page.getByLabel('Administrator account').fill('ABCDEF')
+  await page.getByLabel('Password').fill('A-secure-admin-password!')
+  await page.getByRole('button', { name: 'Sign in' }).click()
+
+  await expect(page.locator('h1')).toHaveCount(0)
+  await expect(page.getByRole('heading', { name: 'Analysis result' })).toHaveCount(0)
+})
+
 test('administrator resumes a cookie-backed session after refresh', async ({ page }) => {
   await mockSessionResume(page)
 
@@ -47,6 +66,7 @@ test('administrator can review and approve a pending worker registration', async
         { event_id: 1, event_type: 'worker_enrollment_approved', payload: {}, occurred_at: '2026-08-15T00:00:00Z' },
       ]),
     })
+
   })
   await page.route('**/api/admin/enrollments/enrollment-1/approve', async (route) => {
     expect(route.request().method()).toBe('POST')
@@ -118,6 +138,36 @@ test('administrator can review and approve a pending worker registration', async
   await expect(page.getByText('No worker registrations are awaiting review.')).toBeVisible()
   await expect(page.getByText('worker_enrollment_approved')).toBeVisible()
   expect(enrollmentRequests).toBe(2)
+})
+
+test('administrator reviews pending enrollments from the notification list', async ({ page }) => {
+  let approved = false
+  await mockLogin(page)
+  await mockManagementData(page)
+  await page.route('**/api/admin/enrollments', async (route) => {
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify(approved ? [] : [buildEnrollment()]),
+    })
+  })
+  await page.route('**/api/admin/enrollments/enrollment-1/approve', async (route) => {
+    approved = true
+    await route.fulfill({ status: 200 })
+  })
+
+  await signIn(page)
+
+  await expect(page.getByRole('heading', { level: 1, name: 'Management console' })).toBeVisible()
+  const notifications = page.getByRole('button', { name: 'Pending enrollment notifications: 1' })
+  await expect(notifications).toBeVisible()
+  await notifications.click()
+  await page.getByRole('button', { name: 'Review registration' }).click()
+  const dialog = page.getByRole('dialog', { name: 'Registration for 12345678 on Broker-Demo' })
+  await expect(dialog.getByText('"currency": "USD"')).toBeVisible()
+  await expect(dialog.getByText('"platform": "MetaTrader 5"')).toBeVisible()
+  await dialog.getByRole('button', { name: 'Approve' }).click()
+
+  await expect(page.getByRole('button', { name: 'Pending enrollment notifications: 0' })).toBeVisible()
 })
 
 test('administrator can view connected worker health and reconciliation', async ({ page }) => {
@@ -220,7 +270,7 @@ test('administrator sees a useful fleet-health empty state', async ({ page }) =>
   await expect(page.getByLabel('Worker summary')).toContainText('No account workers have reported yet.')
 })
 
-test('administrator can launch an analysis with CSRF protection and inspect passing, failing, and exception evidence', async ({ page }) => {
+test('administrator can launch an analysis with CSRF protection and inspect passing and failing evidence', async ({ page }) => {
   let receivedHeaders: Record<string, string> | null = null
   let receivedBody: Record<string, unknown> | null = null
 
@@ -267,12 +317,12 @@ test('administrator can launch an analysis with CSRF protection and inspect pass
   await page.getByLabel('Administrator account').fill('ABCDEF')
   await page.getByLabel('Password').fill('A-secure-admin-password!')
   await page.getByRole('button', { name: 'Sign in' }).click()
-  await page.getByRole('link', { name: 'Launch analysis' }).click()
+  await page.getByRole('link', { name: 'Analysis', exact: true }).click()
 
   await page.getByLabel('First analysis worker').selectOption('worker-a')
   await page.getByLabel('Second analysis worker').selectOption('worker-b')
   await page.getByLabel('Policy label').fill('FX catalog v2')
-  await page.getByRole('button', { name: 'Launch analysis' }).click()
+  await page.getByRole('button', { name: 'Launch' }).click()
 
   expect(receivedHeaders?.['x-csrf-token']).toBe('csrf-token')
   expect(receivedBody).toMatchObject({
@@ -291,20 +341,21 @@ test('administrator can launch an analysis with CSRF protection and inspect pass
   })
 
   await expect(page.getByRole('heading', { name: 'Analysis analysis-1' })).toBeVisible()
+  await page.getByRole('button', { name: /Candidates/ }).click()
   const finalPassingSection = page.getByRole('heading', { name: 'Final passing candidates' }).locator('..')
   const finalFailingSection = page.getByRole('heading', { name: 'Final failing candidates' }).locator('..')
   await expect(finalPassingSection).toBeVisible()
+  await finalPassingSection.getByRole('button', { name: /EURUSD.a ↔ EURUSD/ }).click()
   await expect(finalPassingSection.getByRole('heading', { name: 'EURUSD.a ↔ EURUSD' })).toBeVisible()
   await expect(finalPassingSection.getByRole('heading', { name: 'Warning differences' })).toBeVisible()
   const failedCandidates = finalFailingSection.locator('details')
   await expect(failedCandidates).not.toHaveAttribute('open', '')
   await failedCandidates.locator('summary').click()
-  await expect(finalFailingSection.getByRole('heading', { name: 'Hard-block differences' })).toBeVisible()
-  await expect(page.getByText('volume_step')).toBeVisible()
-  await expect(page.getByText('volume_max')).toBeVisible()
-  await expect(page.getByRole('heading', { name: 'Calculation-mode exceptions' })).toBeVisible()
-  await expect(page.getByText('Trade Calc Mode Mismatch')).toBeVisible()
-  await expect(page.getByText('Worker timed out once.')).toBeVisible()
+  await finalFailingSection.getByRole('button', { name: /GBPUSD.a ↔ GBPUSD/ }).click()
+  await expect(finalFailingSection.getByRole('heading', { name: 'Warning differences' })).toBeVisible()
+  await expect(page.getByText('volume_step')).toHaveCount(0)
+  await expect(page.getByRole('heading', { name: 'Calculation-mode exceptions' })).toHaveCount(0)
+  await expect(page.getByRole('button', { name: /Evidence|Activity/ })).toHaveCount(0)
 })
 
 test('administrator sees the worker-provided analysis failure reason as an alert', async ({ page }) => {
@@ -330,10 +381,10 @@ test('administrator sees the worker-provided analysis failure reason as an alert
   await page.getByLabel('Administrator account').fill('ABCDEF')
   await page.getByLabel('Password').fill('A-secure-admin-password!')
   await page.getByRole('button', { name: 'Sign in' }).click()
-  await page.getByRole('link', { name: 'Launch analysis' }).click()
+  await page.getByRole('link', { name: 'Analysis', exact: true }).click()
   await page.getByLabel('First analysis worker').selectOption('worker-a')
   await page.getByLabel('Second analysis worker').selectOption('worker-b')
-  await page.getByRole('button', { name: 'Launch analysis' }).click()
+  await page.getByRole('button', { name: 'Launch' }).click()
 
   await expect(page.getByRole('alert')).toHaveText('Analysis failed: AUDNZDC M15 evidence is unavailable.')
 })
@@ -394,38 +445,25 @@ test('administrator can inspect immutable evidence, build a pair, and retire it 
   await page.getByLabel('Administrator account').fill('ABCDEF')
   await page.getByLabel('Password').fill('A-secure-admin-password!')
   await page.getByRole('button', { name: 'Sign in' }).click()
-  await page.getByRole('link', { name: 'Launch analysis' }).click()
+  await page.getByRole('link', { name: 'Analysis', exact: true }).click()
   await page.getByLabel('First analysis worker').selectOption('worker-a')
   await page.getByLabel('Second analysis worker').selectOption('worker-b')
-  await page.getByRole('button', { name: 'Launch analysis' }).click()
+  await page.getByRole('button', { name: 'Launch' }).click()
 
-  await expect(page.getByText('It never places, modifies, or closes broker orders.')).toBeVisible()
-  const candidateCard = page.locator('.buildable-result-card').first()
-  await candidateCard.getByRole('button', { name: 'Prepare Build confirmation' }).click()
+  await page.getByRole('button', { name: /Candidates/ }).click()
+  await page.getByRole('button', { name: /EURUSD.a ↔ EURUSD/ }).first().click()
+  await page.getByRole('button', { name: 'Create product pair for EURUSD.a and EURUSD' }).click()
 
+  await expect.poll(() => buildHeaders?.['x-csrf-token']).toBe('csrf-token')
   expect(confirmationHeaders?.['x-csrf-token']).toBe('csrf-token')
-  await expect(candidateCard.getByText('Lot relationship')).toBeVisible()
-  await expect(candidateCard.getByText('1:1')).toBeVisible()
-  await expect(candidateCard.getByText('111111 on Broker-A')).toBeVisible()
-  await expect(candidateCard.getByText('222222 on Broker-B')).toBeVisible()
-  await expect(candidateCard.getByText('Broker-A · EURUSD.a')).toBeVisible()
-  await expect(candidateCard.getByText('Broker-B · EURUSD')).toBeVisible()
-
-  const buildButton = candidateCard.getByRole('button', { name: 'Build product pair' })
-  await expect(buildButton).toBeDisabled()
-  await candidateCard.getByRole('checkbox', { name: /Explicit Build confirmation/i }).check()
-  await expect(buildButton).toBeEnabled()
-  await buildButton.click()
-
   expect(buildHeaders?.['x-csrf-token']).toBe('csrf-token')
+  await expect(page.getByLabel('Notifications').getByText('Created active product pair pair-1.')).toBeVisible()
   await page.getByRole('link', { name: 'Main' }).click()
   await expect(page.getByRole('heading', { name: 'Active product pairs' })).toBeVisible()
   const pairCard = page.locator('.product-pair-card').filter({ hasText: 'pair-1' })
   await expect(pairCard.getByRole('heading', { name: 'Broker-A:EURUSD.a ↔ Broker-B:EURUSD' })).toBeVisible()
   await expect(pairCard).toContainText('Original policy snapshot')
   await expect(pairCard).toContainText('Passed')
-  await expect(page.locator('.buildable-result-card')).toHaveCount(0)
-  await expect(page.getByText('1 final passing candidate(s) already have an active product pair')).toBeVisible()
 
   await page.getByRole('button', { name: 'Retire product pair' }).click()
 
@@ -550,8 +588,8 @@ test('administrator hides a final candidate already represented by an active pai
   await page.getByLabel('Administrator account').fill('ABCDEF')
   await page.getByLabel('Password').fill('A-secure-admin-password!')
   await page.getByRole('button', { name: 'Sign in' }).click()
-  await page.getByRole('link', { name: 'Launch analysis' }).click()
-  await page.getByRole('button', { name: 'Launch analysis' }).click()
+  await page.getByRole('link', { name: 'Analysis', exact: true }).click()
+  await page.getByRole('button', { name: 'Launch' }).click()
 
   await expect(page.locator('.buildable-result-card')).toHaveCount(0)
   await expect(page.getByText('1 final passing candidate(s) already have an active product pair')).toBeVisible()
@@ -879,10 +917,10 @@ test('administrator sees validation feedback when no cross-server pair is availa
   await page.getByLabel('Administrator account').fill('ABCDEF')
   await page.getByLabel('Password').fill('A-secure-admin-password!')
   await page.getByRole('button', { name: 'Sign in' }).click()
-  await page.getByRole('link', { name: 'Launch analysis' }).click()
+  await page.getByRole('link', { name: 'Analysis', exact: true }).click()
 
   await expect(page.getByText('Pick two eligible workers on different exact MT5 servers before launching.')).toBeVisible()
-  await expect(page.getByRole('button', { name: 'Launch analysis' })).toBeDisabled()
+  await expect(page.getByRole('button', { name: 'Launch' })).toBeDisabled()
   expect(launchRequests).toBe(0)
 })
 
@@ -932,9 +970,9 @@ test('administrator sees terminal analysis failures with lifecycle details', asy
   await page.getByLabel('Administrator account').fill('ABCDEF')
   await page.getByLabel('Password').fill('A-secure-admin-password!')
   await page.getByRole('button', { name: 'Sign in' }).click()
-  await page.getByRole('link', { name: 'Launch analysis' }).click()
+  await page.getByRole('link', { name: 'Analysis', exact: true }).click()
 
-  await page.getByRole('button', { name: 'Launch analysis' }).click()
+  await page.getByRole('button', { name: 'Launch' }).click()
 
   await expect(page.locator('.analysis-results .status-badge').first()).toHaveText('Failed')
   await expect(page.getByText('M1 verification failed', { exact: true })).toBeVisible()
@@ -1067,14 +1105,15 @@ test('administrator can search, paginate, and disclose audit evidence', async ({
 
   await signIn(page)
   await page.getByRole('link', { name: 'Audit events' }).click()
-  await expect(page.getByRole('heading', { name: 'Audit events' })).toBeVisible()
+  await expect(page.locator('h1')).toHaveCount(0)
   await expect(page.getByText('administrator_approval_required', { exact: true })).toBeVisible()
   await page.getByText('View raw payload').click()
   await expect(page.getByText('"reason": "administrator_approval_required"')).toBeVisible()
-  await page.getByRole('button', { name: 'Load more' }).click()
+  await page.getByRole('button', { name: 'Next' }).click()
   await expect(page.getByText('Worker Reconciled', { exact: true }).first()).toBeVisible()
-  await page.getByLabel('Search audit events').fill('reconciled')
-  await page.getByRole('button', { name: 'Search' }).click()
+  await page.getByLabel('Search').fill('reconciled')
+  await expect.poll(() => page.evaluate(() => performance.getEntriesByType('resource')
+    .some((entry) => entry.name.includes('q=reconciled')))).toBe(true)
   await expect(page.getByText('Worker Enrollment Approved', { exact: true }).first()).toBeVisible()
 })
 
@@ -1108,17 +1147,20 @@ test('administrator can search worker snapshots and retrieve raw evidence on dem
 
   await signIn(page)
   await page.getByRole('link', { name: 'Workers' }).click()
-  await expect(page.getByRole('heading', { name: 'Worker snapshots' })).toBeVisible()
+  await expect(page.locator('h1')).toHaveCount(0)
   await expect(page.getByText('Broker-A')).toBeVisible()
   await expect(page.getByText('1,000')).toBeVisible()
   await page.getByRole('button', { name: 'View raw JSON' }).click()
-  await expect(page.getByText('"currency": "USD"')).toBeVisible()
-  await page.getByLabel('Search worker snapshots').fill('Broker-A')
-  await page.getByRole('button', { name: 'Search' }).click()
+  await expect(page.getByRole('dialog', { name: 'Raw snapshot JSON' }).getByText('"currency": "USD"')).toBeVisible()
+  await page.getByRole('button', { name: 'Close raw snapshot JSON' }).click()
+  await expect(page.getByRole('dialog', { name: 'Raw snapshot JSON' })).toHaveCount(0)
+  await page.getByLabel('Search').fill('Broker-A')
+  await expect.poll(() => page.evaluate(() => performance.getEntriesByType('resource')
+    .some((entry) => entry.name.includes('q=Broker-A')))).toBe(true)
   await expect(page.getByText('Broker-A')).toBeVisible()
 })
 
-test('administrator can filter analysis history and open its analysis workspace', async ({ page }) => {
+test('administrator can filter, paginate, and open analysis history from its row', async ({ page }) => {
   await mockLogin(page)
   await mockManagementData(page)
   await page.route('**/api/admin/product-catalog-analyses/analysis-1', async (route) => {
@@ -1126,12 +1168,13 @@ test('administrator can filter analysis history and open its analysis workspace'
   })
   await page.route('**/api/admin/product-catalog-analyses?**', async (route) => {
     const query = new URL(route.request().url()).searchParams
-    expect(query.get('limit')).toBe('50')
+    expect(query.get('limit')).toBe('20')
+    const isNextPage = query.get('cursor') === 'next-page'
     await route.fulfill({
       contentType: 'application/json',
       body: JSON.stringify({
         items: [{
-          analysis_id: 'analysis-1',
+          analysis_id: isNextPage ? 'analysis-2' : 'analysis-1',
           requested_by: 'ABCDEF',
           first_worker: { worker_id: 'worker-a', login: 111111, server: 'Broker-A' },
           second_worker: { worker_id: 'worker-b', login: 222222, server: 'Broker-B' },
@@ -1142,19 +1185,26 @@ test('administrator can filter analysis history and open its analysis workspace'
           requested_at: '2026-08-16T00:00:00Z',
           completed_at: '2026-08-16T00:08:00Z',
         }],
-        next_cursor: null,
+        next_cursor: isNextPage ? null : 'next-page',
       }),
     })
   })
 
   await signIn(page)
   await page.getByRole('link', { name: 'Analysis history' }).click()
-  await expect(page.getByRole('heading', { name: 'Analysis history' })).toBeVisible()
+  await expect(page.locator('h1')).toHaveCount(0)
+  await page.getByLabel('Search').fill('20260819')
+  await expect.poll(() => page.evaluate(() => performance.getEntriesByType('resource')
+    .some((entry) => entry.name.includes('q=20260819')))).toBe(true)
+  await expect(page.getByRole('link', { name: 'Open analysis analysis-1' })).toBeVisible()
   await page.getByLabel('Status').selectOption('succeeded')
   await expect(page.getByText('FX catalog v2')).toBeVisible()
-  await page.getByRole('button', { name: 'Open' }).click()
-  await expect(page.getByRole('heading', { name: 'Cross-server product-pair analyses' })).toBeVisible()
-  await expect(page).toHaveURL(/analysis=analysis-1.*#launch/)
+  await page.getByRole('button', { name: 'Next' }).click()
+  await expect(page.getByRole('link', { name: 'Open analysis analysis-2' })).toBeVisible()
+  await page.getByRole('button', { name: 'Previous' }).click()
+  await page.getByRole('link', { name: 'Open analysis analysis-1' }).click()
+  await expect(page.locator('h1')).toHaveCount(0)
+  await expect(page).toHaveURL(/\/analysis\/analysis-1$/)
   await expect(page.getByRole('heading', { name: 'Fleet health' })).not.toBeVisible()
 })
 
@@ -1175,12 +1225,13 @@ test('administrator can browse current and retired product-pair lists', async ({
 
   await signIn(page)
   await page.getByRole('link', { name: 'Current pairs' }).click()
-  await expect(page.getByRole('heading', { name: 'Active product pairs' })).toBeVisible()
+  await expect(page.locator('h1')).toHaveCount(0)
   await expect(page.getByText('Broker-A · EURUSD.a / Broker-B · EURUSD')).toBeVisible()
-  await page.getByLabel('Search product pairs').fill('EURUSD')
-  await page.getByRole('button', { name: 'Search' }).click()
+  await page.getByLabel('Search').fill('EURUSD')
+  await expect.poll(() => page.evaluate(() => performance.getEntriesByType('resource')
+    .some((entry) => entry.name.includes('q=EURUSD')))).toBe(true)
   await page.getByRole('link', { name: 'Retired pairs' }).click()
-  await expect(page.getByRole('heading', { name: 'Retired product pairs' })).toBeVisible()
+  await expect(page.locator('h1')).toHaveCount(0)
   await expect(page.getByText('Policy Replaced')).toBeVisible()
 })
 
@@ -1189,7 +1240,7 @@ test('launch analysis is isolated from main-page operational summaries', async (
   await mockManagementData(page, { workers: [buildWorker({})] })
 
   await signIn(page)
-  await page.getByRole('link', { name: 'Launch analysis' }).click()
+  await page.getByRole('link', { name: 'Analysis', exact: true }).click()
 
   await expect(page.getByRole('heading', { name: 'Cross-server product-pair analyses' })).toBeVisible()
   await expect(page.getByRole('heading', { name: 'Fleet health' })).not.toBeVisible()
@@ -1359,17 +1410,6 @@ function buildAnalysis(overrides?: Record<string, unknown>) {
         second_point: 0.00001,
       },
     ],
-    exceptions: [{
-      first_symbol: 'XAUUSD',
-      second_symbol: 'XAUUSD',
-      currency_base: 'XAU',
-      currency_profit: 'USD',
-      first_point: 0.01,
-      second_point: 0.01,
-      reason: 'trade_calc_mode_mismatch',
-      first_trade_calc_mode: 1,
-      second_trade_calc_mode: 0,
-    }],
     m15_screening_results: [
       buildStageResult({
         first_symbol: 'EURUSD.a',

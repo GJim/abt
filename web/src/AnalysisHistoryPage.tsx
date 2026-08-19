@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import type { FormEvent } from 'react'
+import type { KeyboardEvent } from 'react'
+import { Pagination } from '@astryxdesign/core/Pagination'
 import './Console.css'
 
 export type AnalysisSummary = {
@@ -32,10 +33,16 @@ type AnalysisHistoryPageProps = {
   onOpenAnalysis: (analysisId: string) => void
 }
 
+type AnalysisPage = AnalysisHistoryResponse
+
 type AnalysisRequest = {
   cursor: string
-  append: boolean
+  pageIndex: number
+  query: string
+  status: string
 }
+
+const PAGE_SIZE = 20
 
 const statusOptions = [
   { value: '', label: 'All statuses' },
@@ -46,35 +53,28 @@ const statusOptions = [
 
 export function AnalysisHistoryPage({ onOpenAnalysis }: AnalysisHistoryPageProps) {
   const [search, setSearch] = useState('')
-  const [appliedSearch, setAppliedSearch] = useState('')
   const [status, setStatus] = useState('')
-  const [analyses, setAnalyses] = useState<AnalysisSummary[]>([])
-  const [nextCursor, setNextCursor] = useState<string | null>(null)
+  const [pages, setPages] = useState<AnalysisPage[]>([])
+  const [pageIndex, setPageIndex] = useState(0)
   const [isLoading, setIsLoading] = useState(true)
-  const [isLoadingMore, setIsLoadingMore] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const abortControllerRef = useRef<AbortController | null>(null)
-  const failedRequestRef = useRef<AnalysisRequest>({ cursor: '', append: false })
+  const failedRequestRef = useRef<AnalysisRequest | null>(null)
 
-  const loadAnalyses = useCallback(async (request: AnalysisRequest, query: string, statusFilter: string) => {
+  const loadPage = useCallback(async (request: AnalysisRequest) => {
     abortControllerRef.current?.abort()
     const controller = new AbortController()
     abortControllerRef.current = controller
     failedRequestRef.current = request
     setError(null)
+    setIsLoading(true)
 
-    if (request.append) {
-      setIsLoadingMore(true)
-    } else {
-      setIsLoading(true)
+    const parameters = new URLSearchParams({ limit: String(PAGE_SIZE) })
+    if (request.query) {
+      parameters.set('q', request.query)
     }
-
-    const parameters = new URLSearchParams({ limit: '50' })
-    if (query) {
-      parameters.set('q', query)
-    }
-    if (statusFilter) {
-      parameters.set('status', statusFilter)
+    if (request.status) {
+      parameters.set('status', request.status)
     }
     if (request.cursor) {
       parameters.set('cursor', request.cursor)
@@ -94,8 +94,11 @@ export function AnalysisHistoryPage({ onOpenAnalysis }: AnalysisHistoryPageProps
         throw new Error('Analysis history returned an invalid response.')
       }
 
-      setAnalyses((current) => request.append ? [...current, ...payload.items] : payload.items)
-      setNextCursor(payload.next_cursor)
+      setPages((current) => [
+        ...current.slice(0, request.pageIndex),
+        payload,
+      ])
+      setPageIndex(request.pageIndex)
     } catch (caughtError) {
       if (controller.signal.aborted) {
         return
@@ -104,56 +107,82 @@ export function AnalysisHistoryPage({ onOpenAnalysis }: AnalysisHistoryPageProps
     } finally {
       if (abortControllerRef.current === controller) {
         setIsLoading(false)
-        setIsLoadingMore(false)
       }
     }
   }, [])
 
+  const normalizedSearch = search.trim()
   useEffect(() => {
-    void loadAnalyses({ cursor: '', append: false }, appliedSearch, status)
-    return () => abortControllerRef.current?.abort()
-  }, [appliedSearch, loadAnalyses, status])
-
-  function submitSearch(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault()
-    setAppliedSearch(search.trim())
-  }
+    const delay = window.setTimeout(() => {
+      setPages([])
+      setPageIndex(0)
+      void loadPage({ cursor: '', pageIndex: 0, query: normalizedSearch, status })
+    }, 250)
+    return () => window.clearTimeout(delay)
+  }, [loadPage, normalizedSearch, status])
 
   function retry() {
-    void loadAnalyses(failedRequestRef.current, appliedSearch, status)
+    if (failedRequestRef.current) {
+      void loadPage(failedRequestRef.current)
+    }
   }
 
-  return (
-    <section aria-labelledby="analysis-history-heading">
-      <header className="console-page-header">
-        <div>
-          <h1 id="analysis-history-heading">Analysis history</h1>
-          <p>Search and review product catalog analysis requests across worker pairs.</p>
-        </div>
-      </header>
+  function changePage(nextPage: number) {
+    const nextPageIndex = nextPage - 1
+    if (nextPageIndex === pageIndex) {
+      return
+    }
+    if (pages[nextPageIndex]) {
+      setPageIndex(nextPageIndex)
+      return
+    }
+    const cursor = pages[pageIndex]?.next_cursor
+    if (cursor) {
+      setPageIndex(nextPageIndex)
+      void loadPage({ cursor, pageIndex: nextPageIndex, query: normalizedSearch, status })
+    }
+  }
 
-      <form className="console-table-actions" role="search" onSubmit={submitSearch}>
-        <label htmlFor="analysis-history-search">Search analyses</label>
+  function openRow(analysisId: string, event: KeyboardEvent<HTMLTableRowElement>) {
+    if (event.key === 'Enter' || event.key === ' ') {
+      event.preventDefault()
+      onOpenAnalysis(analysisId)
+    }
+  }
+
+  const currentPage = pages[pageIndex]
+  const analyses = currentPage?.items ?? []
+  const hasNextPage = Boolean(currentPage?.next_cursor || pages[pageIndex + 1])
+
+  return (
+    <section aria-label="Analysis history">
+      <div className="console-table-actions analysis-history-filters" role="search">
+        <label htmlFor="analysis-history-search">Search</label>
         <input
           id="analysis-history-search"
           name="q"
           type="search"
           value={search}
-          onChange={(event) => setSearch(event.target.value)}
-          placeholder="Worker, server, policy, or ID"
+          onChange={(event) => {
+            setSearch(event.target.value)
+            setIsLoading(true)
+          }}
+          placeholder="Worker, server, policy, ID, or YYYYMMDD"
         />
         <label htmlFor="analysis-history-status">Status</label>
         <select
           id="analysis-history-status"
           name="status"
           value={status}
-          onChange={(event) => setStatus(event.target.value)}
-          disabled={isLoadingMore}
+          onChange={(event) => {
+            setStatus(event.target.value)
+            setIsLoading(true)
+          }}
+          disabled={isLoading}
         >
           {statusOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
         </select>
-        <button type="submit" disabled={isLoading || isLoadingMore}>Search</button>
-      </form>
+      </div>
 
       {isLoading && analyses.length === 0 ? (
         <p className="console-empty-state" role="status">Loading analysis history…</p>
@@ -173,15 +202,14 @@ export function AnalysisHistoryPage({ onOpenAnalysis }: AnalysisHistoryPageProps
       {!isLoading && !error && analyses.length === 0 ? (
         <div className="console-empty-state">
           <strong>No analyses found.</strong>
-          <span>{appliedSearch || status ? 'Try changing the search or status filter.' : 'New analysis requests will appear here.'}</span>
+          <span>{normalizedSearch || status ? 'Try changing the search or status filter.' : 'New analysis requests will appear here.'}</span>
         </div>
       ) : null}
 
       {analyses.length > 0 ? (
         <>
           <div className="console-table-scroll">
-            <table className="console-table">
-              <caption className="visually-hidden">Product catalog analysis history</caption>
+            <table aria-label="Analysis history" className="console-table">
               <thead>
                 <tr>
                   <th scope="col">Requested</th>
@@ -190,37 +218,42 @@ export function AnalysisHistoryPage({ onOpenAnalysis }: AnalysisHistoryPageProps
                   <th scope="col">Status</th>
                   <th scope="col">Stage</th>
                   <th scope="col">Retries</th>
-                  <th scope="col">Action</th>
                 </tr>
               </thead>
               <tbody>
                 {analyses.map((analysis) => (
-                  <tr key={analysis.analysis_id}>
+                  <tr
+                    aria-label={`Open analysis ${analysis.analysis_id}`}
+                    className="console-clickable-row"
+                    key={analysis.analysis_id}
+                    onClick={() => onOpenAnalysis(analysis.analysis_id)}
+                    onKeyDown={(event) => openRow(analysis.analysis_id, event)}
+                    role="link"
+                    tabIndex={0}
+                  >
                     <td><time dateTime={analysis.requested_at}>{formatDateTime(analysis.requested_at)}</time></td>
                     <td>{workerLabel(analysis.first_worker)} / {workerLabel(analysis.second_worker)}</td>
                     <td>{analysis.policy_label || '—'}</td>
                     <td><span className="console-status" data-state={analysis.status}>{humanize(analysis.status)}</span></td>
                     <td><span className="console-tag">{humanize(analysis.current_stage)}</span></td>
                     <td>{analysis.retry_count}</td>
-                    <td><button type="button" onClick={() => onOpenAnalysis(analysis.analysis_id)}>Open</button></td>
                   </tr>
                 ))}
               </tbody>
             </table>
           </div>
 
-          {nextCursor ? (
-            <div className="console-table-actions">
-              <button
-                type="button"
-                onClick={() => void loadAnalyses({ cursor: nextCursor, append: true }, appliedSearch, status)}
-                disabled={isLoadingMore}
-              >
-                {isLoadingMore ? 'Loading more analyses…' : 'Load more'}
-              </button>
-              {isLoadingMore ? <span role="status">Loading more analyses…</span> : null}
-            </div>
-          ) : null}
+          <div className="console-pagination">
+            <Pagination
+              hasMore={hasNextPage}
+              isDisabled={isLoading}
+              label="Analysis history pages"
+              onChange={changePage}
+              page={pageIndex + 1}
+              pageSize={PAGE_SIZE}
+              size="sm"
+            />
+          </div>
         </>
       ) : null}
     </section>
@@ -233,7 +266,11 @@ function workerLabel(worker: AnalysisSummary['first_worker']) {
 
 function formatDateTime(value: string) {
   const date = new Date(value)
-  return Number.isNaN(date.getTime()) ? value : date.toLocaleString()
+  if (Number.isNaN(date.getTime())) {
+    return value
+  }
+  const pad = (part: number) => String(part).padStart(2, '0')
+  return `${date.getUTCFullYear()}-${pad(date.getUTCMonth() + 1)}-${pad(date.getUTCDate())} ${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}:${pad(date.getUTCSeconds())}`
 }
 
 function humanize(value: string) {

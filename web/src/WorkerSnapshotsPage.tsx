@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import type { FormEvent } from 'react'
+import { Pagination } from '@astryxdesign/core/Pagination'
 import './Console.css'
 
 export type SnapshotSummary = {
@@ -21,42 +21,41 @@ type SnapshotResponse = {
 
 type SnapshotRequest = {
   cursor: string
-  append: boolean
+  pageIndex: number
+  query: string
 }
+
+const PAGE_SIZE = 50
 
 export function WorkerSnapshotsPage() {
   const [search, setSearch] = useState('')
-  const [appliedSearch, setAppliedSearch] = useState('')
-  const [snapshots, setSnapshots] = useState<SnapshotSummary[]>([])
-  const [nextCursor, setNextCursor] = useState<string | null>(null)
+  const [pages, setPages] = useState<SnapshotResponse[]>([])
+  const [pageIndex, setPageIndex] = useState(0)
   const [isLoading, setIsLoading] = useState(true)
-  const [isLoadingMore, setIsLoadingMore] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [rawSnapshots, setRawSnapshots] = useState<Record<string, unknown>>({})
   const [detailError, setDetailError] = useState<Record<string, string>>({})
   const [loadingDetailId, setLoadingDetailId] = useState<string | null>(null)
+  const [selectedSnapshotId, setSelectedSnapshotId] = useState<string | null>(null)
   const listAbortControllerRef = useRef<AbortController | null>(null)
   const detailAbortControllerRef = useRef<AbortController | null>(null)
-  const failedRequestRef = useRef<SnapshotRequest>({ cursor: '', append: false })
+  const failedRequestRef = useRef<SnapshotRequest | null>(null)
 
-  const loadSnapshots = useCallback(async (request: SnapshotRequest, query: string) => {
+  const loadPage = useCallback(async (request: SnapshotRequest) => {
     listAbortControllerRef.current?.abort()
     const controller = new AbortController()
     listAbortControllerRef.current = controller
     failedRequestRef.current = request
     setError(null)
+    setIsLoading(true)
 
-    if (request.append) {
-      setIsLoadingMore(true)
-    } else {
-      setIsLoading(true)
+    const parameters = new URLSearchParams({ limit: String(PAGE_SIZE) })
+    if (request.query) {
+      parameters.set('q', request.query)
     }
-
-    const parameters = new URLSearchParams({
-      limit: '50',
-      q: query,
-      cursor: request.cursor,
-    })
+    if (request.cursor) {
+      parameters.set('cursor', request.cursor)
+    }
 
     try {
       const response = await fetch(`/api/admin/worker-snapshots?${parameters}`, {
@@ -72,36 +71,53 @@ export function WorkerSnapshotsPage() {
         throw new Error('Worker snapshots returned an invalid response.')
       }
 
-      setSnapshots((current) => request.append ? [...current, ...payload.items] : payload.items)
-      setNextCursor(payload.next_cursor)
+      setPages((current) => [...current.slice(0, request.pageIndex), payload])
+      setPageIndex(request.pageIndex)
     } catch (caughtError) {
-      if (controller.signal.aborted) {
-        return
+      if (!controller.signal.aborted) {
+        setError(caughtError instanceof Error ? caughtError.message : 'Worker snapshots could not be loaded.')
       }
-      setError(caughtError instanceof Error ? caughtError.message : 'Worker snapshots could not be loaded.')
     } finally {
       if (listAbortControllerRef.current === controller) {
         setIsLoading(false)
-        setIsLoadingMore(false)
       }
     }
   }, [])
 
+  const normalizedSearch = search.trim()
   useEffect(() => {
-    void loadSnapshots({ cursor: '', append: false }, appliedSearch)
+    const delay = window.setTimeout(() => {
+      setPages([])
+      setPageIndex(0)
+      void loadPage({ cursor: '', pageIndex: 0, query: normalizedSearch })
+    }, 250)
     return () => {
+      window.clearTimeout(delay)
       listAbortControllerRef.current?.abort()
       detailAbortControllerRef.current?.abort()
     }
-  }, [appliedSearch, loadSnapshots])
-
-  function submitSearch(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault()
-    setAppliedSearch(search.trim())
-  }
+  }, [loadPage, normalizedSearch])
 
   function retry() {
-    void loadSnapshots(failedRequestRef.current, appliedSearch)
+    if (failedRequestRef.current) {
+      void loadPage(failedRequestRef.current)
+    }
+  }
+
+  function changePage(nextPage: number) {
+    const nextPageIndex = nextPage - 1
+    if (nextPageIndex === pageIndex) {
+      return
+    }
+    if (pages[nextPageIndex]) {
+      setPageIndex(nextPageIndex)
+      return
+    }
+    const cursor = pages[pageIndex]?.next_cursor
+    if (cursor) {
+      setPageIndex(nextPageIndex)
+      void loadPage({ cursor, pageIndex: nextPageIndex, query: normalizedSearch })
+    }
   }
 
   async function loadRawSnapshot(snapshotId: SnapshotSummary['snapshot_id']) {
@@ -136,27 +152,36 @@ export function WorkerSnapshotsPage() {
     }
   }
 
-  return (
-    <section aria-labelledby="worker-snapshots-heading">
-      <header className="console-page-header">
-        <div>
-          <h1 id="worker-snapshots-heading">Worker snapshots</h1>
-          <p>Review the latest account state reported by each worker.</p>
-        </div>
-      </header>
+  function openRawSnapshot(snapshotId: SnapshotSummary['snapshot_id']) {
+    setSelectedSnapshotId(snapshotId)
+    if (rawSnapshots[snapshotId] === undefined) {
+      void loadRawSnapshot(snapshotId)
+    }
+  }
 
-      <form className="console-table-actions" role="search" onSubmit={submitSearch}>
-        <label htmlFor="worker-snapshots-search">Search worker snapshots</label>
+  const currentPage = pages[pageIndex]
+  const snapshots = currentPage?.items ?? []
+  const hasNextPage = Boolean(currentPage?.next_cursor || pages[pageIndex + 1])
+  const selectedRawSnapshot = selectedSnapshotId === null ? undefined : rawSnapshots[selectedSnapshotId]
+  const selectedRawError = selectedSnapshotId === null ? undefined : detailError[selectedSnapshotId]
+  const isSelectedRawSnapshotLoading = selectedSnapshotId !== null && loadingDetailId === selectedSnapshotId
+
+  return (
+    <section aria-label="Worker snapshots">
+      <div className="console-table-actions analysis-history-filters" role="search">
+        <label htmlFor="worker-snapshots-search">Search</label>
         <input
           id="worker-snapshots-search"
           name="q"
           type="search"
           value={search}
-          onChange={(event) => setSearch(event.target.value)}
+          onChange={(event) => {
+            setSearch(event.target.value)
+            setIsLoading(true)
+          }}
           placeholder="Server or login"
         />
-        <button type="submit" disabled={isLoading || isLoadingMore}>Search</button>
-      </form>
+      </div>
 
       {isLoading && snapshots.length === 0 ? (
         <p className="console-empty-state" role="status">Loading worker snapshots…</p>
@@ -176,15 +201,14 @@ export function WorkerSnapshotsPage() {
       {!isLoading && !error && snapshots.length === 0 ? (
         <div className="console-empty-state">
           <strong>No worker snapshots found.</strong>
-          <span>{appliedSearch ? 'Try a different search term.' : 'New worker reports will appear here.'}</span>
+          <span>{normalizedSearch ? 'Try a different search term.' : 'New worker reports will appear here.'}</span>
         </div>
       ) : null}
 
       {snapshots.length > 0 ? (
         <>
           <div className="console-table-scroll">
-            <table className="console-table">
-              <caption className="visually-hidden">Worker snapshots</caption>
+            <table aria-label="Worker snapshots" className="console-table">
               <thead>
                 <tr>
                   <th scope="col" title="Trading server">Server</th>
@@ -200,10 +224,6 @@ export function WorkerSnapshotsPage() {
               <tbody>
                 {snapshots.map((snapshot) => {
                   const snapshotId = snapshot.snapshot_id
-                  const rawSnapshot = rawSnapshots[snapshotId]
-                  const rawError = detailError[snapshotId]
-                  const isLoadingDetail = loadingDetailId === snapshotId
-
                   return (
                     <tr key={snapshotId}>
                       <td>{displayValue(snapshot.server)}</td>
@@ -215,23 +235,12 @@ export function WorkerSnapshotsPage() {
                       <td><BooleanTag value={snapshot.tradeapi_disabled} /></td>
                       <td>
                         <time dateTime={snapshot.timestamp}>{formatDateTime(snapshot.timestamp)}</time>
-                        {rawSnapshot === undefined ? (
-                          <div>
-                            <button
-                              type="button"
-                              onClick={() => void loadRawSnapshot(snapshot.snapshot_id)}
-                              disabled={isLoadingDetail}
-                            >
-                              {isLoadingDetail ? 'Loading raw JSON…' : 'View raw JSON'}
-                            </button>
-                            {rawError ? <span role="alert">{rawError}</span> : null}
-                          </div>
-                        ) : (
-                          <details open>
-                            <summary>Raw JSON</summary>
-                            <pre className="console-raw-detail">{JSON.stringify(rawSnapshot, null, 2)}</pre>
-                          </details>
-                        )}
+                        <button
+                          type="button"
+                          onClick={() => openRawSnapshot(snapshot.snapshot_id)}
+                        >
+                          View raw JSON
+                        </button>
                       </td>
                     </tr>
                   )
@@ -240,20 +249,42 @@ export function WorkerSnapshotsPage() {
             </table>
           </div>
 
-          {nextCursor ? (
-            <div className="console-table-actions">
-              <button
-                type="button"
-                onClick={() => void loadSnapshots({ cursor: nextCursor, append: true }, appliedSearch)}
-                disabled={isLoadingMore}
-              >
-                {isLoadingMore ? 'Loading more snapshots…' : 'Load more'}
-              </button>
-              {isLoadingMore ? <span role="status">Loading more worker snapshots…</span> : null}
-            </div>
-          ) : null}
+          <div className="console-pagination">
+            <Pagination
+              hasMore={hasNextPage}
+              isDisabled={isLoading}
+              label="Worker snapshot pages"
+              onChange={changePage}
+              page={pageIndex + 1}
+              pageSize={PAGE_SIZE}
+              size="sm"
+            />
+          </div>
         </>
       ) : null}
+      {selectedSnapshotId !== null && (
+        <div className="snapshot-json-dialog-backdrop" role="presentation">
+          <section
+            aria-labelledby="snapshot-json-dialog-title"
+            aria-modal="true"
+            className="snapshot-json-dialog"
+            role="dialog"
+          >
+            <div className="snapshot-json-dialog-header">
+              <h2 id="snapshot-json-dialog-title">Raw snapshot JSON</h2>
+              <button aria-label="Close raw snapshot JSON" onClick={() => setSelectedSnapshotId(null)} type="button">Close</button>
+            </div>
+            {isSelectedRawSnapshotLoading && <p role="status">Loading raw JSON…</p>}
+            {selectedRawError && (
+              <div role="alert">
+                <p>{selectedRawError}</p>
+                <button type="button" onClick={() => void loadRawSnapshot(selectedSnapshotId)}>Try again</button>
+              </div>
+            )}
+            {selectedRawSnapshot !== undefined && <pre className="console-raw-detail">{JSON.stringify(selectedRawSnapshot, null, 2)}</pre>}
+          </section>
+        </div>
+      )}
     </section>
   )
 }
@@ -278,7 +309,11 @@ function displayNumber(value: number | string | null) {
 
 function formatDateTime(value: string) {
   const date = new Date(value)
-  return Number.isNaN(date.getTime()) ? value : date.toLocaleString()
+  if (Number.isNaN(date.getTime())) {
+    return value
+  }
+  const pad = (part: number) => String(part).padStart(2, '0')
+  return `${date.getUTCFullYear()}-${pad(date.getUTCMonth() + 1)}-${pad(date.getUTCDate())} ${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}:${pad(date.getUTCSeconds())}`
 }
 
 export default WorkerSnapshotsPage

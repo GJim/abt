@@ -15,7 +15,8 @@
     "@astryxdesign/theme-neutral": "^0.4.4",
     "@stylexjs/stylex": "^0.19.0",
     "react": "^19.2.8",
-    "react-dom": "^19.2.8"
+    "react-dom": "^19.2.8",
+    "react-router-dom": "^7.18.2"
   },
   "devDependencies": {
     "@astryxdesign/cli": "^0.4.4",
