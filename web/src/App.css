@@ -167,6 +167,7 @@ li {
 .result-grid,
 .policy-grid,
 .product-pair-list,
+.hedge-overview,
 .buildable-result-card,
 .pair-worker-list,
 .compatibility-panel {
@@ -526,6 +527,35 @@ pre {
   grid-template-columns: repeat(auto-fit, minmax(20rem, 1fr));
 }
 
+.hedge-overview {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.hedge-overview .panel {
+  align-content: start;
+}
+
+.state-summary {
+  color: var(--text-h);
+  font-size: 1.05rem;
+  font-weight: 700;
+  margin: 0;
+}
+
+.lifecycle-availability {
+  background: #f8fafc;
+}
+
+.lifecycle-availability-error {
+  background: #fff7ed;
+  border-color: #fdba74;
+}
+
+.product-pair-management-heading {
+  border-top: 1px solid var(--border);
+  padding-top: 1.5rem;
+}
+
 .pair-worker-list {
   grid-template-columns: repeat(auto-fit, minmax(20rem, 1fr));
 }
@@ -572,7 +602,8 @@ time {
   .compact-form,
   .enrollment dl,
   .enrollment-evidence,
-  .worker-facts {
+  .worker-facts,
+  .hedge-overview {
     grid-template-columns: 1fr;
   }
 

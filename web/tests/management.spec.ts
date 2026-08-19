@@ -426,6 +426,70 @@ test('administrator can inspect immutable evidence, build a pair, and retire it 
   await expect(page.locator('.product-pair-card').first()).toContainText('Manual retirement')
 })
 
+test('administrator sees product-pair state without fabricated paired-trade lifecycle data', async ({ page }) => {
+  await mockLogin(page)
+  await mockManagementData(page, {
+    productPairs: [buildProductPair()],
+    pairedTradeLifecycle: {
+      availability: 'unavailable',
+      reason: 'Paired-trade lifecycle records are not available in the control-plane ledger.',
+    },
+  })
+
+  await page.goto('http://127.0.0.1:4173/')
+  await page.getByLabel('Administrator account').fill('ABCDEF')
+  await page.getByLabel('Password').fill('A-secure-admin-password!')
+  await page.getByRole('button', { name: 'Sign in' }).click()
+
+  const overview = page.getByLabel('Hedge lifecycle availability')
+  await expect(overview).toContainText('1 active product-pair record is currently available.')
+  await expect(overview).toContainText('Unavailable in the control-plane ledger.')
+  await expect(overview).toContainText('cannot infer paired-trade activity')
+  await expect(page.getByRole('button', { name: 'Retire product pair' })).toBeVisible()
+})
+
+test('administrator sees inactive product-pair state separately from paired-trade lifecycle availability', async ({ page }) => {
+  await mockLogin(page)
+  await mockManagementData(page, {
+    productPairs: [buildProductPair({ status: 'retired', retired_at: '2026-08-17T00:12:00Z' })],
+    pairedTradeLifecycle: {
+      availability: 'unavailable',
+      reason: 'Paired-trade lifecycle records are not available in the control-plane ledger.',
+    },
+  })
+
+  await page.goto('http://127.0.0.1:4173/')
+  await page.getByLabel('Administrator account').fill('ABCDEF')
+  await page.getByLabel('Password').fill('A-secure-admin-password!')
+  await page.getByRole('button', { name: 'Sign in' }).click()
+
+  const overview = page.getByLabel('Hedge lifecycle availability')
+  await expect(overview).toContainText('No active product-pair records are currently available.')
+  await expect(overview).toContainText('Unavailable in the control-plane ledger.')
+  await expect(page.locator('#retired-product-pairs-heading')).toBeVisible()
+})
+
+test('administrator sees when paired-trade lifecycle availability cannot be loaded', async ({ page }) => {
+  await mockLogin(page)
+  await mockManagementData(page)
+  await page.route('**/api/admin/operations-dashboard', async (route) => {
+    await route.fulfill({
+      status: 503,
+      contentType: 'application/json',
+      body: JSON.stringify({ detail: 'The MT5 credential mediator is unavailable.' }),
+    })
+  })
+
+  await page.goto('http://127.0.0.1:4173/')
+  await page.getByLabel('Administrator account').fill('ABCDEF')
+  await page.getByLabel('Password').fill('A-secure-admin-password!')
+  await page.getByRole('button', { name: 'Sign in' }).click()
+
+  const overview = page.getByLabel('Hedge lifecycle availability')
+  await expect(overview).toContainText('Availability could not be confirmed.')
+  await expect(overview.getByRole('status')).toContainText('The MT5 credential mediator is unavailable.')
+})
+
 test('administrator hides a final candidate already represented by an active pair', async ({ page }) => {
   const initialPair = buildProductPair({
     product_pair_id: 'pair-existing',
@@ -892,6 +956,10 @@ async function mockManagementData(
     workers?: object[]
     alerts?: object[]
     productPairs?: object[]
+    pairedTradeLifecycle?: {
+      availability: 'available' | 'unavailable'
+      reason: string
+    }
   },
 ) {
   await page.route('**/api/admin/events', async (route) => {
@@ -922,6 +990,17 @@ async function mockManagementData(
     await route.fulfill({
       contentType: 'application/json',
       body: JSON.stringify(overrides?.productPairs ?? []),
+    })
+  })
+  await page.route('**/api/admin/operations-dashboard', async (route) => {
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({
+        paired_trade_lifecycle: overrides?.pairedTradeLifecycle ?? {
+          availability: 'unavailable',
+          reason: 'Paired-trade lifecycle records are not available in the control-plane ledger.',
+        },
+      }),
     })
   })
 }

@@ -337,6 +337,15 @@ type ProductPair = {
   worker_applicability: WorkerApplicability[]
 }
 
+type PairedTradeLifecycle = {
+  availability: 'available' | 'unavailable'
+  reason: string
+}
+
+type OperationsDashboard = {
+  paired_trade_lifecycle: PairedTradeLifecycle
+}
+
 const DEFAULT_POLICY: ProductCatalogAnalysisPolicy = {
   label: 'FX catalog v1',
   require_equal_base_currency: true,
@@ -1738,6 +1747,8 @@ function ProductPairsSection({
   productPairs: ProductPair[]
   workers: AccountWorker[]
 }) {
+  const [dashboard, setDashboard] = useState<OperationsDashboard | null>(null)
+  const [dashboardError, setDashboardError] = useState<string | null>(null)
   const activePairs = useMemo(
     () => productPairs.filter((pair) => pair.status === 'active'),
     [productPairs],
@@ -1747,14 +1758,82 @@ function ProductPairsSection({
     [productPairs],
   )
 
+  useEffect(() => {
+    let cancelled = false
+
+    async function loadDashboard() {
+      setDashboardError(null)
+      try {
+        const response = await fetch('/api/admin/operations-dashboard', { credentials: 'same-origin' })
+        if (!response.ok) {
+          throw new Error(await readResponseDetail(response, 'The operational overview could not be loaded.'))
+        }
+        const payload = (await response.json()) as OperationsDashboard
+        if (!cancelled) {
+          setDashboard(payload)
+        }
+      } catch (loadError) {
+        if (!cancelled) {
+          setDashboard(null)
+          setDashboardError(loadError instanceof Error ? loadError.message : 'The operational overview could not be loaded.')
+        }
+      }
+    }
+
+    void loadDashboard()
+    return () => {
+      cancelled = true
+    }
+  }, [productPairs])
+
   return (
     <section aria-labelledby="product-pairs-heading" className="analysis-section">
       <div className="section-header">
         <div>
-          <h2 id="product-pairs-heading">Active product pairs</h2>
-          <p>Inspect active and retired pairs, their approval evidence, and retirement history without any broker-write path.</p>
+          <h2 id="product-pairs-heading">Hedge and product-pair overview</h2>
+          <p>Configuration lifecycle is visible here; product-pair records are not paired-trade activity.</p>
         </div>
         <span className="status-badge status-queued">{activePairs.length} active / {retiredPairs.length} retired</span>
+      </div>
+
+      <div className="hedge-overview" aria-label="Hedge lifecycle availability">
+        <article className="panel">
+          <h3>Current product-pair state</h3>
+          <p className="state-summary">
+            {activePairs.length === 0
+              ? 'No active product-pair records are currently available.'
+              : `${activePairs.length} active product-pair ${activePairs.length === 1 ? 'record is' : 'records are'} currently available.`}
+          </p>
+          <p className="hint">Active means the control-plane mapping is current. It does not report an order, position, or trade.</p>
+        </article>
+        <article className={`panel lifecycle-availability ${dashboardError ? 'lifecycle-availability-error' : ''}`}>
+          <h3>Paired-trade lifecycle records</h3>
+          {dashboardError ? (
+            <>
+              <p className="state-summary">Availability could not be confirmed.</p>
+              <p className="hint" role="status">{dashboardError}</p>
+            </>
+          ) : dashboard === null ? (
+            <p className="state-summary" role="status">Checking record availability…</p>
+          ) : (
+            <>
+              <p className="state-summary">
+                {dashboard.paired_trade_lifecycle.availability === 'unavailable'
+                  ? 'Unavailable in the control-plane ledger.'
+                  : 'Available in the control-plane ledger.'}
+              </p>
+              <p className="hint">{dashboard.paired_trade_lifecycle.reason}</p>
+            </>
+          )}
+          <p className="hint">This console cannot infer paired-trade activity from product-pair state.</p>
+        </article>
+      </div>
+
+      <div className="section-header product-pair-management-heading">
+        <div>
+          <h3>Active product pairs</h3>
+          <p>Inspect lifecycle details, re-test evidence, and retirement history without any broker-write path.</p>
+        </div>
       </div>
 
       {productPairs.length === 0 ? (
