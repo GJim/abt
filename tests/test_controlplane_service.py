@@ -316,6 +316,61 @@ class ControlPlaneServiceTests(unittest.TestCase):
         self.assertEqual(201, response.status_code)
         self.assertTrue(response.json()["registration_id"])
 
+    def test_worker_and_trader_reject_invalid_registration_invites(self) -> None:
+        private_key = ec.generate_private_key(ec.SECP256R1())
+        public_key_pem = private_key.public_key().public_bytes(
+            serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
+        ).decode("utf-8")
+        worker_invite = self.app.state.ledger.create_registration_invite("ABCDEF", "worker")
+        trader_payload = json.dumps(
+            {"claimed_public_ip": "203.0.113.4", "registration_invite": worker_invite, "strategy_name": "strategy"},
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        trader_signature = base64.b64encode(private_key.sign(trader_payload, ec.ECDSA(hashes.SHA256()))).decode("ascii")
+        self.assertEqual(
+            409,
+            self.client.post(
+                "/api/traders/enrollments",
+                json={
+                    "registration_invite": worker_invite,
+                    "strategy_name": "strategy",
+                    "claimed_public_ip": "203.0.113.4",
+                    "public_key_pem": public_key_pem,
+                    "proof_signature": trader_signature,
+                },
+            ).status_code,
+        )
+        self.app.state.ledger.revoke_registration_invite(worker_invite, "ABCDEF")
+        account_info = {"login": 123456, "server": "Broker-Demo"}
+        terminal_info = {"name": "MetaTrader 5"}
+        challenge = self._enrollment_challenge()
+        worker_signature = base64.b64encode(
+            private_key.sign(
+                enrollment_payload(
+                    123456, "Broker-Demo", account_info, terminal_info, "password", challenge
+                ),
+                ec.ECDSA(hashes.SHA256()),
+            )
+        ).decode("ascii")
+        self.assertEqual(
+            409,
+            self.client.post(
+                "/api/enrollments",
+                json={
+                    "registration_invite": worker_invite,
+                    "login": 123456,
+                    "server": "Broker-Demo",
+                    "account_info": account_info,
+                    "terminal_info": terminal_info,
+                    "mt5_password": "password",
+                    "enrollment_challenge": challenge,
+                    "public_key_pem": public_key_pem,
+                    "proof_signature": worker_signature,
+                },
+            ).status_code,
+        )
+
     def test_admin_session_resumes_with_a_rotated_csrf_token(self) -> None:
         login_response = self.client.post(
             "/api/admin/login",
