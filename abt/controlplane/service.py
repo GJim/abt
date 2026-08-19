@@ -514,7 +514,7 @@ def create_app(
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
 
     @app.post("/api/traders/certificates/rotate")
-    def rotate_trader_certificate(body: TraderRotationRequest) -> dict[str, str]:
+    async def rotate_trader_certificate(body: TraderRotationRequest) -> dict[str, str]:
         try:
             trader = ledger.active_trader(body.trader_id)
             challenge = app.state.trader_rotation_challenges.pop(body.trader_id, None)
@@ -536,6 +536,11 @@ def create_app(
                 lambda trader_id, strategy_name, public_key_pem: certificate_issuer.issue_trader(
                     trader_id=trader_id, strategy_name=strategy_name, public_key_pem=public_key_pem
                 ),
+            )
+            connections = tuple(trader_connections.pop(trader.trader_id, set()))
+            await asyncio.gather(
+                *(connection.close(code=status.WS_1008_POLICY_VIOLATION) for connection in connections),
+                return_exceptions=True,
             )
             return {"trader_id": trader.trader_id, "certificate": certificate}
         except (LedgerError, ProofError, SecretStoreError) as error:
@@ -1208,7 +1213,10 @@ def create_app(
             ledger.active_trader(trader.trader_id)
             trader_connections.setdefault(trader.trader_id, set()).add(websocket)
             session_id = ledger.open_trader_session(trader.trader_id)
-            await websocket.send_json({"type": "authenticated", "trader_id": trader.trader_id, "cursor": 0})
+            cursor = ledger.trader_event_cursor(trader.trader_id)
+            await websocket.send_json({"type": "authenticated", "trader_id": trader.trader_id, "cursor": cursor})
+            for event in ledger.trader_events_after(trader.trader_id, cursor):
+                await websocket.send_json({"type": "event", **jsonable_encoder(event)})
             last_controller_heartbeat = monotonic()
             while True:
                 try:

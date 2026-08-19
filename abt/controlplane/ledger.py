@@ -580,6 +580,13 @@ class ControlLedger:
                 [trader_id, cursor, _utc_now()],
             )
 
+    def trader_event_cursor(self, trader_id: str) -> int:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT cursor FROM trader_event_cursors WHERE trader_id = ?", [trader_id]
+            ).fetchone()
+        return 0 if row is None else int(row[0])
+
     def trader_events_after(self, trader_id: str, cursor: int) -> list[dict[str, Any]]:
         with self._lock:
             rows = self._connection.execute(

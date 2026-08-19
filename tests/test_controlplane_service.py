@@ -462,6 +462,12 @@ class ControlPlaneServiceTests(unittest.TestCase):
         )
         self.assertEqual(200, rotated.status_code)
         self.assertEqual(replacement_public_key_pem, self.app.state.ledger.active_trader(approval.json()["trader_id"]).public_key_pem)
+        with self.client.websocket_connect("/api/traders/session") as old_key_session:
+            old_key_session.send_json(
+                {"trader_id": approval.json()["trader_id"], "certificate": approval.json()["certificate"]}
+            )
+            with self.assertRaises(WebSocketDisconnect):
+                old_key_session.receive_json()
 
     def test_approved_trader_can_authenticate_to_the_command_websocket(self) -> None:
         private_key = ec.generate_private_key(ec.SECP256R1())
@@ -513,13 +519,30 @@ class ControlPlaneServiceTests(unittest.TestCase):
             event = websocket.receive_json()
             websocket.send_json({"type": "ack", "cursor": event["event_id"]})
             self.assertEqual({"type": "acknowledged", "cursor": event["event_id"]}, websocket.receive_json())
-            websocket.send_json({"type": "resume", "cursor": 0})
-            replayed = websocket.receive_json()
+            websocket.send_json(
+                {"type": "command", "command_id": "intent-002", "payload": {"type": "intent", "pair_id": "pair-2"}}
+            )
+            websocket.receive_json()
+            unacknowledged_event = websocket.receive_json()
+
+        with self.client.websocket_connect("/api/traders/session") as reconnected:
+            reconnected.send_json({"trader_id": approval["trader_id"], "certificate": approval["certificate"]})
+            challenge = reconnected.receive_json()
+            proof = private_key.sign(
+                trader_proof_payload(
+                    purpose=challenge["purpose"], trader_id=challenge["trader_id"], nonce=challenge["nonce"]
+                ),
+                ec.ECDSA(hashes.SHA256()),
+            )
+            reconnected.send_json({"signature": base64.b64encode(proof).decode("ascii")})
+            resumed = reconnected.receive_json()
+            automatically_replayed = reconnected.receive_json()
 
         self.assertEqual({"type": "authenticated", "trader_id": approval["trader_id"], "cursor": 0}, authenticated)
         self.assertEqual("accepted", result["status"])
         self.assertEqual(result["event_id"], event["event_id"])
-        self.assertEqual(event["event_id"], replayed["event_id"])
+        self.assertEqual(event["event_id"], resumed["cursor"])
+        self.assertEqual(unacknowledged_event["event_id"], automatically_replayed["event_id"])
 
     def test_worker_and_trader_reject_invalid_registration_invites(self) -> None:
         private_key = ec.generate_private_key(ec.SECP256R1())
