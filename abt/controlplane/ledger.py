@@ -452,6 +452,20 @@ class ControlLedger:
             raise LedgerError("Trader is not active.")
         return ActiveTrader(*row)
 
+    def revoke_trader(self, trader_id: str, revoked_by: str) -> None:
+        with self._transaction():
+            changed = self._connection.execute(
+                """
+                UPDATE traders SET status = 'revoked', revoked_at = ?
+                WHERE trader_id = ? AND status = 'active'
+                RETURNING trader_id
+                """,
+                [_utc_now(), trader_id],
+            ).fetchone()
+            if changed is None:
+                raise LedgerError("Trader is not active.")
+            self._event("trader_certificate_revoked", {"trader_id": trader_id, "revoked_by": revoked_by})
+
     def issue_enrollment_challenge(self) -> tuple[str, datetime]:
         challenge = secrets.token_urlsafe(32)
         now = _utc_now()

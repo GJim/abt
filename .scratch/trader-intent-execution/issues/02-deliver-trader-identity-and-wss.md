@@ -21,3 +21,9 @@ outbound WSS channel for Trader commands and personal lifecycle events.
   and reconnect replay; a Trader can receive only its own events.
 - [ ] Revocation ends active WSS and blocks new commands without changing
   accepted intents.
+
+## Review gaps
+
+- [ ] Add certificate rotation and administrator revocation for approved Traders.
+- [ ] Make Trader heartbeats bidirectional every 30 seconds and persist a stale
+  state after five minutes without a valid signal.

@@ -986,6 +986,25 @@ def create_app(
         )
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
+    @app.post("/api/admin/traders/{trader_id}/revoke", status_code=status.HTTP_204_NO_CONTENT)
+    async def revoke_trader(
+        trader_id: str,
+        abt_admin_session: Annotated[str | None, Cookie()] = None,
+        x_csrf_token: Annotated[str | None, Header()] = None,
+    ) -> Response:
+        username = _require_admin(ledger, abt_admin_session, x_csrf_token, require_csrf=True)
+        try:
+            ledger.revoke_trader(trader_id, username)
+            _create_pki_backup(backup_manager)
+        except LedgerError as error:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
+        connections = tuple(trader_connections.pop(trader_id, set()))
+        await asyncio.gather(
+            *(connection.close(code=status.WS_1008_POLICY_VIOLATION) for connection in connections),
+            return_exceptions=True,
+        )
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
     @app.post("/api/admin/logout", status_code=status.HTTP_204_NO_CONTENT)
     def logout(
         abt_admin_session: Annotated[str | None, Cookie()] = None,
