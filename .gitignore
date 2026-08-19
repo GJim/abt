@@ -13,6 +13,7 @@ build/
 dist/
 .env
 results/
+test-results/
 web/test-results/
 
 # Raw browser/source captures are reproducibility aids, not publishable research.
