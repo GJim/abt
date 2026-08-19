@@ -1122,6 +1122,7 @@ def create_app(
                 trader_id=trader.trader_id,
                 nonce=nonce,
             )
+            ledger.active_trader(trader.trader_id)
             trader_connections.setdefault(trader.trader_id, set()).add(websocket)
             await websocket.send_json({"type": "authenticated", "trader_id": trader.trader_id, "cursor": 0})
             while True:
