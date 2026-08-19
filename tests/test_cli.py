@@ -12,7 +12,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
-from abt.cli import (
+from abt.mt5.cli import (
     ExpirationPlan,
     _build_write_request,
     _check_then_send,
@@ -29,15 +29,29 @@ from abt.cli import (
     _write_command,
     build_parser,
 )
-from abt.config import CalibrationSample, Config, ConfigError, Context, TimeCalibration, TimeCalibrationFamily, load, save
-from abt.mt5 import SessionError
-from abt.output import render
+from abt.mt5.config import (
+    CalibrationSample,
+    Config,
+    ConfigError,
+    Context,
+    TimeCalibration,
+    TimeCalibrationFamily,
+    default_config_path,
+    load,
+    save,
+)
+from abt.mt5.session import SessionError
+from abt.mt5.output import render
 
 
 class ConfigTests(unittest.TestCase):
+    def test_default_config_path_uses_mt5_name(self) -> None:
+        with patch("abt.mt5.config.sys.argv", [r"C:\tools\mt5.exe"]):
+            self.assertEqual(default_config_path(), Path(r"C:\tools\mt5.toml"))
+
     def test_round_trip_preserves_context_and_windows_path(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "abt.toml"
+            path = Path(directory) / "mt5.toml"
             expected = Context(
                 "demo",
                 Path(r"C:\MT5\terminal64.exe"),
@@ -71,7 +85,7 @@ class ConfigTests(unittest.TestCase):
 
     def test_invalid_timezone_is_rejected_and_legacy_context_stays_editable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "abt.toml"
+            path = Path(directory) / "mt5.toml"
             path.write_text(
                 """
 current_context = "legacy"
@@ -91,7 +105,7 @@ server = "Broker-Demo"
                 _required_user_timezone(legacy.contexts["legacy"])
             listed = _context_command(build_parser().parse_args(["context", "list"]), legacy)
             self.assertEqual(listed[0]["user_timezone"], None)
-            with patch("abt.cli.connected") as connected_mock:
+            with patch("abt.mt5.cli.connected") as connected_mock:
                 with self.assertRaises(ValueError):
                     dispatch(build_parser().parse_args(["account"]), legacy)
                 connected_mock.assert_not_called()
@@ -111,7 +125,7 @@ user_timezone = "Not/A_Timezone"
 
     def test_context_set_timezone_updates_legacy_context_without_a_broker_session(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "abt.toml"
+            path = Path(directory) / "mt5.toml"
             legacy = Context("legacy", Path(r"C:\MT5\terminal64.exe"), 123456, "Broker-Demo")
             loaded = Config(path, "legacy", {"legacy": legacy})
             args = build_parser().parse_args(["--config", str(path), "context", "set-timezone", "legacy", "America/New_York"])
@@ -315,7 +329,7 @@ class ParsingAndOutputTests(unittest.TestCase):
             ),
         )
 
-        with patch("abt.cli._structured_records", return_value=[]):
+        with patch("abt.mt5.cli._structured_records", return_value=[]):
             for function, args, start_index in cases:
                 with self.subTest(command=args.command):
                     function(api, args)

@@ -1,6 +1,6 @@
-# abt
+# mt5
 
-`abt` is a local command-line interface for manually inspecting and operating
+`mt5` is a local command-line interface for manually inspecting and operating
 MetaTrader 5 accounts. It keeps named CLI contexts separate from MT5 terminal
 configuration. Context metadata is stored beside the executable; passwords are
 stored in Windows Credential Manager.
@@ -9,7 +9,7 @@ stored in Windows Credential Manager.
 
 ```powershell
 uv sync
-uv run abt context add ftmo-demo `
+uv run mt5 context add ftmo-demo `
   --terminal-path "C:\Program Files\MetaTrader 5\terminal64.exe" `
   --login 123456 `
   --server "Broker-Demo" `
@@ -22,13 +22,13 @@ command-line argument. `--timezone` must be an IANA timezone name. Existing
 contexts without a timezone can be repaired without connecting to a broker:
 
 ```powershell
-uv run abt context set-timezone ftmo-demo Asia/Taipei
+uv run mt5 context set-timezone ftmo-demo Asia/Taipei
 ```
 
 Select an existing context:
 
 ```powershell
-uv run abt context use ftmo-demo
+uv run mt5 context use ftmo-demo
 ```
 
 If the current context has open orders or positions, an interactive switch
@@ -38,12 +38,12 @@ requires confirmation. `--yes` bypasses that prompt.
 
 MT5 exposes more than one broker clock. `tick`, `rates-*`, and `ticks-*`
 use the market-data clock; `orders`, `positions`, and history use the
-trade-record clock. `abt` keeps independent, source-aware offsets in each
-context's `abt.toml`, together with the local calibration date, UTC timestamp,
+trade-record clock. `mt5` keeps independent, source-aware offsets in each
+context's `mt5.toml`, together with the local calibration date, UTC timestamp,
 status, and bounded samples. Older context files remain valid and are migrated
 when saved.
 
-There is no manual calibration command. On a market-data command, `abt` fully
+There is no manual calibration command. On a market-data command, `mt5` fully
 calibrates from the requested symbol's ticks when the saved calibration belongs
 to another local day. During the same local day it probes the saved calibration
 symbol and fully recalibrates if its integer offset drifts. If a probe cannot
@@ -52,7 +52,7 @@ The same selected market-data offset is applied when sending `rates-*` and
 `ticks-*` datetime ranges to MT5, so user-local query bounds select the same
 clock that their returned timestamps use for rendering.
 
-After a successful trading command, `abt` records host UTC immediately before
+After a successful trading command, `mt5` records host UTC immediately before
 and after sending. It finds the resulting order, deal, or position by ticket
 and persists a trade-record sample using the midpoint. Trade-record offsets
 expire at the next date in the context timezone: rendering then explicitly
@@ -60,7 +60,7 @@ marks the expired layer before finally falling back to UTC. Inspect the active
 layers without connecting to MT5:
 
 ```powershell
-uv run abt context time-status
+uv run mt5 context time-status
 ```
 
 ## Read-only commands
@@ -70,21 +70,21 @@ output. A selected context must have a timezone before any broker read/write
 session can run.
 
 ```powershell
-uv run abt account
-uv run abt terminal
-uv run abt symbols
-uv run abt symbol EURUSD
-uv run abt symbol-select SOLUSDC
-uv run abt symbol-hide SOLUSDC
-uv run abt tick EURUSD
-uv run abt positions
-uv run abt orders
-uv run abt history-deals --since 7d
-uv run abt rates-from EURUSD M1 --from 2026-08-14T00:00:00Z --count 100
-uv run abt ticks-range EURUSD --from 2026-08-14T00:00:00Z --to 2026-08-14T01:00:00Z
-uv run abt book EURUSD --watch 10
-uv run abt calc-margin buy EURUSD 0.01 1.15000
-uv run abt order-check --request-json '{"action":1,"symbol":"EURUSD","volume":0.01,"type":0,"price":1.15000}'
+uv run mt5 account
+uv run mt5 terminal
+uv run mt5 symbols
+uv run mt5 symbol EURUSD
+uv run mt5 symbol-select SOLUSDC
+uv run mt5 symbol-hide SOLUSDC
+uv run mt5 tick EURUSD
+uv run mt5 positions
+uv run mt5 orders
+uv run mt5 history-deals --since 7d
+uv run mt5 rates-from EURUSD M1 --from 2026-08-14T00:00:00Z --count 100
+uv run mt5 ticks-range EURUSD --from 2026-08-14T00:00:00Z --to 2026-08-14T01:00:00Z
+uv run mt5 book EURUSD --watch 10
+uv run mt5 calc-margin buy EURUSD 0.01 1.15000
+uv run mt5 order-check --request-json '{"action":1,"symbol":"EURUSD","volume":0.01,"type":0,"price":1.15000}'
 ```
 
 An unoffset ISO-8601 datetime is interpreted in the context timezone; `Z` and
@@ -116,7 +116,7 @@ the request as an order.
 
 Without `--yes`, typed write commands calculate and print the exact MT5
 request, then require the literal response `yes` or `no`. Add `--yes` only
-when the request has already been reviewed. After confirmation, `abt` calls
+when the request has already been reviewed. After confirmation, `mt5` calls
 `order_check` and sends only a request whose check has `retcode` zero. The
 output contains the request, check result, send result, or broker error. Use
 `--output json` for machine-readable records.
@@ -124,8 +124,8 @@ output contains the request, check result, send result, or broker error. Use
 Market buy and sell require an explicit filling policy and allowed deviation:
 
 ```powershell
-uv run abt buy EURUSD 0.01 --fill fok --deviation-points 10
-uv run abt market sell EURUSD 0.01 --fill ioc --deviation-points 10 --yes
+uv run mt5 buy EURUSD 0.01 --fill fok --deviation-points 10
+uv run mt5 market sell EURUSD 0.01 --fill ioc --deviation-points 10 --yes
 ```
 
 The pending types are `buy-limit`, `sell-limit`, `buy-stop`, `sell-stop`,
@@ -136,20 +136,20 @@ with either an explicit offset or a context-local datetime are valid only with
 `--time specified`.
 
 ```powershell
-uv run abt buy-limit EURUSD 0.01 --price 1.15000 --fill return --time gtc
-uv run abt sell-stop-limit EURUSD 0.01 --price 1.14000 --stop-limit-price 1.13950 `
+uv run mt5 buy-limit EURUSD 0.01 --price 1.15000 --fill return --time gtc
+uv run mt5 sell-stop-limit EURUSD 0.01 --price 1.14000 --stop-limit-price 1.13950 `
   --fill fok --time specified --expires-at 2026-08-15T20:00:00
-uv run abt cancel 12345678
-uv run abt pending-modify 12345678 --price 1.15000 --clear-tp
+uv run mt5 cancel 12345678
+uv run mt5 pending-modify 12345678 --price 1.15000 --clear-tp
 ```
 
-For a specified pending expiration, `abt` records the absolute input as a UTC
+For a specified pending expiration, `mt5` records the absolute input as a UTC
 intent. Immediately before the broker check/send, it maps that intent using
 the target symbol's latest tick time; the preview and result show the intent,
 broker expiration epoch, and the broker's actual expiration when available.
 Relative expirations start from that tick time and are rounded up to protect
 the requested duration. If the broker reports a shorter actual duration,
-`abt` immediately cancels the pending order and reports failure.
+`mt5` immediately cancels the pending order and reports failure.
 
 `--magic` and `--comment` are included only when provided; comments longer
 than 31 characters are rejected. New orders accept one value per protection:
@@ -166,9 +166,9 @@ preserves a protection that is not named; use `--clear-sl` or `--clear-tp` to
 remove it. Relative protection values on a position use its entry price.
 
 ```powershell
-uv run abt position-modify --symbol EURUSD --sl-pips 20
-uv run abt position-close --symbol EURUSD --fill ioc --deviation-points 10
-uv run abt close-by 12345678 87654321
+uv run mt5 position-modify --symbol EURUSD --sl-pips 20
+uv run mt5 position-close --symbol EURUSD --fill ioc --deviation-points 10
+uv run mt5 close-by 12345678 87654321
 ```
 
 `close-by` is available only for two opposing positions in a hedging account.
@@ -178,5 +178,5 @@ use the deliberately explicit raw entry point. It follows the same preview,
 check, and confirmation flow, but its JSON fields are not rewritten:
 
 ```powershell
-uv run abt order-send --request-json '{"action":1,"symbol":"EURUSD","volume":0.01,"type":0,"price":1.15000}'
+uv run mt5 order-send --request-json '{"action":1,"symbol":"EURUSD","volume":0.01,"type":0,"price":1.15000}'
 ```

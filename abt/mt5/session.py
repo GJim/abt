@@ -9,7 +9,7 @@ import MetaTrader5 as mt5
 from .config import Context
 
 
-CREDENTIAL_SERVICE = "abt.mt5"
+CREDENTIAL_SERVICE = "mt5"
 
 
 class SessionError(RuntimeError):
@@ -35,7 +35,7 @@ def delete_password(context: Context) -> None:
 def connected(context: Context) -> Iterator[object]:
     password = keyring.get_password(CREDENTIAL_SERVICE, credential_name(context))
     if password is None:
-        raise SessionError(f"No saved password for context {context.name!r}; run `abt context login {context.name}`.")
+        raise SessionError(f"No saved password for context {context.name!r}; run `mt5 context login {context.name}`.")
     if not context.terminal_path.is_file():
         raise SessionError(f"Terminal executable does not exist: {context.terminal_path}")
     if not mt5.initialize(

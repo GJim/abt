@@ -8,10 +8,10 @@ from types import SimpleNamespace
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
-from abt.cli import _check_then_send, _context_command, build_parser
-from abt.config import CalibrationSample, Config, Context, TimeCalibration, TimeCalibrationFamily
-from abt.output import render
-from abt.timecalibration import (
+from abt.mt5.cli import _check_then_send, _context_command, build_parser
+from abt.mt5.config import CalibrationSample, Config, Context, TimeCalibration, TimeCalibrationFamily
+from abt.mt5.output import render
+from abt.mt5.timecalibration import (
     MARKET_DATA,
     TRADE_RECORDS,
     prepare_market_data,
@@ -31,8 +31,8 @@ class TimeCalibrationTests(unittest.TestCase):
     def test_missing_or_new_day_market_calibration_collects_full_samples(self) -> None:
         api = CalibrationApi(int(self.now.timestamp()) + 10_800)
         with (
-            patch("abt.timecalibration._utc_now", return_value=self.now),
-            patch("abt.timecalibration._save_context") as save_context,
+            patch("abt.mt5.timecalibration._utc_now", return_value=self.now),
+            patch("abt.mt5.timecalibration._save_context") as save_context,
         ):
             updated, family = prepare_market_data(api, self.config, self.context, "EURUSD", self.timezone)
 
@@ -65,8 +65,8 @@ class TimeCalibrationTests(unittest.TestCase):
         unchanged_api = CalibrationApi(int(self.now.timestamp()) + 10_800)
         changed_api = CalibrationApi(int(self.now.timestamp()) + 14_400)
         with (
-            patch("abt.timecalibration._utc_now", return_value=self.now),
-            patch("abt.timecalibration._save_context") as save_context,
+            patch("abt.mt5.timecalibration._utc_now", return_value=self.now),
+            patch("abt.mt5.timecalibration._save_context") as save_context,
         ):
             _, unchanged = prepare_market_data(
                 unchanged_api, config, context, "GBPUSD", self.timezone
@@ -101,8 +101,8 @@ class TimeCalibrationTests(unittest.TestCase):
             TimeCalibration(market_data=stale),
         )
         with (
-            patch("abt.timecalibration._utc_now", return_value=self.now),
-            patch("abt.timecalibration._save_context") as save_context,
+            patch("abt.mt5.timecalibration._utc_now", return_value=self.now),
+            patch("abt.mt5.timecalibration._save_context") as save_context,
         ):
             _, retained = prepare_market_data(
                 CalibrationApi(None), self.config, context, "EURUSD", self.timezone
@@ -118,8 +118,8 @@ class TimeCalibrationTests(unittest.TestCase):
         record = SimpleNamespace(ticket=55, time_done=int(self.now.timestamp()) + 7_200)
         api = TradeRecordApi(record)
         with (
-            patch("abt.timecalibration._save_context") as save_context,
-            patch("abt.timecalibration._utc_now", return_value=self.now),
+            patch("abt.mt5.timecalibration._save_context") as save_context,
+            patch("abt.mt5.timecalibration._utc_now", return_value=self.now),
         ):
             updated, family = record_successful_write(
                 api,
@@ -155,7 +155,7 @@ class TimeCalibrationTests(unittest.TestCase):
                 1_800,
             ),
         )
-        with patch("abt.timecalibration._save_context"):
+        with patch("abt.mt5.timecalibration._save_context"):
             for source, api, sent, expected_offset in cases:
                 with self.subTest(source=source):
                     _, family = record_successful_write(
@@ -186,7 +186,7 @@ class TimeCalibrationTests(unittest.TestCase):
             self.context.user_timezone,
             TimeCalibration(trade_records=existing),
         )
-        with patch("abt.timecalibration._save_context") as save_context:
+        with patch("abt.mt5.timecalibration._save_context") as save_context:
             updated, actual = record_successful_write(
                 TradeRecordApi(None),
                 self.config,
@@ -220,7 +220,7 @@ class TimeCalibrationTests(unittest.TestCase):
         record = SimpleNamespace(ticket=55, time_done=int(self.now.timestamp()) + 10_792)
         api = TradeRecordApi(record)
 
-        with patch("abt.timecalibration._save_context") as save_context:
+        with patch("abt.mt5.timecalibration._save_context") as save_context:
             updated, actual = record_successful_write(
                 api,
                 self.config,
@@ -254,7 +254,7 @@ class TimeCalibrationTests(unittest.TestCase):
             self.context.user_timezone,
             TimeCalibration(trade_records=family),
         )
-        with patch("abt.timecalibration._utc_now", return_value=self.now):
+        with patch("abt.mt5.timecalibration._utc_now", return_value=self.now):
             calibration = render_calibration(family, TRADE_RECORDS, self.timezone)
             status = time_status(context, self.timezone)
 
@@ -336,7 +336,7 @@ class CliTimeCalibrationTests(unittest.TestCase):
         context = Context("demo", Path(r"C:\MT5\terminal64.exe"), 123456, "Broker-Demo", "Asia/Taipei")
         config = Config(Path("unused.toml"), "demo", {"demo": context})
         args = build_parser().parse_args(["context", "time-status"])
-        with patch("abt.cli.connected") as connected:
+        with patch("abt.mt5.cli.connected") as connected:
             result = _context_command(args, config)
 
         self.assertEqual(result["context"], "demo")

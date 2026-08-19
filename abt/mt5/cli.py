@@ -17,7 +17,7 @@ import MetaTrader5 as mt5
 
 from . import config
 from .config import Config, Context
-from .mt5 import SessionError, connected, delete_password, save_password
+from .session import SessionError, connected, delete_password, save_password
 from .output import normalize, render
 from .timecalibration import (
     MARKET_DATA,
@@ -30,7 +30,7 @@ from .timecalibration import (
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="abt", description="Manual MetaTrader 5 CLI")
+    parser = argparse.ArgumentParser(prog="mt5", description="Manual MetaTrader 5 CLI")
     parser.add_argument("--config", type=Path, default=config.default_config_path())
     parser.add_argument("--context", help="Override the configured current context.")
     parser.add_argument("--output", choices=("table", "json"), default="table")
@@ -1333,7 +1333,7 @@ def _structured_records(values: Any) -> list[dict[str, Any]]:
 def _selected_context(args: argparse.Namespace, loaded_config: Config) -> Context:
     name = args.context or loaded_config.current_context
     if name is None:
-        raise ValueError("No current context. Run `abt context add` and `abt context use` first.")
+        raise ValueError("No current context. Run `mt5 context add` and `mt5 context use` first.")
     return _named_context(name, loaded_config)
 
 
@@ -1348,7 +1348,7 @@ def _required_user_timezone(context: Context) -> ZoneInfo:
     if context.user_timezone is None:
         raise ValueError(
             f"Context {context.name!r} has no user_timezone. "
-            f"Run `abt context set-timezone {context.name} <IANA_TIMEZONE>` first."
+            f"Run `mt5 context set-timezone {context.name} <IANA_TIMEZONE>` first."
         )
     return ZoneInfo(context.user_timezone)
 

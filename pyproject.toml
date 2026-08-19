@@ -18,7 +18,7 @@ dependencies = [
 ]
 
 [project.scripts]
-abt = "abt.cli:main"
+mt5 = "abt.mt5.cli:main"
 abt-console = "abt.controlplane.console:main"
 abt-worker = "abt.worker.cli:main"
 
@@ -27,4 +27,4 @@ requires = ["setuptools>=80"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["abt", "abt.controlplane", "abt.worker"]
+packages = ["abt", "abt.mt5", "abt.controlplane", "abt.worker"]

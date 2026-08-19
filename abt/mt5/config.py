@@ -63,7 +63,7 @@ class Config:
 
 
 def default_config_path() -> Path:
-    return Path(sys.argv[0]).resolve().parent / "abt.toml"
+    return Path(sys.argv[0]).resolve().parent / "mt5.toml"
 
 
 def load(path: Path) -> Config:
