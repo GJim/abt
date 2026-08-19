@@ -85,6 +85,92 @@ class ProductPairRetestRequest(BaseModel):
     second_worker_id: str = Field(min_length=1)
 
 
+def _operations_dashboard(
+    *,
+    workers: list[dict[str, Any]],
+    alerts: list[dict[str, Any]],
+    pending_enrollments: list[dict[str, Any]],
+    product_pairs: list[dict[str, Any]],
+) -> dict[str, object]:
+    classified_alerts = [
+        {
+            **alert,
+            "category": "intervention_required" if alert["priority"] in {"critical", "high"} else "informational",
+            "classification_reason": alert["reason"],
+        }
+        for alert in alerts
+    ]
+    classified_enrollments = [
+        {
+            **enrollment,
+            "category": "intervention_required",
+            "classification_reason": "approval_required",
+        }
+        for enrollment in pending_enrollments
+    ]
+    classified_workers = [
+        {
+            **worker,
+            **_worker_dashboard_classification(worker),
+        }
+        for worker in workers
+    ]
+    classified_product_pairs = [
+        {
+            **product_pair,
+            "category": "informational",
+            "classification_reason": f"product_pair_{product_pair['status']}",
+        }
+        for product_pair in product_pairs
+    ]
+    interventions = [
+        {
+            "item_type": "pending_enrollment",
+            "item_id": enrollment["enrollment_id"],
+            "category": enrollment["category"],
+            "reason": enrollment["classification_reason"],
+            "occurred_at": enrollment["created_at"],
+        }
+        for enrollment in classified_enrollments
+    ]
+    interventions.extend(
+        {
+            "item_type": "worker_alert",
+            "item_id": alert["alert_id"],
+            "category": alert["category"],
+            "reason": alert["classification_reason"],
+            "occurred_at": alert["occurred_at"],
+            "worker_id": alert["worker_id"],
+            "product_pair_id": alert["product_pair_id"],
+        }
+        for alert in classified_alerts
+        if alert["category"] == "intervention_required"
+    )
+    interventions.sort(key=lambda item: str(item["occurred_at"]), reverse=True)
+    return {
+        "generated_at": datetime.now(UTC).isoformat(),
+        "interventions": interventions,
+        "pending_enrollments": classified_enrollments,
+        "workers": classified_workers,
+        "alerts": classified_alerts,
+        "product_pairs": classified_product_pairs,
+        "paired_trade_lifecycle": {
+            "availability": "unavailable",
+            "reason": "Paired-trade lifecycle records are not available in the control-plane ledger.",
+        },
+    }
+
+
+def _worker_dashboard_classification(worker: dict[str, Any]) -> dict[str, str]:
+    if worker["safety_state"] in {"lost_link_safety", "needs_human"}:
+        return {"category": "intervention_required", "classification_reason": worker["safety_state"]}
+    if worker["connectivity"] == "stale":
+        return {"category": "intervention_required", "classification_reason": "worker_stale"}
+    if worker["connectivity"] == "revoked":
+        return {"category": "informational", "classification_reason": "worker_revoked"}
+    return {"category": "informational", "classification_reason": "worker_healthy"}
+
+
 @dataclass
 class _WorkerAnalysisRequest:
     analysis_id: str
@@ -260,6 +346,24 @@ def create_app(
     ) -> list[dict[str, object]]:
         _require_admin(ledger, abt_admin_session)
         return ledger.alerts()
+
+    @app.get("/api/admin/operations-dashboard")
+    def operations_dashboard(
+        abt_admin_session: Annotated[str | None, Cookie()] = None,
+    ) -> dict[str, object]:
+        _require_admin(ledger, abt_admin_session)
+        if secret_store is None:
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="The MT5 credential mediator is unavailable.")
+        try:
+            _delete_expired_pending_secrets(ledger, secret_store)
+        except SecretStoreError as error:
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(error)) from error
+        return _operations_dashboard(
+            workers=ledger.worker_reconciliation(),
+            alerts=ledger.alerts(),
+            pending_enrollments=ledger.pending_enrollments(),
+            product_pairs=ledger.product_pairs(),
+        )
 
     @app.post("/api/admin/product-catalog-analyses", status_code=status.HTTP_201_CREATED)
     async def create_product_catalog_analysis(

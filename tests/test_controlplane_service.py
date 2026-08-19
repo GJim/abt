@@ -533,6 +533,71 @@ class ControlPlaneServiceTests(unittest.TestCase):
         self.assertEqual({"balance": 1000}, workers[0]["latest_snapshot"]["account"])
         self.assertEqual(["volume_changed", "modified"], [delta["change"] for delta in workers[0]["deltas"]])
 
+    def test_operations_dashboard_requires_an_admin_and_classifies_current_operational_state(self) -> None:
+        self.assertEqual(401, self.client.get("/api/admin/operations-dashboard").status_code)
+
+        pending_enrollment_id = self._create_pending_enrollment()
+        _private_key, worker_id, _certificate = self._approved_worker(654321, "Broker-Live")
+        self.app.state.ledger.record_worker_safety_state(
+            worker_id,
+            "lost_link_safety",
+            "controller_signal_lost",
+        )
+        self.assertEqual(
+            200,
+            self.client.post(
+                "/api/admin/login", json={"username": "ABCDEF", "password": "A-secure-admin-password!"}
+            ).status_code,
+        )
+
+        response = self.client.get("/api/admin/operations-dashboard")
+
+        self.assertEqual(200, response.status_code)
+        dashboard = response.json()
+        self.assertEqual("unavailable", dashboard["paired_trade_lifecycle"]["availability"])
+        self.assertEqual(
+            "Paired-trade lifecycle records are not available in the control-plane ledger.",
+            dashboard["paired_trade_lifecycle"]["reason"],
+        )
+        self.assertEqual([], dashboard["product_pairs"])
+        self.assertEqual("intervention_required", dashboard["alerts"][0]["category"])
+        self.assertEqual("controller_signal_lost", dashboard["alerts"][0]["classification_reason"])
+        self.assertEqual("intervention_required", dashboard["pending_enrollments"][0]["category"])
+        self.assertEqual("approval_required", dashboard["pending_enrollments"][0]["classification_reason"])
+        enrollment_intervention = next(
+            item for item in dashboard["interventions"] if item["item_type"] == "pending_enrollment"
+        )
+        self.assertEqual(
+            {
+                "item_type": "pending_enrollment",
+                "item_id": pending_enrollment_id,
+                "category": "intervention_required",
+                "reason": "approval_required",
+            },
+            {
+                key: value
+                for key, value in enrollment_intervention.items()
+                if key in {"item_type", "item_id", "category", "reason"}
+            },
+        )
+        alert_intervention = next(item for item in dashboard["interventions"] if item["item_type"] == "worker_alert")
+        self.assertEqual(
+            {
+                "item_type": "worker_alert",
+                "item_id": dashboard["alerts"][0]["alert_id"],
+                "category": "intervention_required",
+                "reason": "controller_signal_lost",
+            },
+            {
+                key: value
+                for key, value in alert_intervention.items()
+                if key in {"item_type", "item_id", "category", "reason"}
+            },
+        )
+        self.assertEqual("intervention_required", dashboard["workers"][0]["category"])
+        self.assertEqual("lost_link_safety", dashboard["workers"][0]["classification_reason"])
+        self.assertEqual(UTC, datetime.fromisoformat(dashboard["generated_at"]).tzinfo)
+
     def test_enrollment_does_not_apply_a_client_ip_rate_limit(self) -> None:
         private_key = ec.generate_private_key(ec.SECP256R1())
         public_key_pem = private_key.public_key().public_bytes(
