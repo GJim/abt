@@ -3,6 +3,8 @@ import type { FormEvent } from 'react'
 import { AppShell } from '@astryxdesign/core/AppShell'
 import { Collapsible } from '@astryxdesign/core/Collapsible'
 import { TopNav } from '@astryxdesign/core/TopNav'
+import { AuditEventsPage } from './AuditEventsPage'
+import { WorkerSnapshotsPage } from './WorkerSnapshotsPage'
 import './App.css'
 import './Console.css'
 
@@ -459,6 +461,7 @@ const POLICY_EVALUATION_LABELS: Record<string, string> = {
 const LIVE_REFRESH_INTERVAL_MS = 30_000
 const LIVE_REFRESH_TIMEOUT_MS = 10_000
 const LIVE_REFRESH_STALE_AFTER_MS = LIVE_REFRESH_INTERVAL_MS * 2
+type ConsolePage = 'main' | 'audit' | 'snapshots'
 
 function App() {
   const [username, setUsername] = useState('')
@@ -483,6 +486,7 @@ function App() {
   const [analysisError, setAnalysisError] = useState<string | null>(null)
   const [isLaunchingAnalysis, setIsLaunchingAnalysis] = useState(false)
   const [isLoadingAnalysis, setIsLoadingAnalysis] = useState(false)
+  const [consolePage, setConsolePage] = useState<ConsolePage>(() => readConsolePage())
   const refreshInFlight = useRef(false)
   const operatorActionInProgress = useRef(false)
 
@@ -554,6 +558,12 @@ function App() {
     ].sort((first, second) => second.priorityRank - first.priorityRank || second.occurredAt.localeCompare(first.occurredAt)),
     [alerts, enrollments],
   )
+
+  useEffect(() => {
+    const updatePage = () => setConsolePage(readConsolePage())
+    window.addEventListener('hashchange', updatePage)
+    return () => window.removeEventListener('hashchange', updatePage)
+  }, [])
 
   useEffect(() => {
     if (eligibleWorkers.length === 0) {
@@ -662,17 +672,17 @@ function App() {
       }
 
       const [eventPayload, enrollmentPayload, workerPayload, alertPayload, productPairPayload] = await Promise.all([
-        eventsResponse.json() as Promise<AuditEvent[]>,
+        eventsResponse.json() as Promise<AuditEvent[] | { items: AuditEvent[] }>,
         enrollmentsResponse.json() as Promise<Enrollment[]>,
         workersResponse.json() as Promise<AccountWorker[]>,
         alertsResponse.json() as Promise<WorkerAlert[]>,
-        productPairsResponse.json() as Promise<ProductPair[]>,
+        productPairsResponse.json() as Promise<ProductPair[] | { items: ProductPair[] }>,
       ])
-      setEvents(eventPayload)
+      setEvents(Array.isArray(eventPayload) ? eventPayload : eventPayload.items)
       setEnrollments(enrollmentPayload)
       setWorkers(workerPayload)
       setAlerts(alertPayload)
-      setProductPairs(productPairPayload)
+      setProductPairs(Array.isArray(productPairPayload) ? productPairPayload : productPairPayload.items)
       setLastUpdatedAt(new Date().toISOString())
     } catch (refreshFailure) {
       setRefreshError(
@@ -863,13 +873,13 @@ function App() {
           <aside className="console-sidebar">
             <strong>ABT console</strong>
             <nav aria-label="Console sections" className="console-nav">
-              <a aria-current="page" href="#intervention-queue-heading">Main</a>
+              <a aria-current={consolePage === 'main' ? 'page' : undefined} href="#main">Main</a>
               <a href="#analysis-heading">Launch analysis</a>
               <a href="#analysis-results-heading">Analysis detail</a>
               <a href="#product-pairs-heading">Current pairs</a>
               <a href="#retired-product-pairs-heading">Retired pairs</a>
-              <a href="#account-workers-heading">Workers</a>
-              <a href="#audit-events-heading">Audit events</a>
+              <a href="#snapshots">Workers</a>
+              <a aria-current={consolePage === 'audit' ? 'page' : undefined} href="#audit">Audit events</a>
             </nav>
           </aside>
           <main className="console-main management-content">
@@ -892,6 +902,7 @@ function App() {
           </header>
           {error && <p className="error" role="alert">{error}</p>}
           {refreshError && <p className="error" role="alert">{refreshError}</p>}
+          {consolePage === 'audit' ? <AuditEventsPage /> : consolePage === 'snapshots' ? <WorkerSnapshotsPage /> : <>
 
           <section aria-labelledby="intervention-queue-heading" className="intervention-queue">
             <div className="section-header">
@@ -1289,6 +1300,7 @@ function App() {
               ))}
             </ul>
           </section>
+          </>}
           </main>
         </div>
       </AppShell>
@@ -2711,6 +2723,17 @@ function endpointPairKey(endpoints: Array<{ server: string; symbol: string }>) {
 function readAnalysisQuery() {
   const params = new URLSearchParams(window.location.search)
   return params.get('analysis') ?? ''
+}
+
+function readConsolePage(): ConsolePage {
+  switch (window.location.hash) {
+    case '#audit':
+      return 'audit'
+    case '#snapshots':
+      return 'snapshots'
+    default:
+      return 'main'
+  }
 }
 
 function writeAnalysisQuery(analysisId: string) {
