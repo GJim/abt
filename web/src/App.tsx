@@ -7,6 +7,7 @@ import { AuditEventsPage } from './AuditEventsPage'
 import { AnalysisHistoryPage } from './AnalysisHistoryPage'
 import { ProductPairsListPage } from './ProductPairsListPage'
 import { WorkerSnapshotsPage } from './WorkerSnapshotsPage'
+import { WorkerSummaryTable } from './WorkerSummaryTable'
 import './App.css'
 import './Console.css'
 
@@ -1231,6 +1232,8 @@ function App() {
               </div>
               <span className="fleet-count">{workers.length} {workers.length === 1 ? 'worker' : 'workers'}</span>
             </div>
+            <WorkerSummaryTable workers={workers} onOpenSnapshots={() => { window.location.hash = '#snapshots' }} />
+            <Collapsible defaultIsOpen={false} trigger="Show worker actions and reconciliation">
             {workers.length === 0 ? (
               <p className="empty-state">No approved account workers have reported yet. Approved workers will appear here after their first connection.</p>
             ) : (
@@ -1302,6 +1305,7 @@ function App() {
                 })}
               </ul>
             )}
+            </Collapsible>
           </section>
           <section aria-labelledby="audit-events-heading">
             <h2 id="audit-events-heading">Audit events</h2>
