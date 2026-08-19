@@ -102,6 +102,21 @@ class ControlLedgerTests(unittest.TestCase):
         with self.assertRaisesRegex(LedgerError, "role"):
             self.ledger.consume_registration_invite(worker_invite, "trader")
 
+    def test_trader_ack_cannot_skip_an_event_unseen_by_this_connection(self) -> None:
+        with self.ledger._transaction():
+            first_event = self.ledger._event("intent_accepted", {})
+            second_event = self.ledger._event("intent_accepted", {})
+            self.ledger._connection.execute(
+                "INSERT INTO trader_events (trader_id, event_id) VALUES (?, ?), (?, ?)",
+                ["trader-123", first_event, "trader-123", second_event],
+            )
+
+        with self.assertRaisesRegex(LedgerError, "skip an unseen event"):
+            self.ledger.acknowledge_trader_events("trader-123", second_event, 0, {second_event})
+
+        self.ledger.acknowledge_trader_events("trader-123", second_event, 0, {first_event, second_event})
+        self.assertEqual(second_event, self.ledger.trader_event_cursor("trader-123"))
+
     def test_registration_invite_can_be_revoked_only_before_use(self) -> None:
         invite = self.ledger.create_registration_invite("ABCDEF", "worker")
 

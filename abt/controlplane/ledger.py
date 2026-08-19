@@ -616,15 +616,19 @@ class ControlLedger:
             raise LedgerError("Trader command ID was reused with a different payload.")
         return json.loads(existing[1])
 
-    def acknowledge_trader_events(self, trader_id: str, cursor: int, delivered_high_water: int) -> None:
-        if cursor < 0 or cursor > delivered_high_water:
+    def acknowledge_trader_events(
+        self, trader_id: str, cursor: int, connection_cursor: int, delivered_event_ids: set[int]
+    ) -> None:
+        if cursor < connection_cursor or (cursor != connection_cursor and cursor not in delivered_event_ids):
             raise LedgerError("Trader event ACK cursor was not delivered by this session.")
         with self._transaction():
-            if cursor and self._connection.execute(
-                "SELECT 1 FROM trader_events WHERE trader_id = ? AND event_id = ?",
-                [trader_id, cursor],
-            ).fetchone() is None:
-                raise LedgerError("Trader event ACK cursor is not a Trader event.")
+            required = self._connection.execute(
+                """SELECT event_id FROM trader_events
+                   WHERE trader_id = ? AND event_id > ? AND event_id <= ? ORDER BY event_id""",
+                [trader_id, connection_cursor, cursor],
+            ).fetchall()
+            if any(event_id not in delivered_event_ids for (event_id,) in required):
+                raise LedgerError("Trader event ACK cursor would skip an unseen event.")
             self._connection.execute(
                 """INSERT INTO trader_event_cursors (trader_id, cursor, acknowledged_at) VALUES (?, ?, ?)
                    ON CONFLICT (trader_id) DO UPDATE SET cursor = greatest(trader_event_cursors.cursor, excluded.cursor),

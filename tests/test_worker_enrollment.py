@@ -355,6 +355,34 @@ class WorkerEnrollmentTests(unittest.TestCase):
         self.assertEqual("2026-08-17T00:00:00Z", request["period_end_utc"])
         self.assertEqual(["EURUSD"], request["symbols"])
 
+    def test_analysis_helper_buffers_order_check_requests(self) -> None:
+        session = AuthenticatedWorkerSession(
+            socket=FakeWebSocket(
+                [
+                    {
+                        "type": "order_check_request",
+                        "analysis_id": "order_check",
+                        "request_id": "order-check-123",
+                        "order": {"symbol": "EURUSD"},
+                    },
+                    {
+                        "type": "product_catalog_analysis_request",
+                        "analysis_id": "analysis-123",
+                        "request_id": "request-123",
+                        "stage": "catalog",
+                        "policy": {},
+                    },
+                ]
+            ),
+            reconciliation_cursor=0,
+        )
+
+        analysis = session.receive_product_catalog_analysis()
+        order_check = session.receive_order_check(timeout=0)
+
+        self.assertEqual("analysis-123", analysis["analysis_id"])
+        self.assertEqual({"request_id": "order-check-123", "order": {"symbol": "EURUSD"}}, order_check)
+
     def test_analysis_helper_includes_period_fields_in_market_data_responses(self) -> None:
         socket = FakeWebSocket([])
         session = AuthenticatedWorkerSession(socket=socket, reconciliation_cursor=0)

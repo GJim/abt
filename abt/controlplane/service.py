@@ -1256,10 +1256,18 @@ def create_app(
             session_id = ledger.open_trader_session(trader.trader_id)
             cursor = ledger.trader_event_cursor(trader.trader_id)
             await websocket.send_json({"type": "authenticated", "trader_id": trader.trader_id, "cursor": cursor})
-            delivered_high_water = cursor
-            for event in ledger.trader_events_after(trader.trader_id, cursor):
-                await websocket.send_json({"type": "event", **jsonable_encoder(event)})
-                delivered_high_water = event["event_id"]
+            delivered_event_ids: set[int] = set()
+            last_delivered_event_id = cursor
+
+            async def deliver_events_after(event_cursor: int) -> None:
+                nonlocal last_delivered_event_id
+                for event in ledger.trader_events_after(trader.trader_id, event_cursor):
+                    await websocket.send_json({"type": "event", **jsonable_encoder(event)})
+                    event_id = int(event["event_id"])
+                    delivered_event_ids.add(event_id)
+                    last_delivered_event_id = max(last_delivered_event_id, event_id)
+
+            await deliver_events_after(cursor)
             last_controller_heartbeat = monotonic()
             while True:
                 try:
@@ -1279,13 +1287,13 @@ def create_app(
                     await websocket.send_json({"type": "heartbeat_ack"})
                 elif message_type == "ack" and set(message) == {"type", "cursor"} and isinstance(message["cursor"], int):
                     ledger.record_trader_signal(session_id)
-                    ledger.acknowledge_trader_events(trader.trader_id, message["cursor"], delivered_high_water)
+                    ledger.acknowledge_trader_events(
+                        trader.trader_id, message["cursor"], cursor, delivered_event_ids
+                    )
                     await websocket.send_json({"type": "acknowledged", "cursor": message["cursor"]})
                 elif message_type == "resume" and set(message) == {"type", "cursor"} and isinstance(message["cursor"], int):
                     ledger.record_trader_signal(session_id)
-                    for event in ledger.trader_events_after(trader.trader_id, message["cursor"]):
-                        await websocket.send_json({"type": "event", **jsonable_encoder(event)})
-                        delivered_high_water = event["event_id"]
+                    await deliver_events_after(message["cursor"])
                 elif (
                     message_type == "command"
                     and set(message) == {"type", "command_id", "payload"}
@@ -1307,9 +1315,7 @@ def create_app(
                     else:
                         result = ledger.submit_trader_command(trader.trader_id, message["command_id"], payload)
                     await websocket.send_json(result)
-                    for event in ledger.trader_events_after(trader.trader_id, result["event_id"] - 1):
-                        await websocket.send_json({"type": "event", **jsonable_encoder(event)})
-                        delivered_high_water = event["event_id"]
+                    await deliver_events_after(last_delivered_event_id)
                 else:
                     raise ValueError("Invalid Trader message.")
         except WebSocketDisconnect as error:

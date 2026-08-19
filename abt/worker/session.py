@@ -98,13 +98,17 @@ class AuthenticatedWorkerSession:
     def receive_product_catalog_analysis(self, timeout: float | None = None) -> dict[str, object] | None:
         if self._analysis_requests:
             return self._parse_product_catalog_analysis(self._analysis_requests.popleft())
-        try:
-            response = _message(self.socket, timeout=timeout)
-        except TimeoutError:
-            return None
-        except Exception as error:
-            _raise_closed_connection(error, "analysis request")
-        return self._parse_product_catalog_analysis(response)
+        while True:
+            try:
+                response = _message(self.socket, timeout=timeout)
+            except TimeoutError:
+                return None
+            except Exception as error:
+                _raise_closed_connection(error, "analysis request")
+            if response.get("type") == "order_check_request":
+                self._order_check_requests.append(response)
+                continue
+            return self._parse_product_catalog_analysis(response)
 
     def receive_order_check(self, timeout: float | None = None) -> dict[str, object] | None:
         if self._order_check_requests:
