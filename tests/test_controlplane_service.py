@@ -25,7 +25,14 @@ import uvicorn
 from websockets.exceptions import ConnectionClosed
 from websockets.sync.client import connect as websocket_connect
 
-from abt.controlplane.crypto import ProofError, device_certificate_payload, enrollment_payload, worker_proof_payload
+from abt.controlplane.crypto import (
+    ProofError,
+    device_certificate_payload,
+    enrollment_payload,
+    trader_certificate_payload,
+    trader_proof_payload,
+    worker_proof_payload,
+)
 from abt.controlplane.ledger import LedgerError
 from abt.controlplane.secrets import SecretStore, SecretStoreError
 from abt.controlplane.service import (
@@ -149,6 +156,24 @@ class MemoryCertificateIssuer:
             self._key.public_key().verify(signature, payload, ec.ECDSA(hashes.SHA256()))
         except (InvalidSignature, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
             raise ProofError("The device certificate signature is invalid.") from error
+
+    def issue_trader(self, *, trader_id: str, strategy_name: str, public_key_pem: str) -> str:
+        issued_at = datetime.now(UTC)
+        payload = trader_certificate_payload(
+            trader_id=trader_id,
+            strategy_name=strategy_name,
+            public_key_pem=public_key_pem,
+            issued_at=issued_at,
+            expires_at=issued_at + timedelta(days=30),
+        )
+        return json.dumps(
+            {
+                "payload": base64.b64encode(payload).decode("ascii"),
+                "signature": base64.b64encode(self._key.sign(payload, ec.ECDSA(hashes.SHA256()))).decode("ascii"),
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
 
 
 class ControlPlaneServiceTests(unittest.TestCase):
@@ -350,6 +375,88 @@ class ControlPlaneServiceTests(unittest.TestCase):
 
         self.assertEqual(201, response.status_code)
         self.assertTrue(response.json()["registration_id"])
+
+    def test_administrator_approval_issues_a_30_day_trader_certificate(self) -> None:
+        private_key = ec.generate_private_key(ec.SECP256R1())
+        public_key_pem = private_key.public_key().public_bytes(
+            serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
+        ).decode("utf-8")
+        invite = self.app.state.ledger.create_registration_invite("ABCDEF", "trader")
+        payload = json.dumps(
+            {"claimed_public_ip": "203.0.113.4", "registration_invite": invite, "strategy_name": "mean-reversion"},
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        enrollment = self.client.post(
+            "/api/traders/enrollments",
+            json={
+                "registration_invite": invite,
+                "strategy_name": "mean-reversion",
+                "claimed_public_ip": "203.0.113.4",
+                "public_key_pem": public_key_pem,
+                "proof_signature": base64.b64encode(private_key.sign(payload, ec.ECDSA(hashes.SHA256()))).decode("ascii"),
+            },
+        )
+        login = self.client.post(
+            "/api/admin/login",
+            json={"username": "ABCDEF", "password": "A-secure-admin-password!"},
+        )
+
+        approval = self.client.post(
+            f"/api/admin/traders/enrollments/{enrollment.json()['registration_id']}/approve",
+            headers={"X-CSRF-Token": login.json()["csrf_token"]},
+        )
+
+        self.assertEqual(200, approval.status_code)
+        self.assertIn("trader_id", approval.json())
+        claims = json.loads(base64.b64decode(json.loads(approval.json()["certificate"])["payload"]))
+        self.assertEqual(approval.json()["trader_id"], claims["trader_id"])
+        self.assertEqual(30, (datetime.fromisoformat(claims["expires_at"]) - datetime.fromisoformat(claims["issued_at"])).days)
+
+    def test_approved_trader_can_authenticate_to_the_command_websocket(self) -> None:
+        private_key = ec.generate_private_key(ec.SECP256R1())
+        public_key_pem = private_key.public_key().public_bytes(
+            serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
+        ).decode("utf-8")
+        invite = self.app.state.ledger.create_registration_invite("ABCDEF", "trader")
+        enrollment_payload = json.dumps(
+            {"claimed_public_ip": "203.0.113.4", "registration_invite": invite, "strategy_name": "mean-reversion"},
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        enrollment = self.client.post(
+            "/api/traders/enrollments",
+            json={
+                "registration_invite": invite,
+                "strategy_name": "mean-reversion",
+                "claimed_public_ip": "203.0.113.4",
+                "public_key_pem": public_key_pem,
+                "proof_signature": base64.b64encode(
+                    private_key.sign(enrollment_payload, ec.ECDSA(hashes.SHA256()))
+                ).decode("ascii"),
+            },
+        )
+        login = self.client.post(
+            "/api/admin/login", json={"username": "ABCDEF", "password": "A-secure-admin-password!"}
+        )
+        approval = self.client.post(
+            f"/api/admin/traders/enrollments/{enrollment.json()['registration_id']}/approve",
+            headers={"X-CSRF-Token": login.json()["csrf_token"]},
+        ).json()
+
+        with self.client.websocket_connect("/api/traders/session") as websocket:
+            websocket.send_json({"trader_id": approval["trader_id"], "certificate": approval["certificate"]})
+            challenge = websocket.receive_json()
+            proof = private_key.sign(
+                trader_proof_payload(
+                    purpose=challenge["purpose"], trader_id=challenge["trader_id"], nonce=challenge["nonce"]
+                ),
+                ec.ECDSA(hashes.SHA256()),
+            )
+            websocket.send_json({"signature": base64.b64encode(proof).decode("ascii")})
+            authenticated = websocket.receive_json()
+
+        self.assertEqual({"type": "authenticated", "trader_id": approval["trader_id"], "cursor": 0}, authenticated)
 
     def test_worker_and_trader_reject_invalid_registration_invites(self) -> None:
         private_key = ec.generate_private_key(ec.SECP256R1())

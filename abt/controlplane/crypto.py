@@ -68,6 +68,69 @@ def worker_proof_payload(*, purpose: str, worker_id: str, nonce: str) -> bytes:
     ).encode("utf-8")
 
 
+def trader_certificate_payload(
+    *,
+    trader_id: str,
+    strategy_name: str,
+    public_key_pem: str,
+    issued_at: datetime,
+    expires_at: datetime,
+) -> bytes:
+    return json.dumps(
+        {
+            "expires_at": expires_at.astimezone(UTC).isoformat(),
+            "issued_at": issued_at.astimezone(UTC).isoformat(),
+            "public_key_pem": public_key_pem,
+            "strategy_name": strategy_name,
+            "trader_id": trader_id,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def parse_trader_certificate(certificate: str) -> dict[str, object]:
+    """Decode a Trader certificate without trusting its signature."""
+
+    try:
+        envelope = json.loads(certificate)
+        payload = base64.b64decode(envelope["payload"], validate=True)
+        claims = json.loads(payload)
+    except (TypeError, KeyError, ValueError, json.JSONDecodeError) as error:
+        raise ProofError("The Trader certificate is malformed.") from error
+    if not isinstance(claims, dict):
+        raise ProofError("The Trader certificate is malformed.")
+    required = {"trader_id", "strategy_name", "public_key_pem", "issued_at", "expires_at"}
+    if set(claims) != required or not all(isinstance(claims[name], str) for name in required):
+        raise ProofError("The Trader certificate has invalid claims.")
+    try:
+        expires_at = datetime.fromisoformat(claims["expires_at"])
+        issued_at = datetime.fromisoformat(claims["issued_at"])
+    except (TypeError, ValueError) as error:
+        raise ProofError("The Trader certificate has invalid timestamps.") from error
+    if issued_at.tzinfo is None or expires_at.tzinfo is None or expires_at <= issued_at or datetime.now(UTC) >= expires_at:
+        raise ProofError("The Trader certificate is expired or invalid.")
+    return claims
+
+
+def trader_proof_payload(*, purpose: str, trader_id: str, nonce: str) -> bytes:
+    return json.dumps(
+        {"nonce": nonce, "purpose": purpose, "trader_id": trader_id},
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def verify_trader_proof(public_key_pem: str, signature_base64: str, *, purpose: str, trader_id: str, nonce: str) -> None:
+    _verify_p256_signature(
+        public_key_pem,
+        signature_base64,
+        trader_proof_payload(purpose=purpose, trader_id=trader_id, nonce=nonce),
+        malformed_message="The Trader proof is malformed.",
+        invalid_message="The Trader proof signature is invalid.",
+    )
+
+
 def parse_device_certificate(certificate: str) -> dict[str, object]:
     """Decode a device certificate without trusting its signature."""
 

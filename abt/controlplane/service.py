@@ -24,7 +24,15 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
 from .backup import BackupManager
-from .crypto import ProofError, parse_device_certificate, verify_enrollment_proof, verify_trader_enrollment_proof, verify_worker_proof
+from .crypto import (
+    ProofError,
+    parse_device_certificate,
+    parse_trader_certificate,
+    verify_enrollment_proof,
+    verify_trader_enrollment_proof,
+    verify_trader_proof,
+    verify_worker_proof,
+)
 from .ledger import AuthenticationError, ControlLedger, LedgerError, _hash
 from .secrets import DeviceCertificateIssuer, DeviceCertificateVerifier, SecretStore, SecretStoreError
 
@@ -66,6 +74,15 @@ class TraderEnrollmentRequest(BaseModel):
     claimed_public_ip: str = Field(min_length=1, max_length=64)
     public_key_pem: str = Field(min_length=1)
     proof_signature: str = Field(min_length=1)
+
+
+class TraderCertificateChallengeRequest(BaseModel):
+    registration_id: str = Field(min_length=1)
+
+
+class TraderCertificateRequest(BaseModel):
+    registration_id: str = Field(min_length=1)
+    signature: str = Field(min_length=1)
 
 
 class ProductCatalogAnalysisPolicy(BaseModel):
@@ -248,8 +265,10 @@ def create_app(
 
     app = FastAPI(title="abt control plane", version="0.1.0", lifespan=lifespan)
     app.state.ledger = ledger
+    app.state.trader_certificate_challenges = {}
     admin_notification_connections: set[WebSocket] = set()
     worker_connections: dict[str, set[_WorkerSessionConnection]] = {}
+    trader_connections: dict[str, set[WebSocket]] = {}
     worker_execution_locks: dict[str, asyncio.Lock] = {}
 
     @app.get("/health")
@@ -386,6 +405,59 @@ def create_app(
     ) -> list[dict[str, object]]:
         _require_admin(ledger, abt_admin_session)
         return ledger.pending_trader_enrollments()
+
+    @app.post("/api/admin/traders/enrollments/{registration_id}/approve")
+    def approve_trader_enrollment(
+        registration_id: str,
+        abt_admin_session: Annotated[str | None, Cookie()] = None,
+        x_csrf_token: Annotated[str | None, Header()] = None,
+    ) -> dict[str, str]:
+        username = _require_admin(ledger, abt_admin_session, x_csrf_token, require_csrf=True)
+        try:
+            if certificate_issuer is None:
+                raise SecretStoreError("The device certificate issuer is unavailable.")
+            trader_id = ledger.approve_trader_enrollment(
+                registration_id,
+                username,
+                lambda trader_id, strategy_name, public_key_pem: certificate_issuer.issue_trader(
+                    trader_id=trader_id,
+                    strategy_name=strategy_name,
+                    public_key_pem=public_key_pem,
+                ),
+            )
+            _create_pki_backup(backup_manager)
+            return {"trader_id": trader_id, "certificate": ledger.active_trader(trader_id).certificate}
+        except (LedgerError, SecretStoreError) as error:
+            _LOGGER.warning("Trader enrollment approval failed for %s: %s", registration_id, error)
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
+
+    @app.post("/api/traders/certificates/challenge")
+    def issue_trader_certificate_challenge(body: TraderCertificateChallengeRequest) -> dict[str, str]:
+        try:
+            trader = ledger.active_trader_for_enrollment(body.registration_id)
+            nonce = secrets.token_urlsafe(32)
+            app.state.trader_certificate_challenges[body.registration_id] = nonce
+            return {"purpose": "certificate_delivery", "trader_id": trader.trader_id, "nonce": nonce}
+        except LedgerError as error:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
+
+    @app.post("/api/traders/certificates")
+    def deliver_trader_certificate(body: TraderCertificateRequest) -> dict[str, str]:
+        try:
+            trader = ledger.active_trader_for_enrollment(body.registration_id)
+            nonce = app.state.trader_certificate_challenges.pop(body.registration_id, None)
+            if nonce is None:
+                raise ProofError("The Trader certificate challenge is invalid or expired.")
+            verify_trader_proof(
+                trader.public_key_pem,
+                body.signature,
+                purpose="certificate_delivery",
+                trader_id=trader.trader_id,
+                nonce=nonce,
+            )
+            return {"trader_id": trader.trader_id, "certificate": trader.certificate}
+        except (LedgerError, ProofError) as error:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
 
     @app.get("/api/enrollment-challenge")
     def enrollment_challenge() -> dict[str, str]:
@@ -1000,6 +1072,59 @@ def create_app(
         except Exception:
             _LOGGER.exception("Worker certificate delivery failed unexpectedly.")
             await _reject_worker(websocket)
+
+    @app.websocket("/api/traders/session")
+    async def trader_session(websocket: WebSocket) -> None:
+        await websocket.accept()
+        trader_id: str | None = None
+        try:
+            request = await _worker_message(websocket, {"trader_id", "certificate"})
+            trader_id = _required_text(request, "trader_id")
+            trader = ledger.active_trader(trader_id)
+            certificate = _required_text(request, "certificate")
+            claims = parse_trader_certificate(certificate)
+            if certificate_verifier is None:
+                raise ProofError("The device certificate verifier is unavailable.")
+            certificate_verifier.verify(certificate)
+            if (
+                certificate != trader.certificate
+                or claims["trader_id"] != trader.trader_id
+                or claims["strategy_name"] != trader.strategy_name
+                or claims["public_key_pem"] != trader.public_key_pem
+            ):
+                raise ProofError("The Trader certificate does not match this Trader.")
+            nonce = secrets.token_urlsafe(32)
+            await websocket.send_json({"purpose": "trader_session", "trader_id": trader.trader_id, "nonce": nonce})
+            proof = await _worker_message(websocket, {"signature"})
+            verify_trader_proof(
+                trader.public_key_pem,
+                _required_text(proof, "signature"),
+                purpose="trader_session",
+                trader_id=trader.trader_id,
+                nonce=nonce,
+            )
+            trader_connections.setdefault(trader.trader_id, set()).add(websocket)
+            await websocket.send_json({"type": "authenticated", "trader_id": trader.trader_id, "cursor": 0})
+            while True:
+                message = await websocket.receive_json()
+                if not isinstance(message, dict) or set(message) != {"type"} or message.get("type") != "heartbeat":
+                    raise ValueError("Invalid Trader message.")
+                await websocket.send_json({"type": "heartbeat_ack"})
+        except WebSocketDisconnect as error:
+            _LOGGER.info("Trader session disconnected with code %s.", error.code)
+        except (LedgerError, ProofError, SecretStoreError, ValueError) as error:
+            _LOGGER.warning("Trader session authentication or request failed: %s", error)
+            await _reject_worker(websocket)
+        except Exception:
+            _LOGGER.exception("Trader session authentication or request failed unexpectedly.")
+            await _reject_worker(websocket)
+        finally:
+            if trader_id is not None:
+                connections = trader_connections.get(trader_id)
+                if connections is not None:
+                    connections.discard(websocket)
+                    if not connections:
+                        trader_connections.pop(trader_id, None)
 
     @app.websocket("/api/worker/credentials")
     async def mediate_password(websocket: WebSocket) -> None:

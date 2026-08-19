@@ -54,6 +54,15 @@ class ActiveWorker:
     password_secret_ref: str
 
 
+@dataclass(frozen=True)
+class ActiveTrader:
+    trader_id: str
+    registration_id: str
+    strategy_name: str
+    certificate: str
+    public_key_pem: str
+
+
 class ControlLedger:
     """Single-process DuckDB authority for control-plane state and events."""
 
@@ -372,6 +381,76 @@ class ControlLedger:
             }
             for row in rows
         ]
+
+    def approve_trader_enrollment(
+        self,
+        registration_id: str,
+        approved_by: str,
+        issue_certificate: Callable[[str, str, str], str],
+    ) -> str:
+        now = _utc_now()
+        with self._transaction():
+            row = self._connection.execute(
+                """
+                SELECT strategy_name, public_key_pem, status, expires_at
+                FROM trader_enrollments WHERE registration_id = ?
+                """,
+                [registration_id],
+            ).fetchone()
+            if row is None:
+                raise LedgerError("Trader enrollment does not exist.")
+            strategy_name, public_key_pem, enrollment_status, expires_at = row
+            if enrollment_status != "pending" or now >= expires_at:
+                raise LedgerError("Trader enrollment is no longer pending.")
+            trader_id = str(uuid4())
+            certificate = issue_certificate(trader_id, strategy_name, public_key_pem)
+            self._connection.execute(
+                """
+                INSERT INTO traders (trader_id, registration_id, strategy_name, certificate, status, approved_at)
+                VALUES (?, ?, ?, ?, 'active', ?)
+                """,
+                [trader_id, registration_id, strategy_name, certificate, now],
+            )
+            self._connection.execute(
+                """
+                UPDATE trader_enrollments
+                SET status = 'approved', approved_by = ?, approved_at = ?
+                WHERE registration_id = ?
+                """,
+                [approved_by, now, registration_id],
+            )
+            self._event(
+                "trader_enrollment_approved",
+                {"registration_id": registration_id, "trader_id": trader_id, "approved_by": approved_by},
+            )
+            return trader_id
+
+    def active_trader_for_enrollment(self, registration_id: str) -> ActiveTrader:
+        return self._active_trader(
+            """
+            SELECT t.trader_id, t.registration_id, t.strategy_name, t.certificate, e.public_key_pem
+            FROM traders t JOIN trader_enrollments e ON e.registration_id = t.registration_id
+            WHERE t.registration_id = ? AND t.status = 'active'
+            """,
+            [registration_id],
+        )
+
+    def active_trader(self, trader_id: str) -> ActiveTrader:
+        return self._active_trader(
+            """
+            SELECT t.trader_id, t.registration_id, t.strategy_name, t.certificate, e.public_key_pem
+            FROM traders t JOIN trader_enrollments e ON e.registration_id = t.registration_id
+            WHERE t.trader_id = ? AND t.status = 'active'
+            """,
+            [trader_id],
+        )
+
+    def _active_trader(self, query: str, parameters: list[str]) -> ActiveTrader:
+        with self._lock:
+            row = self._connection.execute(query, parameters).fetchone()
+        if row is None:
+            raise LedgerError("Trader is not active.")
+        return ActiveTrader(*row)
 
     def issue_enrollment_challenge(self) -> tuple[str, datetime]:
         challenge = secrets.token_urlsafe(32)
@@ -2239,7 +2318,18 @@ class ControlLedger:
                     public_key_pem VARCHAR NOT NULL,
                     status VARCHAR NOT NULL,
                     created_at TIMESTAMPTZ NOT NULL,
-                    expires_at TIMESTAMPTZ NOT NULL
+                    expires_at TIMESTAMPTZ NOT NULL,
+                    approved_by VARCHAR,
+                    approved_at TIMESTAMPTZ
+                );
+                CREATE TABLE IF NOT EXISTS traders (
+                    trader_id VARCHAR PRIMARY KEY,
+                    registration_id VARCHAR UNIQUE NOT NULL,
+                    strategy_name VARCHAR NOT NULL,
+                    certificate VARCHAR NOT NULL,
+                    status VARCHAR NOT NULL,
+                    approved_at TIMESTAMPTZ NOT NULL,
+                    revoked_at TIMESTAMPTZ
                 );
                 CREATE TABLE IF NOT EXISTS enrollment_challenges (
                     challenge_hash VARCHAR PRIMARY KEY,

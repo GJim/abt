@@ -7,7 +7,7 @@ import json
 
 import httpx
 
-from .crypto import ProofError, device_certificate_payload
+from .crypto import ProofError, device_certificate_payload, trader_certificate_payload
 
 class SecretStoreError(RuntimeError):
     """Raised when the control plane cannot read or write an OpenBao secret."""
@@ -23,6 +23,8 @@ class SecretStore(Protocol):
 
 class DeviceCertificateIssuer(Protocol):
     def issue(self, *, worker_id: str, login: int, server: str, public_key_pem: str) -> str: ...
+
+    def issue_trader(self, *, trader_id: str, strategy_name: str, public_key_pem: str) -> str: ...
 
 
 class DeviceCertificateVerifier(Protocol):
@@ -79,6 +81,21 @@ class OpenBaoDeviceCertificateIssuer:
             issued_at=issued_at,
             expires_at=expires_at,
         )
+        return self._sign(payload)
+
+    def issue_trader(self, *, trader_id: str, strategy_name: str, public_key_pem: str) -> str:
+        issued_at = datetime.now(UTC)
+        return self._sign(
+            trader_certificate_payload(
+                trader_id=trader_id,
+                strategy_name=strategy_name,
+                public_key_pem=public_key_pem,
+                issued_at=issued_at,
+                expires_at=issued_at + timedelta(days=30),
+            )
+        )
+
+    def _sign(self, payload: bytes) -> str:
         try:
             response = httpx.post(
                 f"{self._address}/v1/transit/sign/{self._transit_key}",
@@ -89,9 +106,7 @@ class OpenBaoDeviceCertificateIssuer:
             response.raise_for_status()
             signature = response.json()["data"]["signature"]
         except httpx.HTTPStatusError as error:
-            raise SecretStoreError(
-                f"OpenBao device certificate signing failed (HTTP {error.response.status_code})."
-            ) from error
+            raise SecretStoreError(f"OpenBao device certificate signing failed (HTTP {error.response.status_code}).") from error
         except httpx.TimeoutException as error:
             raise SecretStoreError("OpenBao device certificate signing timed out.") from error
         except (httpx.HTTPError, KeyError, TypeError, ValueError) as error:
