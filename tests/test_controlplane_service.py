@@ -341,6 +341,32 @@ class ControlPlaneServiceTests(unittest.TestCase):
                 },
             ).status_code,
         )
+
+        login = self.client.post(
+            "/api/admin/login", json={"username": "ABCDEF", "password": "A-secure-admin-password!"}
+        )
+        self.assertEqual([], self.client.get("/api/admin/traders/enrollments").json())
+        self.assertEqual(
+            422,
+            self.client.post("/api/traders/enrollments", json={}).status_code,
+        )
+        used_invite = self.app.state.ledger.create_registration_invite("ABCDEF", "trader")
+        used_payload = json.dumps(
+            {"claimed_public_ip": "203.0.113.5", "registration_invite": used_invite, "strategy_name": "other"},
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        used_signature = base64.b64encode(private_key.sign(used_payload, ec.ECDSA(hashes.SHA256()))).decode("ascii")
+        request = {
+            "registration_invite": used_invite,
+            "strategy_name": "other",
+            "claimed_public_ip": "203.0.113.5",
+            "public_key_pem": public_key_pem,
+            "proof_signature": used_signature,
+        }
+        self.assertEqual(201, self.client.post("/api/traders/enrollments", json=request).status_code)
+        self.assertEqual(409, self.client.post("/api/traders/enrollments", json=request).status_code)
+        self.assertEqual(1, len(self.client.get("/api/admin/traders/enrollments").json()))
         self.app.state.ledger.revoke_registration_invite(worker_invite, "ABCDEF")
         account_info = {"login": 123456, "server": "Broker-Demo"}
         terminal_info = {"name": "MetaTrader 5"}

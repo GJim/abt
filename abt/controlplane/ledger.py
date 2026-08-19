@@ -342,6 +342,30 @@ class ControlLedger:
             self._event("trader_enrollment_requested", {"registration_id": registration_id, "strategy_name": strategy_name})
         return {"registration_id": registration_id, "expires_at": now + timedelta(minutes=15)}
 
+    def pending_trader_enrollments(self) -> list[dict[str, Any]]:
+        now = _utc_now()
+        with self._transaction():
+            self._connection.execute(
+                "UPDATE trader_enrollments SET status = 'expired' WHERE status = 'pending' AND expires_at <= ?",
+                [now],
+            )
+            rows = self._connection.execute(
+                """
+                SELECT registration_id, strategy_name, claimed_public_ip, created_at, expires_at
+                FROM trader_enrollments WHERE status = 'pending' ORDER BY created_at
+                """
+            ).fetchall()
+        return [
+            {
+                "registration_id": row[0],
+                "strategy_name": row[1],
+                "claimed_public_ip": row[2],
+                "created_at": row[3],
+                "expires_at": row[4],
+            }
+            for row in rows
+        ]
+
     def issue_enrollment_challenge(self) -> tuple[str, datetime]:
         challenge = secrets.token_urlsafe(32)
         now = _utc_now()

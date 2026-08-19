@@ -381,6 +381,13 @@ def create_app(
         except LedgerError as error:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
 
+    @app.get("/api/admin/traders/enrollments")
+    def list_trader_enrollments(
+        abt_admin_session: Annotated[str | None, Cookie()] = None,
+    ) -> list[dict[str, object]]:
+        _require_admin(ledger, abt_admin_session)
+        return ledger.pending_trader_enrollments()
+
     @app.get("/api/enrollment-challenge")
     def enrollment_challenge() -> dict[str, str]:
         challenge, expires_at = ledger.issue_enrollment_challenge()
