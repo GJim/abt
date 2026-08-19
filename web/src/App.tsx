@@ -1117,56 +1117,83 @@ function App() {
               </ul>
             )}
           </section>
-          <section aria-labelledby="account-workers-heading">
-            <h2 id="account-workers-heading">Account workers</h2>
+          <section aria-labelledby="account-workers-heading" className="fleet-health">
+            <div className="section-header">
+              <div>
+                <h2 id="account-workers-heading">Fleet health</h2>
+                <p>Scan worker state and snapshot freshness before opening reconciliation evidence.</p>
+              </div>
+              <span className="fleet-count">{workers.length} {workers.length === 1 ? 'worker' : 'workers'}</span>
+            </div>
             {workers.length === 0 ? (
-              <p>No approved account workers have reported yet.</p>
+              <p className="empty-state">No approved account workers have reported yet. Approved workers will appear here after their first connection.</p>
             ) : (
-              <ul className="worker-list" aria-label="Account workers">
-                {workers.map((worker) => (
-                  <li key={worker.worker_id} className="worker">
-                    <dl>
-                      <div><dt>Account</dt><dd>{worker.login} on {worker.server}</dd></div>
-                      <div><dt>Connectivity</dt><dd>{worker.connectivity}</dd></div>
-                      <div><dt>Safety state</dt><dd>{worker.safety_state}</dd></div>
-                    </dl>
-                    {worker.connectivity !== 'revoked' && (
-                      <button
-                        aria-label={`Revoke certificate for ${worker.login} on ${worker.server}`}
-                        className="reject-button"
-                        onClick={() => void revokeWorker(worker.worker_id)}
-                        type="button"
-                      >
-                        Revoke certificate
-                      </button>
-                    )}
-                    {worker.latest_snapshot && (
-                      <section aria-label={`Latest snapshot for ${worker.login} on ${worker.server}`}>
-                        <h3>Latest snapshot</h3>
-                        <time dateTime={worker.latest_snapshot.observed_at}>{worker.latest_snapshot.observed_at}</time>
-                        <pre>{JSON.stringify({
-                          account: worker.latest_snapshot.account,
-                          terminal: worker.latest_snapshot.terminal,
-                          orders: worker.latest_snapshot.orders,
-                          positions: worker.latest_snapshot.positions,
-                        }, null, 2)}</pre>
-                      </section>
-                    )}
-                    <section aria-label={`Lifecycle deltas for ${worker.login} on ${worker.server}`}>
-                      <h3>Lifecycle deltas</h3>
-                      {worker.deltas.length === 0 ? <p>No lifecycle or volume changes reported.</p> : (
-                        <ul className="worker-deltas">
-                          {worker.deltas.map((delta) => (
-                            <li key={delta.cursor}>
-                              <strong>{delta.change}</strong> {delta.entity} {delta.ticket}
-                              <time dateTime={delta.observed_at}>{delta.observed_at}</time>
-                            </li>
-                          ))}
-                        </ul>
-                      )}
-                    </section>
-                  </li>
-                ))}
+              <ul className="worker-list" aria-label="Fleet health by account">
+                {[...workers].sort((first, second) => {
+                  const priority = workerHealthPriority(first) - workerHealthPriority(second)
+                  return priority || `${first.server}:${first.login}`.localeCompare(`${second.server}:${second.login}`)
+                }).map((worker) => {
+                  const health = describeWorkerHealth(worker)
+                  const accountName = `${worker.login} on ${worker.server}`
+                  const snapshot = worker.latest_snapshot
+                  return (
+                    <li key={worker.worker_id} className="worker">
+                      <div className="worker-summary">
+                        <div>
+                          <h3>{accountName}</h3>
+                          <p>{health.description}</p>
+                        </div>
+                        <span className={`status-badge worker-health-${health.tone}`}>{health.label}</span>
+                      </div>
+                      <dl className="worker-facts">
+                        <div><dt>Freshness</dt><dd>{snapshot ? <time dateTime={snapshot.observed_at}>{formatSnapshotFreshness(snapshot.observed_at)}</time> : 'No snapshot received'}</dd></div>
+                        <div><dt>Account</dt><dd>{snapshot ? formatAccountSummary(snapshot.account) : 'Awaiting snapshot'}</dd></div>
+                        <div><dt>Reconciliation</dt><dd>{formatReconciliationSummary(worker)}</dd></div>
+                      </dl>
+                      <div className="worker-actions">
+                        <Collapsible defaultIsOpen={false} trigger={`View snapshot and reconciliation evidence for ${accountName}`}>
+                          <div className="worker-evidence">
+                            {snapshot ? (
+                              <section aria-label={`Latest snapshot for ${accountName}`}>
+                                <h4>Latest snapshot</h4>
+                                <time dateTime={snapshot.observed_at}>{formatDateTime(snapshot.observed_at)}</time>
+                                <pre>{JSON.stringify({
+                                  account: snapshot.account,
+                                  terminal: snapshot.terminal,
+                                  orders: snapshot.orders,
+                                  positions: snapshot.positions,
+                                }, null, 2)}</pre>
+                              </section>
+                            ) : <p>No raw snapshot has been received.</p>}
+                            <section aria-label={`Lifecycle deltas for ${accountName}`}>
+                              <h4>Lifecycle deltas</h4>
+                              {worker.deltas.length === 0 ? <p>No lifecycle or volume changes reported.</p> : (
+                                <ul className="worker-deltas">
+                                  {worker.deltas.map((delta) => (
+                                    <li key={delta.cursor}>
+                                      <strong>{delta.change}</strong> {delta.entity} {delta.ticket}
+                                      <time dateTime={delta.observed_at}>{formatDateTime(delta.observed_at)}</time>
+                                    </li>
+                                  ))}
+                                </ul>
+                              )}
+                            </section>
+                          </div>
+                        </Collapsible>
+                        {worker.connectivity !== 'revoked' && (
+                          <button
+                            aria-label={`Revoke certificate for ${accountName}`}
+                            className="reject-button"
+                            onClick={() => void revokeWorker(worker.worker_id)}
+                            type="button"
+                          >
+                            Revoke certificate
+                          </button>
+                        )}
+                      </div>
+                    </li>
+                  )
+                })}
               </ul>
             )}
           </section>
@@ -2712,6 +2739,91 @@ function describeRetiredReason(reason: string | null) {
     return 'Replaced'
   }
   return humanizeToken(reason)
+}
+
+const SNAPSHOT_STALE_AFTER_MS = 15 * 60 * 1000
+
+function describeWorkerHealth(worker: AccountWorker) {
+  if (worker.connectivity === 'revoked') {
+    return {
+      label: 'Revoked — human action',
+      tone: 'human-action',
+      description: 'Its certificate is revoked. Re-enrol the worker before it can report again.',
+    }
+  }
+  if (worker.safety_state !== 'connected' || worker.connectivity === 'disconnected') {
+    return {
+      label: 'Human action needed',
+      tone: 'human-action',
+      description: `Connectivity is ${humanizeToken(worker.connectivity)} and safety state is ${humanizeToken(worker.safety_state)}.`,
+    }
+  }
+  if (worker.connectivity === 'stale' || isSnapshotStale(worker.latest_snapshot?.observed_at)) {
+    return {
+      label: 'Stale data',
+      tone: 'stale',
+      description: 'The latest snapshot is too old to use for live operational decisions.',
+    }
+  }
+  if (worker.latest_snapshot === null) {
+    return {
+      label: 'Idle — no snapshot',
+      tone: 'idle',
+      description: 'Connected, but waiting for its first account snapshot.',
+    }
+  }
+  return {
+    label: 'Healthy',
+    tone: 'healthy',
+    description: 'Connected with a current account snapshot.',
+  }
+}
+
+function workerHealthPriority(worker: AccountWorker) {
+  const tone = describeWorkerHealth(worker).tone
+  return { 'human-action': 0, stale: 1, idle: 2, healthy: 3 }[tone] ?? 3
+}
+
+function isSnapshotStale(observedAt: string | undefined) {
+  if (!observedAt) {
+    return false
+  }
+  const timestamp = Date.parse(observedAt)
+  return !Number.isFinite(timestamp) || Date.now() - timestamp > SNAPSHOT_STALE_AFTER_MS
+}
+
+function formatSnapshotFreshness(observedAt: string) {
+  const timestamp = Date.parse(observedAt)
+  if (!Number.isFinite(timestamp)) {
+    return 'Snapshot time unavailable'
+  }
+  const ageInMinutes = Math.max(0, Math.floor((Date.now() - timestamp) / 60_000))
+  const age = ageInMinutes === 0 ? 'just now' : `${ageInMinutes} ${ageInMinutes === 1 ? 'minute' : 'minutes'} ago`
+  return `${isSnapshotStale(observedAt) ? 'Stale' : 'Current'}: ${age} (${formatDateTime(observedAt)})`
+}
+
+function formatAccountSummary(account: EnrollmentEvidence) {
+  const balance = account.balance
+  const currency = account.currency
+  if (typeof balance === 'number') {
+    return `Balance ${balance.toLocaleString()}${typeof currency === 'string' ? ` ${currency}` : ''}`
+  }
+  return 'Account snapshot received'
+}
+
+function formatReconciliationSummary(worker: AccountWorker) {
+  const snapshot = worker.latest_snapshot
+  if (snapshot === null) {
+    return 'Awaiting reconciliation'
+  }
+  const counts = `${snapshot.positions.length} positions, ${snapshot.orders.length} orders`
+  if (worker.deltas.length === 0) {
+    return `${counts}; no changes`
+  }
+  const latestDelta = worker.deltas.reduce((latest, delta) => (
+    delta.observed_at > latest.observed_at ? delta : latest
+  ))
+  return `${counts}; ${worker.deltas.length} change${worker.deltas.length === 1 ? '' : 's'}, latest ${humanizeToken(latestDelta.change)}`
 }
 
 export default App

@@ -155,12 +155,65 @@ test('administrator can view connected worker health and reconciliation', async 
   await page.getByLabel('Password').fill('A-secure-admin-password!')
   await page.getByRole('button', { name: 'Sign in' }).click()
 
-  await expect(page.getByRole('heading', { name: 'Account workers' })).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'Fleet health' })).toBeVisible()
   const workerCard = page.getByRole('listitem').filter({ hasText: '123456 on Broker-Demo' })
-  await expect(workerCard.getByText('connected', { exact: true }).first()).toBeVisible()
+  await expect(workerCard.getByText('Stale data', { exact: true })).toBeVisible()
+  await expect(workerCard.getByText('"balance": 1000')).not.toBeVisible()
+  await workerCard.getByRole('button', { name: /View snapshot and reconciliation evidence/ }).click()
   await expect(page.getByText('volume_changed')).toBeVisible()
   await expect(page.getByText('"balance": 1000')).toBeVisible()
   await expect(page.getByText('high: external_broker_change')).toBeVisible()
+})
+
+test('administrator can scan a realistic fleet, including stale and human-action workers, on a narrow screen', async ({ page }) => {
+  const currentSnapshot = {
+    cursor: 1,
+    observed_at: new Date().toISOString(),
+    account: { balance: 1000, currency: 'USD' },
+    terminal: { connected: true },
+    orders: [],
+    positions: [],
+  }
+  const workers = [
+    buildWorker({ worker_id: 'healthy-1', login: 100001, server: 'Broker-A', latest_snapshot: currentSnapshot }),
+    buildWorker({ worker_id: 'healthy-2', login: 100002, server: 'Broker-B', latest_snapshot: currentSnapshot }),
+    buildWorker({ worker_id: 'idle', login: 100003, server: 'Broker-C' }),
+    buildWorker({ worker_id: 'stale', login: 100004, server: 'Broker-D', latest_snapshot: { ...currentSnapshot, observed_at: new Date(Date.now() - 16 * 60_000).toISOString() } }),
+    buildWorker({ worker_id: 'revoked', login: 100005, server: 'Broker-E', connectivity: 'revoked' }),
+    buildWorker({ worker_id: 'paused', login: 100006, server: 'Broker-F', safety_state: 'paused', latest_snapshot: currentSnapshot }),
+    buildWorker({ worker_id: 'healthy-3', login: 100007, server: 'Broker-G', latest_snapshot: currentSnapshot }),
+    buildWorker({ worker_id: 'healthy-4', login: 100008, server: 'Broker-H', latest_snapshot: currentSnapshot }),
+  ]
+
+  await page.setViewportSize({ width: 390, height: 844 })
+  await mockLogin(page)
+  await mockManagementData(page, { workers })
+  await page.goto('http://127.0.0.1:4173/')
+  await page.getByLabel('Administrator account').fill('ABCDEF')
+  await page.getByLabel('Password').fill('A-secure-admin-password!')
+  await page.getByRole('button', { name: 'Sign in' }).click()
+
+  const fleet = page.getByLabel('Fleet health by account')
+  await expect(fleet.getByRole('listitem')).toHaveCount(8)
+  await expect(fleet.getByText('Healthy', { exact: true })).toHaveCount(4)
+  await expect(fleet.getByText('Idle — no snapshot', { exact: true })).toBeVisible()
+  await expect(fleet.getByText('Stale data', { exact: true })).toBeVisible()
+  await expect(fleet.getByText('Revoked — human action', { exact: true })).toBeVisible()
+  await expect(fleet.getByText('Human action needed', { exact: true })).toBeVisible()
+  await expect(fleet.getByText(/Freshness/).first()).toBeVisible()
+  await expect(page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).resolves.toBe(true)
+})
+
+test('administrator sees a useful fleet-health empty state', async ({ page }) => {
+  await mockLogin(page)
+  await mockManagementData(page, { workers: [] })
+  await page.goto('http://127.0.0.1:4173/')
+  await page.getByLabel('Administrator account').fill('ABCDEF')
+  await page.getByLabel('Password').fill('A-secure-admin-password!')
+  await page.getByRole('button', { name: 'Sign in' }).click()
+
+  await expect(page.getByRole('heading', { name: 'Fleet health' })).toBeVisible()
+  await expect(page.getByText('No approved account workers have reported yet. Approved workers will appear here after their first connection.')).toBeVisible()
 })
 
 test('administrator can launch an analysis with CSRF protection and inspect passing, failing, and exception evidence', async ({ page }) => {
