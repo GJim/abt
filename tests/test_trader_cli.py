@@ -400,6 +400,32 @@ class TraderCertificateRotationTests(unittest.TestCase):
                 json.loads(state_path.read_text(encoding="utf-8")),
             )
 
+    def test_failed_identity_switch_does_not_leave_a_journal_for_a_deleted_key(self) -> None:
+        now = datetime(2026, 8, 20, tzinfo=UTC)
+        with TemporaryDirectory() as directory:
+            identity_path = Path(directory) / "trader.json"
+            save_identity(identity_path, self._identity(), replace=False)
+            replacement_keys: list[FakeKeyStore] = []
+
+            with (
+                patch("abt.trader.rotation.save_identity", side_effect=TraderRotationError("disk unavailable")),
+                self.assertRaisesRegex(TraderRotationError, "disk unavailable"),
+            ):
+                maintain_trader_certificate(
+                    identity_path=identity_path,
+                    identity=self._identity(),
+                    trader_id="trader-123",
+                    certificate=self._certificate(now - timedelta(days=16), now + timedelta(days=14)),
+                    current_key=FakeKeyStore("old-key"),
+                    key_store_factory=lambda name: replacement_keys.append(FakeKeyStore(name)) or replacement_keys[-1],
+                    transport=FakeRotationTransport(),
+                    now=lambda: now,
+                    error_output=io.StringIO(),
+                )
+
+            self.assertTrue(replacement_keys[0].deleted)
+            self.assertFalse((Path(directory) / "trader.rotation.pending.json").exists())
+
     def _identity(self, *, key_name: str = "old-key") -> TraderIdentity:
         return TraderIdentity("https://controller.example", "enrollment-123", "mean-reversion", "203.0.113.4", key_name)
 

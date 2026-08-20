@@ -114,7 +114,13 @@ def maintain_trader_certificate(
         raise TraderRotationError("Trader device certificate rotation failed safely.") from error
     finally:
         if replacement_key is not None and not became_current:
-            _delete_key(replacement_key)
+            if journal_path.exists():
+                try:
+                    journal_path.unlink()
+                except OSError:
+                    pass
+            if not journal_path.exists():
+                _delete_key(replacement_key)
         if replacement_key is not None:
             _close_key(replacement_key)
     raise TraderCertificateRotated("Trader device certificate rotated; reconnecting with the replacement identity.")
