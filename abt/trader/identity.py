@@ -70,18 +70,24 @@ def ensure_identity_can_be_saved(path: Path, *, replace: bool) -> None:
 def save_identity(path: Path, identity: TraderIdentity, *, replace: bool) -> None:
     ensure_identity_can_be_saved(path, replace=replace)
     _validate(identity, path)
+    atomic_write_json(path, {"version": _VERSION, **asdict(identity)}, "Trader identity configuration")
+
+
+def atomic_write_json(path: Path, value: dict[str, object], label: str) -> None:
+    """Atomically replace a small, non-secret JSON file."""
+
     temporary_name: str | None = None
     try:
         descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent, text=True)
         with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as temporary:
-            json.dump({"version": _VERSION, **asdict(identity)}, temporary, sort_keys=True, separators=(",", ":"))
+            json.dump(value, temporary, sort_keys=True, separators=(",", ":"))
             temporary.write("\n")
             temporary.flush()
             os.fsync(temporary.fileno())
         os.replace(temporary_name, path)
         temporary_name = None
     except OSError as error:
-        raise TraderEnrollmentError(f"Trader identity configuration cannot be written: {path}.") from error
+        raise TraderEnrollmentError(f"{label} cannot be written: {path}.") from error
     finally:
         if temporary_name is not None:
             try:

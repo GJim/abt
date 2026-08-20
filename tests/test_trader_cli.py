@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import patch
 
 from abt.trader.cli import main
-from abt.trader.session import deliver_trader_events
+from abt.trader.session import deliver_trader_events, run_trader_session
 
 
 class FakeKeyStore:
@@ -44,6 +44,7 @@ class TraderCommandTests(unittest.TestCase):
             config_path = Path(directory) / "trader.json"
             prompts = iter(["https://controller.example", "trader-invite", "mean-reversion", "yes"])
             output = io.StringIO()
+            errors = io.StringIO()
 
             with patch("abt.trader.cli.sys.platform", "win32"):
                 exit_code = main(
@@ -121,6 +122,7 @@ class TraderCommandTests(unittest.TestCase):
                 encoding="utf-8",
             )
             output = io.StringIO()
+            errors = io.StringIO()
 
             with (
                 patch("abt.trader.cli.sys.platform", "win32"),
@@ -130,10 +132,12 @@ class TraderCommandTests(unittest.TestCase):
                     ["connect", "--config", str(config_path)],
                     transport_factory=PendingTransport,
                     output=output,
+                    error_output=errors,
                 )
 
             self.assertEqual(0, exit_code)
-            self.assertIn("pending administrator approval", output.getvalue())
+            self.assertEqual("", output.getvalue())
+            self.assertIn("pending administrator approval", errors.getvalue())
 
     def test_connect_writes_event_before_acknowledging_and_mirrors_acknowledged_cursor(self) -> None:
         output = io.StringIO()
@@ -150,3 +154,43 @@ class TraderCommandTests(unittest.TestCase):
         self.assertEqual('{"event_id":17,"payload":{"state":"accepted"},"type":"event"}\n', output.getvalue())
         self.assertEqual([17], acknowledged)
         self.assertEqual([17], state)
+
+    def test_connect_acknowledges_replayed_events_after_their_json_lines_output(self) -> None:
+        class ReplaySocket:
+            def __init__(self) -> None:
+                self.messages = iter(
+                    [
+                        '{"type":"event","event_id":17,"payload":{"state":"accepted"}}',
+                        '{"type":"event","event_id":18,"payload":{"state":"executing"}}',
+                        '{"type":"acknowledged","cursor":17}',
+                        '{"type":"acknowledged","cursor":18}',
+                    ]
+                )
+                self.sent: list[str] = []
+
+            def recv(self, timeout: float | None = None) -> str:
+                return next(self.messages)
+
+            def send(self, message: str) -> None:
+                self.sent.append(message)
+
+        socket = ReplaySocket()
+        output = io.StringIO()
+        cursors: list[int] = []
+
+        with self.assertRaises(StopIteration):
+            run_trader_session(socket, output=output, save_cursor=cursors.append)  # type: ignore[arg-type]
+
+        self.assertEqual([17, 18], cursors)
+        self.assertEqual(
+            [
+                '{"cursor":17,"type":"ack"}',
+                '{"cursor":18,"type":"ack"}',
+            ],
+            socket.sent,
+        )
+        self.assertEqual(
+            '{"event_id":17,"payload":{"state":"accepted"},"type":"event"}\n'
+            '{"event_id":18,"payload":{"state":"executing"},"type":"event"}\n',
+            output.getvalue(),
+        )

@@ -2,15 +2,15 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
-import tempfile
+import time
 from base64 import b64encode
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Protocol, TextIO
 
 import httpx
+from websockets.exceptions import ConnectionClosed
 
 from abt.controlplane.crypto import trader_proof_payload
 from abt.worker.keystore import HardwareKeyStore, WindowsCNGKeyStore
@@ -18,6 +18,7 @@ from abt.worker.keystore import HardwareKeyStore, WindowsCNGKeyStore
 from .identity import (
     TraderEnrollmentError,
     TraderIdentity,
+    atomic_write_json,
     default_identity_path,
     ensure_identity_can_be_saved,
     load_identity,
@@ -170,14 +171,23 @@ def main(
         transport = transport_factory()
         try:
             pending = pending_identity_path(arguments.config)
-            candidate = load_identity(pending) if pending.exists() else identity
-            status = _required_response(transport.enrollment_status(candidate.controller_url, candidate.enrollment_id), "status")
-            if status == "approved" and pending.exists():
-                save_identity(arguments.config, candidate, replace=True)
-                pending.unlink()
-                identity = candidate
+            if pending.exists():
+                candidate = load_identity(pending)
+                pending_status = _required_response(
+                    transport.enrollment_status(candidate.controller_url, candidate.enrollment_id), "status"
+                )
+                if pending_status == "approved":
+                    save_identity(arguments.config, candidate, replace=True)
+                    pending.unlink()
+                    identity = candidate
+                else:
+                    print(
+                        "Trader replacement enrollment is pending or inactive; continuing with the saved identity.",
+                        file=error_output,
+                    )
+            status = _required_response(transport.enrollment_status(identity.controller_url, identity.enrollment_id), "status")
             if status == "pending":
-                print("Trader enrollment is pending administrator approval.", file=output)
+                print("Trader enrollment is pending administrator approval.", file=error_output)
                 return 0
             if status != "approved":
                 raise TraderEnrollmentError("Trader enrollment is no longer active.")
@@ -211,49 +221,37 @@ def connect_trader(
     try:
         _warn_if_state_unavailable(state_file, error_output)
         while True:
-            challenge = transport.certificate_challenge(identity.controller_url, identity.enrollment_id)
-            trader_id = _required_response(challenge, "trader_id")
-            nonce = _required_response(challenge, "nonce")
-            signature = key_store.sign(
-                trader_proof_payload(purpose="certificate_delivery", trader_id=trader_id, nonce=nonce)
-            )
-            if not isinstance(signature, bytes):
-                raise TraderEnrollmentError("The Windows CNG key returned an invalid signature.")
-            delivery = transport.certificate(
-                identity.controller_url, identity.enrollment_id, b64encode(signature).decode("ascii")
-            )
-            if _required_response(delivery, "trader_id") != trader_id:
-                raise TraderEnrollmentError("The controller returned an invalid Trader certificate.")
-            socket, _ = open_authenticated_trader_session(
-                controller_url=identity.controller_url, enrollment_id=identity.enrollment_id, key_store=key_store,
-                certificate=(trader_id, _required_response(delivery, "certificate")),
-            )
             try:
-                run_trader_session(socket, output=output, save_cursor=lambda cursor: _save_cursor(state_file, cursor))
-            finally:
-                socket.__exit__(None, None, None)
+                challenge = transport.certificate_challenge(identity.controller_url, identity.enrollment_id)
+                trader_id = _required_response(challenge, "trader_id")
+                nonce = _required_response(challenge, "nonce")
+                signature = key_store.sign(
+                    trader_proof_payload(purpose="certificate_delivery", trader_id=trader_id, nonce=nonce)
+                )
+                if not isinstance(signature, bytes):
+                    raise TraderEnrollmentError("The Windows CNG key returned an invalid signature.")
+                delivery = transport.certificate(
+                    identity.controller_url, identity.enrollment_id, b64encode(signature).decode("ascii")
+                )
+                if _required_response(delivery, "trader_id") != trader_id:
+                    raise TraderEnrollmentError("The controller returned an invalid Trader certificate.")
+                socket, _ = open_authenticated_trader_session(
+                    controller_url=identity.controller_url, enrollment_id=identity.enrollment_id, key_store=key_store,
+                    certificate=(trader_id, _required_response(delivery, "certificate")),
+                )
+                try:
+                    run_trader_session(socket, output=output, save_cursor=lambda cursor: _save_cursor(state_file, cursor))
+                finally:
+                    socket.__exit__(None, None, None)
+            except (ConnectionClosed, OSError, TimeoutError) as error:
+                print(f"Trader connection interrupted ({type(error).__name__}); reconnecting.", file=error_output)
+                time.sleep(5)
     finally:
         _close(key_store)
 
 
 def _save_cursor(path: Path, cursor: int) -> None:
-    temporary_name: str | None = None
-    try:
-        descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent, text=True)
-        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as temporary:
-            temporary.write(json.dumps({"version": 1, "acknowledged_cursor": cursor}, separators=(",", ":")) + "\n")
-            temporary.flush()
-            os.fsync(temporary.fileno())
-        os.replace(temporary_name, path)
-        temporary_name = None
-    except OSError as error:
-        raise TraderEnrollmentError(f"Trader state cannot be written: {path}.") from error
-    finally:
-        if temporary_name is not None:
-            try:
-                os.unlink(temporary_name)
-            except OSError:
-                pass
+    atomic_write_json(path, {"version": 1, "acknowledged_cursor": cursor}, "Trader state")
 
 
 def _warn_if_state_unavailable(path: Path, error_output: TextIO) -> None:

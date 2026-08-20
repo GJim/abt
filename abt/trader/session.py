@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from base64 import b64encode
+from collections import deque
 from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Protocol, TextIO
@@ -79,12 +80,16 @@ def run_trader_session(
 ) -> None:
     """Run one foreground connection until it disconnects."""
 
+    pending_events: deque[dict[str, object]] = deque()
     while True:
-        try:
-            message = _message(socket, timeout=30)
-        except TimeoutError:
-            _send(socket, {"type": "heartbeat"})
-            continue
+        if pending_events:
+            message = pending_events.popleft()
+        else:
+            try:
+                message = _message(socket, timeout=30)
+            except TimeoutError:
+                _send(socket, {"type": "heartbeat"})
+                continue
         message_type = message.get("type")
         if message_type == "heartbeat":
             _send(socket, {"type": "heartbeat"})
@@ -97,8 +102,16 @@ def run_trader_session(
         output.flush()
         cursor = message["event_id"]
         _send(socket, {"type": "ack", "cursor": cursor})
-        acknowledged = _message(socket)
-        if acknowledged != {"type": "acknowledged", "cursor": cursor}:
+        while True:
+            acknowledged = _message(socket)
+            if acknowledged == {"type": "acknowledged", "cursor": cursor}:
+                break
+            if acknowledged.get("type") == "event" and isinstance(acknowledged.get("event_id"), int):
+                pending_events.append(acknowledged)
+                continue
+            if acknowledged.get("type") == "heartbeat":
+                _send(socket, {"type": "heartbeat"})
+                continue
             raise TraderEnrollmentError("The controller rejected Trader event acknowledgement.")
         save_cursor(cursor)
 
