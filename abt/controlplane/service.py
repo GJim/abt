@@ -320,6 +320,7 @@ def create_app(
     worker_connections: dict[str, set[_WorkerSessionConnection]] = {}
     trader_connections: dict[str, set[WebSocket]] = {}
     worker_execution_locks: dict[str, asyncio.Lock] = {}
+    startup_reconciliation_started_at = datetime.now(UTC)
 
     @app.get("/health")
     def health() -> dict[str, str]:
@@ -1439,6 +1440,11 @@ def create_app(
                 elif message_type == "snapshot":
                     _record_snapshot(ledger, worker.worker_id, request)
                     await websocket.send_json({"type": "accepted", "cursor": request["cursor"]})
+                    asyncio.create_task(
+                        _fail_undispatched_accepted_intents_after_startup_reconciliation(
+                            ledger, startup_reconciliation_started_at
+                        )
+                    )
                 elif message_type == "delta":
                     _record_delta(ledger, worker.worker_id, request)
                     await websocket.send_json({"type": "accepted", "cursor": request["cursor"]})
@@ -1450,6 +1456,14 @@ def create_app(
                     _record_order_check_response(connection, request)
                 elif message_type == "order_check_error":
                     _record_order_check_error(connection, request)
+                elif message_type == "order_execute_response":
+                    _record_order_execute_response(connection, request)
+                elif message_type == "order_execute_error":
+                    _record_order_execute_error(connection, request)
+                elif message_type == "execution_recovery_response":
+                    _record_execution_recovery_response(connection, request)
+                elif message_type == "execution_recovery_error":
+                    _record_execution_recovery_error(connection, request)
                 else:
                     raise ValueError("Invalid protocol message.")
         except WebSocketDisconnect as error:
@@ -1726,6 +1740,52 @@ def _record_order_check_error(connection: _WorkerSessionConnection, request: dic
         raise ValueError("Invalid worker order-check error.")
     if set(request) != {"type", "analysis_id", "request_id", "reason"}:
         raise ValueError("Invalid worker order-check error.")
+    pending.future.set_exception(LedgerError(_required_text(request, "reason")))
+
+
+def _record_order_execute_response(connection: _WorkerSessionConnection, request: dict[str, object]) -> None:
+    request_id = _required_text(request, "request_id")
+    pending = connection.pending.pop(request_id, None)
+    if pending is None:
+        return
+    if pending.stage != "order_execute" or set(request) != {"type", "request_id", "accepted", "order", "result"}:
+        raise ValueError("Invalid worker order execution response.")
+    if not pending.future.done():
+        pending.future.set_result(request)
+
+
+def _record_order_execute_error(connection: _WorkerSessionConnection, request: dict[str, object]) -> None:
+    request_id = _required_text(request, "request_id")
+    pending = connection.pending.pop(request_id, None)
+    if pending is None:
+        return
+    if pending.stage != "order_execute" or set(request) != {"type", "request_id", "reason"}:
+        raise ValueError("Invalid worker order execution error.")
+    pending.future.set_exception(LedgerError(_required_text(request, "reason")))
+
+
+def _record_execution_recovery_response(connection: _WorkerSessionConnection, request: dict[str, object]) -> None:
+    request_id = _required_text(request, "request_id")
+    pending = connection.pending.pop(request_id, None)
+    if pending is None:
+        return
+    if pending.stage not in {"execution_reconcile", "execution_cancel", "execution_close"} or set(request) != {
+        "type", "request_id", "operation", "accepted", "result"
+    } or request["operation"] != pending.stage or not isinstance(request["accepted"], bool) or not isinstance(request["result"], dict):
+        raise ValueError("Invalid worker execution recovery response.")
+    if not pending.future.done():
+        pending.future.set_result(request)
+
+
+def _record_execution_recovery_error(connection: _WorkerSessionConnection, request: dict[str, object]) -> None:
+    request_id = _required_text(request, "request_id")
+    pending = connection.pending.pop(request_id, None)
+    if pending is None:
+        return
+    if pending.stage not in {"execution_reconcile", "execution_cancel", "execution_close"} or set(request) != {
+        "type", "request_id", "operation", "reason"
+    } or request["operation"] != pending.stage:
+        raise ValueError("Invalid worker execution recovery error.")
     pending.future.set_exception(LedgerError(_required_text(request, "reason")))
 
 
@@ -2070,8 +2130,10 @@ async def _preflight_trader_intent(
             raise LedgerError("Intent direction or protective prices violate endpoint constraints.")
         if any(not _valid_intent_volume(intent.lots, reference["specification"]) for reference in references):
             raise LedgerError("Intent lots are not exactly valid for both endpoints.")
+        execution_id = f"abt:{hashlib.sha256(f'{trader_id}:{command_id}'.encode()).hexdigest()[:24]}"
         orders = [
-            _intent_order(intent, reference, primary=index == 0) for index, reference in enumerate(references)
+            _intent_order(intent, reference, primary=index == 0, execution_id=execution_id)
+            for index, reference in enumerate(references)
         ]
         outcomes = [
             {"worker_id": str(worker["worker_id"]), "status": "not_started", "order": order}
@@ -2116,7 +2178,234 @@ async def _preflight_trader_intent(
         return ledger.reject_trader_command(
             trader_id, command_id, payload, str(error), outcomes
         )
-    return ledger.accept_trader_intent(trader_id, command_id, payload, outcomes)
+    accepted = ledger.accept_trader_intent(trader_id, command_id, payload, outcomes)
+    asyncio.create_task(
+        _dispatch_accepted_trader_intent(
+            ledger,
+            worker_connections,
+            worker_execution_locks,
+            str(accepted["intent_id"]),
+            str(payload["filling_mode"]),
+            outcomes,
+        )
+    )
+    return accepted
+
+
+async def _dispatch_accepted_trader_intent(
+    ledger: ControlLedger,
+    worker_connections: dict[str, set[_WorkerSessionConnection]],
+    worker_execution_locks: dict[str, asyncio.Lock],
+    intent_id: str,
+    filling_mode: str,
+    outcomes: list[dict[str, object]],
+) -> None:
+    """Send only preflighted orders and make every broker result durable."""
+
+    if filling_mode not in {"FOK", "IOC"}:
+        raise LedgerError("Intent filling mode is invalid.")
+    worker_ids = [str(outcome["worker_id"]) for outcome in outcomes]
+    if len(worker_ids) != 2 or len(set(worker_ids)) != 2:
+        raise LedgerError("Intent execution requires two distinct worker outcomes.")
+    if not ledger.claim_accepted_intent_dispatch(intent_id):
+        return
+    ledger.record_intent_execution(intent_id, "intent_dispatch_started", {"filling_mode": filling_mode})
+    try:
+        connections = [
+            _connected_worker_session(worker_connections, worker_id, reason="Selected worker disconnected before dispatch.")
+            for worker_id in worker_ids
+        ]
+        async with _pair_worker_execution(worker_execution_locks, *worker_ids):
+            responses = await asyncio.gather(
+                *(
+                    _request_order_execute(connection, cast(dict[str, object], outcome["order"]))
+                    for connection, outcome in zip(connections, outcomes, strict=True)
+                ),
+                return_exceptions=True,
+            )
+    except LedgerError as error:
+        ledger.record_intent_execution(
+            intent_id, "intent_execution_frozen", {"reason": str(error)}, status="needs_human"
+        )
+        return
+
+    accepted = True
+    for outcome, response in zip(outcomes, responses, strict=True):
+        if isinstance(response, Exception):
+            accepted = False
+            record = {"worker_id": outcome["worker_id"], "order": outcome["order"], "error": str(response)}
+        else:
+            response = cast(dict[str, object], response)
+            valid = response.get("accepted") is True and response.get("order") == outcome["order"]
+            accepted = accepted and valid
+            record = {
+                "worker_id": outcome["worker_id"],
+                "order": outcome["order"],
+                "response": response,
+            }
+        ledger.record_intent_execution(intent_id, "intent_leg_dispatched", record)
+
+    if not accepted:
+        ledger.record_intent_execution(intent_id, "incomplete_entry_detected", {}, status="working")
+        await _recover_ioc_partial_fill(ledger, worker_connections, worker_execution_locks, intent_id, outcomes)
+    elif filling_mode == "FOK":
+        ledger.record_intent_execution(intent_id, "fok_orders_placed", {}, status="working")
+    else:
+        ledger.record_intent_execution(
+            intent_id,
+            "ioc_orders_placed",
+            {"notice": "Matched volume is established only by reconciliation; placement acknowledgements are not fills."},
+            status="working",
+        )
+        await _recover_ioc_partial_fill(ledger, worker_connections, worker_execution_locks, intent_id, outcomes)
+
+
+async def _recover_ioc_partial_fill(
+    ledger: ControlLedger,
+    worker_connections: dict[str, set[_WorkerSessionConnection]],
+    worker_execution_locks: dict[str, asyncio.Lock],
+    intent_id: str,
+    outcomes: list[dict[str, object]],
+) -> None:
+    """Use broker observations, never execution acknowledgements, to flatten IOC imbalance."""
+
+    worker_ids = [str(outcome["worker_id"]) for outcome in outcomes]
+    execution_ids = {str(cast(dict[str, object], outcome["order"])["control_plane_command_id"]) for outcome in outcomes}
+    if len(execution_ids) != 1:
+        _freeze_intent_execution(ledger, intent_id, "IOC recovery has inconsistent execution correlation IDs.")
+        return
+    execution_id = execution_ids.pop()
+    try:
+        connections = [_connected_worker_session(worker_connections, worker_id) for worker_id in worker_ids]
+        async with _pair_worker_execution(worker_execution_locks, *worker_ids):
+            observed = await _reconcile_execution(connections, execution_id)
+            ledger.record_intent_execution(
+                intent_id, "ioc_reconciled", {"execution_id": execution_id, "legs": observed}
+            )
+            for connection, leg in zip(connections, observed, strict=True):
+                for order in leg["orders"]:
+                    await _execution_recovery_request(
+                        connection, "execution_cancel", {"ticket": order["ticket"], "volume": order["volume"]}
+                    )
+            if any(leg["orders"] for leg in observed):
+                ledger.record_intent_execution(intent_id, "ioc_residual_cancelled", {"execution_id": execution_id})
+            observed = await _reconcile_execution(connections, execution_id)
+            ledger.record_intent_execution(
+                intent_id, "ioc_reconciled_after_cancellation", {"execution_id": execution_id, "legs": observed}
+            )
+            if any(leg["orders"] for leg in observed):
+                raise LedgerError("IOC residual order remains after cancellation.")
+            volumes = [_execution_volume(leg["positions"]) for leg in observed]
+            if volumes[0] != volumes[1]:
+                unmatched_index = 0 if volumes[0] > volumes[1] else 1
+                remaining = abs(volumes[0] - volumes[1])
+                for position in observed[unmatched_index]["positions"]:
+                    close_volume = min(remaining, Decimal(position["volume"]))
+                    if close_volume:
+                        await _execution_recovery_request(
+                            connections[unmatched_index], "execution_close",
+                            {"ticket": position["ticket"], "volume": str(close_volume)},
+                        )
+                        remaining -= close_volume
+                    if remaining == 0:
+                        break
+                if remaining != 0:
+                    raise LedgerError("IOC reconciliation could not identify unmatched market exposure.")
+                ledger.record_intent_execution(
+                    intent_id, "ioc_unmatched_exposure_closed",
+                    {"execution_id": execution_id, "worker_id": worker_ids[unmatched_index]},
+                )
+            observed = await _reconcile_execution(connections, execution_id)
+            final_volumes = [_execution_volume(leg["positions"]) for leg in observed]
+            if any(leg["orders"] for leg in observed) or final_volumes[0] != final_volumes[1]:
+                raise LedgerError("IOC final reconciliation does not prove matched exposure.")
+            ledger.record_intent_execution(
+                intent_id, "ioc_recovery_completed",
+                {"execution_id": execution_id, "matched_volume": str(final_volumes[0]), "legs": observed},
+                status="working",
+            )
+    except (KeyError, LedgerError, ValueError, asyncio.TimeoutError) as error:
+        _freeze_intent_execution(ledger, intent_id, f"IOC recovery could not be proven safe: {error}")
+
+
+def _freeze_intent_execution(ledger: ControlLedger, intent_id: str, reason: str) -> None:
+    ledger.record_intent_execution(intent_id, "intent_execution_frozen", {"reason": reason}, status="needs_human")
+
+
+async def _reconcile_execution(
+    connections: list[_WorkerSessionConnection], execution_id: str
+) -> list[dict[str, list[dict[str, str]]]]:
+    responses = await asyncio.gather(*(
+        _execution_recovery_request(connection, "execution_reconcile", {"execution_id": execution_id})
+        for connection in connections
+    ))
+    legs: list[dict[str, list[dict[str, str]]]] = []
+    for response in responses:
+        result = response["result"]
+        orders = _execution_records(result.get("orders"))
+        positions = _execution_records(result.get("positions"))
+        legs.append({"orders": orders, "positions": positions})
+    return legs
+
+
+async def _execution_recovery_request(
+    connection: _WorkerSessionConnection, operation: str, payload: dict[str, str]
+) -> dict[str, object]:
+    request_id = str(uuid4())
+    response = await _request_worker_analysis(
+        connection, analysis_id=operation, stage=operation, timeout=30,
+        message={"type": f"{operation}_request", "request_id": request_id, **payload},
+    )
+    if response.get("accepted") is not True or response.get("operation") != operation:
+        raise LedgerError(f"Worker did not confirm {operation}.")
+    return response
+
+
+def _execution_records(records: object) -> list[dict[str, str]]:
+    if not isinstance(records, list):
+        raise ValueError("Execution reconciliation returned an unknown broker state.")
+    normalized: list[dict[str, str]] = []
+    for record in records:
+        if not isinstance(record, dict) or not isinstance(record.get("ticket"), (str, int)) or isinstance(record.get("ticket"), bool):
+            raise ValueError("Execution reconciliation returned an unknown broker record.")
+        try:
+            volume = Decimal(str(record["volume"]))
+        except (KeyError, ValueError, ArithmeticError) as error:
+            raise ValueError("Execution reconciliation returned an unknown broker volume.") from error
+        if volume <= 0:
+            raise ValueError("Execution reconciliation returned an unknown broker volume.")
+        normalized.append({"ticket": str(record["ticket"]), "volume": str(volume)})
+    return normalized
+
+
+def _execution_volume(positions: list[dict[str, str]]) -> Decimal:
+    return sum((Decimal(position["volume"]) for position in positions), Decimal())
+
+
+async def _fail_undispatched_accepted_intents_after_startup_reconciliation(
+    ledger: ControlLedger, startup_reconciliation_started_at: datetime
+) -> None:
+    """Terminally fail restart-surviving intents once both workers are freshly reconciled."""
+
+    for record in ledger.accepted_intents_for_dispatch():
+        outcomes = cast(list[dict[str, object]], record["preflight"])
+        if len(outcomes) != 2 or not all(isinstance(item.get("worker_id"), str) and isinstance(item.get("order"), dict) for item in outcomes):
+            _freeze_intent_execution(ledger, str(record["intent_id"]), "Interrupted dispatch has malformed preflight evidence.")
+            continue
+        worker_ids = [str(item["worker_id"]) for item in outcomes]
+        if not ledger.workers_reconciled_since(worker_ids, startup_reconciliation_started_at):
+            continue
+        if record["status"] == "dispatching":
+            _freeze_intent_execution(
+                ledger, str(record["intent_id"]), "Controller restarted during broker dispatch; broker state is uncertain."
+            )
+        else:
+            ledger.record_intent_execution(
+                str(record["intent_id"]),
+                "intent_dispatch_abandoned",
+                {"reason": "Controller restarted before dispatch; preflight does not reserve broker liquidity."},
+                status="failed_before_dispatch",
+            )
 
 
 def _valid_intent_volume(lots: Decimal, specification: dict[str, Any]) -> bool:
@@ -2124,7 +2413,9 @@ def _valid_intent_volume(lots: Decimal, specification: dict[str, Any]) -> bool:
     return minimum <= lots <= maximum and (lots - minimum) % step == 0
 
 
-def _intent_order(intent: TraderIntentPayload, reference: dict[str, Any], *, primary: bool) -> dict[str, object]:
+def _intent_order(
+    intent: TraderIntentPayload, reference: dict[str, Any], *, primary: bool, execution_id: str
+) -> dict[str, object]:
     specification = cast(dict[str, Any], reference["specification"])
     pip_size = _intent_pip_size(specification)
     direction = intent.primary_direction if primary else ("SHORT" if intent.primary_direction == "LONG" else "LONG")
@@ -2140,6 +2431,8 @@ def _intent_order(intent: TraderIntentPayload, reference: dict[str, Any], *, pri
         "sl": str(stop_loss),
         "tp": str(take_profit),
         "filling_mode": intent.filling_mode,
+        "expires_at": intent.expires_at.isoformat(),
+        "control_plane_command_id": execution_id,
     }
 
 
@@ -2160,6 +2453,19 @@ async def _request_order_check(
         stage="order_check",
         timeout=timeout,
         message={"type": "order_check_request", "analysis_id": "order_check", "request_id": request_id, "order": order},
+    )
+
+
+async def _request_order_execute(
+    connection: _WorkerSessionConnection, order: dict[str, object], *, timeout: float = 30
+) -> dict[str, object]:
+    request_id = str(uuid4())
+    return await _request_worker_analysis(
+        connection,
+        analysis_id="order_execute",
+        stage="order_execute",
+        timeout=timeout,
+        message={"type": "order_execute_request", "request_id": request_id, "order": order},
     )
 
 

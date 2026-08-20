@@ -49,6 +49,8 @@ class AuthenticatedWorkerSession:
     reconciliation_cursor: int
     _analysis_requests: deque[dict[str, object]] = field(default_factory=deque, init=False, repr=False)
     _order_check_requests: deque[dict[str, object]] = field(default_factory=deque, init=False, repr=False)
+    _order_execute_requests: deque[dict[str, object]] = field(default_factory=deque, init=False, repr=False)
+    _execution_recovery_requests: deque[dict[str, object]] = field(default_factory=deque, init=False, repr=False)
 
     def __enter__(self) -> Self:
         return self
@@ -108,6 +110,12 @@ class AuthenticatedWorkerSession:
             if response.get("type") == "order_check_request":
                 self._order_check_requests.append(response)
                 continue
+            if response.get("type") == "order_execute_request":
+                self._order_execute_requests.append(response)
+                continue
+            if response.get("type", "").startswith("execution_"):
+                self._execution_recovery_requests.append(response)
+                continue
             return self._parse_product_catalog_analysis(response)
 
     def receive_order_check(self, timeout: float | None = None) -> dict[str, object] | None:
@@ -120,6 +128,12 @@ class AuthenticatedWorkerSession:
         except Exception as error:
             _raise_closed_connection(error, "order-check request")
         if response.get("type") != "order_check_request":
+            if response.get("type") == "order_execute_request":
+                self._order_execute_requests.append(response)
+                return None
+            if response.get("type", "").startswith("execution_"):
+                self._execution_recovery_requests.append(response)
+                return None
             self._analysis_requests.append(response)
             return None
         return self._parse_order_check(response)
@@ -132,6 +146,12 @@ class AuthenticatedWorkerSession:
                 continue
             if response.get("type") == "order_check_request":
                 self._order_check_requests.append(response)
+                continue
+            if response.get("type") == "order_execute_request":
+                self._order_execute_requests.append(response)
+                continue
+            if response.get("type", "").startswith("execution_"):
+                self._execution_recovery_requests.append(response)
                 continue
             return response
 
@@ -189,6 +209,102 @@ class AuthenticatedWorkerSession:
             )
         except Exception as error:
             _raise_closed_connection(error, "order-check error response")
+
+    def receive_order_execute(self, timeout: float | None = None) -> dict[str, object] | None:
+        if self._order_execute_requests:
+            return self._parse_order_execute(self._order_execute_requests.popleft())
+        try:
+            response = _message(self.socket, timeout=timeout)
+        except TimeoutError:
+            return None
+        except Exception as error:
+            _raise_closed_connection(error, "order execution request")
+        if response.get("type") != "order_execute_request":
+            if response.get("type") == "order_check_request":
+                self._order_check_requests.append(response)
+            elif response.get("type", "").startswith("execution_"):
+                self._execution_recovery_requests.append(response)
+            else:
+                self._analysis_requests.append(response)
+            return None
+        return self._parse_order_execute(response)
+
+    def _parse_order_execute(self, response: dict[str, object]) -> dict[str, object]:
+        if set(response) != {"type", "request_id", "order"} or response.get("type") != "order_execute_request":
+            raise WorkerEnrollmentError("The controller returned an invalid order execution request.")
+        order = response.get("order")
+        if not isinstance(order, dict):
+            raise WorkerEnrollmentError("The controller returned an invalid order execution request.")
+        return {"request_id": _required_text(response, "request_id"), "order": order}
+
+    def send_order_execute(
+        self, *, request_id: str, order: dict[str, object], accepted: bool, result: dict[str, object]
+    ) -> None:
+        try:
+            _send(
+                self.socket,
+                {
+                    "type": "order_execute_response",
+                    "request_id": request_id,
+                    "accepted": accepted,
+                    "order": order,
+                    "result": result,
+                },
+            )
+        except Exception as error:
+            _raise_closed_connection(error, "order execution response")
+
+    def send_order_execute_error(self, *, request_id: str, reason: str) -> None:
+        try:
+            _send(self.socket, {"type": "order_execute_error", "request_id": request_id, "reason": reason})
+        except Exception as error:
+            _raise_closed_connection(error, "order execution error response")
+
+    def receive_execution_recovery(self, timeout: float | None = None) -> dict[str, object] | None:
+        if self._execution_recovery_requests:
+            return self._parse_execution_recovery(self._execution_recovery_requests.popleft())
+        try:
+            response = _message(self.socket, timeout=timeout)
+        except TimeoutError:
+            return None
+        except Exception as error:
+            _raise_closed_connection(error, "execution recovery request")
+        if response.get("type", "").startswith("execution_"):
+            return self._parse_execution_recovery(response)
+        if response.get("type") == "order_check_request":
+            self._order_check_requests.append(response)
+        elif response.get("type") == "order_execute_request":
+            self._order_execute_requests.append(response)
+        else:
+            self._analysis_requests.append(response)
+        return None
+
+    def _parse_execution_recovery(self, response: dict[str, object]) -> dict[str, object]:
+        request_type = response.get("type")
+        if request_type == "execution_reconcile_request" and set(response) == {"type", "request_id", "execution_id"}:
+            return {"type": request_type, "request_id": _required_text(response, "request_id"),
+                    "execution_id": _required_text(response, "execution_id")}
+        if request_type in {"execution_cancel_request", "execution_close_request"} and set(response) == {
+            "type", "request_id", "ticket", "volume"
+        }:
+            return {"type": request_type, "request_id": _required_text(response, "request_id"),
+                    "ticket": _required_text(response, "ticket"), "volume": _required_text(response, "volume")}
+        raise WorkerEnrollmentError("The controller returned an invalid execution recovery request.")
+
+    def send_execution_recovery(self, *, request_id: str, operation: str, accepted: bool,
+                                result: dict[str, object]) -> None:
+        try:
+            _send(self.socket, {"type": "execution_recovery_response", "request_id": request_id,
+                                "operation": operation, "accepted": accepted, "result": result})
+        except Exception as error:
+            _raise_closed_connection(error, "execution recovery response")
+
+    def send_execution_recovery_error(self, *, request_id: str, operation: str, reason: str) -> None:
+        try:
+            _send(self.socket, {"type": "execution_recovery_error", "request_id": request_id,
+                                "operation": operation, "reason": reason})
+        except Exception as error:
+            _raise_closed_connection(error, "execution recovery error response")
 
     def send_product_catalog_analysis(
         self,

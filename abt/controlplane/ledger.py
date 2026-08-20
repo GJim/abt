@@ -673,6 +673,73 @@ class ControlLedger:
             )
             return result
 
+    def record_intent_execution(
+        self,
+        intent_id: str,
+        event_type: str,
+        payload: dict[str, Any],
+        *,
+        status: str | None = None,
+    ) -> int:
+        """Append an immutable broker-observable lifecycle record for an accepted intent."""
+
+        with self._transaction():
+            row = self._connection.execute(
+                "SELECT trader_id FROM trader_intents WHERE intent_id = ?", [intent_id]
+            ).fetchone()
+            if row is None:
+                raise LedgerError("Intent does not exist.")
+            trader_id = str(row[0])
+            event_id = self._event(event_type, {"intent_id": intent_id, **payload})
+            self._connection.execute(
+                """INSERT INTO trader_intent_execution_records (intent_id, event_id, event_type, payload, recorded_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                [intent_id, event_id, event_type, json.dumps(payload, separators=(",", ":"), sort_keys=True), _utc_now()],
+            )
+            self._connection.execute(
+                "INSERT INTO trader_events (trader_id, event_id) VALUES (?, ?)", [trader_id, event_id]
+            )
+            if status is not None:
+                self._connection.execute(
+                    "UPDATE trader_intents SET status = ? WHERE intent_id = ?", [status, intent_id]
+                )
+            return event_id
+
+    def claim_accepted_intent_dispatch(self, intent_id: str) -> bool:
+        """Atomically reserve an accepted intent for one dispatcher."""
+
+        with self._transaction():
+            claimed = self._connection.execute(
+                """UPDATE trader_intents SET status = 'dispatching'
+                   WHERE intent_id = ? AND status = 'accepted'
+                   RETURNING intent_id""",
+                [intent_id],
+            ).fetchone()
+            return claimed is not None
+
+    def accepted_intents_for_dispatch(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._connection.execute(
+                """SELECT intent_id, intent, preflight, status FROM trader_intents
+                   WHERE status IN ('accepted', 'dispatching') ORDER BY accepted_at"""
+            ).fetchall()
+        return [
+            {"intent_id": row[0], "intent": json.loads(row[1]), "preflight": json.loads(row[2]), "status": row[3]}
+            for row in rows
+        ]
+
+    def workers_reconciled_since(self, worker_ids: list[str], started_at: datetime) -> bool:
+        if not worker_ids:
+            return False
+        placeholders = ", ".join("?" for _ in worker_ids)
+        with self._lock:
+            rows = self._connection.execute(
+                f"""SELECT DISTINCT worker_id FROM reconciliation_snapshots
+                    WHERE worker_id IN ({placeholders}) AND received_at >= ?""",
+                [*worker_ids, started_at],
+            ).fetchall()
+        return {str(row[0]) for row in rows} == set(worker_ids)
+
     def trader_command_result(self, trader_id: str, command_id: str, payload: dict[str, Any]) -> dict[str, Any] | None:
         payload_hash = _hash(json.dumps(payload, separators=(",", ":"), sort_keys=True))
         with self._lock:
@@ -923,7 +990,31 @@ class ControlLedger:
                 "worker_reconciliation_delta",
                 {"worker_id": worker_id, "cursor": cursor, "entity": entity, "ticket": ticket, "change": change},
             )
-            if not isinstance(record.get("control_plane_command_id"), str) or not record["control_plane_command_id"]:
+            execution_id = record.get("control_plane_command_id")
+            if isinstance(execution_id, str) and execution_id:
+                intents = self._connection.execute(
+                    """SELECT intent_id, trader_id FROM trader_intents
+                       WHERE status = 'working' AND CAST(preflight AS VARCHAR) LIKE ?""",
+                    [f"%{execution_id}%"],
+                ).fetchall()
+                for intent_id, trader_id in intents:
+                    event_id = self._event(
+                        "intent_reconciliation_observed",
+                        {
+                            "intent_id": intent_id, "worker_id": worker_id, "cursor": cursor,
+                            "entity": entity, "ticket": ticket, "change": change, "record": record,
+                        },
+                    )
+                    self._connection.execute(
+                        """INSERT INTO trader_intent_execution_records (intent_id, event_id, event_type, payload, recorded_at)
+                           VALUES (?, ?, ?, ?, ?)""",
+                        [intent_id, event_id, "intent_reconciliation_observed",
+                         json.dumps({"worker_id": worker_id, "record": record}, sort_keys=True), _utc_now()],
+                    )
+                    self._connection.execute(
+                        "INSERT INTO trader_events (trader_id, event_id) VALUES (?, ?)", [trader_id, event_id]
+                    )
+            else:
                 self._connection.execute(
                     "UPDATE workers SET safety_state = 'needs_human' WHERE worker_id = ?", [worker_id]
                 )
@@ -2610,6 +2701,13 @@ class ControlLedger:
                     status VARCHAR NOT NULL,
                     accepted_at TIMESTAMPTZ NOT NULL,
                     UNIQUE (trader_id, command_id)
+                );
+                CREATE TABLE IF NOT EXISTS trader_intent_execution_records (
+                    intent_id VARCHAR NOT NULL,
+                    event_id BIGINT PRIMARY KEY,
+                    event_type VARCHAR NOT NULL,
+                    payload JSON NOT NULL,
+                    recorded_at TIMESTAMPTZ NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS trader_events (
                     trader_id VARCHAR NOT NULL,

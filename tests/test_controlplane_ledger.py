@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import duckdb
@@ -163,6 +164,66 @@ class ControlLedgerTests(unittest.TestCase):
                 {**payload, "lots": "0.2"},
                 preflight,
             )
+
+    def test_execution_records_are_immutable_and_visible_to_the_originating_trader(self) -> None:
+        enrollment = self.ledger.create_trader_enrollment(
+            strategy_name="mean-reversion",
+            claimed_public_ip="203.0.113.4",
+            public_key_pem="public-key",
+            attestation_provider="TPM",
+        )
+        trader_id = self.ledger.approve_trader_enrollment(
+            enrollment["registration_id"], "ABCDEF", lambda trader_id, *_: f"certificate:{trader_id}"
+        )
+        accepted = self.ledger.accept_trader_intent(
+            trader_id,
+            "intent-execute-001",
+            {
+                "type": "intent", "pair_id": "pair-123", "primary_direction": "LONG", "lots": "0.1",
+                "entry_price": "1.2345", "stop_loss_pips": "10", "take_profit_pips": "20",
+                "filling_mode": "IOC", "expires_at": "2026-08-20T00:05:00+00:00",
+            },
+            [{"worker_id": "worker-a", "status": "accepted"}, {"worker_id": "worker-b", "status": "accepted"}],
+        )
+
+        event_id = self.ledger.record_intent_execution(
+            accepted["intent_id"], "ioc_matched_volume_retained", {"volume": "0.1"}, status="working"
+        )
+
+        event = next(event for event in self.ledger.trader_events_after(trader_id, 0) if event["event_id"] == event_id)
+        self.assertEqual("ioc_matched_volume_retained", event["event_type"])
+        self.assertEqual("0.1", event["payload"]["volume"])
+
+    def test_requires_fresh_reconciliation_from_every_worker_before_restart_recovery(self) -> None:
+        started_at = datetime.now(UTC)
+        stale_at = started_at - timedelta(seconds=1)
+        fresh_at = started_at + timedelta(seconds=1)
+        snapshot = (
+            "snapshot", 0, "2026-08-20T00:00:00+00:00", "{}", "{}", "[]", "[]"
+        )
+        with self.ledger._transaction():
+            self.ledger._connection.execute(
+                """INSERT INTO reconciliation_snapshots
+                   (worker_id, snapshot_id, cursor, observed_at, account, terminal, orders, positions, received_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                ["worker-a", *snapshot, stale_at],
+            )
+            self.ledger._connection.execute(
+                """INSERT INTO reconciliation_snapshots
+                   (worker_id, snapshot_id, cursor, observed_at, account, terminal, orders, positions, received_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                ["worker-b", *snapshot, fresh_at],
+            )
+
+        self.assertFalse(self.ledger.workers_reconciled_since(["worker-a", "worker-b"], started_at))
+        with self.ledger._transaction():
+            self.ledger._connection.execute(
+                """INSERT INTO reconciliation_snapshots
+                   (worker_id, snapshot_id, cursor, observed_at, account, terminal, orders, positions, received_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                ["worker-a", "fresh-snapshot", *snapshot[1:], fresh_at],
+            )
+        self.assertTrue(self.ledger.workers_reconciled_since(["worker-a", "worker-b"], started_at))
 
     def test_registration_invite_can_be_revoked_only_before_use(self) -> None:
         invite = self.ledger.create_registration_invite("ABCDEF", "worker")

@@ -26,6 +26,8 @@ class ReadOnlyMT5(Protocol):
 
     def order_check(self, request: dict[str, object]) -> object: ...
 
+    def order_send(self, request: dict[str, object]) -> object: ...
+
 
 class AuthenticatedReconciliationSession(Protocol):
     reconciliation_cursor: int
@@ -72,6 +74,22 @@ class AnalysisWorkerSession(Protocol):
     def send_order_check(self, *, request_id: str, order: dict[str, object], accepted: bool) -> None: ...
 
     def send_order_check_error(self, *, request_id: str, reason: str) -> None: ...
+
+    def receive_order_execute(self, timeout: float | None = None) -> dict[str, object] | None: ...
+
+    def send_order_execute(
+        self, *, request_id: str, order: dict[str, object], accepted: bool, result: dict[str, object]
+    ) -> None: ...
+
+    def send_order_execute_error(self, *, request_id: str, reason: str) -> None: ...
+
+    def receive_execution_recovery(self, timeout: float | None = None) -> dict[str, object] | None: ...
+
+    def send_execution_recovery(
+        self, *, request_id: str, operation: str, accepted: bool, result: dict[str, object]
+    ) -> None: ...
+
+    def send_execution_recovery_error(self, *, request_id: str, operation: str, reason: str) -> None: ...
 
 
 class WorkerSafetyAdapter:
@@ -322,6 +340,16 @@ def _run_reconciliation_with_analysis(
                 order_check = receive_order_check(timeout=0.0)
                 if order_check is not None:
                     _serve_order_check(mt5, session, order_check)
+            receive_order_execute = getattr(session, "receive_order_execute", None)
+            if callable(receive_order_execute):
+                order_execute = receive_order_execute(timeout=0.0)
+                if order_execute is not None:
+                    _serve_order_execute(mt5, session, order_execute)
+            receive_execution_recovery = getattr(session, "receive_execution_recovery", None)
+            if callable(receive_execution_recovery):
+                recovery = receive_execution_recovery(timeout=0.0)
+                if recovery is not None:
+                    _serve_execution_recovery(mt5, session, recovery)
             if safety is not None:
                 safety.heartbeat(now())
 
@@ -413,7 +441,7 @@ def _serve_order_check(mt5: ReadOnlyMT5, session: AnalysisWorkerSession, request
         session.send_order_check_error(request_id=request_id, reason="The controller requested an invalid order check.")
         return
     try:
-        result = mt5.order_check(order)
+        result = mt5.order_check(_broker_limit_request(mt5, order))
         retcode = getattr(result, "retcode", None)
         if not isinstance(retcode, int):
             raise WorkerEnrollmentError("The local MT5 terminal returned an invalid order check result.")
@@ -422,6 +450,102 @@ def _serve_order_check(mt5: ReadOnlyMT5, session: AnalysisWorkerSession, request
         session.send_order_check_error(request_id=request_id, reason=str(error))
     except Exception:
         session.send_order_check_error(request_id=request_id, reason="The local MT5 order check failed.")
+
+
+def _serve_order_execute(mt5: ReadOnlyMT5, session: AnalysisWorkerSession, request: dict[str, object]) -> None:
+    request_id = _request_text(request, "request_id")
+    order = request.get("order")
+    if not isinstance(order, dict):
+        session.send_order_execute_error(request_id=request_id, reason="The controller requested an invalid order execution.")
+        return
+    try:
+        broker_request = _broker_limit_request(mt5, order)
+        sent = mt5.order_send(broker_request)
+        result = _evidence(sent, "order execution")
+        retcode = result.get("retcode")
+        accepted = isinstance(retcode, int) and retcode in {
+            getattr(mt5, "TRADE_RETCODE_DONE", -1),
+            getattr(mt5, "TRADE_RETCODE_PLACED", -2),
+        }
+        session.send_order_execute(request_id=request_id, order=order, accepted=accepted, result=result)
+    except WorkerEnrollmentError as error:
+        session.send_order_execute_error(request_id=request_id, reason=str(error))
+    except Exception:
+        _LOGGER.exception("MT5 limit-order execution failed.")
+        session.send_order_execute_error(request_id=request_id, reason="The local MT5 order execution failed.")
+
+
+def _serve_execution_recovery(mt5: ReadOnlyMT5, session: AnalysisWorkerSession, request: dict[str, object]) -> None:
+    request_id = _request_text(request, "request_id")
+    operation = _request_text(request, "type").removesuffix("_request")
+    try:
+        if operation == "execution_reconcile":
+            execution_id = _request_text(request, "execution_id")
+            result = {
+                "orders": [record for record in _records(mt5.orders_get(), "order") if record.get("comment") == execution_id],
+                "positions": [record for record in _records(mt5.positions_get(), "position") if record.get("comment") == execution_id],
+            }
+            session.send_execution_recovery(request_id=request_id, operation=operation, accepted=True, result=result)
+            return
+        ticket = int(_request_text(request, "ticket"))
+        volume = float(_request_text(request, "volume"))
+        if volume <= 0:
+            raise ValueError
+        if operation == "execution_cancel":
+            result = _evidence(mt5.order_send({"action": getattr(mt5, "TRADE_ACTION_REMOVE"), "order": ticket}), "order cancellation")
+        elif operation == "execution_close":
+            position = next((item for item in _records(mt5.positions_get(), "position") if str(item.get("ticket")) == str(ticket)), None)
+            if position is None or position.get("symbol") is None or position.get("type") is None:
+                raise WorkerEnrollmentError("The execution position is no longer observable.")
+            result = _evidence(mt5.order_send({
+                "action": getattr(mt5, "TRADE_ACTION_DEAL"), "position": ticket, "symbol": position["symbol"],
+                "volume": volume, "type": getattr(mt5, "ORDER_TYPE_SELL")
+                if position["type"] == getattr(mt5, "POSITION_TYPE_BUY") else getattr(mt5, "ORDER_TYPE_BUY"),
+                "type_filling": getattr(mt5, "ORDER_FILLING_IOC"),
+            }), "position close")
+        else:
+            raise ValueError
+        session.send_execution_recovery(
+            request_id=request_id, operation=operation,
+            accepted=result.get("retcode") == getattr(mt5, "TRADE_RETCODE_DONE", -1), result=result
+        )
+    except (WorkerEnrollmentError, ValueError):
+        session.send_execution_recovery_error(request_id=request_id, operation=operation, reason="The execution recovery request failed.")
+    except Exception:
+        _LOGGER.exception("MT5 execution recovery failed.")
+        session.send_execution_recovery_error(request_id=request_id, operation=operation, reason="The local MT5 execution recovery failed.")
+
+
+def _broker_limit_request(mt5: object, order: dict[str, object]) -> dict[str, object]:
+    required = ("symbol", "volume", "direction", "price", "sl", "tp", "filling_mode", "expires_at", "control_plane_command_id")
+    if set(order) != {"action", *required} or order.get("action") != "pending_limit":
+        raise WorkerEnrollmentError("The controller requested an invalid limit order.")
+    direction = order.get("direction")
+    filling_mode = order.get("filling_mode")
+    if direction not in {"LONG", "SHORT"} or filling_mode not in {"FOK", "IOC"}:
+        raise WorkerEnrollmentError("The controller requested an invalid limit order.")
+    if not all(isinstance(order[field], str) and order[field] for field in required):
+        raise WorkerEnrollmentError("The controller requested an invalid limit order.")
+    try:
+        expires_at = datetime.fromisoformat(str(order["expires_at"]).replace("Z", "+00:00"))
+        if expires_at.tzinfo is None:
+            raise ValueError
+        expiration = int(expires_at.timestamp())
+        return {
+            "action": getattr(mt5, "TRADE_ACTION_PENDING"),
+            "symbol": order["symbol"],
+            "volume": float(str(order["volume"])),
+            "type": getattr(mt5, "ORDER_TYPE_BUY_LIMIT" if direction == "LONG" else "ORDER_TYPE_SELL_LIMIT"),
+            "price": float(str(order["price"])),
+            "sl": float(str(order["sl"])),
+            "tp": float(str(order["tp"])),
+            "type_filling": getattr(mt5, "ORDER_FILLING_FOK" if filling_mode == "FOK" else "ORDER_FILLING_IOC"),
+            "type_time": getattr(mt5, "ORDER_TIME_SPECIFIED"),
+            "expiration": expiration,
+            "comment": order["control_plane_command_id"],
+        }
+    except (TypeError, ValueError, AttributeError) as error:
+        raise WorkerEnrollmentError("The controller requested an invalid limit order.") from error
 
 
 def _send_product_catalog_analysis_error(
@@ -475,6 +599,9 @@ def _records(value: object, kind: str) -> dict[str, dict[str, object]]:
     records: dict[str, dict[str, object]] = {}
     for item in value:
         record = _evidence(item, kind)
+        comment = record.get("comment")
+        if isinstance(comment, str) and comment.startswith("abt:"):
+            record["control_plane_command_id"] = comment
         ticket = record.get("ticket")
         if isinstance(ticket, bool) or not isinstance(ticket, int):
             raise WorkerEnrollmentError(f"The local MT5 terminal returned a {kind} without a ticket.")

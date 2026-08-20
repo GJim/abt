@@ -97,8 +97,11 @@ class MetaTrader5Adapter:
     def order_check(self, request: dict[str, object]) -> object:
         return self._mt5.order_check(request)
 
+    def order_send(self, request: dict[str, object]) -> object:
+        return self._mt5.order_send(request)
+
     def __getattr__(self, name: str) -> object:
-        if name.startswith("TIMEFRAME_"):
+        if name.startswith(("TIMEFRAME_", "TRADE_", "ORDER_", "POSITION_")):
             return getattr(self._mt5, name)
         raise AttributeError(name)
 

@@ -14,11 +14,10 @@ and event recording.
   request/response, tickets, prices, volumes, and timestamps immutably.
 - [ ] FOK and IOC are allowed only where both endpoints support the selected
   mode.
-- [ ] IOC retains matched volume, cancels residual orders, and closes
+- [x] IOC retains matched volume, cancels residual orders, and closes
   unmatched exposure at market; it never performs IOC top-up orders.
 - [ ] Single-leg timeout, incomplete entry, protective exit, reconciliation
   mismatch, cancellation/close failure, and external change use the existing
   freeze and human-recovery semantics.
 - [ ] Every Trader receives its own lifecycle events; management receives the
   full immutable record.
-
