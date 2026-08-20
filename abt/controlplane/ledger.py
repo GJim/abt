@@ -383,6 +383,24 @@ class ControlLedger:
             for row in rows
         ]
 
+    def traders(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._connection.execute(
+                """SELECT trader_id, registration_id, strategy_name, status, approved_at, revoked_at
+                   FROM traders ORDER BY approved_at DESC"""
+            ).fetchall()
+        return [
+            {
+                "trader_id": row[0],
+                "registration_id": row[1],
+                "strategy_name": row[2],
+                "status": row[3],
+                "approved_at": row[4],
+                "revoked_at": row[5],
+            }
+            for row in rows
+        ]
+
     def approve_trader_enrollment(
         self,
         registration_id: str,
@@ -673,6 +691,69 @@ class ControlLedger:
             )
             return result
 
+    def management_command_result(self, username: str, command_id: str, payload: dict[str, Any]) -> dict[str, Any] | None:
+        payload_hash = _hash(json.dumps(payload, separators=(",", ":"), sort_keys=True))
+        with self._lock:
+            existing = self._connection.execute(
+                "SELECT payload_hash, result FROM management_intent_commands WHERE username = ? AND command_id = ?",
+                [username, command_id],
+            ).fetchone()
+        if existing is None:
+            return None
+        if existing[0] != payload_hash:
+            raise LedgerError("Management command ID was reused with a different payload.")
+        return json.loads(existing[1])
+
+    def accept_management_intent(
+        self, username: str, command_id: str, payload: dict[str, Any], preflight: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        return self._record_management_intent(username, command_id, payload, preflight, reason=None)
+
+    def reject_management_intent(
+        self, username: str, command_id: str, payload: dict[str, Any], reason: str, preflight: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        return self._record_management_intent(username, command_id, payload, preflight, reason=reason)
+
+    def _record_management_intent(
+        self, username: str, command_id: str, payload: dict[str, Any], preflight: list[dict[str, Any]], *, reason: str | None
+    ) -> dict[str, Any]:
+        canonical_payload = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+        payload_hash = _hash(canonical_payload)
+        with self._transaction():
+            existing = self._connection.execute(
+                "SELECT payload_hash, result FROM management_intent_commands WHERE username = ? AND command_id = ?",
+                [username, command_id],
+            ).fetchone()
+            if existing is not None:
+                if existing[0] != payload_hash:
+                    raise LedgerError("Management command ID was reused with a different payload.")
+                return json.loads(existing[1])
+            event_type = "rejected_preflight" if reason is not None else "intent_accepted"
+            event_id = self._event(
+                event_type,
+                {"username": username, "command_id": command_id, "command": payload, "reason": reason, "preflight": preflight},
+            )
+            result: dict[str, Any] = {
+                "command_id": command_id,
+                "status": "rejected_preflight" if reason is not None else "accepted",
+                "event_id": event_id,
+            }
+            if reason is None:
+                intent_id = str(uuid4())
+                self._connection.execute(
+                    """INSERT INTO trader_intents (intent_id, trader_id, command_id, pair_id, intent, preflight, status, accepted_at)
+                       VALUES (?, ?, ?, ?, ?, ?, 'accepted', ?)""",
+                    [intent_id, f"management:{username}", command_id, payload["pair_id"], canonical_payload,
+                     json.dumps(preflight, separators=(",", ":"), sort_keys=True), _utc_now()],
+                )
+                result["intent_id"] = intent_id
+            self._connection.execute(
+                """INSERT INTO management_intent_commands (username, command_id, payload_hash, result, created_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                [username, command_id, payload_hash, json.dumps(result, sort_keys=True), _utc_now()],
+            )
+            return result
+
     def request_trader_intent_cancellation(
         self, trader_id: str, command_id: str, payload: dict[str, Any]
     ) -> tuple[dict[str, Any], list[dict[str, Any]], bool]:
@@ -753,8 +834,11 @@ class ControlLedger:
             ).fetchone()
             if intent is None:
                 raise LedgerError("Intent does not exist.")
-            if intent[2] not in {"accepted", "dispatching", "working", "cancelling"}:
-                raise LedgerError("Intent is not eligible for this management operation.")
+            has_fill = self._intent_has_fill(intent_id)
+            if operation == "cancel" and (has_fill or intent[2] not in {"accepted", "dispatching", "working"}):
+                raise LedgerError("Only zero-fill intents are eligible for ordinary cancellation.")
+            if operation == "emergency_flatten" and (not has_fill and intent[2] != "needs_human"):
+                raise LedgerError("Only filled or frozen intents are eligible for emergency flatten.")
             self._connection.execute(
                 "UPDATE trader_intents SET status = 'cancelling' WHERE intent_id = ?", [intent_id]
             )
@@ -782,6 +866,14 @@ class ControlLedger:
                 [username, command_id, payload_hash, json.dumps(result, sort_keys=True), _utc_now()],
             )
             return result, json.loads(intent[1]), True
+
+    def _intent_has_fill(self, intent_id: str) -> bool:
+        row = self._connection.execute(
+            """SELECT 1 FROM trader_intent_execution_records
+               WHERE intent_id = ? AND event_type LIKE '%fill%' LIMIT 1""",
+            [intent_id],
+        ).fetchone()
+        return row is not None
 
     def claim_scheduled_intent_operation(self, intent_id: str) -> bool:
         """Ensure exactly one process executes a persisted cancellation request."""
@@ -874,6 +966,34 @@ class ControlLedger:
                 for row in records
             ],
         }
+
+    def intents(self, *, active_only: bool, status_filter: str | None) -> list[dict[str, Any]]:
+        statuses = {"accepted", "dispatching", "working", "cancelling", "cancellation_executing", "needs_human"}
+        with self._lock:
+            rows = self._connection.execute(
+                """SELECT i.intent_id, i.trader_id, i.command_id, i.pair_id, i.intent, i.status, i.accepted_at,
+                          EXISTS (SELECT 1 FROM trader_intent_execution_records r
+                                  WHERE r.intent_id = i.intent_id AND r.event_type LIKE '%fill%')
+                   FROM trader_intents i
+                   ORDER BY i.accepted_at DESC"""
+            ).fetchall()
+        items = [
+            {
+                "intent_id": row[0],
+                "origin": "management" if str(row[1]).startswith("management:") else "trader",
+                "originator": str(row[1]).removeprefix("management:"),
+                "command_id": row[2],
+                "pair_id": row[3],
+                "intent": json.loads(row[4]),
+                "status": row[5],
+                "accepted_at": row[6],
+                "has_fill": bool(row[7]),
+            }
+            for row in rows
+        ]
+        if status_filter is not None:
+            return [item for item in items if item["status"] == status_filter]
+        return [item for item in items if item["status"] in statuses] if active_only else items
 
     def claim_accepted_intent_dispatch(self, intent_id: str) -> bool:
         """Atomically reserve an accepted intent for one dispatcher."""

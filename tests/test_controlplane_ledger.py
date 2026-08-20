@@ -103,6 +103,62 @@ class ControlLedgerTests(unittest.TestCase):
         with self.assertRaisesRegex(LedgerError, "role"):
             self.ledger.consume_registration_invite(worker_invite, "trader")
 
+    def test_management_intents_are_idempotent_and_visible_with_their_origin(self) -> None:
+        payload = {
+            "type": "intent",
+            "pair_id": "pair-123",
+            "primary_direction": "LONG",
+            "lots": "0.10",
+            "entry_price": "1.23450",
+            "stop_loss_pips": "10",
+            "take_profit_pips": "20",
+            "filling_mode": "FOK",
+            "expires_at": "2026-09-01T12:00:00+00:00",
+        }
+
+        accepted = self.ledger.accept_management_intent("ABCDEF", "create-001", payload, [])
+        replay = self.ledger.accept_management_intent("ABCDEF", "create-001", payload, [])
+
+        self.assertEqual(accepted, replay)
+        self.assertEqual(
+            [{"origin": "management", "originator": "ABCDEF", "intent_id": accepted["intent_id"]}],
+            [
+                {key: value for key, value in item.items() if key in {"origin", "originator", "intent_id"}}
+                for item in self.ledger.intents(active_only=True, status_filter=None)
+            ],
+        )
+        with self.assertRaisesRegex(LedgerError, "different payload"):
+            self.ledger.accept_management_intent("ABCDEF", "create-001", {**payload, "lots": "0.20"}, [])
+
+    def test_management_operation_requires_zero_fills_to_cancel_and_fills_to_flatten(self) -> None:
+        payload = {
+            "type": "intent",
+            "pair_id": "pair-123",
+            "primary_direction": "LONG",
+            "lots": "0.10",
+            "entry_price": "1.23450",
+            "stop_loss_pips": "10",
+            "take_profit_pips": "20",
+            "filling_mode": "FOK",
+            "expires_at": "2026-09-01T12:00:00+00:00",
+        }
+        zero_fill = self.ledger.accept_management_intent("ABCDEF", "create-zero", payload, [])
+        result, _, scheduled = self.ledger.request_management_intent_operation(
+            "ABCDEF", "cancel-zero", str(zero_fill["intent_id"]), "cancel"
+        )
+        self.assertEqual("cancellation_scheduled", result["status"])
+        self.assertTrue(scheduled)
+
+        filled = self.ledger.accept_management_intent("ABCDEF", "create-filled", {**payload, "pair_id": "pair-456"}, [])
+        self.ledger.record_intent_execution(str(filled["intent_id"]), "intent_leg_filled", {}, status="working")
+        with self.assertRaisesRegex(LedgerError, "zero-fill"):
+            self.ledger.request_management_intent_operation("ABCDEF", "cancel-filled", str(filled["intent_id"]), "cancel")
+        result, _, scheduled = self.ledger.request_management_intent_operation(
+            "ABCDEF", "flatten-filled", str(filled["intent_id"]), "emergency_flatten"
+        )
+        self.assertEqual("emergency_flatten_scheduled", result["status"])
+        self.assertTrue(scheduled)
+
     def test_trader_ack_cannot_skip_an_event_unseen_by_this_connection(self) -> None:
         with self.ledger._transaction():
             first_event = self.ledger._event("intent_accepted", {})

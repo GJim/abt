@@ -142,6 +142,10 @@ class ManagementIntentCommandRequest(BaseModel):
     command_id: str = Field(min_length=1, max_length=128)
 
 
+class ManagementIntentCreateRequest(TraderIntentPayload):
+    command_id: str = Field(min_length=1, max_length=128)
+
+
 class ProductCatalogAnalysisPolicy(BaseModel):
     label: str = Field(min_length=1, max_length=128)
     require_equal_base_currency: bool = True
@@ -474,6 +478,13 @@ def create_app(
         _require_admin(ledger, abt_admin_session)
         return ledger.pending_trader_enrollments()
 
+    @app.get("/api/admin/traders")
+    def list_traders(
+        abt_admin_session: Annotated[str | None, Cookie()] = None,
+    ) -> list[dict[str, object]]:
+        _require_admin(ledger, abt_admin_session)
+        return ledger.traders()
+
     @app.post("/api/admin/traders/enrollments/{registration_id}/approve")
     def approve_trader_enrollment(
         registration_id: str,
@@ -662,6 +673,26 @@ def create_app(
             return ledger.intent_record(intent_id)
         except LedgerError as error:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
+
+    @app.get("/api/admin/intents")
+    def list_intents(
+        active_only: bool = True,
+        status_filter: Annotated[str | None, Query(alias="status", min_length=1, max_length=64)] = None,
+        abt_admin_session: Annotated[str | None, Cookie()] = None,
+    ) -> list[dict[str, object]]:
+        _require_admin(ledger, abt_admin_session)
+        return ledger.intents(active_only=active_only, status_filter=status_filter)
+
+    @app.post("/api/admin/intents", status_code=status.HTTP_201_CREATED)
+    async def create_management_intent(
+        body: ManagementIntentCreateRequest,
+        abt_admin_session: Annotated[str | None, Cookie()] = None,
+        x_csrf_token: Annotated[str | None, Header()] = None,
+    ) -> dict[str, object]:
+        username = _require_admin(ledger, abt_admin_session, x_csrf_token, require_csrf=True)
+        return await _preflight_management_intent(
+            ledger, worker_connections, worker_execution_locks, username, body.command_id, body.model_dump(mode="json", exclude={"command_id"})
+        )
 
     @app.post("/api/admin/intents/{intent_id}/cancel")
     async def cancel_intent(
@@ -1567,7 +1598,10 @@ def create_app(
         def management_spa_route() -> FileResponse:
             return FileResponse(spa_directory / "index.html")
 
-        for spa_route in ("/analysis", "/analysis/{analysis_path:path}", "/audit", "/workers", "/pairs/{pair_status:path}"):
+        for spa_route in (
+            "/analysis", "/analysis/{analysis_path:path}", "/audit", "/workers", "/traders", "/intents",
+            "/pairs/{pair_status:path}",
+        ):
             app.add_api_route(spa_route, management_spa_route, methods=["GET"], include_in_schema=False)
 
         app.mount("/", StaticFiles(directory=spa_directory, html=True), name="management-spa")
@@ -2168,9 +2202,41 @@ async def _preflight_trader_intent(
     command_id: str,
     payload: dict[str, Any],
 ) -> dict[str, Any]:
+    return await _preflight_intent(
+        ledger, worker_connections, worker_execution_locks, trader_id, command_id, payload, management=False
+    )
+
+
+async def _preflight_management_intent(
+    ledger: ControlLedger,
+    worker_connections: dict[str, set[_WorkerSessionConnection]],
+    worker_execution_locks: dict[str, asyncio.Lock],
+    username: str,
+    command_id: str,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    return await _preflight_intent(
+        ledger, worker_connections, worker_execution_locks, username, command_id, payload, management=True
+    )
+
+
+async def _preflight_intent(
+    ledger: ControlLedger,
+    worker_connections: dict[str, set[_WorkerSessionConnection]],
+    worker_execution_locks: dict[str, asyncio.Lock],
+    originator: str,
+    command_id: str,
+    payload: dict[str, Any],
+    *,
+    management: bool,
+) -> dict[str, Any]:
     """Accept an intent only after both selected brokers validate its exact orders."""
 
-    existing = ledger.trader_command_result(trader_id, command_id, payload)
+    existing = (
+        ledger.management_command_result(originator, command_id, payload)
+        if management
+        else ledger.trader_command_result(originator, command_id, payload)
+    )
     if existing is not None:
         return existing
     outcomes: list[dict[str, object]] = []
@@ -2206,7 +2272,7 @@ async def _preflight_trader_intent(
             raise LedgerError("Intent direction or protective prices violate endpoint constraints.")
         if any(not _valid_intent_volume(intent.lots, reference["specification"]) for reference in references):
             raise LedgerError("Intent lots are not exactly valid for both endpoints.")
-        execution_id = f"abt:{hashlib.sha256(f'{trader_id}:{command_id}'.encode()).hexdigest()[:24]}"
+        execution_id = f"abt:{hashlib.sha256(f'{originator}:{command_id}'.encode()).hexdigest()[:24]}"
         orders = [
             _intent_order(intent, reference, primary=index == 0, execution_id=execution_id)
             for index, reference in enumerate(references)
@@ -2253,10 +2319,16 @@ async def _preflight_trader_intent(
     except (KeyError, LedgerError, ValidationError, ValueError, asyncio.TimeoutError) as error:
         if not outcomes:
             outcomes = [{"status": "rejected", "reason": str(error)}]
-        return ledger.reject_trader_command(
-            trader_id, command_id, payload, str(error), outcomes
+        return (
+            ledger.reject_management_intent(originator, command_id, payload, str(error), outcomes)
+            if management
+            else ledger.reject_trader_command(originator, command_id, payload, str(error), outcomes)
         )
-    accepted = ledger.accept_trader_intent(trader_id, command_id, payload, outcomes)
+    accepted = (
+        ledger.accept_management_intent(originator, command_id, payload, outcomes)
+        if management
+        else ledger.accept_trader_intent(originator, command_id, payload, outcomes)
+    )
     asyncio.create_task(
         _dispatch_accepted_trader_intent(
             ledger,
