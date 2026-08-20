@@ -7,7 +7,7 @@ tests and a controlled multi-network release gate.
 
 **Status:** ready-for-agent
 
-- [ ] Automated tests cover invite lifecycle/migration, Trader identity and
+- [x] Automated tests cover invite lifecycle/migration, Trader identity and
   WSS replay, idempotent command handling, every preflight result, FOK/IOC
   execution, cancellation/fill races, and emergency flatten.
 - [ ] Browser tests cover invite/trader management, active/history/event views,
@@ -18,3 +18,10 @@ tests and a controlled multi-network release gate.
   management intervention.
 - [ ] Release evidence distinguishes preflight failures from broker execution
   failures and retains immutable audit records for each scenario.
+
+## Validation blocker
+
+The full browser suite currently has unrelated failures in analysis and live
+refresh scenarios. The new Trader/intents coverage passes in isolation, but
+the controlled release gate cannot be marked complete until the full suite
+passes and the multi-network procedure is executed.

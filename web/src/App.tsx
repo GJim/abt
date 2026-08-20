@@ -13,6 +13,7 @@ import { AuditEventsPage } from './AuditEventsPage'
 import { AnalysisHistoryPage } from './AnalysisHistoryPage'
 import { ProductPairsListPage } from './ProductPairsListPage'
 import { IntentWorkspacePage } from './IntentWorkspacePage'
+import { RegistrationInvitesPage } from './RegistrationInvitesPage'
 import { TraderManagementPage } from './TraderManagementPage'
 import { WorkerSnapshotsPage } from './WorkerSnapshotsPage'
 import { WorkerSummaryTable } from './WorkerSummaryTable'
@@ -437,7 +438,7 @@ const STAGE_LABELS: Record<string, string> = {
 
 const LIVE_REFRESH_INTERVAL_MS = 30_000
 const LIVE_REFRESH_TIMEOUT_MS = 10_000
-type ConsolePage = 'main' | 'launch' | 'audit' | 'snapshots' | 'history' | 'active-pairs' | 'retired-pairs' | 'traders' | 'intents'
+type ConsolePage = 'main' | 'launch' | 'audit' | 'snapshots' | 'history' | 'active-pairs' | 'retired-pairs' | 'invites' | 'traders' | 'intents'
 
 function App() {
   const location = useLocation()
@@ -935,6 +936,7 @@ function App() {
               <Link aria-current={consolePage === 'active-pairs' ? 'page' : undefined} to="/pairs/active">Current pairs</Link>
               <Link aria-current={consolePage === 'retired-pairs' ? 'page' : undefined} to="/pairs/retired">Retired pairs</Link>
               <Link aria-current={consolePage === 'snapshots' ? 'page' : undefined} to="/workers">Workers</Link>
+              <Link aria-current={consolePage === 'invites' ? 'page' : undefined} to="/registration-invites">Registration invites</Link>
               <Link aria-current={consolePage === 'traders' ? 'page' : undefined} to="/traders">Traders</Link>
               <Link aria-current={consolePage === 'intents' ? 'page' : undefined} to="/intents">Intents</Link>
               <Link aria-current={consolePage === 'audit' ? 'page' : undefined} to="/audit">Audit events</Link>
@@ -978,7 +980,9 @@ function App() {
               </section>
             </div>
           )}
-          {consolePage === 'audit' ? <AuditEventsPage /> : consolePage === 'snapshots' ? <WorkerSnapshotsPage /> : consolePage === 'traders' ? (
+          {consolePage === 'audit' ? <AuditEventsPage /> : consolePage === 'snapshots' ? <WorkerSnapshotsPage /> : consolePage === 'invites' ? (
+            <RegistrationInvitesPage csrfToken={csrfToken} />
+          ) : consolePage === 'traders' ? (
             <TraderManagementPage csrfToken={csrfToken} />
           ) : consolePage === 'intents' ? (
             <IntentWorkspacePage csrfToken={csrfToken} />
@@ -2553,6 +2557,8 @@ function readConsolePage(pathname: string): ConsolePage {
       return 'audit'
     case '/workers':
       return 'snapshots'
+    case '/registration-invites':
+      return 'invites'
     case '/analysis/history':
       return 'history'
     case '/pairs/active':

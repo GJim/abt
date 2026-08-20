@@ -1235,6 +1235,182 @@ test('administrator can browse current and retired product-pair lists', async ({
   await expect(page.getByText('Policy Replaced')).toBeVisible()
 })
 
+test('administrator can issue, reveal once, and revoke an unused registration invite', async ({ page }) => {
+  let invites = [{
+    invite_id: 'invite-1',
+    role: 'trader',
+    issued_by: 'ABCDEF',
+    issued_at: '2026-08-20T00:00:00Z',
+    expires_at: '2026-08-20T01:00:00Z',
+    status: 'active',
+    used_at: null,
+    revoked_at: null,
+  }]
+  let createHeaders: Record<string, string> | undefined
+  let revokeHeaders: Record<string, string> | undefined
+
+  await mockLogin(page)
+  await mockManagementData(page)
+  await page.route('**/api/admin/registration-invites', async (route) => {
+    if (route.request().method() === 'GET') {
+      await route.fulfill({ contentType: 'application/json', body: JSON.stringify(invites) })
+      return
+    }
+    createHeaders = route.request().headers()
+    const created = {
+      ...invites[0],
+      invite: 'one-time-trader-invite',
+    }
+    await route.fulfill({ status: 201, contentType: 'application/json', body: JSON.stringify(created) })
+  })
+  await page.route('**/api/admin/registration-invites/invite-1/revoke', async (route) => {
+    revokeHeaders = route.request().headers()
+    invites = [{ ...invites[0], status: 'revoked', revoked_at: '2026-08-20T00:01:00Z' }]
+    await route.fulfill({ status: 204 })
+  })
+
+  await signIn(page)
+  await page.getByRole('link', { name: 'Registration invites' }).click()
+
+  await expect(page.getByRole('heading', { name: 'Registration invites' })).toBeVisible()
+  await page.getByLabel('Role').selectOption('trader')
+  await page.getByRole('button', { name: 'Issue invite' }).click()
+  const disclosure = page.getByRole('dialog', { name: 'Registration invite issued' })
+  await expect(disclosure.getByText('one-time-trader-invite')).toBeVisible()
+  await disclosure.getByRole('button', { name: 'I have saved this invite' }).click()
+  await expect(disclosure).toHaveCount(0)
+  expect(createHeaders?.['x-csrf-token']).toBe('csrf-token')
+
+  await page.getByRole('button', { name: 'Revoke invite for trader' }).click()
+  expect(revokeHeaders?.['x-csrf-token']).toBe('csrf-token')
+  await expect(page.getByText('revoked', { exact: true })).toBeVisible()
+})
+
+test('administrator can review Trader identities with CSRF-protected actions', async ({ page }) => {
+  let pending = [{
+    registration_id: 'trader-registration-1',
+    strategy_name: 'mean-reversion',
+    claimed_public_ip: '203.0.113.4',
+    created_at: '2026-08-20T00:00:00Z',
+    expires_at: '2026-08-20T00:15:00Z',
+  }]
+  let traders = [{
+    trader_id: 'trader-1',
+    strategy_name: 'spread-capture',
+    status: 'active',
+    approved_at: '2026-08-20T00:00:00Z',
+    revoked_at: null,
+  }]
+  let actionHeaders: Record<string, string>[] = []
+
+  await mockLogin(page)
+  await mockManagementData(page)
+  await page.route('**/api/admin/traders/enrollments', async (route) => {
+    await route.fulfill({ contentType: 'application/json', body: JSON.stringify(pending) })
+  })
+  await page.route('**/api/admin/traders', async (route) => {
+    await route.fulfill({ contentType: 'application/json', body: JSON.stringify(traders) })
+  })
+  await page.route('**/api/admin/traders/enrollments/trader-registration-1/approve', async (route) => {
+    actionHeaders.push(route.request().headers())
+    pending = []
+    await route.fulfill({ status: 200 })
+  })
+  await page.route('**/api/admin/traders/trader-1/revoke', async (route) => {
+    actionHeaders.push(route.request().headers())
+    traders = [{ ...traders[0], status: 'revoked', revoked_at: '2026-08-20T00:01:00Z' }]
+    await route.fulfill({ status: 204 })
+  })
+
+  await signIn(page)
+  await page.getByRole('link', { name: 'Traders' }).click()
+  await expect(page.getByText('mean-reversion')).toBeVisible()
+  await page.getByRole('button', { name: 'Approve' }).click()
+  await expect(page.getByText('No Trader registrations are awaiting review.')).toBeVisible()
+  await page.getByRole('button', { name: 'Revoke certificate' }).click()
+  await expect(page.getByText('revoked', { exact: true })).toBeVisible()
+  expect(actionHeaders).toHaveLength(2)
+  expect(actionHeaders.every((headers) => headers['x-csrf-token'] === 'csrf-token')).toBe(true)
+})
+
+test('administrator previews intent actions, reads immutable events, and sees command errors', async ({ page }) => {
+  const zeroFillIntent = buildIntent({ intent_id: 'intent-zero', status: 'working', has_fill: false })
+  const filledIntent = buildIntent({ intent_id: 'intent-filled', status: 'working', has_fill: true })
+  let intents = [zeroFillIntent, filledIntent]
+  const createBodies: Record<string, unknown>[] = []
+  let cancelHeaders: Record<string, string> | undefined
+  let flattenHeaders: Record<string, string> | undefined
+  const intentQueries: string[] = []
+
+  await mockLogin(page)
+  await mockManagementData(page)
+  await page.route('**/api/admin/intents?**', async (route) => {
+    intentQueries.push(new URL(route.request().url()).search)
+    await route.fulfill({ contentType: 'application/json', body: JSON.stringify(intents) })
+  })
+  await page.route('**/api/admin/product-pairs?status=active', async (route) => {
+    await route.fulfill({ contentType: 'application/json', body: JSON.stringify([{
+      product_pair_id: 'pair-1',
+      endpoints: [{ server: 'Broker-A', symbol: 'EURUSD.a' }, { server: 'Broker-B', symbol: 'EURUSD' }],
+    }]) })
+  })
+  await page.route('**/api/admin/intents', async (route) => {
+    createBodies.push(route.request().postDataJSON() as Record<string, unknown>)
+    if (createBodies.length === 1) {
+      await route.fulfill({ status: 503, contentType: 'application/json', body: JSON.stringify({ detail: 'The controller timed out before replying.' }) })
+      return
+    }
+    await route.fulfill({ status: 201, contentType: 'application/json', body: JSON.stringify(buildIntent({ intent_id: 'intent-created' })) })
+  })
+  await page.route('**/api/admin/intents/intent-zero', async (route) => {
+    await route.fulfill({ contentType: 'application/json', body: JSON.stringify({
+      ...zeroFillIntent,
+      execution_records: [{ event_id: 1, event_type: 'intent_accepted', occurred_at: '2026-08-20T00:00:00Z', payload: { preflight: 'passed' } }],
+    }) })
+  })
+  await page.route('**/api/admin/intents/intent-zero/cancel', async (route) => {
+    cancelHeaders = route.request().headers()
+    await route.fulfill({ status: 409, contentType: 'application/json', body: JSON.stringify({ detail: 'A fill was observed while cancelling.' }) })
+  })
+  await page.route('**/api/admin/intents/intent-filled/emergency-flatten', async (route) => {
+    flattenHeaders = route.request().headers()
+    await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ status: 'scheduled' }) })
+  })
+
+  await signIn(page)
+  await page.getByRole('link', { name: 'Intents' }).click()
+  await page.getByLabel('Active pair').selectOption('pair-1')
+  await page.getByLabel('Lots').fill('0.1')
+  await page.getByLabel('Entry price').fill('1.2345')
+  await page.getByLabel('Stop loss (pips)').fill('10')
+  await page.getByLabel('Take profit (pips)').fill('20')
+  await page.getByLabel('Absolute expiry').fill('2026-08-20T01:00')
+  await page.getByRole('button', { name: 'Preview intent' }).click()
+  const createPreview = page.locator('[role="dialog"]').filter({ hasText: 'Confirm create' })
+  await expect(createPreview).toContainText('"pair_id": "pair-1"')
+  await createPreview.getByRole('button', { name: 'Confirm create' }).click()
+  await expect(page.getByRole('alert')).toContainText('The controller timed out before replying.')
+  await createPreview.getByRole('button', { name: 'Confirm create' }).click()
+  expect(createBodies).toHaveLength(2)
+  expect(createBodies[0]).toMatchObject({ pair_id: 'pair-1', filling_mode: 'FOK' })
+  expect(createBodies[0].command_id).toEqual(createBodies[1].command_id)
+
+  await page.getByRole('button', { name: 'Timeline' }).first().click()
+  await expect(page.locator('[role="dialog"]').filter({ hasText: 'Immutable intent timeline' }).getByText('intent_accepted')).toBeVisible()
+  await page.getByRole('button', { name: 'Close' }).click()
+  await page.getByRole('button', { name: 'Preview cancellation' }).click()
+  await page.locator('[role="dialog"]').filter({ hasText: 'Confirm cancel' }).getByRole('button', { name: 'Confirm cancel' }).click()
+  await expect(page.getByRole('alert')).toContainText('A fill was observed while cancelling.')
+  expect(cancelHeaders?.['x-csrf-token']).toBe('csrf-token')
+  await page.locator('[role="dialog"]').filter({ hasText: 'Confirm cancel' }).getByRole('button', { name: 'Back' }).click()
+
+  await page.getByRole('button', { name: 'Preview emergency flatten' }).click()
+  await page.locator('[role="dialog"]').filter({ hasText: 'Confirm emergency flatten' }).getByRole('button', { name: 'Confirm emergency flatten' }).click()
+  expect(flattenHeaders?.['x-csrf-token']).toBe('csrf-token')
+  await page.getByLabel('Show complete history').check()
+  await expect.poll(() => intentQueries.some((query) => query.includes('active_only=false'))).toBe(true)
+})
+
 test('launch analysis is isolated from main-page operational summaries', async ({ page }) => {
   await mockLogin(page)
   await mockManagementData(page, { workers: [buildWorker({})] })
@@ -1343,6 +1519,28 @@ function buildEnrollment() {
       platform: 'MetaTrader 5',
       version: '5.0.0',
     },
+  }
+}
+
+function buildIntent(overrides?: Record<string, unknown>) {
+  return {
+    intent_id: 'intent-1',
+    origin: 'trader',
+    originator: 'trader-1',
+    pair_id: 'pair-1',
+    status: 'accepted',
+    accepted_at: '2026-08-20T00:00:00Z',
+    has_fill: false,
+    intent: {
+      primary_direction: 'LONG',
+      lots: '0.1',
+      entry_price: '1.2345',
+      stop_loss_pips: '10',
+      take_profit_pips: '20',
+      filling_mode: 'FOK',
+      expires_at: '2026-08-20T01:00:00Z',
+    },
+    ...overrides,
   }
 }
 

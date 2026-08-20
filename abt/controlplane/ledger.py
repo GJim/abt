@@ -247,25 +247,27 @@ class ControlLedger:
         with self._lock:
             rows = self._connection.execute(
                 """
-                SELECT role, issued_by, issued_at, expires_at, status, used_at, revoked_at
+                SELECT invite_hash, role, issued_by, issued_at, expires_at, status, used_at, revoked_at
                 FROM registration_invites
                 ORDER BY issued_at DESC
                 """
             ).fetchall()
         return [
             {
-                "role": row[0],
-                "issued_by": row[1],
-                "issued_at": row[2],
-                "expires_at": row[3],
-                "status": row[4],
-                "used_at": row[5],
-                "revoked_at": row[6],
+                "invite_id": row[0],
+                "role": row[1],
+                "issued_by": row[2],
+                "issued_at": row[3],
+                "expires_at": row[4],
+                "status": row[5],
+                "used_at": row[6],
+                "revoked_at": row[7],
             }
             for row in rows
         ]
 
     def revoke_registration_invite(self, invite: str, revoked_by: str) -> None:
+        invite_hash = invite if len(invite) == 64 and all(character in "0123456789abcdef" for character in invite) else _hash(invite)
         with self._transaction():
             changed = self._connection.execute(
                 """
@@ -274,7 +276,7 @@ class ControlLedger:
                 WHERE invite_hash = ? AND status = 'active' AND expires_at > ?
                 RETURNING invite_hash
                 """,
-                [_utc_now(), _hash(invite), _utc_now()],
+                [_utc_now(), invite_hash, _utc_now()],
             ).fetchone()
             if changed is None:
                 raise LedgerError("Registration invite is no longer active.")

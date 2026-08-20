@@ -17,7 +17,7 @@ export function IntentWorkspacePage({ csrfToken }: { csrfToken: string }) {
   const [history, setHistory] = useState(false)
   const [statusFilter, setStatusFilter] = useState('')
   const [draft, setDraft] = useState<Draft>(emptyDraft)
-  const [preview, setPreview] = useState<{ kind: 'create' | 'cancel' | 'emergency_flatten'; intent?: Intent; draft?: Draft } | null>(null)
+  const [preview, setPreview] = useState<{ commandId: string; kind: 'create' | 'cancel' | 'emergency_flatten'; intent?: Intent; draft?: Draft } | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [timeline, setTimeline] = useState<IntentRecord | null>(null)
 
@@ -35,16 +35,15 @@ export function IntentWorkspacePage({ csrfToken }: { csrfToken: string }) {
 
   const submit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
-    setPreview({ kind: 'create', draft })
+    setPreview({ commandId: crypto.randomUUID(), kind: 'create', draft })
   }
   const confirm = async () => {
     if (!preview) return
     setError(null)
-    const commandId = crypto.randomUUID()
     const target = preview.kind === 'create' ? '/api/admin/intents' : `/api/admin/intents/${encodeURIComponent(preview.intent!.intent_id)}/${preview.kind === 'cancel' ? 'cancel' : 'emergency-flatten'}`
     const body = preview.kind === 'create'
-      ? { ...preview.draft, expires_at: new Date(preview.draft!.expires_at).toISOString(), command_id: commandId }
-      : { command_id: commandId }
+      ? { ...preview.draft, expires_at: new Date(preview.draft!.expires_at).toISOString(), command_id: preview.commandId }
+      : { command_id: preview.commandId }
     const response = await fetch(target, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json', 'X-CSRF-Token': csrfToken }, body: JSON.stringify(body) })
     if (!response.ok) {
       const payload = await response.json().catch(() => null) as { detail?: string } | null
@@ -72,7 +71,7 @@ export function IntentWorkspacePage({ csrfToken }: { csrfToken: string }) {
       <button type="submit">Preview intent</button>
     </form>
     <h2>{history ? 'Intent history' : 'Active intents'}</h2>
-    {intents.length === 0 ? <p>No intents match this view.</p> : <table className="console-table"><thead><tr><th>Origin</th><th>Pair</th><th>Order</th><th>Status</th><th>Accepted</th><th>Action</th></tr></thead><tbody>{intents.map((intent) => <tr key={intent.intent_id}><td>{intent.origin}: {intent.originator}</td><td>{intent.pair_id}</td><td>{intent.intent.primary_direction} {intent.intent.lots} @ {intent.intent.entry_price}<br />{intent.intent.filling_mode}, SL {intent.intent.stop_loss_pips}, TP {intent.intent.take_profit_pips}</td><td>{intent.status}</td><td>{formatDateTime(intent.accepted_at)}</td><td><button type="button" onClick={() => void fetch(`/api/admin/intents/${encodeURIComponent(intent.intent_id)}`, { credentials: 'same-origin' }).then(async (response) => { if (!response.ok) throw new Error('Intent timeline could not be loaded.'); setTimeline(await response.json() as IntentRecord) }).catch((caught) => setError(caught instanceof Error ? caught.message : 'Intent timeline could not be loaded.'))}>Timeline</button>{' '}{!intent.has_fill && ['accepted', 'dispatching', 'working'].includes(intent.status) ? <button type="button" onClick={() => setPreview({ kind: 'cancel', intent })}>Preview cancellation</button> : (intent.has_fill || intent.status === 'needs_human') ? <button className="reject-button" type="button" onClick={() => setPreview({ kind: 'emergency_flatten', intent })}>Preview emergency flatten</button> : null}</td></tr>)}</tbody></table>}
+    {intents.length === 0 ? <p>No intents match this view.</p> : <table className="console-table"><thead><tr><th>Origin</th><th>Pair</th><th>Order</th><th>Status</th><th>Accepted</th><th>Action</th></tr></thead><tbody>{intents.map((intent) => <tr key={intent.intent_id}><td>{intent.origin}: {intent.originator}</td><td>{intent.pair_id}</td><td>{intent.intent.primary_direction} {intent.intent.lots} @ {intent.intent.entry_price}<br />{intent.intent.filling_mode}, SL {intent.intent.stop_loss_pips}, TP {intent.intent.take_profit_pips}</td><td>{intent.status}</td><td>{formatDateTime(intent.accepted_at)}</td><td><button type="button" onClick={() => void fetch(`/api/admin/intents/${encodeURIComponent(intent.intent_id)}`, { credentials: 'same-origin' }).then(async (response) => { if (!response.ok) throw new Error('Intent timeline could not be loaded.'); setTimeline(await response.json() as IntentRecord) }).catch((caught) => setError(caught instanceof Error ? caught.message : 'Intent timeline could not be loaded.'))}>Timeline</button>{' '}{!intent.has_fill && ['accepted', 'dispatching', 'working'].includes(intent.status) ? <button type="button" onClick={() => setPreview({ commandId: crypto.randomUUID(), kind: 'cancel', intent })}>Preview cancellation</button> : (intent.has_fill || intent.status === 'needs_human') ? <button className="reject-button" type="button" onClick={() => setPreview({ commandId: crypto.randomUUID(), kind: 'emergency_flatten', intent })}>Preview emergency flatten</button> : null}</td></tr>)}</tbody></table>}
     {preview ? <div className="snapshot-json-dialog-backdrop"><section aria-modal="true" className="snapshot-json-dialog" role="dialog"><h2>Confirm {preview.kind.replace('_', ' ')}</h2><p>Review the exact data below. This action is sent only after confirmation.</p><pre className="console-raw-detail">{JSON.stringify(preview.draft ?? preview.intent?.intent, null, 2)}</pre><button type="button" onClick={() => void confirm()}>Confirm {preview.kind.replace('_', ' ')}</button>{' '}<button type="button" onClick={() => setPreview(null)}>Back</button></section></div> : null}
     {timeline ? <div className="snapshot-json-dialog-backdrop"><section aria-modal="true" className="snapshot-json-dialog" role="dialog"><h2>Immutable intent timeline</h2>{timeline.execution_records.length === 0 ? <p>No execution events have been recorded.</p> : <ol>{timeline.execution_records.map((record) => <li key={record.event_id}><strong>{record.event_type}</strong> <time dateTime={record.occurred_at}>{formatDateTime(record.occurred_at)}</time><pre className="console-raw-detail">{JSON.stringify(record.payload, null, 2)}</pre></li>)}</ol>}<button type="button" onClick={() => setTimeline(null)}>Close</button></section></div> : null}
   </section>

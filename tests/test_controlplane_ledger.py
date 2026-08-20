@@ -103,6 +103,19 @@ class ControlLedgerTests(unittest.TestCase):
         with self.assertRaisesRegex(LedgerError, "role"):
             self.ledger.consume_registration_invite(worker_invite, "trader")
 
+    def test_registration_invite_list_exposes_an_opaque_revoke_handle_not_the_secret(self) -> None:
+        invite = self.ledger.create_registration_invite("ABCDEF", "trader")
+
+        record = self.ledger.registration_invites()[0]
+        self.assertEqual({"invite_id", "role", "issued_by", "issued_at", "expires_at", "status", "used_at", "revoked_at"}, set(record))
+        self.assertNotEqual(invite, record["invite_id"])
+
+        self.ledger.revoke_registration_invite(record["invite_id"], "ABCDEF")
+
+        self.assertEqual("revoked", self.ledger.registration_invites()[0]["status"])
+        with self.assertRaisesRegex(LedgerError, "no longer active"):
+            self.ledger.consume_registration_invite(invite, "trader")
+
     def test_management_intents_are_idempotent_and_visible_with_their_origin(self) -> None:
         payload = {
             "type": "intent",
