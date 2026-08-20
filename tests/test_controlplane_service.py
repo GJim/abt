@@ -33,6 +33,7 @@ from abt.controlplane.crypto import (
     trader_certificate_payload,
     trader_proof_payload,
     trader_rotation_payload,
+    worker_rotation_payload,
     worker_proof_payload,
 )
 from abt.controlplane.ledger import LedgerError
@@ -531,7 +532,7 @@ class MemoryCertificateIssuer:
             server=server,
             public_key_pem=public_key_pem,
             issued_at=issued_at,
-            expires_at=issued_at + timedelta(days=1),
+            expires_at=issued_at + timedelta(days=30),
         )
         return json.dumps(
             {
@@ -575,15 +576,10 @@ class ControlPlaneServiceTests(unittest.TestCase):
         self._directory = tempfile.TemporaryDirectory()
         self.secret_store = MemorySecretStore()
         self.certificate_issuer = MemoryCertificateIssuer()
-        self.attestation_key = ec.generate_private_key(ec.SECP256R1())
-        trust_root = self.attestation_key.public_key().public_bytes(
-            serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
-        ).decode("utf-8")
         self.app = create_app(
             Path(self._directory.name) / "ledger.duckdb",
             secret_store=self.secret_store,
             certificate_issuer=self.certificate_issuer,
-            trader_attestation_trust_root=trust_root,
         )
         self.client = TestClient(self.app, base_url="https://testserver")
         self.http_client = TestClient(self.app, base_url="https://testserver")
@@ -748,7 +744,7 @@ class ControlPlaneServiceTests(unittest.TestCase):
         self.assertTrue(issued.json()["invite"])
         self.assertNotIn("invite", self.client.get("/api/admin/registration-invites").json()[0])
 
-    def test_trader_enrollment_requires_a_trader_invite_and_p256_proof(self) -> None:
+    def test_trader_enrollment_accepts_a_trader_invite_and_p256_proof_without_attestation(self) -> None:
         private_key = ec.generate_private_key(ec.SECP256R1())
         public_key_pem = private_key.public_key().public_bytes(
             serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
@@ -761,16 +757,6 @@ class ControlPlaneServiceTests(unittest.TestCase):
         ).encode("utf-8")
         signature = private_key.sign(payload, ec.ECDSA(hashes.SHA256()))
 
-        unsigned = self.client.post(
-            "/api/traders/enrollments",
-            json={
-                "registration_invite": invite, "strategy_name": "mean-reversion", "claimed_public_ip": "203.0.113.4",
-                "public_key_pem": public_key_pem, "proof_signature": base64.b64encode(signature).decode("ascii"),
-                "attestation_jwt": "eyJhbGciOiJFUzI1NiJ9.eyJub25fZXhwb3J0YWJsZSI6dHJ1ZX0.",
-            },
-        )
-        self.assertEqual(422, unsigned.status_code)
-
         response = self.client.post(
             "/api/traders/enrollments",
             json={
@@ -779,7 +765,6 @@ class ControlPlaneServiceTests(unittest.TestCase):
                 "claimed_public_ip": "203.0.113.4",
                 "public_key_pem": public_key_pem,
                 "proof_signature": base64.b64encode(signature).decode("ascii"),
-                "attestation_jwt": self._trader_attestation(public_key_pem),
             },
         )
 
@@ -805,7 +790,6 @@ class ControlPlaneServiceTests(unittest.TestCase):
                 "claimed_public_ip": "203.0.113.4",
                 "public_key_pem": public_key_pem,
                 "proof_signature": base64.b64encode(private_key.sign(payload, ec.ECDSA(hashes.SHA256()))).decode("ascii"),
-                "attestation_jwt": self._trader_attestation(public_key_pem),
             },
         )
         login = self.client.post(
@@ -832,7 +816,6 @@ class ControlPlaneServiceTests(unittest.TestCase):
             json={
                 "trader_id": approval.json()["trader_id"],
                 "public_key_pem": replacement_public_key_pem,
-                "attestation_jwt": self._trader_attestation(replacement_public_key_pem, provider="PKCS11"),
             },
         )
         self.assertEqual(200, challenge.status_code)
@@ -858,8 +841,106 @@ class ControlPlaneServiceTests(unittest.TestCase):
             old_key_session.send_json(
                 {"trader_id": approval.json()["trader_id"], "certificate": approval.json()["certificate"]}
             )
+            old_challenge = old_key_session.receive_json()
+            old_proof = private_key.sign(
+                trader_proof_payload(
+                    purpose=old_challenge["purpose"], trader_id=old_challenge["trader_id"], nonce=old_challenge["nonce"]
+                ),
+                ec.ECDSA(hashes.SHA256()),
+            )
+            old_key_session.send_json({"signature": base64.b64encode(old_proof).decode("ascii")})
+            self.assertEqual("authenticated", old_key_session.receive_json()["type"])
+
+        with self.app.state.ledger._transaction():
+            self.app.state.ledger._connection.execute(
+                "UPDATE certificate_overlaps SET expires_at = ? WHERE role = 'trader' AND identity_id = ?",
+                [datetime.now(UTC) - timedelta(seconds=1), approval.json()["trader_id"]],
+            )
+        with self.client.websocket_connect("/api/traders/session") as old_key_session:
+            old_key_session.send_json(
+                {"trader_id": approval.json()["trader_id"], "certificate": approval.json()["certificate"]}
+            )
             with self.assertRaises(WebSocketDisconnect):
                 old_key_session.receive_json()
+        self.assertIn(
+            "trader_certificate_rotated",
+            [event["event_type"] for event in self.app.state.ledger.events()],
+        )
+
+    def test_worker_rotation_requires_both_proofs_and_preserves_one_hour_overlap(self) -> None:
+        old_key, worker_id, old_certificate = self._approved_worker(987654, "Broker-Rotation")
+        replacement_key = ec.generate_private_key(ec.SECP256R1())
+        replacement_public_key_pem = replacement_key.public_key().public_bytes(
+            serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
+        ).decode("utf-8")
+
+        challenge = self.client.post(
+            "/api/workers/certificates/rotation-challenge",
+            json={"worker_id": worker_id, "public_key_pem": replacement_public_key_pem},
+        )
+        self.assertEqual(200, challenge.status_code)
+        payload = worker_rotation_payload(
+            worker_id=worker_id, replacement_public_key_pem=replacement_public_key_pem, nonce=challenge.json()["nonce"]
+        )
+        rejected = self.client.post(
+            "/api/workers/certificates/rotate",
+            json={
+                "worker_id": worker_id,
+                "public_key_pem": replacement_public_key_pem,
+                "old_key_signature": base64.b64encode(old_key.sign(payload, ec.ECDSA(hashes.SHA256()))).decode("ascii"),
+                "replacement_key_signature": "invalid",
+            },
+        )
+        self.assertEqual(409, rejected.status_code)
+
+        challenge = self.client.post(
+            "/api/workers/certificates/rotation-challenge",
+            json={"worker_id": worker_id, "public_key_pem": replacement_public_key_pem},
+        ).json()
+        payload = worker_rotation_payload(
+            worker_id=worker_id, replacement_public_key_pem=replacement_public_key_pem, nonce=challenge["nonce"]
+        )
+        rotated = self.client.post(
+            "/api/workers/certificates/rotate",
+            json={
+                "worker_id": worker_id,
+                "public_key_pem": replacement_public_key_pem,
+                "old_key_signature": base64.b64encode(old_key.sign(payload, ec.ECDSA(hashes.SHA256()))).decode("ascii"),
+                "replacement_key_signature": base64.b64encode(
+                    replacement_key.sign(payload, ec.ECDSA(hashes.SHA256()))
+                ).decode("ascii"),
+            },
+        )
+        self.assertEqual(200, rotated.status_code)
+        self.assertEqual(replacement_public_key_pem, self.app.state.ledger.active_worker(worker_id).public_key_pem)
+        claims = json.loads(base64.b64decode(json.loads(rotated.json()["certificate"])["payload"]))
+        self.assertEqual(30, (datetime.fromisoformat(claims["expires_at"]) - datetime.fromisoformat(claims["issued_at"])).days)
+
+        with self.client.websocket_connect("/api/worker/session") as socket:
+            socket.send_json({"worker_id": worker_id, "certificate": old_certificate})
+            overlap_challenge = socket.receive_json()
+            proof = old_key.sign(
+                worker_proof_payload(
+                    purpose=overlap_challenge["purpose"], worker_id=worker_id, nonce=overlap_challenge["nonce"]
+                ),
+                ec.ECDSA(hashes.SHA256()),
+            )
+            socket.send_json({"signature": base64.b64encode(proof).decode("ascii")})
+            self.assertEqual("authenticated", socket.receive_json()["type"])
+
+        with self.app.state.ledger._transaction():
+            self.app.state.ledger._connection.execute(
+                "UPDATE certificate_overlaps SET expires_at = ? WHERE role = 'worker' AND identity_id = ?",
+                [datetime.now(UTC) - timedelta(seconds=1), worker_id],
+            )
+        with self.client.websocket_connect("/api/worker/session") as socket:
+            socket.send_json({"worker_id": worker_id, "certificate": old_certificate})
+            with self.assertRaises(WebSocketDisconnect):
+                socket.receive_json()
+        self.assertIn(
+            "worker_certificate_rotated",
+            [event["event_type"] for event in self.app.state.ledger.events()],
+        )
 
     def test_approved_trader_can_authenticate_to_the_command_websocket(self) -> None:
         private_key = ec.generate_private_key(ec.SECP256R1())
@@ -882,7 +963,6 @@ class ControlPlaneServiceTests(unittest.TestCase):
                 "proof_signature": base64.b64encode(
                     private_key.sign(enrollment_payload, ec.ECDSA(hashes.SHA256()))
                 ).decode("ascii"),
-                "attestation_jwt": self._trader_attestation(public_key_pem),
             },
         )
         login = self.client.post(
@@ -958,7 +1038,6 @@ class ControlPlaneServiceTests(unittest.TestCase):
                     "claimed_public_ip": "203.0.113.4",
                     "public_key_pem": public_key_pem,
                     "proof_signature": trader_signature,
-                    "attestation_jwt": self._trader_attestation(public_key_pem),
                 },
             ).status_code,
         )
@@ -984,7 +1063,6 @@ class ControlPlaneServiceTests(unittest.TestCase):
             "claimed_public_ip": "203.0.113.5",
             "public_key_pem": public_key_pem,
             "proof_signature": used_signature,
-            "attestation_jwt": self._trader_attestation(public_key_pem),
         }
         self.assertEqual(201, self.client.post("/api/traders/enrollments", json=request).status_code)
         self.assertEqual(409, self.client.post("/api/traders/enrollments", json=request).status_code)

@@ -31,16 +31,43 @@ from .crypto import (
     parse_trader_certificate,
     verify_enrollment_proof,
     verify_trader_enrollment_proof,
-    verify_trader_attestation,
     verify_trader_proof,
     verify_trader_rotation_proof,
     verify_worker_proof,
+    verify_worker_rotation_proof,
 )
 from .ledger import AuthenticationError, ControlLedger, LedgerError, _hash
 from .secrets import DeviceCertificateIssuer, DeviceCertificateVerifier, SecretStore, SecretStoreError
 
 _LOGGER = logging.getLogger(__name__)
 _MARKET_DATA_REQUEST_TIMEOUT_SECONDS = 30
+
+
+def _verify_worker_certificate(certificate_verifier: DeviceCertificateVerifier | None, worker: Any) -> None:
+    claims = parse_device_certificate(worker.certificate)
+    if certificate_verifier is None:
+        raise ProofError("The device certificate verifier is unavailable.")
+    certificate_verifier.verify(worker.certificate)
+    if (
+        claims["worker_id"] != worker.worker_id
+        or claims["login"] != worker.login
+        or claims["server"] != worker.server
+        or claims["public_key_pem"] != worker.public_key_pem
+    ):
+        raise ProofError("The device certificate does not match this worker.")
+
+
+def _verify_trader_certificate(certificate_verifier: DeviceCertificateVerifier | None, trader: Any) -> None:
+    claims = parse_trader_certificate(trader.certificate)
+    if certificate_verifier is None:
+        raise ProofError("The device certificate verifier is unavailable.")
+    certificate_verifier.verify(trader.certificate)
+    if (
+        claims["trader_id"] != trader.trader_id
+        or claims["strategy_name"] != trader.strategy_name
+        or claims["public_key_pem"] != trader.public_key_pem
+    ):
+        raise ProofError("The Trader certificate does not match this Trader.")
 
 
 class LoginRequest(BaseModel):
@@ -72,12 +99,13 @@ class RegistrationInviteRequest(BaseModel):
 
 
 class TraderEnrollmentRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     registration_invite: str = Field(min_length=1, max_length=512)
     strategy_name: str = Field(min_length=1, max_length=128)
     claimed_public_ip: str = Field(min_length=1, max_length=64)
     public_key_pem: str = Field(min_length=1)
     proof_signature: str = Field(min_length=1)
-    attestation_jwt: str = Field(min_length=1)
 
 
 class TraderCertificateChallengeRequest(BaseModel):
@@ -90,21 +118,44 @@ class TraderCertificateRequest(BaseModel):
 
 
 class TraderRotationChallengeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     trader_id: str = Field(min_length=1)
     public_key_pem: str = Field(min_length=1)
-    attestation_jwt: str = Field(min_length=1)
 
 
 @dataclass(frozen=True)
 class _TraderRotationChallenge:
     nonce: str
     replacement_public_key_pem: str
-    attestation_provider: str
     expires_at: datetime
 
 
 class TraderRotationRequest(BaseModel):
     trader_id: str = Field(min_length=1)
+    public_key_pem: str = Field(min_length=1)
+    old_key_signature: str = Field(min_length=1)
+    replacement_key_signature: str = Field(min_length=1)
+
+
+class WorkerRotationChallengeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    worker_id: str = Field(min_length=1)
+    public_key_pem: str = Field(min_length=1)
+
+
+@dataclass(frozen=True)
+class _WorkerRotationChallenge:
+    nonce: str
+    replacement_public_key_pem: str
+    expires_at: datetime
+
+
+class WorkerRotationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    worker_id: str = Field(min_length=1)
     public_key_pem: str = Field(min_length=1)
     old_key_signature: str = Field(min_length=1)
     replacement_key_signature: str = Field(min_length=1)
@@ -292,7 +343,6 @@ def create_app(
     backup_directory: Path | None = None,
     openbao_raft_directory: Path | None = None,
     softhsm_tokens_directory: Path | None = None,
-    trader_attestation_trust_root: str | None = None,
 ) -> FastAPI:
     ledger = ControlLedger(ledger_path)
     backup_paths = (backup_directory, openbao_raft_directory, softhsm_tokens_directory)
@@ -331,6 +381,7 @@ def create_app(
     app.state.ledger = ledger
     app.state.trader_certificate_challenges = {}
     app.state.trader_rotation_challenges: dict[str, _TraderRotationChallenge] = {}
+    app.state.worker_rotation_challenges: dict[str, _WorkerRotationChallenge] = {}
     admin_notification_connections: set[WebSocket] = set()
     worker_connections: dict[str, set[_WorkerSessionConnection]] = {}
     trader_connections: dict[str, set[WebSocket]] = {}
@@ -461,17 +512,11 @@ def create_app(
                 strategy_name=body.strategy_name,
                 claimed_public_ip=body.claimed_public_ip,
             )
-            provider = verify_trader_attestation(
-                body.attestation_jwt,
-                public_key_pem=body.public_key_pem,
-                trust_root_public_key_pem=trader_attestation_trust_root,
-            )
             ledger.consume_registration_invite(body.registration_invite, "trader")
             return ledger.create_trader_enrollment(
                 strategy_name=body.strategy_name,
                 claimed_public_ip=body.claimed_public_ip,
                 public_key_pem=body.public_key_pem,
-                attestation_provider=provider,
             )
         except ProofError as error:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(error)) from error
@@ -562,16 +607,11 @@ def create_app(
     def issue_trader_rotation_challenge(body: TraderRotationChallengeRequest) -> dict[str, str]:
         try:
             trader = ledger.active_trader(body.trader_id)
-            provider = verify_trader_attestation(
-                body.attestation_jwt,
-                public_key_pem=body.public_key_pem,
-                trust_root_public_key_pem=trader_attestation_trust_root,
-            )
+            _verify_trader_certificate(certificate_verifier, trader)
             nonce = secrets.token_urlsafe(32)
             app.state.trader_rotation_challenges[body.trader_id] = _TraderRotationChallenge(
                 nonce=nonce,
                 replacement_public_key_pem=body.public_key_pem,
-                attestation_provider=provider,
                 expires_at=datetime.now(UTC) + timedelta(minutes=2),
             )
             return {"purpose": "trader_certificate_rotation", "trader_id": trader.trader_id, "nonce": nonce}
@@ -582,6 +622,7 @@ def create_app(
     async def rotate_trader_certificate(body: TraderRotationRequest) -> dict[str, str]:
         try:
             trader = ledger.active_trader(body.trader_id)
+            _verify_trader_certificate(certificate_verifier, trader)
             challenge = app.state.trader_rotation_challenges.pop(body.trader_id, None)
             if (
                 challenge is None
@@ -591,7 +632,6 @@ def create_app(
                 raise ProofError("The Trader rotation challenge is invalid or expired.")
             nonce = challenge.nonce
             replacement_public_key_pem = challenge.replacement_public_key_pem
-            provider = challenge.attestation_provider
             verify_trader_rotation_proof(
                 trader.public_key_pem, body.old_key_signature, trader_id=trader.trader_id,
                 replacement_public_key_pem=replacement_public_key_pem, nonce=nonce,
@@ -603,7 +643,7 @@ def create_app(
             if certificate_issuer is None:
                 raise SecretStoreError("The device certificate issuer is unavailable.")
             certificate = ledger.rotate_trader_certificate(
-                trader.trader_id, replacement_public_key_pem, provider,
+                trader.trader_id, replacement_public_key_pem,
                 lambda trader_id, strategy_name, public_key_pem: certificate_issuer.issue_trader(
                     trader_id=trader_id, strategy_name=strategy_name, public_key_pem=public_key_pem
                 ),
@@ -614,6 +654,58 @@ def create_app(
                 return_exceptions=True,
             )
             return {"trader_id": trader.trader_id, "certificate": certificate}
+        except (LedgerError, ProofError, SecretStoreError) as error:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
+
+    @app.post("/api/workers/certificates/rotation-challenge")
+    def issue_worker_rotation_challenge(body: WorkerRotationChallengeRequest) -> dict[str, str]:
+        try:
+            worker = ledger.active_worker(body.worker_id)
+            _verify_worker_certificate(certificate_verifier, worker)
+            nonce = secrets.token_urlsafe(32)
+            app.state.worker_rotation_challenges[body.worker_id] = _WorkerRotationChallenge(
+                nonce=nonce,
+                replacement_public_key_pem=body.public_key_pem,
+                expires_at=datetime.now(UTC) + timedelta(minutes=2),
+            )
+            return {"purpose": "worker_certificate_rotation", "worker_id": worker.worker_id, "nonce": nonce}
+        except (LedgerError, ProofError) as error:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
+
+    @app.post("/api/workers/certificates/rotate")
+    async def rotate_worker_certificate(body: WorkerRotationRequest) -> dict[str, str]:
+        try:
+            worker = ledger.active_worker(body.worker_id)
+            _verify_worker_certificate(certificate_verifier, worker)
+            challenge = app.state.worker_rotation_challenges.pop(body.worker_id, None)
+            if (
+                challenge is None
+                or challenge.replacement_public_key_pem != body.public_key_pem
+                or datetime.now(UTC) >= challenge.expires_at
+            ):
+                raise ProofError("The Worker rotation challenge is invalid or expired.")
+            verify_worker_rotation_proof(
+                worker.public_key_pem, body.old_key_signature, worker_id=worker.worker_id,
+                replacement_public_key_pem=challenge.replacement_public_key_pem, nonce=challenge.nonce,
+            )
+            verify_worker_rotation_proof(
+                challenge.replacement_public_key_pem, body.replacement_key_signature, worker_id=worker.worker_id,
+                replacement_public_key_pem=challenge.replacement_public_key_pem, nonce=challenge.nonce,
+            )
+            if certificate_issuer is None:
+                raise SecretStoreError("The device certificate issuer is unavailable.")
+            certificate = ledger.rotate_worker_certificate(
+                worker.worker_id, challenge.replacement_public_key_pem,
+                lambda worker_id, login, server, public_key_pem: certificate_issuer.issue(
+                    worker_id=worker_id, login=login, server=server, public_key_pem=public_key_pem
+                ),
+            )
+            connections = tuple(worker_connections.pop(worker.worker_id, set()))
+            await asyncio.gather(
+                *(connection.close(code=status.WS_1008_POLICY_VIOLATION) for connection in connections),
+                return_exceptions=True,
+            )
+            return {"worker_id": worker.worker_id, "certificate": certificate}
         except (LedgerError, ProofError, SecretStoreError) as error:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
 
@@ -1331,12 +1423,12 @@ def create_app(
         try:
             request = await _receive_exact_message(websocket, {"trader_id", "certificate"})
             trader_id = _required_text(request, "trader_id")
-            trader = ledger.active_trader(trader_id)
             certificate = _required_text(request, "certificate")
             claims = parse_trader_certificate(certificate)
             if certificate_verifier is None:
                 raise ProofError("The device certificate verifier is unavailable.")
             certificate_verifier.verify(certificate)
+            trader = ledger.trader_for_certificate(trader_id, certificate)
             if (
                 certificate != trader.certificate
                 or claims["trader_id"] != trader.trader_id
@@ -1454,12 +1546,13 @@ def create_app(
         await websocket.accept()
         try:
             request = await _receive_exact_message(websocket, {"worker_id", "certificate"})
-            worker = ledger.active_worker(_required_text(request, "worker_id"))
+            worker_id = _required_text(request, "worker_id")
             certificate = _required_text(request, "certificate")
             claims = parse_device_certificate(certificate)
             if certificate_verifier is None:
                 raise ProofError("The device certificate verifier is unavailable.")
             certificate_verifier.verify(certificate)
+            worker = ledger.worker_for_certificate(worker_id, certificate)
             if (
                 certificate != worker.certificate
                 or claims["worker_id"] != worker.worker_id
@@ -1499,12 +1592,13 @@ def create_app(
         sender_task: asyncio.Task[None] | None = None
         try:
             request = await _receive_exact_message(websocket, {"worker_id", "certificate"})
-            worker = ledger.active_worker(_required_text(request, "worker_id"))
+            worker_id = _required_text(request, "worker_id")
             certificate = _required_text(request, "certificate")
             claims = parse_device_certificate(certificate)
             if certificate_verifier is None:
                 raise ProofError("The device certificate verifier is unavailable.")
             certificate_verifier.verify(certificate)
+            worker = ledger.worker_for_certificate(worker_id, certificate)
             if (
                 certificate != worker.certificate
                 or claims["worker_id"] != worker.worker_id

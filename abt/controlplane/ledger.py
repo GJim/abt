@@ -8,7 +8,7 @@ import tarfile
 import threading
 from base64 import urlsafe_b64decode, urlsafe_b64encode
 from binascii import Error as Base64Error
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable
@@ -61,7 +61,6 @@ class ActiveTrader:
     strategy_name: str
     certificate: str
     public_key_pem: str
-    attestation_provider: str
 
 
 class ControlLedger:
@@ -345,7 +344,7 @@ class ControlLedger:
         return enrollment
 
     def create_trader_enrollment(
-        self, *, strategy_name: str, claimed_public_ip: str, public_key_pem: str, attestation_provider: str
+        self, *, strategy_name: str, claimed_public_ip: str, public_key_pem: str
     ) -> dict[str, Any]:
         now = _utc_now()
         registration_id = str(uuid4())
@@ -356,7 +355,7 @@ class ControlLedger:
                     (registration_id, strategy_name, claimed_public_ip, public_key_pem, attestation_provider, status, created_at, expires_at)
                 VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)
                 """,
-                [registration_id, strategy_name, claimed_public_ip, public_key_pem, attestation_provider, now, now + timedelta(minutes=15)],
+                [registration_id, strategy_name, claimed_public_ip, public_key_pem, "CNG", now, now + timedelta(minutes=15)],
             )
             self._event("trader_enrollment_requested", {"registration_id": registration_id, "strategy_name": strategy_name})
         return {"registration_id": registration_id, "expires_at": now + timedelta(minutes=15)}
@@ -466,7 +465,7 @@ class ControlLedger:
     def active_trader_for_enrollment(self, registration_id: str) -> ActiveTrader:
         return self._active_trader(
             """
-            SELECT t.trader_id, t.registration_id, t.strategy_name, t.certificate, e.public_key_pem, e.attestation_provider
+            SELECT t.trader_id, t.registration_id, t.strategy_name, t.certificate, e.public_key_pem
             FROM traders t JOIN trader_enrollments e ON e.registration_id = t.registration_id
             WHERE t.registration_id = ? AND t.status = 'active'
             """,
@@ -476,7 +475,7 @@ class ControlLedger:
     def active_trader(self, trader_id: str) -> ActiveTrader:
         return self._active_trader(
             """
-            SELECT t.trader_id, t.registration_id, t.strategy_name, t.certificate, e.public_key_pem, e.attestation_provider
+            SELECT t.trader_id, t.registration_id, t.strategy_name, t.certificate, e.public_key_pem
             FROM traders t JOIN trader_enrollments e ON e.registration_id = t.registration_id
             WHERE t.trader_id = ? AND t.status = 'active'
             """,
@@ -505,7 +504,7 @@ class ControlLedger:
             self._event("trader_certificate_revoked", {"trader_id": trader_id, "revoked_by": revoked_by})
 
     def rotate_trader_certificate(
-        self, trader_id: str, public_key_pem: str, attestation_provider: str, issue_certificate: Callable[[str, str, str], str]
+        self, trader_id: str, public_key_pem: str, issue_certificate: Callable[[str, str, str], str]
     ) -> str:
         """Replace an active Trader's key only after the service verified both proofs."""
 
@@ -516,17 +515,41 @@ class ControlLedger:
             if row is None:
                 raise LedgerError("Trader is not active.")
             registration_id, strategy_name = row
+            predecessor = self.active_trader(trader_id)
             certificate = issue_certificate(trader_id, strategy_name, public_key_pem)
             self._connection.execute(
-                "UPDATE trader_enrollments SET public_key_pem = ?, attestation_provider = ? WHERE registration_id = ?",
-                [public_key_pem, attestation_provider, registration_id],
+                """
+                INSERT INTO certificate_overlaps (role, identity_id, certificate, public_key_pem, expires_at)
+                VALUES ('trader', ?, ?, ?, ?)
+                """,
+                [trader_id, predecessor.certificate, predecessor.public_key_pem, _utc_now() + timedelta(hours=1)],
+            )
+            self._connection.execute(
+                "UPDATE trader_enrollments SET public_key_pem = ? WHERE registration_id = ?",
+                [public_key_pem, registration_id],
             )
             self._connection.execute("UPDATE traders SET certificate = ? WHERE trader_id = ?", [certificate, trader_id])
             self._event(
                 "trader_certificate_rotated",
-                {"trader_id": trader_id, "attestation_provider": attestation_provider},
+                {"trader_id": trader_id},
             )
             return certificate
+
+    def trader_for_certificate(self, trader_id: str, certificate: str) -> ActiveTrader:
+        trader = self.active_trader(trader_id)
+        if certificate == trader.certificate:
+            return trader
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT public_key_pem FROM certificate_overlaps
+                WHERE role = 'trader' AND identity_id = ? AND certificate = ? AND expires_at > ?
+                """,
+                [trader_id, certificate, _utc_now()],
+            ).fetchone()
+        if row is None:
+            raise LedgerError("Trader certificate is no longer active.")
+        return replace(trader, certificate=certificate, public_key_pem=row[0])
 
     def open_trader_session(self, trader_id: str) -> str:
         session_id = str(uuid4())
@@ -1191,6 +1214,50 @@ class ControlLedger:
             """,
             [worker_id],
         )
+
+    def rotate_worker_certificate(
+        self, worker_id: str, public_key_pem: str, issue_certificate: Callable[[str, int, str, str], str]
+    ) -> str:
+        """Replace an active Worker's key only after the service verified both proofs."""
+
+        with self._transaction():
+            worker = self.active_worker(worker_id)
+            certificate = issue_certificate(worker_id, worker.login, worker.server, public_key_pem)
+            self._connection.execute(
+                """
+                INSERT INTO certificate_overlaps (role, identity_id, certificate, public_key_pem, expires_at)
+                VALUES ('worker', ?, ?, ?, ?)
+                """,
+                [worker_id, worker.certificate, worker.public_key_pem, _utc_now() + timedelta(hours=1)],
+            )
+            self._connection.execute(
+                "UPDATE enrollments SET public_key_pem = ? WHERE enrollment_id = ?",
+                [public_key_pem, self._worker_enrollment_id(worker_id)],
+            )
+            self._connection.execute("UPDATE workers SET certificate = ? WHERE worker_id = ?", [certificate, worker_id])
+            self._event("worker_certificate_rotated", {"worker_id": worker_id})
+            return certificate
+
+    def _worker_enrollment_id(self, worker_id: str) -> str:
+        row = self._connection.execute("SELECT enrollment_id FROM workers WHERE worker_id = ?", [worker_id]).fetchone()
+        assert row is not None
+        return str(row[0])
+
+    def worker_for_certificate(self, worker_id: str, certificate: str) -> ActiveWorker:
+        worker = self.active_worker(worker_id)
+        if certificate == worker.certificate:
+            return worker
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT public_key_pem FROM certificate_overlaps
+                WHERE role = 'worker' AND identity_id = ? AND certificate = ? AND expires_at > ?
+                """,
+                [worker_id, certificate, _utc_now()],
+            ).fetchone()
+        if row is None:
+            raise LedgerError("Worker certificate is no longer active.")
+        return replace(worker, certificate=certificate, public_key_pem=row[0])
 
     def _active_worker(self, query: str, parameters: list[str]) -> ActiveWorker:
         with self._lock:
@@ -3100,6 +3167,14 @@ class ControlLedger:
                     last_seen_at TIMESTAMPTZ,
                     safety_state VARCHAR NOT NULL DEFAULT 'connected',
                     revoked_at TIMESTAMPTZ
+                );
+                CREATE TABLE IF NOT EXISTS certificate_overlaps (
+                    role VARCHAR NOT NULL,
+                    identity_id VARCHAR NOT NULL,
+                    certificate VARCHAR NOT NULL,
+                    public_key_pem VARCHAR NOT NULL,
+                    expires_at TIMESTAMPTZ NOT NULL,
+                    PRIMARY KEY (role, identity_id, certificate)
                 );
                 CREATE TABLE IF NOT EXISTS reconciliation_snapshots (
                     worker_id VARCHAR NOT NULL,

@@ -192,7 +192,6 @@ class ControlLedgerTests(unittest.TestCase):
             strategy_name="mean-reversion",
             claimed_public_ip="203.0.113.4",
             public_key_pem="public-key",
-            attestation_provider="TPM",
         )
         trader_id = self.ledger.approve_trader_enrollment(
             enrollment["registration_id"], "ABCDEF", lambda trader_id, *_: f"certificate:{trader_id}"
@@ -239,7 +238,6 @@ class ControlLedgerTests(unittest.TestCase):
             strategy_name="mean-reversion",
             claimed_public_ip="203.0.113.4",
             public_key_pem="public-key",
-            attestation_provider="TPM",
         )
         trader_id = self.ledger.approve_trader_enrollment(
             enrollment["registration_id"], "ABCDEF", lambda trader_id, *_: f"certificate:{trader_id}"
@@ -277,7 +275,6 @@ class ControlLedgerTests(unittest.TestCase):
             strategy_name="mean-reversion",
             claimed_public_ip="203.0.113.4",
             public_key_pem="public-key",
-            attestation_provider="TPM",
         )
         trader_id = self.ledger.approve_trader_enrollment(
             enrollment["registration_id"], "ABCDEF", lambda trader_id, *_: f"certificate:{trader_id}"
@@ -306,7 +303,6 @@ class ControlLedgerTests(unittest.TestCase):
             strategy_name="mean-reversion",
             claimed_public_ip="203.0.113.4",
             public_key_pem="public-key",
-            attestation_provider="TPM",
         )
         trader_id = self.ledger.approve_trader_enrollment(
             enrollment["registration_id"], "ABCDEF", lambda trader_id, *_: f"certificate:{trader_id}"
@@ -341,7 +337,6 @@ class ControlLedgerTests(unittest.TestCase):
             strategy_name="mean-reversion",
             claimed_public_ip="203.0.113.4",
             public_key_pem="public-key",
-            attestation_provider="TPM",
         )
         trader_id = self.ledger.approve_trader_enrollment(
             enrollment["registration_id"], "ABCDEF", lambda trader_id, *_: f"certificate:{trader_id}"
