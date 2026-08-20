@@ -2,21 +2,40 @@ from __future__ import annotations
 
 import io
 import json
+import base64
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
+from abt.controlplane.crypto import trader_certificate_payload
 from abt.trader.cli import main
+from abt.trader.identity import TraderIdentity, load_identity, save_identity
+from abt.trader.rotation import (
+    TraderCertificateRotated,
+    TraderRotationError,
+    maintain_trader_certificate,
+)
 from abt.trader.session import deliver_trader_events, run_trader_session
 
 
 class FakeKeyStore:
+    def __init__(self, name: str = "key", *, fail_delete: bool = False) -> None:
+        self.name = name
+        self.fail_delete = fail_delete
+        self.deleted = False
+
     def public_key_pem(self) -> str:
-        return "public-key"
+        return f"public-key-{self.name}"
 
     def sign(self, _: bytes) -> bytes:
         return b"signature"
+
+    def delete(self) -> None:
+        if self.fail_delete:
+            raise RuntimeError("CNG is busy")
+        self.deleted = True
 
     def close(self) -> None:
         pass
@@ -194,3 +213,156 @@ class TraderCommandTests(unittest.TestCase):
             '{"event_id":18,"payload":{"state":"executing"},"type":"event"}\n',
             output.getvalue(),
         )
+
+
+class FakeRotationTransport:
+    def __init__(self) -> None:
+        self.rotate_result: dict[str, object] = {"trader_id": "trader-123", "certificate": "replacement"}
+
+    def rotation_challenge(self, _: str, trader_id: str, __: str) -> dict[str, object]:
+        return {"purpose": "trader_certificate_rotation", "trader_id": trader_id, "nonce": "nonce"}
+
+    def rotate(self, _: str, trader_id: str, __: str, ___: str, ____: str) -> dict[str, object]:
+        return self.rotate_result
+
+
+class TraderCertificateRotationTests(unittest.TestCase):
+    def test_rotates_past_half_life_without_advancing_acknowledged_cursor(self) -> None:
+        now = datetime(2026, 8, 20, tzinfo=UTC)
+        with TemporaryDirectory() as directory:
+            identity_path = Path(directory) / "trader.json"
+            save_identity(identity_path, self._identity(), replace=False)
+            state_path = Path(directory) / "trader.state.json"
+            state_path.write_text('{"version":1,"acknowledged_cursor":17}\n', encoding="utf-8")
+            keys: dict[str, FakeKeyStore] = {}
+
+            with self.assertRaises(TraderCertificateRotated):
+                maintain_trader_certificate(
+                    identity_path=identity_path,
+                    identity=self._identity(),
+                    trader_id="trader-123",
+                    certificate=self._certificate(now - timedelta(days=16), now + timedelta(days=14)),
+                    current_key=FakeKeyStore("old-key"),
+                    key_store_factory=lambda name: keys.setdefault(name, FakeKeyStore(name)),
+                    transport=FakeRotationTransport(),
+                    now=lambda: now,
+                    error_output=io.StringIO(),
+                )
+
+            self.assertNotEqual("old-key", load_identity(identity_path).key_name)
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(17, state["acknowledged_cursor"])
+            self.assertEqual("old-key", state["retired_keys"][0]["key_name"])
+            self.assertEqual((now + timedelta(hours=1)).isoformat(), state["retired_keys"][0]["eligible_at"])
+
+    def test_failed_rotation_retains_the_current_trader_identity(self) -> None:
+        now = datetime(2026, 8, 20, tzinfo=UTC)
+        with TemporaryDirectory() as directory:
+            identity_path = Path(directory) / "trader.json"
+            save_identity(identity_path, self._identity(), replace=False)
+            transport = FakeRotationTransport()
+            transport.rotate_result = {"trader_id": "trader-123"}
+            replacements: list[FakeKeyStore] = []
+
+            with self.assertRaisesRegex(TraderRotationError, "invalid rotation response"):
+                maintain_trader_certificate(
+                    identity_path=identity_path,
+                    identity=self._identity(),
+                    trader_id="trader-123",
+                    certificate=self._certificate(now - timedelta(days=16), now + timedelta(days=14)),
+                    current_key=FakeKeyStore("old-key"),
+                    key_store_factory=lambda name: replacements.append(FakeKeyStore(name)) or replacements[-1],
+                    transport=transport,
+                    now=lambda: now,
+                    error_output=io.StringIO(),
+                )
+
+            self.assertEqual("old-key", load_identity(identity_path).key_name)
+            self.assertTrue(replacements[0].deleted)
+
+    def test_retries_retired_key_cleanup_daily_without_overwriting_cursor(self) -> None:
+        now = datetime(2026, 8, 20, tzinfo=UTC)
+        with TemporaryDirectory() as directory:
+            identity_path = Path(directory) / "trader.json"
+            save_identity(identity_path, self._identity(key_name="new-key"), replace=False)
+            state_path = Path(directory) / "trader.state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "version": 2,
+                        "acknowledged_cursor": 29,
+                        "retired_keys": [{"key_name": "old-key", "eligible_at": (now - timedelta(hours=1)).isoformat()}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            errors = io.StringIO()
+
+            maintain_trader_certificate(
+                identity_path=identity_path,
+                identity=self._identity(key_name="new-key"),
+                trader_id="trader-123",
+                certificate=self._certificate(now - timedelta(days=1), now + timedelta(days=29)),
+                current_key=FakeKeyStore("new-key"),
+                key_store_factory=lambda _: FakeKeyStore("old-key", fail_delete=True),
+                transport=FakeRotationTransport(),
+                now=lambda: now,
+                error_output=errors,
+            )
+
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(29, state["acknowledged_cursor"])
+            self.assertEqual((now + timedelta(days=1)).isoformat(), state["retired_keys"][0]["retry_at"])
+            self.assertIn("retired CNG key cleanup failed", errors.getvalue())
+
+    def test_recovers_retired_key_cleanup_after_an_identity_switch(self) -> None:
+        now = datetime(2026, 8, 20, tzinfo=UTC)
+        with TemporaryDirectory() as directory:
+            identity_path = Path(directory) / "trader.json"
+            save_identity(identity_path, self._identity(), replace=False)
+            keys: dict[str, FakeKeyStore] = {}
+
+            with (
+                patch("abt.trader.rotation._add_retired_key", side_effect=TraderRotationError("disk unavailable")),
+                self.assertRaises(TraderCertificateRotated),
+            ):
+                maintain_trader_certificate(
+                    identity_path=identity_path,
+                    identity=self._identity(),
+                    trader_id="trader-123",
+                    certificate=self._certificate(now - timedelta(days=16), now + timedelta(days=14)),
+                    current_key=FakeKeyStore("old-key"),
+                    key_store_factory=lambda name: keys.setdefault(name, FakeKeyStore(name)),
+                    transport=FakeRotationTransport(),
+                    now=lambda: now,
+                    error_output=io.StringIO(),
+                )
+
+            replacement = load_identity(identity_path)
+            maintain_trader_certificate(
+                identity_path=identity_path,
+                identity=replacement,
+                trader_id="trader-123",
+                certificate=self._certificate(now - timedelta(days=1), now + timedelta(days=29)),
+                current_key=keys[replacement.key_name],
+                key_store_factory=lambda name: keys.setdefault(name, FakeKeyStore(name)),
+                transport=FakeRotationTransport(),
+                now=lambda: now,
+                error_output=io.StringIO(),
+            )
+
+            self.assertEqual("old-key", json.loads((Path(directory) / "trader.state.json").read_text())["retired_keys"][0]["key_name"])
+            self.assertFalse((Path(directory) / "trader.rotation.pending.json").exists())
+
+    def _identity(self, *, key_name: str = "old-key") -> TraderIdentity:
+        return TraderIdentity("https://controller.example", "enrollment-123", "mean-reversion", "203.0.113.4", key_name)
+
+    def _certificate(self, issued_at: datetime, expires_at: datetime) -> str:
+        payload = trader_certificate_payload(
+            trader_id="trader-123",
+            strategy_name="mean-reversion",
+            public_key_pem="public-key-old-key",
+            issued_at=issued_at,
+            expires_at=expires_at,
+        )
+        return json.dumps({"payload": base64.b64encode(payload).decode("ascii"), "signature": "ignored"})

@@ -77,6 +77,7 @@ def run_trader_session(
     *,
     output: TextIO,
     save_cursor: Callable[[int], None],
+    on_heartbeat: Callable[[], None] | None = None,
 ) -> None:
     """Run one foreground connection until it disconnects."""
 
@@ -88,6 +89,8 @@ def run_trader_session(
             try:
                 message = _message(socket, timeout=30)
             except TimeoutError:
+                if on_heartbeat is not None:
+                    on_heartbeat()
                 _send(socket, {"type": "heartbeat"})
                 continue
         message_type = message.get("type")

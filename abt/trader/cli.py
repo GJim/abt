@@ -6,6 +6,7 @@ import sys
 import time
 from base64 import b64encode
 from collections.abc import Callable, Mapping
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Protocol, TextIO
 
@@ -27,6 +28,14 @@ from .identity import (
     state_path,
 )
 from .session import open_authenticated_trader_session, run_trader_session
+from .rotation import (
+    TraderCertificateExpired,
+    TraderCertificateRotated,
+    TraderRotationError,
+    maintain_trader_certificate,
+    save_acknowledged_cursor,
+    validate_or_warn_state,
+)
 
 
 class TraderTransport(Protocol):
@@ -34,6 +43,10 @@ class TraderTransport(Protocol):
     def enrollment_status(self, controller_url: str, enrollment_id: str) -> Mapping[str, object]: ...
     def certificate_challenge(self, controller_url: str, enrollment_id: str) -> Mapping[str, object]: ...
     def certificate(self, controller_url: str, enrollment_id: str, signature: str) -> Mapping[str, object]: ...
+    def rotation_challenge(self, controller_url: str, trader_id: str, public_key_pem: str) -> Mapping[str, object]: ...
+    def rotate(
+        self, controller_url: str, trader_id: str, public_key_pem: str, old_signature: str, replacement_signature: str
+    ) -> Mapping[str, object]: ...
 
 
 class PublicIpDiscovery(Protocol):
@@ -62,6 +75,26 @@ class HTTPTraderTransport:
         return self._request(
             "POST", controller_url, "/api/traders/certificates",
             {"registration_id": enrollment_id, "signature": signature}, expected=200,
+        )
+
+    def rotation_challenge(self, controller_url: str, trader_id: str, public_key_pem: str) -> Mapping[str, object]:
+        return self._request(
+            "POST", controller_url, "/api/traders/certificates/rotation-challenge",
+            {"trader_id": trader_id, "public_key_pem": public_key_pem}, expected=200,
+        )
+
+    def rotate(
+        self, controller_url: str, trader_id: str, public_key_pem: str, old_signature: str, replacement_signature: str
+    ) -> Mapping[str, object]:
+        return self._request(
+            "POST", controller_url, "/api/traders/certificates/rotate",
+            {
+                "trader_id": trader_id,
+                "public_key_pem": public_key_pem,
+                "old_key_signature": old_signature,
+                "replacement_key_signature": replacement_signature,
+            },
+            expected=200,
         )
 
     def _request(
@@ -198,6 +231,7 @@ def main(
                 output=output,
                 error_output=error_output,
                 state_file=state_path(arguments.config),
+                identity_path=arguments.config,
             )
             return 0
         finally:
@@ -213,16 +247,21 @@ def main(
 
 def connect_trader(
     identity: TraderIdentity, *, transport: TraderTransport, key_store_factory: Callable[[str], HardwareKeyStore],
-    output: TextIO, error_output: TextIO, state_file: Path,
+    output: TextIO, error_output: TextIO, state_file: Path, identity_path: Path | None = None,
+    now: Callable[[], datetime] = lambda: datetime.now(UTC),
+    sleep: Callable[[float], None] = time.sleep,
 ) -> None:
     """Retrieve a certificate per connection and safely reconnect after interruption."""
 
-    key_store = key_store_factory(identity.key_name)
-    try:
-        _warn_if_state_unavailable(state_file, error_output)
-        while True:
+    identity_path = identity_path or state_file.with_name(f"{state_file.stem.removesuffix('.state')}{state_file.suffix}")
+    validate_or_warn_state(state_file, error_output)
+    next_maintenance_at: datetime | None = None
+    while True:
+        current_identity = load_identity(identity_path) if identity_path.exists() else identity
+        key_store = key_store_factory(current_identity.key_name)
+        try:
             try:
-                challenge = transport.certificate_challenge(identity.controller_url, identity.enrollment_id)
+                challenge = transport.certificate_challenge(current_identity.controller_url, current_identity.enrollment_id)
                 trader_id = _required_response(challenge, "trader_id")
                 nonce = _required_response(challenge, "nonce")
                 signature = key_store.sign(
@@ -231,44 +270,79 @@ def connect_trader(
                 if not isinstance(signature, bytes):
                     raise TraderEnrollmentError("The Windows CNG key returned an invalid signature.")
                 delivery = transport.certificate(
-                    identity.controller_url, identity.enrollment_id, b64encode(signature).decode("ascii")
+                    current_identity.controller_url, current_identity.enrollment_id, b64encode(signature).decode("ascii")
                 )
                 if _required_response(delivery, "trader_id") != trader_id:
                     raise TraderEnrollmentError("The controller returned an invalid Trader certificate.")
+                certificate = _required_response(delivery, "certificate")
+                try:
+                    maintain_trader_certificate(
+                        identity_path=identity_path,
+                        identity=current_identity,
+                        trader_id=trader_id,
+                        certificate=certificate,
+                        current_key=key_store,
+                        key_store_factory=key_store_factory,
+                        transport=transport,
+                        now=now,
+                        error_output=error_output,
+                    )
+                except TraderCertificateRotated:
+                    print("Trader device certificate rotated; reconnecting.", file=error_output)
+                    continue
+                except TraderCertificateExpired:
+                    raise
+                except TraderRotationError as error:
+                    print(f"Trader device certificate rotation failed: {error}", file=error_output)
+
+                next_maintenance_at = now().astimezone(UTC) + timedelta(days=1)
+
+                def maintain_daily() -> None:
+                    nonlocal next_maintenance_at
+                    if next_maintenance_at is not None and now().astimezone(UTC) < next_maintenance_at:
+                        return
+                    try:
+                        maintain_trader_certificate(
+                            identity_path=identity_path,
+                            identity=current_identity,
+                            trader_id=trader_id,
+                            certificate=certificate,
+                            current_key=key_store,
+                            key_store_factory=key_store_factory,
+                            transport=transport,
+                            now=now,
+                            error_output=error_output,
+                        )
+                    except TraderCertificateRotated:
+                        raise
+                    except TraderCertificateExpired:
+                        raise
+                    except TraderRotationError as error:
+                        print(f"Trader device certificate rotation failed: {error}", file=error_output)
+                    finally:
+                        next_maintenance_at = now().astimezone(UTC) + timedelta(days=1)
+
                 socket, _ = open_authenticated_trader_session(
-                    controller_url=identity.controller_url, enrollment_id=identity.enrollment_id, key_store=key_store,
-                    certificate=(trader_id, _required_response(delivery, "certificate")),
+                    controller_url=current_identity.controller_url, enrollment_id=current_identity.enrollment_id, key_store=key_store,
+                    certificate=(trader_id, certificate),
                 )
                 try:
-                    run_trader_session(socket, output=output, save_cursor=lambda cursor: _save_cursor(state_file, cursor))
+                    run_trader_session(
+                        socket,
+                        output=output,
+                        save_cursor=lambda cursor: save_acknowledged_cursor(state_file, cursor),
+                        on_heartbeat=maintain_daily,
+                    )
                 finally:
                     socket.__exit__(None, None, None)
+            except TraderCertificateRotated:
+                print("Trader device certificate rotated; reconnecting.", file=error_output)
+                continue
             except (ConnectionClosed, OSError, TimeoutError) as error:
                 print(f"Trader connection interrupted ({type(error).__name__}); reconnecting.", file=error_output)
-                time.sleep(5)
-    finally:
-        _close(key_store)
-
-
-def _save_cursor(path: Path, cursor: int) -> None:
-    atomic_write_json(path, {"version": 1, "acknowledged_cursor": cursor}, "Trader state")
-
-
-def _warn_if_state_unavailable(path: Path, error_output: TextIO) -> None:
-    if not path.exists():
-        print("Trader cursor state is unavailable; the controller will replay from its acknowledged cursor.", file=error_output)
-        return
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-        if (
-            not isinstance(value, dict)
-            or set(value) != {"version", "acknowledged_cursor"}
-            or value.get("version") != 1
-            or not isinstance(value.get("acknowledged_cursor"), int)
-        ):
-            raise ValueError
-    except (OSError, ValueError, json.JSONDecodeError):
-        print("Trader cursor state is invalid; the controller will replay from its acknowledged cursor.", file=error_output)
+                sleep(5)
+        finally:
+            _close(key_store)
 
 
 def _public_ip(
