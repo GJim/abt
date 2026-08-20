@@ -210,11 +210,17 @@ class MT5ReconciliationAdapter:
         now: Callable[[], datetime] = lambda: datetime.now(UTC),
         sleep: Callable[[float], None] = _sleep,
         heartbeat: Callable[[], bool] | None = None,
+        maintenance: Callable[[], None] | None = None,
     ) -> None:
         """Run the required one-minute read-only polling cadence and 30-second heartbeats."""
 
+        next_maintenance = now()
         while True:
-            self.poll(now())
+            observed_at = now()
+            if maintenance is not None and observed_at >= next_maintenance:
+                maintenance()
+                next_maintenance = observed_at + timedelta(days=1)
+            self.poll(observed_at)
             if heartbeat is None:
                 sleep(60)
             else:
@@ -232,6 +238,7 @@ def reconcile_authenticated_worker(
     server: str,
     now: Callable[[], datetime] = lambda: datetime.now(UTC),
     sleep: Callable[[float], None] = _sleep,
+    maintenance: Callable[[], None] | None = None,
 ) -> None:
     """Use an authenticated session's memory-only password for read-only MT5 reconciliation."""
 
@@ -263,12 +270,14 @@ def reconcile_authenticated_worker(
                 session=session,  # type: ignore[arg-type]
                 now=now,
                 safety=safety,
+                maintenance=maintenance,
             )
         else:
             reconciliation.run_forever(
                 now=now,
                 sleep=sleep,
                 heartbeat=None if safety is None else lambda: safety.heartbeat(now()),
+                maintenance=maintenance,
             )
     finally:
         password = ""
@@ -286,12 +295,13 @@ def reconcile_with_safety(
     server: str,
     now: Callable[[], datetime] = lambda: datetime.now(UTC),
     sleep: Callable[[float], None] = _sleep,
+    maintenance: Callable[[], None] | None = None,
 ) -> None:
     """Run reconciliation with bounded terminal/API recovery and human escalation."""
 
     WorkerSafetyAdapter(session).run_with_retries(
         lambda: reconcile_authenticated_worker(
-            mt5=mt5, session=session, login=login, server=server, now=now, sleep=sleep
+            mt5=mt5, session=session, login=login, server=server, now=now, sleep=sleep, maintenance=maintenance
         ),
         sleep=sleep,
     )
@@ -305,6 +315,7 @@ def reconnect_worker_session(
     server: str,
     sleep: Callable[[float], None] = _sleep,
     run_reconciliation: Callable[..., None] = reconcile_with_safety,
+    maintenance: Callable[[AuthenticatedReconciliationSession], None] | None = None,
 ) -> None:
     """Reconnect an interrupted proved WSS session with a bounded exponential backoff."""
 
@@ -312,7 +323,14 @@ def reconnect_worker_session(
     while True:
         try:
             with open_session() as session:
-                run_reconciliation(mt5=mt5, session=session, login=login, server=server, sleep=sleep)
+                run_reconciliation(
+                    mt5=mt5,
+                    session=session,
+                    login=login,
+                    server=server,
+                    sleep=sleep,
+                    maintenance=None if maintenance is None else lambda: maintenance(session),
+                )
             return
         except WorkerSessionDisconnected:
             if attempts >= 10:
@@ -328,9 +346,15 @@ def _run_reconciliation_with_analysis(
     session: AnalysisWorkerSession,
     now: Callable[[], datetime],
     safety: WorkerSafetyAdapter | None,
+    maintenance: Callable[[], None] | None,
 ) -> None:
+    next_maintenance = now()
     while True:
-        reconciliation.poll(now())
+        observed_at = now()
+        if maintenance is not None and observed_at >= next_maintenance:
+            maintenance()
+            next_maintenance = observed_at + timedelta(days=1)
+        reconciliation.poll(observed_at)
         for _ in range(2):
             request = session.receive_product_catalog_analysis(timeout=30.0)
             if request is not None:

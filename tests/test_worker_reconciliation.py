@@ -205,6 +205,29 @@ class WorkerReconciliationTests(unittest.TestCase):
         self.assertEqual([60], sleeps)
         self.assertEqual(["account_info", "terminal_info", "orders_get", "positions_get"], mt5.calls)
 
+    def test_runs_certificate_maintenance_daily_including_the_final_day(self) -> None:
+        mt5 = ReadOnlyMT5()
+        adapter = MT5ReconciliationAdapter(mt5, emit=lambda _: None)
+        started = datetime(2026, 8, 16, tzinfo=UTC)
+        moments = iter([started, started, started + timedelta(hours=23, minutes=59), started + timedelta(days=1)])
+        maintenance: list[datetime] = []
+        waits = 0
+
+        def wait(_: float) -> None:
+            nonlocal waits
+            waits += 1
+            if waits == 3:
+                raise StopIteration
+
+        with self.assertRaises(StopIteration):
+            adapter.run_forever(
+                now=lambda: next(moments),
+                sleep=wait,
+                maintenance=lambda: maintenance.append(datetime.now(UTC)),
+            )
+
+        self.assertEqual(2, len(maintenance))
+
     def test_authenticates_with_memory_only_password_before_read_only_reconciliation(self) -> None:
         mt5 = ReadOnlyMT5()
         mt5.initialize = lambda: True  # type: ignore[attr-defined]

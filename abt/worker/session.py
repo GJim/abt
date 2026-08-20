@@ -47,6 +47,8 @@ class AuthenticatedWorkerSession:
 
     socket: WorkerWebSocket
     reconciliation_cursor: int
+    worker_id: str = ""
+    certificate: str = ""
     _analysis_requests: deque[dict[str, object]] = field(default_factory=deque, init=False, repr=False)
     _order_check_requests: deque[dict[str, object]] = field(default_factory=deque, init=False, repr=False)
     _order_execute_requests: deque[dict[str, object]] = field(default_factory=deque, init=False, repr=False)
@@ -703,6 +705,7 @@ def open_authenticated_worker_session(
     enrollment_id: str,
     key_store: HardwareKeyStore,
     connect: WebSocketConnector | None = None,
+    certificate_received: Callable[[str], None] | None = None,
 ) -> AuthenticatedWorkerSession:
     """Deliver the approved certificate, then prove the device key on one persistent WSS channel."""
 
@@ -720,6 +723,8 @@ def open_authenticated_worker_session(
             if _required_text(delivery, "worker_id") != worker_id:
                 raise WorkerEnrollmentError("The controller returned an invalid device certificate.")
             certificate = _required_text(delivery, "certificate")
+            if certificate_received is not None:
+                certificate_received(certificate)
     except Exception as error:
         _raise_closed_connection(error, "certificate delivery")
 
@@ -746,7 +751,7 @@ def open_authenticated_worker_session(
         if isinstance(error, Exception):
             _raise_closed_connection(error, "authenticated worker session")
         raise
-    return AuthenticatedWorkerSession(socket, reconciliation_cursor=cursor)
+    return AuthenticatedWorkerSession(socket, reconciliation_cursor=cursor, worker_id=worker_id, certificate=certificate)
 
 
 def _raise_closed_connection(error: Exception, phase: str) -> None:

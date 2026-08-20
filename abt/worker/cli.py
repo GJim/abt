@@ -5,6 +5,7 @@ import getpass
 import logging
 import sys
 from collections.abc import Callable, Mapping
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TextIO
 
@@ -21,6 +22,13 @@ from .identity import (
 )
 from .keystore import HardwareKeyStore, WindowsCNGKeyStore
 from .reconciliation import reconnect_worker_session
+from .rotation import (
+    WorkerCertificateExpired,
+    WorkerCertificateRotated,
+    WorkerRotationError,
+    ensure_worker_certificate_current,
+    maintain_worker_certificate,
+)
 from .session import open_authenticated_worker_session
 
 
@@ -74,6 +82,41 @@ class HTTPEnrollmentTransport:
             raise WorkerEnrollmentError("The controller enrollment status request failed.") from error
         if not isinstance(body, Mapping):
             raise WorkerEnrollmentError("The controller returned an invalid enrollment status.")
+        return body
+
+    def rotation_challenge(self, controller_url: str, worker_id: str, public_key_pem: str) -> Mapping[str, object]:
+        return self._rotation_request(
+            "POST", controller_url, "/api/workers/certificates/rotation-challenge",
+            {"worker_id": worker_id, "public_key_pem": public_key_pem},
+        )
+
+    def rotate(
+        self, controller_url: str, worker_id: str, public_key_pem: str, old_signature: str, replacement_signature: str
+    ) -> Mapping[str, object]:
+        return self._rotation_request(
+            "POST", controller_url, "/api/workers/certificates/rotate",
+            {
+                "worker_id": worker_id,
+                "public_key_pem": public_key_pem,
+                "old_key_signature": old_signature,
+                "replacement_key_signature": replacement_signature,
+            },
+        )
+
+    def _rotation_request(
+        self, method: str, controller_url: str, path: str, request: dict[str, object]
+    ) -> Mapping[str, object]:
+        try:
+            response = self._client.request(method, _controller_endpoint(controller_url, path), json=request, follow_redirects=False)
+            if response.status_code != 200:
+                raise WorkerEnrollmentError(f"The controller certificate rotation request returned HTTP {response.status_code}.")
+            body = response.json()
+        except WorkerEnrollmentError:
+            raise
+        except (httpx.HTTPError, ValueError) as error:
+            raise WorkerEnrollmentError("The controller certificate rotation request failed.") from error
+        if not isinstance(body, Mapping):
+            raise WorkerEnrollmentError("The controller returned an invalid certificate rotation response.")
         return body
 
     def close(self) -> None:
@@ -203,15 +246,14 @@ def main(
         key_store = key_store_factory(identity.key_name)
         try:
             if arguments.command == "reconcile":
-                reconnect_worker_session(
-                    open_session=lambda: open_authenticated_worker_session(
-                        controller_url=identity.controller_url,
-                        enrollment_id=identity.enrollment_id,
-                        key_store=key_store,
-                    ),
+                _reconcile_with_certificate_maintenance(
+                    identity_path=arguments.config,
+                    identity=identity,
                     mt5=mt5,
-                    login=identity.login,
-                    server=identity.server,
+                    key_store=key_store,
+                    key_store_factory=key_store_factory,
+                    transport_factory=transport_factory,
+                    error_output=error_output,
                 )
                 return 0
             transport = transport_factory()
@@ -262,6 +304,73 @@ def main(
     for error in cleanup_errors:
         print(f"Worker registration completed, but local cleanup failed: {type(error).__name__}.", file=error_output)
     return 0
+
+
+def _reconcile_with_certificate_maintenance(
+    *,
+    identity_path: Path,
+    identity: WorkerIdentity,
+    mt5: MT5Client,
+    key_store: HardwareKeyStore,
+    key_store_factory: Callable[[str], HardwareKeyStore],
+    transport_factory: Callable[[], EnrollmentTransport],
+    error_output: TextIO,
+) -> None:
+    current_identity = identity
+    current_key = key_store
+    try:
+        while True:
+            def maintain(session: object) -> None:
+                worker_id = getattr(session, "worker_id", None)
+                certificate = getattr(session, "certificate", None)
+                if not isinstance(worker_id, str) or not worker_id or not isinstance(certificate, str) or not certificate:
+                    return
+                transport: EnrollmentTransport | None = None
+                try:
+                    transport = transport_factory()
+                    maintain_worker_certificate(
+                        identity_path=identity_path,
+                        identity=current_identity,
+                        worker_id=worker_id,
+                        certificate=certificate,
+                        current_key=current_key,
+                        key_store_factory=key_store_factory,
+                        transport=transport,  # type: ignore[arg-type]
+                        now=lambda: datetime.now(UTC),
+                        error_output=error_output,
+                    )
+                except WorkerCertificateExpired:
+                    raise
+                except WorkerCertificateRotated:
+                    raise
+                except WorkerRotationError as error:
+                    print(f"Worker certificate rotation failed; continuing with the current identity: {error}", file=error_output)
+                finally:
+                    if transport is not None:
+                        _close(transport)
+
+            try:
+                reconnect_worker_session(
+                    open_session=lambda: open_authenticated_worker_session(
+                        controller_url=current_identity.controller_url,
+                        enrollment_id=current_identity.enrollment_id,
+                        key_store=current_key,
+                        certificate_received=lambda certificate: ensure_worker_certificate_current(
+                            certificate, now=lambda: datetime.now(UTC)
+                        ),
+                    ),
+                    mt5=mt5,
+                    login=current_identity.login,
+                    server=current_identity.server,
+                    maintenance=maintain,
+                )
+                return
+            except WorkerCertificateRotated:
+                _close(current_key)
+                current_identity = load_identity(identity_path)
+                current_key = key_store_factory(current_identity.key_name)
+    finally:
+        _close(current_key)
 
 
 def _parser() -> argparse.ArgumentParser:
