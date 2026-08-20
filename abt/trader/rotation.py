@@ -125,7 +125,10 @@ def save_acknowledged_cursor(path: Path, cursor: int) -> None:
 
     if not isinstance(cursor, int):
         raise TraderRotationError("The Trader acknowledgement cursor is invalid.")
-    state = _load_state(path)
+    try:
+        state = _load_state(path)
+    except TraderRotationError:
+        state = {"acknowledged_cursor": None, "retired_keys": []}
     state["acknowledged_cursor"] = cursor
     _write_state(path, state)
 
@@ -170,8 +173,9 @@ def _clean_retired_keys(
         if key_name == active_key_name or observed_at < eligible_at or observed_at < retry_at:
             retained.append(retired)
             continue
-        key = key_store_factory(key_name)
+        key: HardwareKeyStore | None = None
         try:
+            key = key_store_factory(key_name)
             _delete_key(key)
         except Exception:
             retained.append(
@@ -182,7 +186,8 @@ def _clean_retired_keys(
         else:
             changed = True
         finally:
-            _close_key(key)
+            if key is not None:
+                _close_key(key)
     if changed:
         state["retired_keys"] = retained
         _write_state(path, state)

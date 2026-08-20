@@ -16,6 +16,7 @@ from abt.trader.rotation import (
     TraderCertificateRotated,
     TraderRotationError,
     maintain_trader_certificate,
+    save_acknowledged_cursor,
 )
 from abt.trader.session import deliver_trader_events, run_trader_session
 
@@ -353,6 +354,51 @@ class TraderCertificateRotationTests(unittest.TestCase):
 
             self.assertEqual("old-key", json.loads((Path(directory) / "trader.state.json").read_text())["retired_keys"][0]["key_name"])
             self.assertFalse((Path(directory) / "trader.rotation.pending.json").exists())
+
+    def test_cleanup_open_failure_is_warned_and_retried_daily(self) -> None:
+        now = datetime(2026, 8, 20, tzinfo=UTC)
+        with TemporaryDirectory() as directory:
+            identity_path = Path(directory) / "trader.json"
+            save_identity(identity_path, self._identity(key_name="new-key"), replace=False)
+            state_path = Path(directory) / "trader.state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "version": 2,
+                        "acknowledged_cursor": 29,
+                        "retired_keys": [{"key_name": "old-key", "eligible_at": (now - timedelta(hours=1)).isoformat()}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            errors = io.StringIO()
+
+            maintain_trader_certificate(
+                identity_path=identity_path,
+                identity=self._identity(key_name="new-key"),
+                trader_id="trader-123",
+                certificate=self._certificate(now - timedelta(days=1), now + timedelta(days=29)),
+                current_key=FakeKeyStore("new-key"),
+                key_store_factory=lambda _: (_ for _ in ()).throw(RuntimeError("CNG unavailable")),
+                transport=FakeRotationTransport(),
+                now=lambda: now,
+                error_output=errors,
+            )
+
+            self.assertEqual((now + timedelta(days=1)).isoformat(), json.loads(state_path.read_text())["retired_keys"][0]["retry_at"])
+            self.assertIn("retired CNG key cleanup failed", errors.getvalue())
+
+    def test_acknowledged_cursor_recovers_from_corrupt_local_state(self) -> None:
+        with TemporaryDirectory() as directory:
+            state_path = Path(directory) / "trader.state.json"
+            state_path.write_text("not-json", encoding="utf-8")
+
+            save_acknowledged_cursor(state_path, 41)
+
+            self.assertEqual(
+                {"version": 2, "acknowledged_cursor": 41, "retired_keys": []},
+                json.loads(state_path.read_text(encoding="utf-8")),
+            )
 
     def _identity(self, *, key_name: str = "old-key") -> TraderIdentity:
         return TraderIdentity("https://controller.example", "enrollment-123", "mean-reversion", "203.0.113.4", key_name)

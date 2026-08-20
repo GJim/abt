@@ -83,14 +83,14 @@ def run_trader_session(
 
     pending_events: deque[dict[str, object]] = deque()
     while True:
+        if on_heartbeat is not None:
+            on_heartbeat()
         if pending_events:
             message = pending_events.popleft()
         else:
             try:
                 message = _message(socket, timeout=30)
             except TimeoutError:
-                if on_heartbeat is not None:
-                    on_heartbeat()
                 _send(socket, {"type": "heartbeat"})
                 continue
         message_type = message.get("type")
