@@ -147,9 +147,9 @@ class TraderIntentPreflightTests(unittest.IsolatedAsyncioTestCase):
                 return None
 
             def product_pairs(self) -> list[dict[str, object]]:
-                specification = {
+                first_specification = {
                     "filling_modes": ["FOK", "IOC"],
-                    "allowed_directions": ["LONG", "SHORT"],
+                    "allowed_directions": ["LONG"],
                     "trade_stops_level": 5,
                     "volume_min": "0.1",
                     "volume_max": "100",
@@ -157,13 +157,14 @@ class TraderIntentPreflightTests(unittest.IsolatedAsyncioTestCase):
                     "point": "0.00001",
                     "digits": 5,
                 }
+                second_specification = {**first_specification, "allowed_directions": ["SHORT"]}
                 return [
                     {
                         "product_pair_id": "pair-123",
                         "status": "active",
                         "reference_specifications": [
-                            {"server": "Broker-A", "symbol": "EURUSD.a", "specification": specification},
-                            {"server": "Broker-B", "symbol": "EURUSD", "specification": specification},
+                            {"server": "Broker-A", "symbol": "EURUSD.a", "specification": first_specification},
+                            {"server": "Broker-B", "symbol": "EURUSD", "specification": second_specification},
                         ],
                         "source_workers": {
                             "first_worker": {"worker_id": "worker-a", "server": "Broker-A"},
@@ -207,6 +208,21 @@ class TraderIntentPreflightTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("worker-b", outcomes[1]["worker_id"])  # type: ignore[index]
         self.assertEqual("1.23350", outcomes[0]["order"]["sl"])  # type: ignore[index]
         self.assertEqual("1.23650", outcomes[0]["order"]["tp"])  # type: ignore[index]
+
+        disconnected_ledger = Ledger()
+        disconnected = await _preflight_trader_intent(
+            disconnected_ledger,  # type: ignore[arg-type]
+            {"worker-a": {first_connection}},  # type: ignore[arg-type]
+            {},
+            "trader-123",
+            "intent-002",
+            payload,
+        )
+
+        self.assertEqual({"status": "rejected_preflight"}, disconnected)
+        assert disconnected_ledger.rejected is not None
+        disconnected_outcomes = disconnected_ledger.rejected[4]
+        self.assertEqual(["not_started", "rejected"], [outcome["status"] for outcome in disconnected_outcomes])  # type: ignore[index]
 
 
 class MemoryCertificateIssuer:

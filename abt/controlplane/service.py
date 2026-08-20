@@ -2050,34 +2050,45 @@ async def _preflight_trader_intent(
         specifications = cast(list[dict[str, Any]], pair["reference_specifications"])
         if len(specifications) != 2 or any(intent.filling_mode not in item["specification"]["filling_modes"] for item in specifications):
             raise LedgerError("Intent filling mode is not supported by both endpoints.")
-        if any(
-            intent.primary_direction not in item["specification"]["allowed_directions"]
-            or intent.stop_loss_pips * _intent_pip_size(item["specification"])
-            < Decimal(str(item["specification"]["trade_stops_level"])) * Decimal(str(item["specification"]["point"]))
-            or intent.take_profit_pips * _intent_pip_size(item["specification"])
-            < Decimal(str(item["specification"]["trade_stops_level"])) * Decimal(str(item["specification"]["point"]))
-            for item in specifications
-        ):
-            raise LedgerError("Intent direction or protective prices violate endpoint constraints.")
-        if any(not _valid_intent_volume(intent.lots, item["specification"]) for item in specifications):
-            raise LedgerError("Intent lots are not exactly valid for both endpoints.")
         sources = cast(dict[str, dict[str, Any]], pair["source_workers"])
         workers = [sources["first_worker"], sources["second_worker"]]
         endpoint_by_server = {str(item["server"]): item for item in specifications}
         if set(endpoint_by_server) != {str(worker["server"]) for worker in workers}:
             raise LedgerError("Product pair source workers do not match its endpoints.")
-        connections = [
-            _connected_worker_session(worker_connections, str(worker["worker_id"]), reason="Selected worker is disconnected.")
-            for worker in workers
-        ]
+        references = [endpoint_by_server[str(worker["server"])] for worker in workers]
+        directions = [intent.primary_direction, "SHORT" if intent.primary_direction == "LONG" else "LONG"]
+        if any(
+            direction not in reference["specification"]["allowed_directions"]
+            or intent.stop_loss_pips * _intent_pip_size(reference["specification"])
+            < Decimal(str(reference["specification"]["trade_stops_level"]))
+            * Decimal(str(reference["specification"]["point"]))
+            or intent.take_profit_pips * _intent_pip_size(reference["specification"])
+            < Decimal(str(reference["specification"]["trade_stops_level"]))
+            * Decimal(str(reference["specification"]["point"]))
+            for direction, reference in zip(directions, references, strict=True)
+        ):
+            raise LedgerError("Intent direction or protective prices violate endpoint constraints.")
+        if any(not _valid_intent_volume(intent.lots, reference["specification"]) for reference in references):
+            raise LedgerError("Intent lots are not exactly valid for both endpoints.")
         orders = [
-            _intent_order(intent, endpoint_by_server[str(worker["server"])], primary=index == 0)
-            for index, worker in enumerate(workers)
+            _intent_order(intent, reference, primary=index == 0) for index, reference in enumerate(references)
         ]
         outcomes = [
             {"worker_id": str(worker["worker_id"]), "status": "not_started", "order": order}
             for worker, order in zip(workers, orders, strict=True)
         ]
+        connections: list[_WorkerSessionConnection] = []
+        for worker, outcome in zip(workers, outcomes, strict=True):
+            try:
+                connections.append(
+                    _connected_worker_session(
+                        worker_connections, str(worker["worker_id"]), reason="Selected worker is disconnected."
+                    )
+                )
+            except LedgerError as error:
+                outcome.update(status="rejected", reason=str(error))
+        if len(connections) != len(workers):
+            raise LedgerError("Selected worker is disconnected.")
         if monotonic() >= deadline:
             raise LedgerError("Intent expiry passed before broker preflight.")
         async with _pair_worker_execution(worker_execution_locks, str(workers[0]["worker_id"]), str(workers[1]["worker_id"])):
