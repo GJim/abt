@@ -31,6 +31,23 @@ Select an existing context:
 uv run mt5 context use ftmo-demo
 ```
 
+## Worker enrollment
+
+On native Windows, `abt-worker enroll` prompts for omitted controller, MT5
+account, server, and registration invite values. It writes versioned,
+non-secret identity data to `worker.json` beside the executable; use
+`--config PATH` to select another location. The password and invite are never
+saved or printed.
+
+```powershell
+abt-worker enroll
+abt-worker reconcile
+```
+
+Enrollment output reports `pending_approval` until an administrator approves
+the worker. Existing identity configuration is protected; use
+`abt-worker enroll --replace-config` only to replace it deliberately.
+
 If the current context has open orders or positions, an interactive switch
 requires confirmation. `--yes` bypasses that prompt.
 

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import io
 import json
+from pathlib import Path
+from tempfile import TemporaryDirectory
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -72,11 +74,21 @@ class FakeTransport:
         self.request = dict(request)
         return {"enrollment_id": "registration-123", "expires_at": "2026-08-16T06:00:00+00:00"}
 
+    def enrollment_status(self, controller_url: str, enrollment_id: str) -> dict[str, object]:
+        return {"status": "approved"}
+
     def close(self) -> None:
         self.closed = True
 
 
 class WorkerEnrollmentTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._config_directory = TemporaryDirectory()
+        self.config_path = Path(self._config_directory.name) / "worker-identity.json"
+
+    def tearDown(self) -> None:
+        self._config_directory.cleanup()
+
     def test_registration_sends_password_but_success_output_never_prints_it(self) -> None:
         password = "never-display-this-password"
         mt5 = FakeMT5()
@@ -146,6 +158,8 @@ class WorkerEnrollmentTests(unittest.TestCase):
         exit_code = main(
             [
                 "enroll",
+                "--config",
+                str(self.config_path),
                 "--controller-url",
                 "https://controller.example",
                 "--login",
@@ -167,7 +181,7 @@ class WorkerEnrollmentTests(unittest.TestCase):
         self.assertEqual("", errors.getvalue())
         displayed = json.loads(output.getvalue())
         self.assertEqual(
-            {"account_info", "expires_at", "registration_id", "terminal_info"},
+            {"account_info", "expires_at", "registration_id", "status", "terminal_info"},
             displayed.keys(),
         )
         self.assertNotIn(password, output.getvalue())
@@ -186,6 +200,10 @@ class WorkerEnrollmentTests(unittest.TestCase):
     def test_cli_reconcile_stops_cleanly_on_keyboard_interrupt(self) -> None:
         errors = io.StringIO()
         session = InterruptibleSession()
+        self.config_path.write_text(
+            '{"version":1,"controller_url":"https://controller.example","enrollment_id":"enrollment-123","login":123456,"server":"Broker-Demo","key_name":"abt-worker-device-key"}\n',
+            encoding="utf-8",
+        )
 
         with (
             patch("abt.worker.cli.sys.platform", "win32"),
@@ -194,16 +212,11 @@ class WorkerEnrollmentTests(unittest.TestCase):
             exit_code = main(
                 [
                     "reconcile",
-                    "--controller-url",
-                    "https://controller.example",
-                    "--enrollment-id",
-                    "enrollment-123",
-                    "--login",
-                    "123456",
-                    "--server",
-                    "Broker-Demo",
+                    "--config",
+                    str(self.config_path),
                 ],
                 mt5_factory=FakeMT5,
+                transport_factory=FakeTransport,
                 key_store_factory=lambda _: FakeKeyStore(),
                 error_output=errors,
             )
@@ -220,6 +233,8 @@ class WorkerEnrollmentTests(unittest.TestCase):
         exit_code = main(
             [
                 "enroll",
+                "--config",
+                str(self.config_path),
                 "--controller-url",
                 "https://controller.example",
                 "--login",
@@ -248,6 +263,8 @@ class WorkerEnrollmentTests(unittest.TestCase):
         exit_code = main(
             [
                 "enroll",
+                "--config",
+                str(self.config_path),
                 "--controller-url",
                 "https://controller.example",
                 "--login",
@@ -278,6 +295,8 @@ class WorkerEnrollmentTests(unittest.TestCase):
         exit_code = main(
             [
                 "enroll",
+                "--config",
+                str(self.config_path),
                 "-v",
                 "--controller-url",
                 "https://controller.example",
@@ -306,6 +325,8 @@ class WorkerEnrollmentTests(unittest.TestCase):
         exit_code = main(
             [
                 "enroll",
+                "--config",
+                str(self.config_path),
                 "-v",
                 "--controller-url",
                 "https://controller.example",

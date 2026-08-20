@@ -1162,6 +1162,16 @@ class ControlLedger:
             raise LedgerError("Enrollment is no longer pending.")
         return row[0]
 
+    def enrollment_status(self, enrollment_id: str) -> str:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT status FROM enrollments WHERE enrollment_id = ?",
+                [enrollment_id],
+            ).fetchone()
+        if row is None:
+            raise LedgerError("Enrollment does not exist.")
+        return row[0]
+
     def active_worker_for_enrollment(self, enrollment_id: str) -> ActiveWorker:
         return self._active_worker(
             """

@@ -40,6 +40,8 @@ class EnrollmentTransport(Protocol):
 
     def enroll(self, controller_url: str, request: dict[str, object]) -> Mapping[str, object]: ...
 
+    def enrollment_status(self, controller_url: str, enrollment_id: str) -> Mapping[str, object]: ...
+
 
 @dataclass(frozen=True)
 class EnrollmentResult:
@@ -56,6 +58,7 @@ class EnrollmentResult:
                 "account_info": self.account_info,
                 "expires_at": self.expires_at,
                 "registration_id": self.registration_id,
+                "status": "pending_approval",
                 "terminal_info": self.terminal_info,
             },
             indent=2,

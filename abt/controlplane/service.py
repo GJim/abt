@@ -444,6 +444,13 @@ def create_app(
         except SecretStoreError as error:
             raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(error)) from error
 
+    @app.get("/api/enrollments/{enrollment_id}/status")
+    def enrollment_status(enrollment_id: str) -> dict[str, str]:
+        try:
+            return {"status": ledger.enrollment_status(enrollment_id)}
+        except LedgerError as error:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
+
     @app.post("/api/traders/enrollments", status_code=status.HTTP_201_CREATED)
     def create_trader_enrollment(body: TraderEnrollmentRequest) -> dict[str, object]:
         try:

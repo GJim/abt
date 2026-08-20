@@ -5,11 +5,20 @@ import getpass
 import logging
 import sys
 from collections.abc import Callable, Mapping
+from pathlib import Path
 from typing import TextIO
 
 import httpx
 
 from .enrollment import EnrollmentTransport, MT5Client, WorkerEnrollmentError, register_worker
+from .identity import (
+    WorkerIdentity,
+    default_identity_path,
+    ensure_identity_can_be_saved,
+    load_identity,
+    pending_identity_path,
+    save_identity,
+)
 from .keystore import HardwareKeyStore, WindowsCNGKeyStore
 from .reconciliation import reconnect_worker_session
 from .session import open_authenticated_worker_session
@@ -50,6 +59,21 @@ class HTTPEnrollmentTransport:
             raise WorkerEnrollmentError("The controller enrollment challenge request failed.") from error
         if not isinstance(body, Mapping):
             raise WorkerEnrollmentError("The controller returned an invalid enrollment challenge.")
+        return body
+
+    def enrollment_status(self, controller_url: str, enrollment_id: str) -> Mapping[str, object]:
+        endpoint = _controller_endpoint(controller_url, f"/api/enrollments/{enrollment_id}/status")
+        try:
+            response = self._client.get(endpoint, follow_redirects=False)
+            if response.status_code != 200:
+                raise WorkerEnrollmentError(f"The controller enrollment status request returned HTTP {response.status_code}.")
+            body = response.json()
+        except WorkerEnrollmentError:
+            raise
+        except (httpx.HTTPError, ValueError) as error:
+            raise WorkerEnrollmentError("The controller enrollment status request failed.") from error
+        if not isinstance(body, Mapping):
+            raise WorkerEnrollmentError("The controller returned an invalid enrollment status.")
         return body
 
     def close(self) -> None:
@@ -116,6 +140,7 @@ def main(
     transport_factory: Callable[[], EnrollmentTransport] = HTTPEnrollmentTransport,
     key_store_factory: Callable[[str], HardwareKeyStore] = WindowsCNGKeyStore,
     password_prompt: Callable[[str], str] = getpass.getpass,
+    input_prompt: Callable[[str], str] = input,
     output: TextIO | None = None,
     error_output: TextIO | None = None,
 ) -> int:
@@ -140,32 +165,78 @@ def main(
         logging.getLogger("abt.worker").setLevel(logging.DEBUG)
     cleanup_errors: list[Exception] = []
     try:
+        if arguments.command == "reconcile":
+            identity = load_identity(arguments.config)
+            transport = transport_factory()
+            try:
+                pending_path = pending_identity_path(arguments.config)
+                pending_identity = load_identity(pending_path) if pending_path.exists() else None
+                candidate = pending_identity or identity
+                status = _required_enrollment_status(transport.enrollment_status(candidate.controller_url, candidate.enrollment_id))
+                if status == "approved" and pending_identity is not None:
+                    save_identity(arguments.config, pending_identity, replace=True)
+                    pending_path.unlink()
+                    identity = pending_identity
+            finally:
+                _close_safely(transport, cleanup_errors)
+            if status == "pending":
+                print("Worker enrollment is pending administrator approval.", file=output)
+                return 0
+            if status != "approved":
+                raise WorkerEnrollmentError("Worker enrollment is no longer active.")
+        else:
+            existing_identity = load_identity(arguments.config) if arguments.config.exists() else None
+            ensure_identity_can_be_saved(arguments.config, replace=arguments.replace_config)
+            identity = WorkerIdentity(
+                controller_url=_required_prompted(arguments.controller_url, "Controller URL: ", input_prompt),
+                login=_prompted_login(arguments.login, input_prompt),
+                server=_required_prompted(arguments.server, "MT5 server: ", input_prompt),
+                enrollment_id="",
+                key_name=arguments.key_name or (
+                    existing_identity.key_name if existing_identity is not None else "abt-worker-device-key"
+                ),
+            )
+            registration_invite = _required_prompted(
+                arguments.registration_invite, "Registration invite: ", input_prompt
+            )
         mt5 = mt5_factory()
-        key_store = key_store_factory(arguments.key_name)
+        key_store = key_store_factory(identity.key_name)
         try:
             if arguments.command == "reconcile":
                 reconnect_worker_session(
                     open_session=lambda: open_authenticated_worker_session(
-                        controller_url=arguments.controller_url,
-                        enrollment_id=arguments.enrollment_id,
+                        controller_url=identity.controller_url,
+                        enrollment_id=identity.enrollment_id,
                         key_store=key_store,
                     ),
                     mt5=mt5,
-                    login=arguments.login,
-                    server=arguments.server,
+                    login=identity.login,
+                    server=identity.server,
                 )
                 return 0
             transport = transport_factory()
             try:
                 result = register_worker(
-                    controller_url=arguments.controller_url,
-                    login=arguments.login,
-                    server=arguments.server,
-                    registration_invite=arguments.registration_invite,
+                    controller_url=identity.controller_url,
+                    login=identity.login,
+                    server=identity.server,
+                    registration_invite=registration_invite,
                     key_store=key_store,
                     mt5=mt5,
                     transport=transport,
                     password_prompt=password_prompt,
+                )
+                saved_identity = WorkerIdentity(
+                    controller_url=identity.controller_url,
+                    enrollment_id=result.registration_id,
+                    login=identity.login,
+                    server=identity.server,
+                    key_name=identity.key_name,
+                )
+                save_identity(
+                    pending_identity_path(arguments.config) if existing_identity is not None else arguments.config,
+                    saved_identity,
+                    replace=True if existing_identity is not None else arguments.replace_config,
                 )
             finally:
                 _close_safely(transport, cleanup_errors)
@@ -174,8 +245,15 @@ def main(
     except KeyboardInterrupt:
         print("Worker reconciliation stopped.", file=error_output)
         return 130
+    except WorkerEnrollmentError as error:
+        operation = "reconciliation" if arguments.command == "reconcile" else "registration"
+        print(f"Worker {operation} failed: {error}", file=error_output)
+        if arguments.verbose:
+            _print_diagnostic(error, error_output)
+        return 1
     except Exception as error:
-        print("Worker registration failed.", file=error_output)
+        operation = "reconciliation" if arguments.command == "reconcile" else "registration"
+        print(f"Worker {operation} failed.", file=error_output)
         if arguments.verbose:
             _print_diagnostic(error, error_output)
         return 1
@@ -192,28 +270,23 @@ def _parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command")
     enroll = commands.add_parser("enroll", help="enroll this Windows MT5 worker")
     enroll.add_argument("-v", "--verbose", action="store_true", default=argparse.SUPPRESS, help="show safe failure diagnostics")
-    enroll.add_argument("--controller-url", required=True, help="HTTPS controller origin")
-    enroll.add_argument("--login", required=True, type=_positive_login, help="MT5 account login")
-    enroll.add_argument("--server", required=True, help="MT5 server")
-    enroll.add_argument("--registration-invite", required=True, help="one-time worker enrollment invite")
+    enroll.add_argument("--config", type=Path, default=default_identity_path(), help="worker identity configuration path")
+    enroll.add_argument(
+        "--replace-config", action="store_true", help="replace an existing worker identity configuration"
+    )
+    enroll.add_argument("--controller-url", help="HTTPS controller origin")
+    enroll.add_argument("--login", type=_positive_login, help="MT5 account login")
+    enroll.add_argument("--server", help="MT5 server")
+    enroll.add_argument("--registration-invite", help="one-time worker enrollment invite")
     enroll.add_argument(
         "--key-name",
-        default="abt-worker-device-key",
         help="persistent Windows CNG key name",
     )
     reconcile = commands.add_parser("reconcile", help="run read-only MT5 reconciliation for an approved worker")
     reconcile.add_argument(
         "-v", "--verbose", action="store_true", default=argparse.SUPPRESS, help="show safe failure diagnostics"
     )
-    reconcile.add_argument("--controller-url", required=True, help="HTTPS controller origin")
-    reconcile.add_argument("--enrollment-id", required=True, help="approved worker enrollment ID")
-    reconcile.add_argument("--login", required=True, type=_positive_login, help="bound MT5 account login")
-    reconcile.add_argument("--server", required=True, help="bound MT5 server")
-    reconcile.add_argument(
-        "--key-name",
-        default="abt-worker-device-key",
-        help="persistent Windows CNG key name",
-    )
+    reconcile.add_argument("--config", type=Path, default=default_identity_path(), help="worker identity configuration path")
     return parser
 
 
@@ -225,6 +298,31 @@ def _positive_login(value: str) -> int:
     if login <= 0:
         raise argparse.ArgumentTypeError("must be a positive integer")
     return login
+
+
+def _required_prompted(value: str | None, prompt: str, input_prompt: Callable[[str], str]) -> str:
+    if value is None:
+        value = input_prompt(prompt)
+    if not isinstance(value, str) or not value.strip():
+        raise WorkerEnrollmentError(f"{prompt.rstrip(': ')} is required.")
+    return value.strip()
+
+
+def _prompted_login(value: int | None, input_prompt: Callable[[str], str]) -> int:
+    if value is not None:
+        return value
+    prompted = _required_prompted(None, "MT5 account login: ", input_prompt)
+    try:
+        return _positive_login(prompted)
+    except argparse.ArgumentTypeError as error:
+        raise WorkerEnrollmentError("MT5 account login must be a positive integer.") from error
+
+
+def _required_enrollment_status(response: Mapping[str, object]) -> str:
+    status = response.get("status")
+    if not isinstance(status, str) or status not in {"pending", "approved"}:
+        raise WorkerEnrollmentError("The controller returned an invalid enrollment status.")
+    return status
 
 
 def _enrollment_endpoint(controller_url: str) -> str:
