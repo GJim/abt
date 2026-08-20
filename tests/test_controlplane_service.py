@@ -866,6 +866,9 @@ class ControlPlaneServiceTests(unittest.TestCase):
             "trader_certificate_rotated",
             [event["event_type"] for event in self.app.state.ledger.events()],
         )
+        events = self.client.get("/api/admin/events")
+        self.assertEqual(200, events.status_code)
+        self.assertIn("trader_certificate_rotated", [event["event_type"] for event in events.json()["items"]])
 
     def test_worker_rotation_requires_both_proofs_and_preserves_one_hour_overlap(self) -> None:
         old_key, worker_id, old_certificate = self._approved_worker(987654, "Broker-Rotation")
@@ -941,6 +944,14 @@ class ControlPlaneServiceTests(unittest.TestCase):
             "worker_certificate_rotated",
             [event["event_type"] for event in self.app.state.ledger.events()],
         )
+        login = self.client.post(
+            "/api/admin/login",
+            json={"username": "ABCDEF", "password": "A-secure-admin-password!"},
+        )
+        self.assertEqual(200, login.status_code)
+        events = self.client.get("/api/admin/events")
+        self.assertEqual(200, events.status_code)
+        self.assertIn("worker_certificate_rotated", [event["event_type"] for event in events.json()["items"]])
 
     def test_approved_trader_can_authenticate_to_the_command_websocket(self) -> None:
         private_key = ec.generate_private_key(ec.SECP256R1())

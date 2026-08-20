@@ -132,6 +132,8 @@ class _TraderRotationChallenge:
 
 
 class TraderRotationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     trader_id: str = Field(min_length=1)
     public_key_pem: str = Field(min_length=1)
     old_key_signature: str = Field(min_length=1)
@@ -153,6 +155,8 @@ class _WorkerRotationChallenge:
 
 
 class WorkerRotationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     model_config = ConfigDict(extra="forbid")
 
     worker_id: str = Field(min_length=1)
@@ -619,7 +623,7 @@ def create_app(
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
 
     @app.post("/api/traders/certificates/rotate")
-    async def rotate_trader_certificate(body: TraderRotationRequest) -> dict[str, str]:
+    def rotate_trader_certificate(body: TraderRotationRequest) -> dict[str, str]:
         try:
             trader = ledger.active_trader(body.trader_id)
             _verify_trader_certificate(certificate_verifier, trader)
@@ -648,11 +652,6 @@ def create_app(
                     trader_id=trader_id, strategy_name=strategy_name, public_key_pem=public_key_pem
                 ),
             )
-            connections = tuple(trader_connections.pop(trader.trader_id, set()))
-            await asyncio.gather(
-                *(connection.close(code=status.WS_1008_POLICY_VIOLATION) for connection in connections),
-                return_exceptions=True,
-            )
             return {"trader_id": trader.trader_id, "certificate": certificate}
         except (LedgerError, ProofError, SecretStoreError) as error:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
@@ -673,7 +672,7 @@ def create_app(
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
 
     @app.post("/api/workers/certificates/rotate")
-    async def rotate_worker_certificate(body: WorkerRotationRequest) -> dict[str, str]:
+    def rotate_worker_certificate(body: WorkerRotationRequest) -> dict[str, str]:
         try:
             worker = ledger.active_worker(body.worker_id)
             _verify_worker_certificate(certificate_verifier, worker)
@@ -699,11 +698,6 @@ def create_app(
                 lambda worker_id, login, server, public_key_pem: certificate_issuer.issue(
                     worker_id=worker_id, login=login, server=server, public_key_pem=public_key_pem
                 ),
-            )
-            connections = tuple(worker_connections.pop(worker.worker_id, set()))
-            await asyncio.gather(
-                *(connection.close(code=status.WS_1008_POLICY_VIOLATION) for connection in connections),
-                return_exceptions=True,
             )
             return {"worker_id": worker.worker_id, "certificate": certificate}
         except (LedgerError, ProofError, SecretStoreError) as error:
