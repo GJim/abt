@@ -930,6 +930,14 @@ class ControlPlaneServiceTests(unittest.TestCase):
             )
             socket.send_json({"signature": base64.b64encode(proof).decode("ascii")})
             self.assertEqual("authenticated", socket.receive_json()["type"])
+            with self.app.state.ledger._transaction():
+                self.app.state.ledger._connection.execute(
+                    "UPDATE certificate_overlaps SET expires_at = ? WHERE role = 'worker' AND identity_id = ?",
+                    [datetime.now(UTC) - timedelta(seconds=1), worker_id],
+                )
+            socket.send_json({"type": "heartbeat"})
+            with self.assertRaises(WebSocketDisconnect):
+                socket.receive_json()
 
         with self.app.state.ledger._transaction():
             self.app.state.ledger._connection.execute(

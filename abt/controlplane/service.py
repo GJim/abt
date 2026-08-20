@@ -1459,6 +1459,7 @@ def create_app(
             await deliver_events_after(cursor)
             last_controller_heartbeat = monotonic()
             while True:
+                ledger.trader_for_certificate(trader.trader_id, certificate)
                 try:
                     message = await asyncio.wait_for(websocket.receive_json(), timeout=30)
                 except asyncio.TimeoutError:
@@ -1619,7 +1620,12 @@ def create_app(
                 {"type": "authenticated", "worker_id": worker.worker_id, "cursor": ledger.reconciliation_cursor(worker.worker_id)}
             )
             while True:
-                request = await websocket.receive_json()
+                try:
+                    request = await asyncio.wait_for(websocket.receive_json(), timeout=30)
+                except asyncio.TimeoutError:
+                    ledger.worker_for_certificate(worker.worker_id, certificate)
+                    continue
+                ledger.worker_for_certificate(worker.worker_id, certificate)
                 if not isinstance(request, dict):
                     raise ValueError("Invalid protocol message.")
                 message_type = request.get("type")
