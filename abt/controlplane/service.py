@@ -2037,6 +2037,7 @@ async def _preflight_trader_intent(
     existing = ledger.trader_command_result(trader_id, command_id, payload)
     if existing is not None:
         return existing
+    outcomes: list[dict[str, object]] = []
     try:
         intent = TraderIntentPayload.model_validate(payload)
         remaining_seconds = (intent.expires_at - datetime.now(UTC)).total_seconds()
@@ -2051,8 +2052,10 @@ async def _preflight_trader_intent(
             raise LedgerError("Intent filling mode is not supported by both endpoints.")
         if any(
             intent.primary_direction not in item["specification"]["allowed_directions"]
-            or intent.stop_loss_pips < Decimal(str(item["specification"]["trade_stops_level"]))
-            or intent.take_profit_pips < Decimal(str(item["specification"]["trade_stops_level"]))
+            or intent.stop_loss_pips * _intent_pip_size(item["specification"])
+            < Decimal(str(item["specification"]["trade_stops_level"])) * Decimal(str(item["specification"]["point"]))
+            or intent.take_profit_pips * _intent_pip_size(item["specification"])
+            < Decimal(str(item["specification"]["trade_stops_level"])) * Decimal(str(item["specification"]["point"]))
             for item in specifications
         ):
             raise LedgerError("Intent direction or protective prices violate endpoint constraints.")
@@ -2071,21 +2074,38 @@ async def _preflight_trader_intent(
             _intent_order(intent, endpoint_by_server[str(worker["server"])], primary=index == 0)
             for index, worker in enumerate(workers)
         ]
+        outcomes = [
+            {"worker_id": str(worker["worker_id"]), "status": "not_started", "order": order}
+            for worker, order in zip(workers, orders, strict=True)
+        ]
         if monotonic() >= deadline:
             raise LedgerError("Intent expiry passed before broker preflight.")
         async with _pair_worker_execution(worker_execution_locks, str(workers[0]["worker_id"]), str(workers[1]["worker_id"])):
             responses = await asyncio.gather(
-                *(_request_order_check(connection, order) for connection, order in zip(connections, orders, strict=True))
+                *(
+                    _request_order_check(connection, order, timeout=max(0.001, deadline - monotonic()))
+                    for connection, order in zip(connections, orders, strict=True)
+                ),
+                return_exceptions=True,
             )
+        for outcome, response in zip(outcomes, responses, strict=True):
+            if isinstance(response, Exception):
+                outcome.update(status="rejected", reason=str(response))
+            elif _validated_order_check_response(response, cast(dict[str, object], outcome["order"])):
+                outcome.update(status="accepted", response=response)
+            else:
+                outcome.update(status="malformed", response=response)
         if monotonic() >= deadline:
             raise LedgerError("Intent expiry passed during broker preflight.")
-        if not all(_validated_order_check_response(response, order) for response, order in zip(responses, orders, strict=True)):
+        if any(outcome["status"] != "accepted" for outcome in outcomes):
             raise LedgerError("A broker rejected the intent order check.")
-    except (LedgerError, ValidationError, ValueError, asyncio.TimeoutError) as error:
+    except (KeyError, LedgerError, ValidationError, ValueError, asyncio.TimeoutError) as error:
+        if not outcomes:
+            outcomes = [{"status": "rejected", "reason": str(error)}]
         return ledger.reject_trader_command(
-            trader_id, command_id, payload, str(error), [{"status": "rejected", "reason": str(error)}]
+            trader_id, command_id, payload, str(error), outcomes
         )
-    return ledger.submit_trader_command(trader_id, command_id, cast(dict[str, Any], intent.model_dump(mode="json")))
+    return ledger.accept_trader_intent(trader_id, command_id, payload, outcomes)
 
 
 def _valid_intent_volume(lots: Decimal, specification: dict[str, Any]) -> bool:
@@ -2095,11 +2115,11 @@ def _valid_intent_volume(lots: Decimal, specification: dict[str, Any]) -> bool:
 
 def _intent_order(intent: TraderIntentPayload, reference: dict[str, Any], *, primary: bool) -> dict[str, object]:
     specification = cast(dict[str, Any], reference["specification"])
-    point = Decimal(str(specification["point"]))
+    pip_size = _intent_pip_size(specification)
     direction = intent.primary_direction if primary else ("SHORT" if intent.primary_direction == "LONG" else "LONG")
     entry = intent.entry_price
-    stop_loss = entry - intent.stop_loss_pips * point if direction == "LONG" else entry + intent.stop_loss_pips * point
-    take_profit = entry + intent.take_profit_pips * point if direction == "LONG" else entry - intent.take_profit_pips * point
+    stop_loss = entry - intent.stop_loss_pips * pip_size if direction == "LONG" else entry + intent.stop_loss_pips * pip_size
+    take_profit = entry + intent.take_profit_pips * pip_size if direction == "LONG" else entry - intent.take_profit_pips * pip_size
     return {
         "action": "pending_limit",
         "symbol": reference["symbol"],
@@ -2112,13 +2132,22 @@ def _intent_order(intent: TraderIntentPayload, reference: dict[str, Any], *, pri
     }
 
 
-async def _request_order_check(connection: _WorkerSessionConnection, order: dict[str, object]) -> dict[str, object]:
+def _intent_pip_size(specification: dict[str, Any]) -> Decimal:
+    point = Decimal(str(specification["point"]))
+    digits = int(specification["digits"])
+    pip_digits = 2 if digits in {2, 3} else 4
+    return point * Decimal(10) ** max(0, digits - pip_digits)
+
+
+async def _request_order_check(
+    connection: _WorkerSessionConnection, order: dict[str, object], *, timeout: float
+) -> dict[str, object]:
     request_id = str(uuid4())
     return await _request_worker_analysis(
         connection,
         analysis_id="order_check",
         stage="order_check",
-        timeout=5,
+        timeout=timeout,
         message={"type": "order_check_request", "analysis_id": "order_check", "request_id": request_id, "order": order},
     )
 

@@ -41,6 +41,7 @@ from abt.controlplane.service import (
     _analyze_product_catalogs,
     _delete_expired_pending_secrets,
     _market_data_statistics,
+    _preflight_trader_intent,
     _request_market_data_with_retry,
     _shared_supported_filling_modes,
     _validated_market_data_response,
@@ -121,6 +122,91 @@ class MarketDataRequestTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([30, 30, 30, 30], timeouts)
         self.assertEqual(["Worker did not respond within 30 seconds."], retries)
+
+
+class TraderIntentPreflightTests(unittest.IsolatedAsyncioTestCase):
+    async def test_records_the_outcome_from_each_worker_when_one_check_fails(self) -> None:
+        first_connection = object()
+        second_connection = object()
+        payload = {
+            "type": "intent",
+            "pair_id": "pair-123",
+            "primary_direction": "LONG",
+            "lots": "0.1",
+            "entry_price": "1.2345",
+            "stop_loss_pips": "10",
+            "take_profit_pips": "20",
+            "filling_mode": "FOK",
+            "expires_at": (datetime.now(UTC) + timedelta(minutes=1)).isoformat(),
+        }
+
+        class Ledger:
+            rejected: tuple[object, ...] | None = None
+
+            def trader_command_result(self, *_: object) -> None:
+                return None
+
+            def product_pairs(self) -> list[dict[str, object]]:
+                specification = {
+                    "filling_modes": ["FOK", "IOC"],
+                    "allowed_directions": ["LONG", "SHORT"],
+                    "trade_stops_level": 5,
+                    "volume_min": "0.1",
+                    "volume_max": "100",
+                    "volume_step": "0.1",
+                    "point": "0.00001",
+                    "digits": 5,
+                }
+                return [
+                    {
+                        "product_pair_id": "pair-123",
+                        "status": "active",
+                        "reference_specifications": [
+                            {"server": "Broker-A", "symbol": "EURUSD.a", "specification": specification},
+                            {"server": "Broker-B", "symbol": "EURUSD", "specification": specification},
+                        ],
+                        "source_workers": {
+                            "first_worker": {"worker_id": "worker-a", "server": "Broker-A"},
+                            "second_worker": {"worker_id": "worker-b", "server": "Broker-B"},
+                        },
+                    }
+                ]
+
+            def reject_trader_command(self, *args: object) -> dict[str, object]:
+                self.rejected = args
+                return {"status": "rejected_preflight"}
+
+        ledger = Ledger()
+
+        async def check(connection: object, order: dict[str, object], **_: object) -> dict[str, object]:
+            if connection is first_connection:
+                return {
+                    "type": "order_check_response",
+                    "analysis_id": "order_check",
+                    "request_id": "first",
+                    "accepted": True,
+                    "order": order,
+                }
+            raise LedgerError("Broker rejected the order.")
+
+        with patch("abt.controlplane.service._request_order_check", side_effect=check):
+            result = await _preflight_trader_intent(
+                ledger,  # type: ignore[arg-type]
+                {"worker-a": {first_connection}, "worker-b": {second_connection}},  # type: ignore[arg-type]
+                {},
+                "trader-123",
+                "intent-001",
+                payload,
+            )
+
+        self.assertEqual({"status": "rejected_preflight"}, result)
+        assert ledger.rejected is not None
+        outcomes = ledger.rejected[4]
+        self.assertEqual(["accepted", "rejected"], [outcome["status"] for outcome in outcomes])  # type: ignore[index]
+        self.assertEqual("worker-a", outcomes[0]["worker_id"])  # type: ignore[index]
+        self.assertEqual("worker-b", outcomes[1]["worker_id"])  # type: ignore[index]
+        self.assertEqual("1.23350", outcomes[0]["order"]["sl"])  # type: ignore[index]
+        self.assertEqual("1.23650", outcomes[0]["order"]["tp"])  # type: ignore[index]
 
 
 class MemoryCertificateIssuer:

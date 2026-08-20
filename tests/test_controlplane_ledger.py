@@ -117,6 +117,53 @@ class ControlLedgerTests(unittest.TestCase):
         self.ledger.acknowledge_trader_events("trader-123", second_event, 0, {first_event, second_event})
         self.assertEqual(second_event, self.ledger.trader_event_cursor("trader-123"))
 
+    def test_accepted_intent_is_durable_and_idempotent(self) -> None:
+        enrollment = self.ledger.create_trader_enrollment(
+            strategy_name="mean-reversion",
+            claimed_public_ip="203.0.113.4",
+            public_key_pem="public-key",
+            attestation_provider="TPM",
+        )
+        trader_id = self.ledger.approve_trader_enrollment(
+            enrollment["registration_id"], "ABCDEF", lambda trader_id, *_: f"certificate:{trader_id}"
+        )
+        payload = {
+            "type": "intent",
+            "pair_id": "pair-123",
+            "primary_direction": "LONG",
+            "lots": "0.1",
+            "entry_price": "1.2345",
+            "stop_loss_pips": "10",
+            "take_profit_pips": "20",
+            "filling_mode": "FOK",
+            "expires_at": "2026-08-20T00:05:00+00:00",
+        }
+        preflight = [
+            {"worker_id": "worker-a", "status": "accepted", "order": {"symbol": "EURUSD.a"}},
+            {"worker_id": "worker-b", "status": "accepted", "order": {"symbol": "EURUSD"}},
+        ]
+
+        accepted = self.ledger.accept_trader_intent(trader_id, "intent-001", payload, preflight)
+        replay = self.ledger.accept_trader_intent(trader_id, "intent-001", payload, preflight)
+
+        self.assertEqual(accepted, replay)
+        self.assertEqual("accepted", accepted["status"])
+        self.assertTrue(accepted["intent_id"])
+        self.assertEqual(
+            1,
+            self.ledger._connection.execute(
+                "SELECT count(*) FROM trader_intents WHERE trader_id = ? AND command_id = ?",
+                [trader_id, "intent-001"],
+            ).fetchone()[0],
+        )
+        with self.assertRaisesRegex(LedgerError, "different payload"):
+            self.ledger.accept_trader_intent(
+                trader_id,
+                "intent-001",
+                {**payload, "lots": "0.2"},
+                preflight,
+            )
+
     def test_registration_invite_can_be_revoked_only_before_use(self) -> None:
         invite = self.ledger.create_registration_invite("ABCDEF", "worker")
 

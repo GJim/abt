@@ -575,6 +575,76 @@ class ControlLedger:
             )
             return result
 
+    def accept_trader_intent(
+        self,
+        trader_id: str,
+        command_id: str,
+        payload: dict[str, Any],
+        preflight: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Persist an executable intent only after both broker checks succeeded."""
+
+        canonical_payload = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+        payload_hash = _hash(canonical_payload)
+        if payload.get("type") != "intent":
+            raise LedgerError("Trader command type is invalid.")
+        with self._transaction():
+            if self._connection.execute(
+                "SELECT 1 FROM traders WHERE trader_id = ? AND status = 'active'", [trader_id]
+            ).fetchone() is None:
+                raise LedgerError("Trader is not active.")
+            existing = self._connection.execute(
+                "SELECT payload_hash, result FROM trader_commands WHERE trader_id = ? AND command_id = ?",
+                [trader_id, command_id],
+            ).fetchone()
+            if existing is not None:
+                if existing[0] != payload_hash:
+                    raise LedgerError("Trader command ID was reused with a different payload.")
+                return json.loads(existing[1])
+
+            intent_id = str(uuid4())
+            self._connection.execute(
+                """
+                INSERT INTO trader_intents (intent_id, trader_id, command_id, pair_id, intent, preflight, status, accepted_at)
+                VALUES (?, ?, ?, ?, ?, ?, 'accepted', ?)
+                """,
+                [
+                    intent_id,
+                    trader_id,
+                    command_id,
+                    payload["pair_id"],
+                    canonical_payload,
+                    json.dumps(preflight, separators=(",", ":"), sort_keys=True),
+                    _utc_now(),
+                ],
+            )
+            event_id = self._event(
+                "intent_accepted",
+                {
+                    "trader_id": trader_id,
+                    "command_id": command_id,
+                    "intent_id": intent_id,
+                    "command": payload,
+                    "preflight": preflight,
+                    "preflight_notice": "Broker order checks do not reserve liquidity or guarantee later execution.",
+                },
+            )
+            self._connection.execute(
+                "INSERT INTO trader_events (trader_id, event_id) VALUES (?, ?)", [trader_id, event_id]
+            )
+            result = {
+                "type": "command_result",
+                "command_id": command_id,
+                "status": "accepted",
+                "intent_id": intent_id,
+                "event_id": event_id,
+            }
+            self._connection.execute(
+                "INSERT INTO trader_commands (trader_id, command_id, payload_hash, result, created_at) VALUES (?, ?, ?, ?, ?)",
+                [trader_id, command_id, payload_hash, json.dumps(result, sort_keys=True), _utc_now()],
+            )
+            return result
+
     def reject_trader_command(
         self, trader_id: str, command_id: str, payload: dict[str, Any], reason: str, preflight: list[dict[str, Any]]
     ) -> dict[str, Any]:
@@ -2529,6 +2599,17 @@ class ControlLedger:
                     result JSON NOT NULL,
                     created_at TIMESTAMPTZ NOT NULL,
                     PRIMARY KEY (trader_id, command_id)
+                );
+                CREATE TABLE IF NOT EXISTS trader_intents (
+                    intent_id VARCHAR PRIMARY KEY,
+                    trader_id VARCHAR NOT NULL,
+                    command_id VARCHAR NOT NULL,
+                    pair_id VARCHAR NOT NULL,
+                    intent JSON NOT NULL,
+                    preflight JSON NOT NULL,
+                    status VARCHAR NOT NULL,
+                    accepted_at TIMESTAMPTZ NOT NULL,
+                    UNIQUE (trader_id, command_id)
                 );
                 CREATE TABLE IF NOT EXISTS trader_events (
                     trader_id VARCHAR NOT NULL,
