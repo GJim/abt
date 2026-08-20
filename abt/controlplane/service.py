@@ -639,6 +639,19 @@ def create_app(
         except LedgerError as error:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(error)) from error
 
+    @app.get("/api/admin/intents/{intent_id}")
+    def get_intent_record(
+        intent_id: str,
+        abt_admin_session: Annotated[str | None, Cookie()] = None,
+    ) -> dict[str, object]:
+        """Expose the original request, preflight, and immutable broker lifecycle."""
+
+        _require_admin(ledger, abt_admin_session)
+        try:
+            return ledger.intent_record(intent_id)
+        except LedgerError as error:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
+
     @app.get("/api/admin/worker-snapshots")
     def list_worker_snapshots(
         limit: Annotated[int, Query(ge=1, le=50)] = 50,
@@ -2135,6 +2148,8 @@ async def _preflight_trader_intent(
             _intent_order(intent, reference, primary=index == 0, execution_id=execution_id)
             for index, reference in enumerate(references)
         ]
+        if any(not _valid_intent_order_prices(order, reference["specification"]) for order, reference in zip(orders, references, strict=True)):
+            raise LedgerError("Intent entry or protective prices are not valid for both endpoint price increments.")
         outcomes = [
             {"worker_id": str(worker["worker_id"]), "status": "not_started", "order": order}
             for worker, order in zip(workers, orders, strict=True)
@@ -2411,6 +2426,17 @@ async def _fail_undispatched_accepted_intents_after_startup_reconciliation(
 def _valid_intent_volume(lots: Decimal, specification: dict[str, Any]) -> bool:
     minimum, maximum, step = (Decimal(str(specification[name])) for name in ("volume_min", "volume_max", "volume_step"))
     return minimum <= lots <= maximum and (lots - minimum) % step == 0
+
+
+def _valid_intent_order_prices(order: dict[str, object], specification: dict[str, Any]) -> bool:
+    """Require the shared entry and mapped protections to lie on each symbol's price grid."""
+
+    try:
+        point = Decimal(str(specification["point"]))
+        prices = [Decimal(str(order[field])) for field in ("price", "sl", "tp")]
+    except (KeyError, ValueError, ArithmeticError):
+        return False
+    return point > 0 and all(price > 0 and price % point == 0 for price in prices)
 
 
 def _intent_order(

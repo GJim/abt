@@ -8,16 +8,16 @@ and event recording.
 
 **Status:** ready-for-agent
 
-- [ ] Controller maps shared entry price and directional SL/TP pips to two
+- [x] Controller maps shared entry price and directional SL/TP pips to two
   opposite limit orders, respecting per-symbol pip and stops-level rules.
-- [ ] Dispatch sends only the preflighted order parameters and records broker
+- [x] Dispatch sends only the preflighted order parameters and records broker
   request/response, tickets, prices, volumes, and timestamps immutably.
-- [ ] FOK and IOC are allowed only where both endpoints support the selected
+- [x] FOK and IOC are allowed only where both endpoints support the selected
   mode.
 - [x] IOC retains matched volume, cancels residual orders, and closes
   unmatched exposure at market; it never performs IOC top-up orders.
-- [ ] Single-leg timeout, incomplete entry, protective exit, reconciliation
+- [x] Single-leg timeout, incomplete entry, protective exit, reconciliation
   mismatch, cancellation/close failure, and external change use the existing
   freeze and human-recovery semantics.
-- [ ] Every Trader receives its own lifecycle events; management receives the
+- [x] Every Trader receives its own lifecycle events; management receives the
   full immutable record.

@@ -194,6 +194,72 @@ class ControlLedgerTests(unittest.TestCase):
         self.assertEqual("ioc_matched_volume_retained", event["event_type"])
         self.assertEqual("0.1", event["payload"]["volume"])
 
+    def test_management_intent_record_preserves_exact_broker_request_response_and_timestamps(self) -> None:
+        enrollment = self.ledger.create_trader_enrollment(
+            strategy_name="mean-reversion",
+            claimed_public_ip="203.0.113.4",
+            public_key_pem="public-key",
+            attestation_provider="TPM",
+        )
+        trader_id = self.ledger.approve_trader_enrollment(
+            enrollment["registration_id"], "ABCDEF", lambda trader_id, *_: f"certificate:{trader_id}"
+        )
+        accepted = self.ledger.accept_trader_intent(
+            trader_id, "intent-record-001",
+            {
+                "type": "intent", "pair_id": "pair-123", "primary_direction": "LONG", "lots": "0.1",
+                "entry_price": "1.23450", "stop_loss_pips": "10", "take_profit_pips": "20",
+                "filling_mode": "FOK", "expires_at": "2026-08-20T00:05:00+00:00",
+            },
+            [{"worker_id": "worker-a", "status": "accepted"}, {"worker_id": "worker-b", "status": "accepted"}],
+        )
+        broker_record = {
+            "worker_id": "worker-a",
+            "order": {"price": "1.23450", "volume": "0.1", "control_plane_command_id": "abt:one"},
+            "response": {"ticket": 17, "price": 1.2345, "volume": 0.1, "time": 1724112000},
+        }
+        self.ledger.record_intent_execution(accepted["intent_id"], "intent_leg_dispatched", broker_record)
+        broker_record["response"]["ticket"] = 99
+
+        record = self.ledger.intent_record(accepted["intent_id"])
+
+        self.assertEqual("1.23450", record["intent"]["entry_price"])
+        self.assertEqual(17, record["execution_records"][0]["payload"]["response"]["ticket"])
+        self.assertIsNotNone(record["accepted_at"])
+        self.assertIsNotNone(record["execution_records"][0]["recorded_at"])
+        self.assertIsNotNone(record["execution_records"][0]["occurred_at"])
+
+    def test_external_broker_change_freezes_related_working_intent_for_human_recovery(self) -> None:
+        enrollment = self.ledger.create_trader_enrollment(
+            strategy_name="mean-reversion",
+            claimed_public_ip="203.0.113.4",
+            public_key_pem="public-key",
+            attestation_provider="TPM",
+        )
+        trader_id = self.ledger.approve_trader_enrollment(
+            enrollment["registration_id"], "ABCDEF", lambda trader_id, *_: f"certificate:{trader_id}"
+        )
+        accepted = self.ledger.accept_trader_intent(
+            trader_id, "intent-external-change",
+            {
+                "type": "intent", "pair_id": "pair-123", "primary_direction": "LONG", "lots": "0.1",
+                "entry_price": "1.23450", "stop_loss_pips": "10", "take_profit_pips": "20",
+                "filling_mode": "IOC", "expires_at": "2026-08-20T00:05:00+00:00",
+            },
+            [{"worker_id": "worker-a", "status": "accepted"}, {"worker_id": "worker-b", "status": "accepted"}],
+        )
+        self.ledger.record_intent_execution(accepted["intent_id"], "ioc_orders_placed", {}, status="working")
+
+        self.ledger.record_delta(
+            "worker-a", 1, "2026-08-20T00:00:00+00:00", "position", "42", "created", {"volume": 0.1}
+        )
+
+        record = self.ledger.intent_record(accepted["intent_id"])
+        self.assertEqual("needs_human", record["status"])
+        self.assertEqual("intent_execution_frozen", record["execution_records"][-1]["event_type"])
+        events = self.ledger.trader_events_after(trader_id, 0)
+        self.assertIn("intent_execution_frozen", [event["event_type"] for event in events])
+
     def test_requires_fresh_reconciliation_from_every_worker_before_restart_recovery(self) -> None:
         started_at = datetime.now(UTC)
         stale_at = started_at - timedelta(seconds=1)

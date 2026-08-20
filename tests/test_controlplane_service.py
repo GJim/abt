@@ -39,12 +39,15 @@ from abt.controlplane.ledger import LedgerError
 from abt.controlplane.secrets import SecretStore, SecretStoreError
 from abt.controlplane.service import (
     _analyze_product_catalogs,
+    _dispatch_accepted_trader_intent,
     _delete_expired_pending_secrets,
     _market_data_statistics,
     _preflight_trader_intent,
     _recover_ioc_partial_fill,
     _request_market_data_with_retry,
     _shared_supported_filling_modes,
+    _intent_order,
+    TraderIntentPayload,
     _validated_market_data_response,
     _validated_product_catalog_response,
     create_app,
@@ -126,6 +129,23 @@ class MarketDataRequestTests(unittest.IsolatedAsyncioTestCase):
 
 
 class TraderIntentPreflightTests(unittest.IsolatedAsyncioTestCase):
+    def test_maps_a_shared_entry_and_directional_pip_protections_for_both_legs(self) -> None:
+        payload = {
+            "type": "intent", "pair_id": "pair-123", "primary_direction": "LONG", "lots": "0.1",
+            "entry_price": "1.23450", "stop_loss_pips": "10", "take_profit_pips": "20",
+            "filling_mode": "FOK", "expires_at": (datetime.now(UTC) + timedelta(minutes=1)).isoformat(),
+        }
+        intent = TraderIntentPayload.model_validate(payload)
+        specification = {"point": "0.00001", "digits": 5}
+
+        primary = _intent_order(intent, {"symbol": "EURUSD.a", "specification": specification}, primary=True, execution_id="abt:x")
+        hedge = _intent_order(intent, {"symbol": "EURUSD", "specification": specification}, primary=False, execution_id="abt:x")
+
+        self.assertEqual("1.23450", primary["price"])
+        self.assertEqual(primary["price"], hedge["price"])
+        self.assertEqual(("LONG", "1.23350", "1.23650"), (primary["direction"], primary["sl"], primary["tp"]))
+        self.assertEqual(("SHORT", "1.23550", "1.23250"), (hedge["direction"], hedge["sl"], hedge["tp"]))
+
     async def test_records_the_outcome_from_each_worker_when_one_check_fails(self) -> None:
         first_connection = object()
         second_connection = object()
@@ -225,6 +245,45 @@ class TraderIntentPreflightTests(unittest.IsolatedAsyncioTestCase):
         disconnected_outcomes = disconnected_ledger.rejected[4]
         self.assertEqual(["not_started", "rejected"], [outcome["status"] for outcome in disconnected_outcomes])  # type: ignore[index]
 
+    async def test_rejects_a_filling_mode_not_admitted_by_both_endpoints(self) -> None:
+        class Ledger:
+            def trader_command_result(self, *_: object) -> None:
+                return None
+
+            def product_pairs(self) -> list[dict[str, object]]:
+                specification = {
+                    "allowed_directions": ["LONG", "SHORT"], "trade_stops_level": 5,
+                    "volume_min": "0.1", "volume_max": "100", "volume_step": "0.1",
+                    "point": "0.00001", "digits": 5,
+                }
+                return [{
+                    "product_pair_id": "pair-123", "status": "active",
+                    "reference_specifications": [
+                        {"server": "Broker-A", "symbol": "EURUSD.a", "specification": {**specification, "filling_modes": ["FOK", "IOC"]}},
+                        {"server": "Broker-B", "symbol": "EURUSD", "specification": {**specification, "filling_modes": ["IOC"]}},
+                    ],
+                    "source_workers": {
+                        "first_worker": {"worker_id": "worker-a", "server": "Broker-A"},
+                        "second_worker": {"worker_id": "worker-b", "server": "Broker-B"},
+                    },
+                }]
+
+            def reject_trader_command(self, *_: object) -> dict[str, object]:
+                return {"status": "rejected_preflight"}
+
+        result = await _preflight_trader_intent(
+            Ledger(),  # type: ignore[arg-type]
+            {}, {},
+            "trader-123", "intent-fok-unshared",
+            {
+                "type": "intent", "pair_id": "pair-123", "primary_direction": "LONG", "lots": "0.1",
+                "entry_price": "1.23450", "stop_loss_pips": "10", "take_profit_pips": "20",
+                "filling_mode": "FOK", "expires_at": (datetime.now(UTC) + timedelta(minutes=1)).isoformat(),
+            },
+        )
+
+        self.assertEqual({"status": "rejected_preflight"}, result)
+
 
 class IocRecoveryTests(unittest.IsolatedAsyncioTestCase):
     async def test_cancels_then_reconciles_then_closes_only_unmatched_exposure(self) -> None:
@@ -273,6 +332,74 @@ class IocRecoveryTests(unittest.IsolatedAsyncioTestCase):
              "ioc_unmatched_exposure_closed", "ioc_recovery_completed"],
             [event[0] for event in events],
         )
+
+    async def test_cancellation_or_reconciliation_failure_freezes_for_human_recovery(self) -> None:
+        events: list[tuple[str, dict[str, object], str | None]] = []
+
+        class Ledger:
+            def record_intent_execution(
+                self, _intent_id: str, event_type: str, payload: dict[str, object], *, status: str | None = None
+            ) -> None:
+                events.append((event_type, payload, status))
+
+        async def failed_recovery(*_: object, **__: object) -> dict[str, object]:
+            raise LedgerError("Worker did not confirm execution_cancel.")
+
+        with (
+            patch("abt.controlplane.service._connected_worker_session", side_effect=[object(), object()]),
+            patch("abt.controlplane.service._reconcile_execution", side_effect=[
+                [{"orders": [{"ticket": "101", "volume": "0.1"}], "positions": []}, {"orders": [], "positions": []}],
+            ]),
+            patch("abt.controlplane.service._execution_recovery_request", side_effect=failed_recovery),
+        ):
+            await _recover_ioc_partial_fill(
+                Ledger(),  # type: ignore[arg-type]
+                {"worker-a": {object()}, "worker-b": {object()}}, {}, "intent-123",
+                [
+                    {"worker_id": "worker-a", "order": {"control_plane_command_id": "abt:correlated"}},
+                    {"worker_id": "worker-b", "order": {"control_plane_command_id": "abt:correlated"}},
+                ],
+            )
+
+        self.assertEqual(("intent_execution_frozen", "needs_human"), (events[-1][0], events[-1][2]))
+
+    async def test_single_leg_execution_timeout_enters_incomplete_entry_recovery(self) -> None:
+        events: list[tuple[str, str | None]] = []
+        recovered: list[str] = []
+
+        class Ledger:
+            def claim_accepted_intent_dispatch(self, _intent_id: str) -> bool:
+                return True
+
+            def record_intent_execution(
+                self, _intent_id: str, event_type: str, _payload: dict[str, object], *, status: str | None = None
+            ) -> None:
+                events.append((event_type, status))
+
+        async def execution(*args: object, **_: object) -> dict[str, object]:
+            if args[0] == "first":
+                raise asyncio.TimeoutError
+            return {"accepted": True, "order": args[1], "result": {"ticket": 12}}
+
+        async def recovery(*args: object, **_: object) -> None:
+            recovered.append(str(args[3]))
+
+        outcomes = [
+            {"worker_id": "worker-a", "order": {"control_plane_command_id": "abt:correlated"}},
+            {"worker_id": "worker-b", "order": {"control_plane_command_id": "abt:correlated"}},
+        ]
+        with (
+            patch("abt.controlplane.service._connected_worker_session", side_effect=["first", "second"]),
+            patch("abt.controlplane.service._request_order_execute", side_effect=execution),
+            patch("abt.controlplane.service._recover_ioc_partial_fill", side_effect=recovery),
+        ):
+            await _dispatch_accepted_trader_intent(
+                Ledger(),  # type: ignore[arg-type]
+                {"worker-a": {object()}, "worker-b": {object()}}, {}, "intent-123", "FOK", outcomes
+            )
+
+        self.assertIn(("incomplete_entry_detected", "working"), events)
+        self.assertEqual(["intent-123"], recovered)
 
 
 class MemoryCertificateIssuer:

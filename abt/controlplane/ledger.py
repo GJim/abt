@@ -329,7 +329,7 @@ class ControlLedger:
                     registration_invite_hash,
                 ],
             )
-            self._event(
+            event_id = self._event(
                 "worker_enrollment_requested",
                 {"enrollment_id": enrollment.enrollment_id, "login": login, "server": server},
             )
@@ -420,7 +420,7 @@ class ControlLedger:
                 """,
                 [approved_by, now, registration_id],
             )
-            self._event(
+            event_id = self._event(
                 "trader_enrollment_approved",
                 {"registration_id": registration_id, "trader_id": trader_id, "approved_by": approved_by},
             )
@@ -704,6 +704,46 @@ class ControlLedger:
                     "UPDATE trader_intents SET status = ? WHERE intent_id = ?", [status, intent_id]
                 )
             return event_id
+
+    def intent_record(self, intent_id: str) -> dict[str, Any]:
+        """Return the complete append-only execution record for management review."""
+
+        with self._lock:
+            intent = self._connection.execute(
+                """SELECT intent_id, trader_id, command_id, pair_id, intent, preflight, status, accepted_at
+                   FROM trader_intents WHERE intent_id = ?""",
+                [intent_id],
+            ).fetchone()
+            if intent is None:
+                raise LedgerError("Intent does not exist.")
+            records = self._connection.execute(
+                """SELECT r.event_id, r.event_type, r.payload, r.recorded_at, e.occurred_at
+                   FROM trader_intent_execution_records r
+                   JOIN events e ON e.event_id = r.event_id
+                   WHERE r.intent_id = ?
+                   ORDER BY r.event_id""",
+                [intent_id],
+            ).fetchall()
+        return {
+            "intent_id": intent[0],
+            "trader_id": intent[1],
+            "command_id": intent[2],
+            "pair_id": intent[3],
+            "intent": json.loads(intent[4]),
+            "preflight": json.loads(intent[5]),
+            "status": intent[6],
+            "accepted_at": intent[7],
+            "execution_records": [
+                {
+                    "event_id": row[0],
+                    "event_type": row[1],
+                    "payload": json.loads(row[2]),
+                    "recorded_at": row[3],
+                    "occurred_at": row[4],
+                }
+                for row in records
+            ],
+        }
 
     def claim_accepted_intent_dispatch(self, intent_id: str) -> bool:
         """Atomically reserve an accepted intent for one dispatcher."""
@@ -1023,6 +1063,40 @@ class ControlLedger:
                     {"worker_id": worker_id, "cursor": cursor, "entity": entity, "ticket": ticket, "change": change},
                 )
                 self._alert(worker_id, "high", "external_broker_change", "unattributed_broker_change")
+                affected = self._connection.execute(
+                    """SELECT intent_id, trader_id FROM trader_intents
+                       WHERE status IN ('dispatching', 'working')
+                         AND CAST(preflight AS VARCHAR) LIKE ?""",
+                    [f"%{worker_id}%"],
+                ).fetchall()
+                for intent_id, trader_id in affected:
+                    payload = {
+                        "worker_id": worker_id,
+                        "cursor": cursor,
+                        "entity": entity,
+                        "ticket": ticket,
+                        "change": change,
+                        "reason": "Unattributed external broker change requires human recovery.",
+                    }
+                    execution_event_id = self._event(
+                        "intent_execution_frozen",
+                        {"intent_id": intent_id, **payload},
+                    )
+                    self._connection.execute(
+                        """INSERT INTO trader_intent_execution_records
+                           (intent_id, event_id, event_type, payload, recorded_at)
+                           VALUES (?, ?, ?, ?, ?)""",
+                        [intent_id, execution_event_id, "intent_execution_frozen",
+                         json.dumps(payload, separators=(",", ":"), sort_keys=True), _utc_now()],
+                    )
+                    self._connection.execute(
+                        "INSERT INTO trader_events (trader_id, event_id) VALUES (?, ?)",
+                        [trader_id, execution_event_id],
+                    )
+                    self._connection.execute(
+                        "UPDATE trader_intents SET status = 'needs_human' WHERE intent_id = ?",
+                        [intent_id],
+                    )
 
     def worker_reconciliation(self) -> list[dict[str, Any]]:
         now = _utc_now()
