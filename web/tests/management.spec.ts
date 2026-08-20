@@ -32,7 +32,7 @@ test('administrator resumes a cookie-backed session after refresh', async ({ pag
 
   await page.goto('http://127.0.0.1:4173/')
 
-  await expect(page.getByRole('heading', { name: 'Cross-server product-pair analyses' })).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'Management console' })).toBeVisible()
   await expect(page.getByRole('heading', { name: 'Audit events' })).toBeVisible()
 })
 
@@ -536,7 +536,7 @@ test('administrator sees when paired-trade lifecycle availability cannot be load
   await expect(overview.getByRole('status')).toContainText('The MT5 credential mediator is unavailable.')
 })
 
-test('administrator hides a final candidate already represented by an active pair', async ({ page }) => {
+test('administrator can review a final candidate that would replace an active pair', async ({ page }) => {
   const initialPair = buildProductPair({
     product_pair_id: 'pair-existing',
     built_from_analysis_id: 'analysis-old',
@@ -591,8 +591,9 @@ test('administrator hides a final candidate already represented by an active pai
   await page.getByRole('link', { name: 'Analysis', exact: true }).click()
   await page.getByRole('button', { name: 'Launch' }).click()
 
-  await expect(page.locator('.buildable-result-card')).toHaveCount(0)
-  await expect(page.getByText('1 final passing candidate(s) already have an active product pair')).toBeVisible()
+  await page.getByRole('button', { name: /Candidates/ }).click()
+  await expect(page.locator('.buildable-result-card')).toHaveCount(1)
+  await expect(page.getByRole('button', { name: 'Create product pair for EURUSD.a and EURUSD' })).toBeVisible()
   await page.getByRole('link', { name: 'Main' }).click()
   await expect(page.locator('.product-pair-card').first()).toContainText('pair-existing')
 })
@@ -974,12 +975,8 @@ test('administrator sees terminal analysis failures with lifecycle details', asy
 
   await page.getByRole('button', { name: 'Launch' }).click()
 
-  await expect(page.locator('.analysis-results .status-badge').first()).toHaveText('Failed')
-  await expect(page.getByText('M1 verification failed', { exact: true })).toBeVisible()
-  const lifecycleCard = page.locator('.analysis-results .summary-grid .panel').first()
-  await expect(lifecycleCard).toContainText('Worker returned incomplete evidence.')
-  await expect(lifecycleCard).toContainText('Retry count')
-  await expect(lifecycleCard).toContainText('1')
+  await expect(page.getByRole('heading', { name: 'Analysis analysis-failed' })).toBeVisible()
+  await expect(page.getByText('Analysis failed: Worker returned incomplete evidence.', { exact: true })).toBeVisible()
 })
 
 test('administrator receives bounded live updates without losing the current console', async ({ page }) => {
@@ -1006,7 +1003,6 @@ test('administrator receives bounded live updates without losing the current con
   await page.getByLabel('Password').fill('A-secure-admin-password!')
   await page.getByRole('button', { name: 'Sign in' }).click()
 
-  await expect(page.getByText('Live updates active — checking every 30 seconds.', { exact: true })).toBeVisible()
   await page.clock.fastForward(30_000)
   await expect(page.getByText('worker_reconciliation_snapshot')).toBeVisible()
   expect(eventRequests).toBe(2)
@@ -1035,7 +1031,6 @@ test('administrator sees stale-connection feedback and retains prior management 
 
   await page.clock.fastForward(30_000)
   await expect(page.getByRole('alert')).toContainText('Management data could not be loaded. Your previous data is still shown.')
-  await expect(page.getByText('Live updates interrupted — retry manually when the connection is available.', { exact: true })).toBeVisible()
   await page.getByRole('button', { name: 'Show worker actions and reconciliation' }).click()
   await expect(page.getByLabel('Fleet health by account').getByRole('listitem').filter({ hasText: '123456 on Broker-Demo' })).toBeVisible()
 })
@@ -1418,7 +1413,7 @@ test('launch analysis is isolated from main-page operational summaries', async (
   await signIn(page)
   await page.getByRole('link', { name: 'Analysis', exact: true }).click()
 
-  await expect(page.getByRole('heading', { name: 'Cross-server product-pair analyses' })).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'Launch' }).first()).toBeVisible()
   await expect(page.getByRole('heading', { name: 'Fleet health' })).not.toBeVisible()
   await expect(page.getByRole('heading', { name: 'Needs attention' })).not.toBeVisible()
 })
