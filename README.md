@@ -48,6 +48,23 @@ Enrollment output reports `pending_approval` until an administrator approves
 the worker. Existing identity configuration is protected; use
 `abt-worker enroll --replace-config` only to replace it deliberately.
 
+## Trader enrollment and event connection
+
+On native Windows, `abt-trader enroll` prompts for omitted controller URL,
+registration invite, strategy name, and a confirmed public-IP declaration. It
+uses `https://api.ipify.org` only when `--public-ip` is omitted. The invite,
+device private key, and Trader certificate are never written to disk.
+
+```powershell
+abt-trader enroll
+abt-trader connect
+```
+
+`connect` keeps a foreground authenticated WSS session, writes lifecycle
+events as JSON Lines to standard output, and sends diagnostics to standard
+error. Existing Trader identity configuration is protected; use
+`abt-trader enroll --replace-config` only for deliberate replacement.
+
 If the current context has open orders or positions, an interactive switch
 requires confirmation. `--yes` bypasses that prompt.
 

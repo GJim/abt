@@ -472,6 +472,17 @@ class ControlLedger:
             [registration_id],
         )
 
+    def trader_enrollment_status(self, registration_id: str) -> str:
+        """Return the current status for a Trader's external enrollment identifier."""
+
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT status FROM trader_enrollments WHERE registration_id = ?", [registration_id]
+            ).fetchone()
+        if row is None:
+            raise LedgerError("Trader enrollment does not exist.")
+        return str(row[0])
+
     def active_trader(self, trader_id: str) -> ActiveTrader:
         return self._active_trader(
             """

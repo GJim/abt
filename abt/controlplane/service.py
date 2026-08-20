@@ -527,6 +527,13 @@ def create_app(
         except LedgerError as error:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
 
+    @app.get("/api/traders/enrollments/{registration_id}/status")
+    def trader_enrollment_status(registration_id: str) -> dict[str, str]:
+        try:
+            return {"status": ledger.trader_enrollment_status(registration_id)}
+        except LedgerError as error:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
+
     @app.get("/api/admin/traders/enrollments")
     def list_trader_enrollments(
         abt_admin_session: Annotated[str | None, Cookie()] = None,
