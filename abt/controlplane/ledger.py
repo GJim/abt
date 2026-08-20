@@ -673,6 +673,136 @@ class ControlLedger:
             )
             return result
 
+    def request_trader_intent_cancellation(
+        self, trader_id: str, command_id: str, payload: dict[str, Any]
+    ) -> tuple[dict[str, Any], list[dict[str, Any]], bool]:
+        """Atomically suppress undispatched work before scheduling a Trader's cancellation."""
+
+        if payload.get("type") != "cancel" or not isinstance(payload.get("intent_id"), str):
+            raise LedgerError("Trader cancellation command is invalid.")
+        canonical_payload = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+        payload_hash = _hash(canonical_payload)
+        intent_id = payload["intent_id"]
+        with self._transaction():
+            existing = self._connection.execute(
+                "SELECT payload_hash, result FROM trader_commands WHERE trader_id = ? AND command_id = ?",
+                [trader_id, command_id],
+            ).fetchone()
+            if existing is not None:
+                if existing[0] != payload_hash:
+                    raise LedgerError("Trader command ID was reused with a different payload.")
+                result = json.loads(existing[1])
+                return result, self._intent_preflight(intent_id), False
+            intent = self._connection.execute(
+                """SELECT preflight, status FROM trader_intents
+                   WHERE intent_id = ? AND trader_id = ?""",
+                [intent_id, trader_id],
+            ).fetchone()
+            if intent is None:
+                raise LedgerError("Trader cannot cancel an intent it does not own.")
+            if intent[1] not in {"accepted", "dispatching", "working"}:
+                raise LedgerError("Intent is not eligible for ordinary cancellation.")
+            self._connection.execute(
+                "UPDATE trader_intents SET status = 'cancelling' WHERE intent_id = ?", [intent_id]
+            )
+            event_id = self._event(
+                "cancellation_scheduled",
+                {"trader_id": trader_id, "command_id": command_id, "intent_id": intent_id},
+            )
+            self._connection.execute(
+                "INSERT INTO trader_events (trader_id, event_id) VALUES (?, ?)", [trader_id, event_id]
+            )
+            self._connection.execute(
+                """INSERT INTO trader_intent_execution_records (intent_id, event_id, event_type, payload, recorded_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                [intent_id, event_id, "cancellation_scheduled", "{}", _utc_now()],
+            )
+            result = {
+                "type": "command_result",
+                "command_id": command_id,
+                "status": "cancellation_scheduled",
+                "intent_id": intent_id,
+                "event_id": event_id,
+            }
+            self._connection.execute(
+                "INSERT INTO trader_commands (trader_id, command_id, payload_hash, result, created_at) VALUES (?, ?, ?, ?, ?)",
+                [trader_id, command_id, payload_hash, json.dumps(result, sort_keys=True), _utc_now()],
+            )
+            return result, json.loads(intent[0]), True
+
+    def request_management_intent_operation(
+        self, username: str, command_id: str, intent_id: str, operation: str
+    ) -> tuple[dict[str, Any], list[dict[str, Any]], bool]:
+        """Durably schedule an administrator cancellation or emergency flatten."""
+
+        if operation not in {"cancel", "emergency_flatten"}:
+            raise LedgerError("Management intent operation is invalid.")
+        payload = {"intent_id": intent_id, "type": operation}
+        payload_hash = _hash(json.dumps(payload, separators=(",", ":"), sort_keys=True))
+        with self._transaction():
+            existing = self._connection.execute(
+                "SELECT payload_hash, result FROM management_intent_commands WHERE username = ? AND command_id = ?",
+                [username, command_id],
+            ).fetchone()
+            if existing is not None:
+                if existing[0] != payload_hash:
+                    raise LedgerError("Management command ID was reused with a different payload.")
+                return json.loads(existing[1]), self._intent_preflight(intent_id), False
+            intent = self._connection.execute(
+                "SELECT trader_id, preflight, status FROM trader_intents WHERE intent_id = ?", [intent_id]
+            ).fetchone()
+            if intent is None:
+                raise LedgerError("Intent does not exist.")
+            if intent[2] not in {"accepted", "dispatching", "working", "cancelling"}:
+                raise LedgerError("Intent is not eligible for this management operation.")
+            self._connection.execute(
+                "UPDATE trader_intents SET status = 'cancelling' WHERE intent_id = ?", [intent_id]
+            )
+            event_type = "emergency_flatten_scheduled" if operation == "emergency_flatten" else "cancellation_scheduled"
+            event_id = self._event(
+                event_type, {"username": username, "command_id": command_id, "intent_id": intent_id}
+            )
+            self._connection.execute(
+                "INSERT INTO trader_events (trader_id, event_id) VALUES (?, ?)", [intent[0], event_id]
+            )
+            self._connection.execute(
+                """INSERT INTO trader_intent_execution_records (intent_id, event_id, event_type, payload, recorded_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                [intent_id, event_id, event_type, "{}", _utc_now()],
+            )
+            result = {
+                "command_id": command_id,
+                "status": "emergency_flatten_scheduled" if operation == "emergency_flatten" else "cancellation_scheduled",
+                "intent_id": intent_id,
+                "event_id": event_id,
+            }
+            self._connection.execute(
+                """INSERT INTO management_intent_commands (username, command_id, payload_hash, result, created_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                [username, command_id, payload_hash, json.dumps(result, sort_keys=True), _utc_now()],
+            )
+            return result, json.loads(intent[1]), True
+
+    def claim_scheduled_intent_operation(self, intent_id: str) -> bool:
+        """Ensure exactly one process executes a persisted cancellation request."""
+
+        with self._transaction():
+            claimed = self._connection.execute(
+                """UPDATE trader_intents SET status = 'cancellation_executing'
+                   WHERE intent_id = ? AND status = 'cancelling'
+                   RETURNING intent_id""",
+                [intent_id],
+            ).fetchone()
+            return claimed is not None
+
+    def _intent_preflight(self, intent_id: str) -> list[dict[str, Any]]:
+        row = self._connection.execute(
+            "SELECT preflight FROM trader_intents WHERE intent_id = ?", [intent_id]
+        ).fetchone()
+        if row is None:
+            raise LedgerError("Intent does not exist.")
+        return json.loads(row[0])
+
     def record_intent_execution(
         self,
         intent_id: str,
@@ -761,7 +891,7 @@ class ControlLedger:
         with self._lock:
             rows = self._connection.execute(
                 """SELECT intent_id, intent, preflight, status FROM trader_intents
-                   WHERE status IN ('accepted', 'dispatching') ORDER BY accepted_at"""
+                   WHERE status IN ('accepted', 'dispatching', 'cancelling') ORDER BY accepted_at"""
             ).fetchall()
         return [
             {"intent_id": row[0], "intent": json.loads(row[1]), "preflight": json.loads(row[2]), "status": row[3]}
@@ -2764,6 +2894,14 @@ class ControlLedger:
                     result JSON NOT NULL,
                     created_at TIMESTAMPTZ NOT NULL,
                     PRIMARY KEY (trader_id, command_id)
+                );
+                CREATE TABLE IF NOT EXISTS management_intent_commands (
+                    username VARCHAR NOT NULL,
+                    command_id VARCHAR NOT NULL,
+                    payload_hash VARCHAR NOT NULL,
+                    result JSON NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL,
+                    PRIMARY KEY (username, command_id)
                 );
                 CREATE TABLE IF NOT EXISTS trader_intents (
                     intent_id VARCHAR PRIMARY KEY,

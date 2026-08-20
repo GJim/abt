@@ -39,6 +39,7 @@ from abt.controlplane.ledger import LedgerError
 from abt.controlplane.secrets import SecretStore, SecretStoreError
 from abt.controlplane.service import (
     _analyze_product_catalogs,
+    _cancel_intent,
     _dispatch_accepted_trader_intent,
     _delete_expired_pending_secrets,
     _market_data_statistics,
@@ -47,6 +48,7 @@ from abt.controlplane.service import (
     _request_market_data_with_retry,
     _shared_supported_filling_modes,
     _intent_order,
+    _flatten_intent,
     TraderIntentPayload,
     _validated_market_data_response,
     _validated_product_catalog_response,
@@ -362,6 +364,117 @@ class IocRecoveryTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(("intent_execution_frozen", "needs_human"), (events[-1][0], events[-1][2]))
+
+
+class IntentCancellationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cancels_zero_fill_orders_and_emits_terminal_event_after_reconciliation(self) -> None:
+        events: list[tuple[str, str | None]] = []
+        operations: list[tuple[str, dict[str, str]]] = []
+
+        class Ledger:
+            def record_intent_execution(
+                self, _intent_id: str, event_type: str, _payload: dict[str, object], *, status: str | None = None
+            ) -> None:
+                events.append((event_type, status))
+
+        async def recover(_connection: object, operation: str, payload: dict[str, str]) -> dict[str, object]:
+            operations.append((operation, payload))
+            return {"accepted": True, "operation": operation, "result": {"retcode": 10009}}
+
+        with (
+            patch("abt.controlplane.service._connected_worker_session", side_effect=[object(), object()]),
+            patch("abt.controlplane.service._reconcile_execution", side_effect=[
+                [{"orders": [{"ticket": "101", "volume": "0.1"}], "positions": []}, {"orders": [{"ticket": "102", "volume": "0.1"}], "positions": []}],
+                [{"orders": [], "positions": []}, {"orders": [], "positions": []}],
+            ]),
+            patch("abt.controlplane.service._execution_recovery_request", side_effect=recover),
+        ):
+            await _cancel_intent(
+                Ledger(),  # type: ignore[arg-type]
+                {"worker-a": {object()}, "worker-b": {object()}}, {},
+                "intent-123",
+                [
+                    {"worker_id": "worker-a", "order": {"control_plane_command_id": "abt:correlated"}},
+                    {"worker_id": "worker-b", "order": {"control_plane_command_id": "abt:correlated"}},
+                ],
+            )
+
+        self.assertEqual(
+            [("execution_cancel", {"ticket": "101", "volume": "0.1"}), ("execution_cancel", {"ticket": "102", "volume": "0.1"})],
+            operations,
+        )
+        self.assertEqual(("cancelled", "cancelled"), events[-1])
+
+    async def test_rejects_cancellation_when_reconciliation_observes_a_fill(self) -> None:
+        events: list[tuple[str, str | None]] = []
+
+        class Ledger:
+            def record_intent_execution(
+                self, _intent_id: str, event_type: str, _payload: dict[str, object], *, status: str | None = None
+            ) -> None:
+                events.append((event_type, status))
+
+        with (
+            patch("abt.controlplane.service._connected_worker_session", side_effect=[object(), object()]),
+            patch("abt.controlplane.service._reconcile_execution", return_value=[
+                {"orders": [], "positions": [{"ticket": "201", "volume": "0.1"}]}, {"orders": [], "positions": []}
+            ]),
+            patch("abt.controlplane.service._recover_ioc_partial_fill"),
+        ):
+            await _cancel_intent(
+                Ledger(),  # type: ignore[arg-type]
+                {"worker-a": {object()}, "worker-b": {object()}}, {},
+                "intent-123",
+                [
+                    {"worker_id": "worker-a", "order": {"control_plane_command_id": "abt:correlated"}},
+                    {"worker_id": "worker-b", "order": {"control_plane_command_id": "abt:correlated"}},
+                ],
+            )
+
+        self.assertEqual(("rejected_due_to_fill", "working"), events[-1])
+
+    async def test_emergency_flatten_cancels_orders_and_closes_all_positions(self) -> None:
+        events: list[tuple[str, str | None]] = []
+        operations: list[tuple[str, dict[str, str]]] = []
+
+        class Ledger:
+            def record_intent_execution(
+                self, _intent_id: str, event_type: str, _payload: dict[str, object], *, status: str | None = None
+            ) -> None:
+                events.append((event_type, status))
+
+        async def recover(_connection: object, operation: str, payload: dict[str, str]) -> dict[str, object]:
+            operations.append((operation, payload))
+            return {"accepted": True, "operation": operation, "result": {"retcode": 10009}}
+
+        with (
+            patch("abt.controlplane.service._connected_worker_session", side_effect=[object(), object()]),
+            patch("abt.controlplane.service._reconcile_execution", side_effect=[
+                [{"orders": [{"ticket": "101", "volume": "0.1"}], "positions": [{"ticket": "201", "volume": "0.1"}]},
+                 {"orders": [], "positions": [{"ticket": "202", "volume": "0.1"}]}],
+                [{"orders": [], "positions": []}, {"orders": [], "positions": []}],
+            ]),
+            patch("abt.controlplane.service._execution_recovery_request", side_effect=recover),
+        ):
+            await _flatten_intent(
+                Ledger(),  # type: ignore[arg-type]
+                {"worker-a": {object()}, "worker-b": {object()}}, {},
+                "intent-123",
+                [
+                    {"worker_id": "worker-a", "order": {"control_plane_command_id": "abt:correlated"}},
+                    {"worker_id": "worker-b", "order": {"control_plane_command_id": "abt:correlated"}},
+                ],
+            )
+
+        self.assertEqual(
+            [
+                ("execution_cancel", {"ticket": "101", "volume": "0.1"}),
+                ("execution_close", {"ticket": "201", "volume": "0.1"}),
+                ("execution_close", {"ticket": "202", "volume": "0.1"}),
+            ],
+            operations,
+        )
+        self.assertEqual(("emergency_flattened", "cancelled"), events[-1])
 
     async def test_single_leg_execution_timeout_enters_incomplete_entry_recovery(self) -> None:
         events: list[tuple[str, str | None]] = []

@@ -131,6 +131,17 @@ class TraderIntentPayload(BaseModel):
         return value.astimezone(UTC)
 
 
+class TraderIntentCancellationPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["cancel"]
+    intent_id: str = Field(min_length=1)
+
+
+class ManagementIntentCommandRequest(BaseModel):
+    command_id: str = Field(min_length=1, max_length=128)
+
+
 class ProductCatalogAnalysisPolicy(BaseModel):
     label: str = Field(min_length=1, max_length=128)
     require_equal_base_currency: bool = True
@@ -651,6 +662,46 @@ def create_app(
             return ledger.intent_record(intent_id)
         except LedgerError as error:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
+
+    @app.post("/api/admin/intents/{intent_id}/cancel")
+    async def cancel_intent(
+        intent_id: str,
+        body: ManagementIntentCommandRequest,
+        abt_admin_session: Annotated[str | None, Cookie()] = None,
+        x_csrf_token: Annotated[str | None, Header()] = None,
+    ) -> dict[str, object]:
+        username = _require_admin(ledger, abt_admin_session, x_csrf_token, require_csrf=True)
+        try:
+            result, preflight, scheduled = ledger.request_management_intent_operation(
+                username, body.command_id, intent_id, "cancel"
+            )
+            if scheduled:
+                asyncio.create_task(
+                    _cancel_intent(ledger, worker_connections, worker_execution_locks, intent_id, preflight)
+                )
+            return result
+        except LedgerError as error:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
+
+    @app.post("/api/admin/intents/{intent_id}/emergency-flatten")
+    async def flatten_intent(
+        intent_id: str,
+        body: ManagementIntentCommandRequest,
+        abt_admin_session: Annotated[str | None, Cookie()] = None,
+        x_csrf_token: Annotated[str | None, Header()] = None,
+    ) -> dict[str, object]:
+        username = _require_admin(ledger, abt_admin_session, x_csrf_token, require_csrf=True)
+        try:
+            result, preflight, scheduled = ledger.request_management_intent_operation(
+                username, body.command_id, intent_id, "emergency_flatten"
+            )
+            if scheduled:
+                asyncio.create_task(
+                    _flatten_intent(ledger, worker_connections, worker_execution_locks, intent_id, preflight)
+                )
+            return result
+        except LedgerError as error:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
 
     @app.get("/api/admin/worker-snapshots")
     def list_worker_snapshots(
@@ -1326,8 +1377,20 @@ def create_app(
                             message["command_id"],
                             payload,
                         )
+                    elif payload.get("type") == "cancel":
+                        cancellation = TraderIntentCancellationPayload.model_validate(payload)
+                        result, preflight, scheduled = ledger.request_trader_intent_cancellation(
+                            trader.trader_id, message["command_id"], cancellation.model_dump(mode="json")
+                        )
+                        if scheduled:
+                            asyncio.create_task(
+                                _cancel_intent(
+                                    ledger, worker_connections, worker_execution_locks,
+                                    cancellation.intent_id, preflight,
+                                )
+                            )
                     else:
-                        result = ledger.submit_trader_command(trader.trader_id, message["command_id"], payload)
+                        raise ValueError("Invalid Trader command.")
                     await websocket.send_json(result)
                     await deliver_events_after(last_delivered_event_id)
                 else:
@@ -1455,7 +1518,7 @@ def create_app(
                     await websocket.send_json({"type": "accepted", "cursor": request["cursor"]})
                     asyncio.create_task(
                         _fail_undispatched_accepted_intents_after_startup_reconciliation(
-                            ledger, startup_reconciliation_started_at
+                            ledger, startup_reconciliation_started_at, worker_connections, worker_execution_locks
                         )
                     )
                 elif message_type == "delta":
@@ -2343,6 +2406,98 @@ async def _recover_ioc_partial_fill(
         _freeze_intent_execution(ledger, intent_id, f"IOC recovery could not be proven safe: {error}")
 
 
+async def _cancel_intent(
+    ledger: ControlLedger,
+    worker_connections: dict[str, set[_WorkerSessionConnection]],
+    worker_execution_locks: dict[str, asyncio.Lock],
+    intent_id: str,
+    outcomes: list[dict[str, object]],
+) -> None:
+    """Cancel zero-fill orders and prove both legs remain unfilled before terminalizing."""
+
+    await _operate_on_intent_exposure(
+        ledger, worker_connections, worker_execution_locks, intent_id, outcomes, emergency_flatten=False
+    )
+
+
+async def _flatten_intent(
+    ledger: ControlLedger,
+    worker_connections: dict[str, set[_WorkerSessionConnection]],
+    worker_execution_locks: dict[str, asyncio.Lock],
+    intent_id: str,
+    outcomes: list[dict[str, object]],
+) -> None:
+    """Cancel remaining orders and close all observed exposure for an administrator."""
+
+    await _operate_on_intent_exposure(
+        ledger, worker_connections, worker_execution_locks, intent_id, outcomes, emergency_flatten=True
+    )
+
+
+async def _operate_on_intent_exposure(
+    ledger: ControlLedger,
+    worker_connections: dict[str, set[_WorkerSessionConnection]],
+    worker_execution_locks: dict[str, asyncio.Lock],
+    intent_id: str,
+    outcomes: list[dict[str, object]],
+    *,
+    emergency_flatten: bool,
+) -> None:
+    operation = "Emergency flatten" if emergency_flatten else "Cancellation"
+    claim = getattr(ledger, "claim_scheduled_intent_operation", None)
+    if callable(claim) and not claim(intent_id):
+        return
+    fill_observed = False
+    try:
+        worker_ids = [str(outcome["worker_id"]) for outcome in outcomes]
+        execution_ids = {
+            str(cast(dict[str, object], outcome["order"])["control_plane_command_id"]) for outcome in outcomes
+        }
+        if len(worker_ids) != 2 or len(set(worker_ids)) != 2 or len(execution_ids) != 1:
+            raise LedgerError(f"{operation} has malformed execution evidence.")
+        execution_id = execution_ids.pop()
+        connections = [_connected_worker_session(worker_connections, worker_id) for worker_id in worker_ids]
+        async with _pair_worker_execution(worker_execution_locks, *worker_ids):
+            observed = await _reconcile_execution(connections, execution_id)
+            ledger.record_intent_execution(
+                intent_id,
+                "emergency_flatten_reconciled" if emergency_flatten else "cancellation_reconciled",
+                {"execution_id": execution_id, "legs": observed},
+            )
+            if not emergency_flatten and any(leg["positions"] for leg in observed):
+                ledger.record_intent_execution(
+                    intent_id, "rejected_due_to_fill", {"execution_id": execution_id, "legs": observed}, status="working"
+                )
+                fill_observed = True
+            if not fill_observed:
+                if emergency_flatten and not any(leg["positions"] for leg in observed):
+                    raise LedgerError("Emergency flatten requires filled exposure.")
+                for connection, leg in zip(connections, observed, strict=True):
+                    for order in leg["orders"]:
+                        await _execution_recovery_request(
+                            connection, "execution_cancel", {"ticket": order["ticket"], "volume": order["volume"]}
+                        )
+                for connection, leg in zip(connections, observed, strict=True):
+                    for position in leg["positions"]:
+                        await _execution_recovery_request(
+                            connection, "execution_close", {"ticket": position["ticket"], "volume": position["volume"]}
+                        )
+                final = await _reconcile_execution(connections, execution_id)
+                if any(leg["orders"] or leg["positions"] for leg in final):
+                    raise LedgerError(f"{operation} final reconciliation did not prove zero exposure.")
+                ledger.record_intent_execution(
+                    intent_id,
+                    "emergency_flattened" if emergency_flatten else "cancelled",
+                    {"execution_id": execution_id, "legs": final},
+                    status="cancelled",
+                )
+    except (KeyError, LedgerError, ValueError, asyncio.TimeoutError) as error:
+        _freeze_intent_execution(ledger, intent_id, f"{operation} could not be proven safe: {error}")
+        return
+    if fill_observed:
+        await _recover_ioc_partial_fill(ledger, worker_connections, worker_execution_locks, intent_id, outcomes)
+
+
 def _freeze_intent_execution(ledger: ControlLedger, intent_id: str, reason: str) -> None:
     ledger.record_intent_execution(intent_id, "intent_execution_frozen", {"reason": reason}, status="needs_human")
 
@@ -2398,7 +2553,10 @@ def _execution_volume(positions: list[dict[str, str]]) -> Decimal:
 
 
 async def _fail_undispatched_accepted_intents_after_startup_reconciliation(
-    ledger: ControlLedger, startup_reconciliation_started_at: datetime
+    ledger: ControlLedger,
+    startup_reconciliation_started_at: datetime,
+    worker_connections: dict[str, set[_WorkerSessionConnection]],
+    worker_execution_locks: dict[str, asyncio.Lock],
 ) -> None:
     """Terminally fail restart-surviving intents once both workers are freshly reconciled."""
 
@@ -2409,6 +2567,11 @@ async def _fail_undispatched_accepted_intents_after_startup_reconciliation(
             continue
         worker_ids = [str(item["worker_id"]) for item in outcomes]
         if not ledger.workers_reconciled_since(worker_ids, startup_reconciliation_started_at):
+            continue
+        if record["status"] == "cancelling":
+            await _cancel_intent(
+                ledger, worker_connections, worker_execution_locks, str(record["intent_id"]), outcomes
+            )
             continue
         if record["status"] == "dispatching":
             _freeze_intent_execution(

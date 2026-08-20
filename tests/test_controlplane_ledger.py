@@ -165,6 +165,44 @@ class ControlLedgerTests(unittest.TestCase):
                 preflight,
             )
 
+    def test_trader_cancellation_atomically_blocks_undispatched_intent_and_is_idempotent(self) -> None:
+        enrollment = self.ledger.create_trader_enrollment(
+            strategy_name="mean-reversion",
+            claimed_public_ip="203.0.113.4",
+            public_key_pem="public-key",
+            attestation_provider="TPM",
+        )
+        trader_id = self.ledger.approve_trader_enrollment(
+            enrollment["registration_id"], "ABCDEF", lambda trader_id, *_: f"certificate:{trader_id}"
+        )
+        accepted = self.ledger.accept_trader_intent(
+            trader_id,
+            "intent-001",
+            {
+                "type": "intent", "pair_id": "pair-123", "primary_direction": "LONG", "lots": "0.1",
+                "entry_price": "1.2345", "stop_loss_pips": "10", "take_profit_pips": "20",
+                "filling_mode": "FOK", "expires_at": "2026-08-20T00:05:00+00:00",
+            },
+            [
+                {"worker_id": "worker-a", "status": "accepted", "order": {"control_plane_command_id": "abt:one"}},
+                {"worker_id": "worker-b", "status": "accepted", "order": {"control_plane_command_id": "abt:one"}},
+            ],
+        )
+        payload = {"type": "cancel", "intent_id": accepted["intent_id"]}
+
+        result, preflight, scheduled = self.ledger.request_trader_intent_cancellation(trader_id, "cancel-001", payload)
+        replay, replay_preflight, replay_scheduled = self.ledger.request_trader_intent_cancellation(
+            trader_id, "cancel-001", payload
+        )
+
+        self.assertEqual("cancellation_scheduled", result["status"])
+        self.assertEqual(result, replay)
+        self.assertEqual(preflight, replay_preflight)
+        self.assertTrue(scheduled)
+        self.assertFalse(replay_scheduled)
+        self.assertFalse(self.ledger.claim_accepted_intent_dispatch(accepted["intent_id"]))
+        self.assertEqual("cancelling", self.ledger.intent_record(accepted["intent_id"])["status"])
+
     def test_execution_records_are_immutable_and_visible_to_the_originating_trader(self) -> None:
         enrollment = self.ledger.create_trader_enrollment(
             strategy_name="mean-reversion",
