@@ -9,6 +9,7 @@ from abt.worker.reconciliation import (
     AccountMismatchError,
     MT5ReconciliationAdapter,
     WorkerSafetyAdapter,
+    _order_check_diagnostics,
     reconnect_worker_session,
     reconcile_authenticated_worker,
 )
@@ -44,6 +45,22 @@ class ReadOnlyMT5:
 
 
 class WorkerReconciliationTests(unittest.TestCase):
+    def test_order_check_diagnostics_include_rejection_and_quote(self) -> None:
+        class OrderCheckMT5:
+            def symbol_info_tick(self, symbol: str) -> dict[str, object]:
+                if symbol != "USDJPY":
+                    raise AssertionError(symbol)
+                return {"bid": 158.912, "ask": 158.915, "time": 1_787_068_740}
+
+        diagnostics = _order_check_diagnostics(
+            OrderCheckMT5(), "USDJPY", {"retcode": 10015, "comment": "Invalid price"}
+        )
+
+        self.assertEqual(
+            {"retcode": 10015, "comment": "Invalid price", "quote": {"bid": 158.912, "ask": 158.915, "time": 1_787_068_740}},
+            diagnostics,
+        )
+
     def test_reconnects_disconnected_wss_sessions_with_exponential_backoff(self) -> None:
         opened = 0
         waits: list[float] = []
@@ -71,6 +88,31 @@ class WorkerReconciliationTests(unittest.TestCase):
 
         self.assertEqual(3, opened)
         self.assertEqual([5.0, 10.0], waits)
+
+    def test_logs_each_session_reconnect_attempt(self) -> None:
+        runs = 0
+
+        def run_reconciliation(**_: object) -> None:
+            nonlocal runs
+            runs += 1
+            if runs == 1:
+                raise WorkerSessionDisconnected("controller disconnected")
+
+        with self.assertLogs("abt.worker.reconciliation", level="WARNING") as logs:
+            reconnect_worker_session(
+                open_session=ReconnectSession,
+                mt5=ReadOnlyMT5(),
+                login=123456,
+                server="Broker-Demo",
+                sleep=lambda _: None,
+                run_reconciliation=run_reconciliation,
+            )
+
+        self.assertEqual(
+            ["WARNING:abt.worker.reconciliation:Worker session disconnected (controller disconnected); "
+             "reconnecting attempt 1/10 in 5 seconds."],
+            logs.output,
+        )
 
     def test_stops_reconnecting_after_ten_wss_retry_attempts(self) -> None:
         opened = 0

@@ -2388,7 +2388,12 @@ async def _preflight_intent(
         if any(not _valid_intent_order_prices(order, reference["specification"]) for order, reference in zip(orders, references, strict=True)):
             raise LedgerError("Intent entry or protective prices are not valid for both endpoint price increments.")
         outcomes = [
-            {"worker_id": str(worker["worker_id"]), "status": "not_started", "order": order}
+            {
+                "worker_id": str(worker["worker_id"]),
+                "server": str(worker["server"]),
+                "status": "not_started",
+                "order": order,
+            }
             for worker, order in zip(workers, orders, strict=True)
         ]
         connections: list[_WorkerSessionConnection] = []
@@ -2416,8 +2421,8 @@ async def _preflight_intent(
         for outcome, response in zip(outcomes, responses, strict=True):
             if isinstance(response, Exception):
                 outcome.update(status="rejected", reason=str(response))
-            elif _validated_order_check_response(response, cast(dict[str, object], outcome["order"])):
-                outcome.update(status="accepted", response=response)
+            elif _valid_order_check_response(response, cast(dict[str, object], outcome["order"])):
+                outcome.update(status="accepted" if response["accepted"] else "rejected", response=response)
             else:
                 outcome.update(status="malformed", response=response)
         if monotonic() >= deadline:
@@ -2838,13 +2843,44 @@ async def _request_order_execute(
     )
 
 
-def _validated_order_check_response(response: dict[str, object], order: dict[str, object]) -> bool:
+def _valid_order_check_response(response: dict[str, object], order: dict[str, object]) -> bool:
+    required = {"type", "analysis_id", "request_id", "accepted", "order"}
+    response_fields = set(response)
+    if response_fields != required and response_fields != required | {"diagnostics"}:
+        return False
+    if (
+        response["type"] != "order_check_response"
+        or response["analysis_id"] != "order_check"
+        or not isinstance(response["request_id"], str)
+        or not response["request_id"]
+        or not isinstance(response["accepted"], bool)
+        or response["order"] != order
+    ):
+        return False
     return (
-        set(response) == {"type", "analysis_id", "request_id", "accepted", "order"}
-        and response["type"] == "order_check_response"
-        and response["analysis_id"] == "order_check"
-        and response["accepted"] is True
-        and response["order"] == order
+        "diagnostics" not in response
+        or (
+            _valid_order_check_diagnostics(response["diagnostics"])
+            and response["accepted"] == (response["diagnostics"]["retcode"] == 0)
+        )
+    )
+
+
+def _valid_order_check_diagnostics(value: object) -> bool:
+    if not isinstance(value, dict) or not {"retcode"} <= set(value) <= {"retcode", "comment", "quote"}:
+        return False
+    if isinstance(value["retcode"], bool) or not isinstance(value["retcode"], int):
+        return False
+    if "comment" in value and (not isinstance(value["comment"], str) or not value["comment"]):
+        return False
+    if "quote" not in value:
+        return True
+    quote = value["quote"]
+    return (
+        isinstance(quote, dict)
+        and set(quote) <= {"bid", "ask", "time"}
+        and bool(quote)
+        and all(isinstance(item, (int, float)) and not isinstance(item, bool) for item in quote.values())
     )
 
 

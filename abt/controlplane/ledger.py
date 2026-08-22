@@ -774,6 +774,9 @@ class ControlLedger:
                 "status": "rejected_preflight" if reason is not None else "accepted",
                 "event_id": event_id,
             }
+            if reason is not None:
+                result["reason"] = reason
+                result["preflight"] = preflight
             if reason is None:
                 intent_id = str(uuid4())
                 self._connection.execute(

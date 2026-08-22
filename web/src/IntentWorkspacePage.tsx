@@ -7,6 +7,11 @@ type Intent = {
   intent: { primary_direction: string; lots: string; entry_price: string; stop_loss_pips: string; take_profit_pips: string; filling_mode: string; expires_at: string }
 }
 type IntentRecord = Intent & { execution_records: Array<{ event_id: number; event_type: string; occurred_at: string; payload: Record<string, unknown> }> }
+type PreflightOutcome = {
+  worker_id: string; server?: string; status: string; order: { symbol: string; direction: string }
+  response?: { diagnostics?: { retcode: number; comment?: string; quote?: { bid?: number; ask?: number; time?: number } } }
+}
+type RejectedPreflight = { status: 'rejected_preflight'; reason: string; preflight: PreflightOutcome[] }
 
 type Draft = Omit<Intent['intent'], 'expires_at'> & { pair_id: string; expires_at: string }
 const emptyDraft: Draft = { pair_id: '', primary_direction: 'LONG', lots: '', entry_price: '', stop_loss_pips: '', take_profit_pips: '', filling_mode: 'FOK', expires_at: '' }
@@ -18,6 +23,7 @@ export function IntentWorkspacePage({ csrfToken }: { csrfToken: string }) {
   const [statusFilter, setStatusFilter] = useState('')
   const [draft, setDraft] = useState<Draft>(emptyDraft)
   const [preview, setPreview] = useState<{ commandId: string; kind: 'create' | 'cancel' | 'emergency_flatten'; intent?: Intent; draft?: Draft } | null>(null)
+  const [rejectedPreflight, setRejectedPreflight] = useState<RejectedPreflight | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [timeline, setTimeline] = useState<IntentRecord | null>(null)
 
@@ -40,14 +46,20 @@ export function IntentWorkspacePage({ csrfToken }: { csrfToken: string }) {
   const confirm = async () => {
     if (!preview) return
     setError(null)
+    setRejectedPreflight(null)
     const target = preview.kind === 'create' ? '/api/admin/intents' : `/api/admin/intents/${encodeURIComponent(preview.intent!.intent_id)}/${preview.kind === 'cancel' ? 'cancel' : 'emergency-flatten'}`
     const body = preview.kind === 'create'
-      ? { ...preview.draft, expires_at: new Date(preview.draft!.expires_at).toISOString(), command_id: preview.commandId }
+      ? { type: 'intent', ...preview.draft, expires_at: new Date(preview.draft!.expires_at).toISOString(), command_id: preview.commandId }
       : { command_id: preview.commandId }
     const response = await fetch(target, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json', 'X-CSRF-Token': csrfToken }, body: JSON.stringify(body) })
+    const payload = await response.json().catch(() => null) as (RejectedPreflight & { detail?: string }) | null
     if (!response.ok) {
-      const payload = await response.json().catch(() => null) as { detail?: string } | null
       setError(payload?.detail ?? 'The management command was rejected.')
+      return
+    }
+    if (preview.kind === 'create' && payload?.status === 'rejected_preflight') {
+      setPreview(null)
+      setRejectedPreflight(payload)
       return
     }
     setPreview(null)
@@ -58,6 +70,7 @@ export function IntentWorkspacePage({ csrfToken }: { csrfToken: string }) {
   return <section aria-label="Intent workspace">
     <header className="console-page-header"><div><h1>Intents</h1><p>Create and intervene on Trader- and management-originated paired intents.</p></div><label><input checked={history} onChange={(event) => setHistory(event.target.checked)} type="checkbox" /> Show complete history</label><label>Status <select value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)}><option value="">All statuses</option><option value="accepted">Accepted</option><option value="working">Working</option><option value="needs_human">Frozen</option><option value="cancelled">Cancelled</option></select></label></header>
     {error ? <p className="error" role="alert">{error}</p> : null}
+    {rejectedPreflight ? <section className="intent-preflight-result" role="alert"><h2>Intent preflight rejected</h2><p>{rejectedPreflight.reason}</p><table className="console-table"><thead><tr><th>Endpoint</th><th>Order</th><th>Result</th><th>Broker diagnostic</th></tr></thead><tbody>{rejectedPreflight.preflight.map((outcome) => <tr key={outcome.worker_id}><td>{outcome.server ?? outcome.worker_id}</td><td>{outcome.order.direction} {outcome.order.symbol}</td><td>{outcome.status === 'accepted' ? 'Accepted' : 'Rejected'}</td><td>{outcome.response?.diagnostics ? <>{`Retcode ${outcome.response.diagnostics.retcode}`}{outcome.response.diagnostics.comment ? `: ${outcome.response.diagnostics.comment}` : ''}{outcome.response.diagnostics.quote ? <><br />Bid {outcome.response.diagnostics.quote.bid ?? '—'} / Ask {outcome.response.diagnostics.quote.ask ?? '—'}</> : null}</> : 'No broker diagnostic returned.'}</td></tr>)}</tbody></table><details><summary>View complete preflight evidence</summary><pre className="console-raw-detail">{JSON.stringify(rejectedPreflight.preflight, null, 2)}</pre></details><button type="button" onClick={() => setRejectedPreflight(null)}>Dismiss preflight result</button></section> : null}
     <form className="analysis-form launch-form" onSubmit={submit}>
       <h2>Create management intent</h2>
       <label>Active pair<select required value={draft.pair_id} onChange={(event) => setDraft({ ...draft, pair_id: event.target.value })}><option value="">Select an active pair</option>{pairs.map((pair) => <option key={pair.product_pair_id} value={pair.product_pair_id}>{pair.endpoints.map((endpoint) => `${endpoint.server}:${endpoint.symbol}`).join(' / ')}</option>)}</select></label>

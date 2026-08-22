@@ -212,7 +212,18 @@ class TraderIntentPreflightTests(unittest.IsolatedAsyncioTestCase):
                     "accepted": True,
                     "order": order,
                 }
-            raise LedgerError("Broker rejected the order.")
+            return {
+                "type": "order_check_response",
+                "analysis_id": "order_check",
+                "request_id": "second",
+                "accepted": False,
+                "order": order,
+                "diagnostics": {
+                    "retcode": 10015,
+                    "comment": "Invalid price",
+                    "quote": {"bid": 1.2344, "ask": 1.2346},
+                },
+            }
 
         with patch("abt.controlplane.service._request_order_check", side_effect=check):
             result = await _preflight_trader_intent(
@@ -230,6 +241,7 @@ class TraderIntentPreflightTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(["accepted", "rejected"], [outcome["status"] for outcome in outcomes])  # type: ignore[index]
         self.assertEqual("worker-a", outcomes[0]["worker_id"])  # type: ignore[index]
         self.assertEqual("worker-b", outcomes[1]["worker_id"])  # type: ignore[index]
+        self.assertEqual("Invalid price", outcomes[1]["response"]["diagnostics"]["comment"])  # type: ignore[index]
         self.assertEqual("1.23350", outcomes[0]["order"]["sl"])  # type: ignore[index]
         self.assertEqual("1.23650", outcomes[0]["order"]["tp"])  # type: ignore[index]
 

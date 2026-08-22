@@ -28,6 +28,8 @@ class ReadOnlyMT5(Protocol):
 
     def order_send(self, request: dict[str, object]) -> object: ...
 
+    def symbol_info_tick(self, symbol: str) -> object: ...
+
 
 class AuthenticatedReconciliationSession(Protocol):
     reconciliation_cursor: int
@@ -71,7 +73,9 @@ class AnalysisWorkerSession(Protocol):
 
     def receive_order_check(self, timeout: float | None = None) -> dict[str, object] | None: ...
 
-    def send_order_check(self, *, request_id: str, order: dict[str, object], accepted: bool) -> None: ...
+    def send_order_check(
+        self, *, request_id: str, order: dict[str, object], accepted: bool, diagnostics: dict[str, object]
+    ) -> None: ...
 
     def send_order_check_error(self, *, request_id: str, reason: str) -> None: ...
 
@@ -332,10 +336,17 @@ def reconnect_worker_session(
                     maintenance=None if maintenance is None else lambda: maintenance(session),
                 )
             return
-        except WorkerSessionDisconnected:
+        except WorkerSessionDisconnected as error:
             if attempts >= 10:
                 raise
-            sleep(float(5 * 2 ** attempts))
+            delay = float(5 * 2 ** attempts)
+            _LOGGER.warning(
+                "Worker session disconnected (%s); reconnecting attempt %s/10 in %.0f seconds.",
+                error,
+                attempts + 1,
+                delay,
+            )
+            sleep(delay)
             attempts += 1
 
 
@@ -466,14 +477,40 @@ def _serve_order_check(mt5: ReadOnlyMT5, session: AnalysisWorkerSession, request
         return
     try:
         result = mt5.order_check(_broker_limit_request(mt5, order))
-        retcode = getattr(result, "retcode", None)
-        if not isinstance(retcode, int):
-            raise WorkerEnrollmentError("The local MT5 terminal returned an invalid order check result.")
-        session.send_order_check(request_id=request_id, order=order, accepted=retcode == 0)
+        diagnostics = _order_check_diagnostics(mt5, str(order["symbol"]), result)
+        accepted = diagnostics["retcode"] == 0
+        _LOGGER.debug(
+            "Order check %s for %s completed with retcode %s (%s).",
+            request_id, order["symbol"], diagnostics["retcode"], "accepted" if accepted else "rejected",
+        )
+        session.send_order_check(request_id=request_id, order=order, accepted=accepted, diagnostics=diagnostics)
     except WorkerEnrollmentError as error:
         session.send_order_check_error(request_id=request_id, reason=str(error))
     except Exception:
         session.send_order_check_error(request_id=request_id, reason="The local MT5 order check failed.")
+
+
+def _order_check_diagnostics(mt5: ReadOnlyMT5, symbol: str, result: object) -> dict[str, object]:
+    evidence = _evidence(result, "order check")
+    retcode = evidence.get("retcode")
+    if isinstance(retcode, bool) or not isinstance(retcode, int):
+        raise WorkerEnrollmentError("The local MT5 terminal returned an invalid order check result.")
+    diagnostics: dict[str, object] = {"retcode": retcode}
+    comment = evidence.get("comment")
+    if isinstance(comment, str) and comment:
+        diagnostics["comment"] = comment
+    try:
+        tick = _evidence(mt5.symbol_info_tick(symbol), "symbol tick")
+    except WorkerEnrollmentError:
+        return diagnostics
+    quote = {
+        field: tick[field]
+        for field in ("bid", "ask", "time")
+        if isinstance(tick.get(field), (int, float)) and not isinstance(tick.get(field), bool)
+    }
+    if quote:
+        diagnostics["quote"] = quote
+    return diagnostics
 
 
 def _serve_order_execute(mt5: ReadOnlyMT5, session: AnalysisWorkerSession, request: dict[str, object]) -> None:

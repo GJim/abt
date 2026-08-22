@@ -29,6 +29,27 @@ class ControlLedgerTests(unittest.TestCase):
         session = self.ledger.authenticate_admin("ABCDEF", "long-admin-password")
         self.assertEqual("ABCDEF", self.ledger.validate_session(session.token, session.csrf_token, require_csrf=True))
 
+    def test_rejected_management_intent_returns_its_preflight_evidence(self) -> None:
+        preflight = [{
+            "worker_id": "worker-b",
+            "server": "Broker-B",
+            "status": "rejected",
+            "order": {"symbol": "USDJPY"},
+            "response": {"diagnostics": {"retcode": 10015, "comment": "Invalid price"}},
+        }]
+
+        result = self.ledger.reject_management_intent(
+            "ABCDEF",
+            "command-123",
+            {"type": "intent", "pair_id": "pair-123"},
+            "A broker rejected the intent order check.",
+            preflight,
+        )
+
+        self.assertEqual("rejected_preflight", result["status"])
+        self.assertEqual("A broker rejected the intent order check.", result["reason"])
+        self.assertEqual(preflight, result["preflight"])
+
     def test_migration_removes_legacy_pairing_code_column(self) -> None:
         self.ledger.close()
         path = Path(self._directory.name) / "ledger.duckdb"

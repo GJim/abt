@@ -404,6 +404,29 @@ class WorkerEnrollmentTests(unittest.TestCase):
         self.assertEqual("analysis-123", analysis["analysis_id"])
         self.assertEqual({"request_id": "order-check-123", "order": {"symbol": "EURUSD"}}, order_check)
 
+    def test_order_check_response_includes_broker_diagnostics(self) -> None:
+        socket = FakeWebSocket([])
+        session = AuthenticatedWorkerSession(socket=socket, reconciliation_cursor=0)
+
+        session.send_order_check(
+            request_id="order-check-123",
+            order={"symbol": "EURUSD"},
+            accepted=False,
+            diagnostics={"retcode": 10016, "comment": "Invalid stops", "quote": {"bid": 1.2345, "ask": 1.2347}},
+        )
+
+        self.assertEqual(
+            {
+                "type": "order_check_response",
+                "analysis_id": "order_check",
+                "request_id": "order-check-123",
+                "accepted": False,
+                "order": {"symbol": "EURUSD"},
+                "diagnostics": {"retcode": 10016, "comment": "Invalid stops", "quote": {"bid": 1.2345, "ask": 1.2347}},
+            },
+            json.loads(socket.sent[-1]),
+        )
+
     def test_analysis_helper_includes_period_fields_in_market_data_responses(self) -> None:
         socket = FakeWebSocket([])
         session = AuthenticatedWorkerSession(socket=socket, reconciliation_cursor=0)
@@ -674,6 +697,12 @@ class WorkerCredentialTests(unittest.TestCase):
         with self.assertRaisesRegex(WorkerSessionDisconnected, "reconciliation"):
             session.send_reconciliation({"type": "snapshot", "cursor": 0})
 
+    def test_marks_abrupt_reconciliation_send_disconnects_for_session_reconnect(self) -> None:
+        session = AuthenticatedWorkerSession(socket=AbruptlyClosingWebSocket(), reconciliation_cursor=0)
+
+        with self.assertRaisesRegex(WorkerSessionDisconnected, "reconciliation"):
+            session.send_reconciliation({"type": "snapshot", "cursor": 0})
+
 
 class FakeWebSocket:
     def __init__(self, responses: list[dict[str, str]]) -> None:
@@ -705,6 +734,14 @@ class ClosingWebSocket(FakeWebSocket):
 
     def send(self, message: str) -> None:
         raise ConnectionClosedError(None, Close(1011, ""))
+
+
+class AbruptlyClosingWebSocket(FakeWebSocket):
+    def __init__(self) -> None:
+        super().__init__([])
+
+    def send(self, message: str) -> None:
+        raise ConnectionClosedError(None, None)
 
 
 def _connect(

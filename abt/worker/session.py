@@ -12,6 +12,8 @@ from dataclasses import dataclass, field
 from typing import Protocol, Self
 from zoneinfo import ZoneInfo
 
+from websockets.exceptions import ConnectionClosed
+
 from ..mt5.config import TimeCalibrationFamily
 from ..mt5.output import render
 from ..mt5.timecalibration import MARKET_DATA, render_calibration
@@ -188,7 +190,9 @@ class AuthenticatedWorkerSession:
             raise WorkerEnrollmentError("The controller returned an invalid order-check request.")
         return {"request_id": _required_text(response, "request_id"), "order": response["order"]}
 
-    def send_order_check(self, *, request_id: str, order: dict[str, object], accepted: bool) -> None:
+    def send_order_check(
+        self, *, request_id: str, order: dict[str, object], accepted: bool, diagnostics: dict[str, object]
+    ) -> None:
         try:
             _send(
                 self.socket,
@@ -198,6 +202,7 @@ class AuthenticatedWorkerSession:
                     "request_id": request_id,
                     "accepted": accepted,
                     "order": order,
+                    "diagnostics": diagnostics,
                 },
             )
         except Exception as error:
@@ -755,8 +760,6 @@ def open_authenticated_worker_session(
 
 
 def _raise_closed_connection(error: Exception, phase: str) -> None:
-    received_code = getattr(getattr(error, "rcvd", None), "code", None)
-    sent_code = getattr(getattr(error, "sent", None), "code", None)
-    if isinstance(received_code, int) or isinstance(sent_code, int):
+    if isinstance(error, (ConnectionClosed, OSError, TimeoutError)):
         raise WorkerSessionDisconnected(f"The controller closed the {phase} WebSocket.") from error
     raise error
