@@ -108,10 +108,11 @@ test('administrator can review and approve a pending worker registration', async
   await page.getByLabel('Administrator account').fill('ABCDEF')
   await page.getByLabel('Password').fill('A-secure-admin-password!')
   await page.getByRole('button', { name: 'Sign in' }).click()
+  await page.getByRole('link', { name: 'Workers' }).click()
 
   await expect(page.getByRole('heading', { name: 'Needs attention' })).toBeVisible()
   await expect(page.getByText('Pending approval')).toBeVisible()
-  await expect(page.getByRole('heading', { name: 'Pending worker registrations' })).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'Pending registrations' })).toBeVisible()
   await expect(page.getByText('12345678')).toBeVisible()
   await expect(page.getByText('Broker-Demo')).toBeVisible()
   await expect(page.getByText('87654321')).toBeVisible()
@@ -136,7 +137,6 @@ test('administrator can review and approve a pending worker registration', async
 
   await expect(page.getByText('No operator action is needed.')).toBeVisible()
   await expect(page.getByText('No worker registrations are awaiting review.')).toBeVisible()
-  await expect(page.getByText('worker_enrollment_approved')).toBeVisible()
   expect(enrollmentRequests).toBe(2)
 })
 
@@ -204,17 +204,39 @@ test('administrator can view connected worker health and reconciliation', async 
   await page.getByLabel('Administrator account').fill('ABCDEF')
   await page.getByLabel('Password').fill('A-secure-admin-password!')
   await page.getByRole('button', { name: 'Sign in' }).click()
+  await page.getByRole('link', { name: 'Workers' }).click()
 
-  await expect(page.getByRole('heading', { name: 'Fleet health' })).toBeVisible()
-  await expect(page.getByLabel('Worker summary').getByText('Stale', { exact: true })).toBeVisible()
-  await page.getByRole('button', { name: 'Show worker actions and reconciliation' }).click()
-  const workerCard = page.getByRole('listitem').filter({ hasText: '123456 on Broker-Demo' })
-  await expect(workerCard.getByText('Stale data', { exact: true })).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'Fleet' })).toBeVisible()
+  const workerCard = page.getByLabel('Workers by account').getByRole('listitem').filter({ hasText: '123456 on Broker-Demo' })
+  await expect(workerCard.getByText('Action needed', { exact: true })).toBeVisible()
   await expect(workerCard.getByText('"balance": 1000')).not.toBeVisible()
-  await workerCard.getByRole('button', { name: /View snapshot and reconciliation evidence/ }).click()
+  await workerCard.getByRole('button', { name: /123456 on Broker-Demo/ }).click()
   await expect(page.getByText('volume_changed')).toBeVisible()
   await expect(page.getByText('"balance": 1000')).toBeVisible()
-  await expect(page.getByText('high: external_broker_change')).toBeVisible()
+  await expect(page.getByText('unattributed_broker_change')).toBeVisible()
+})
+
+test('administrator keeps the revoke confirmation open when certificate containment fails', async ({ page }) => {
+  await mockLogin(page)
+  await mockManagementData(page, {
+    workers: [buildWorker({ worker_id: 'worker-1', login: 123456, server: 'Broker-Demo' })],
+  })
+  await page.route('**/api/admin/workers/worker-1/revoke', async (route) => {
+    expect(route.request().method()).toBe('POST')
+    expect(route.request().headers()['x-csrf-token']).toBe('csrf-token')
+    await route.fulfill({ status: 503, contentType: 'application/json', body: JSON.stringify({ detail: 'unavailable' }) })
+  })
+
+  await signIn(page)
+  await page.getByRole('link', { name: 'Workers' }).click()
+  const workerCard = page.getByLabel('Workers by account').getByRole('listitem').filter({ hasText: '123456 on Broker-Demo' })
+  await workerCard.getByRole('button', { name: /123456 on Broker-Demo/ }).click()
+  await workerCard.getByRole('button', { name: 'Revoke certificate' }).click()
+  await page.getByRole('button', { name: 'Confirm revoke and flatten' }).click()
+
+  await expect(page.getByRole('alert')).toContainText('Could not revoke this worker certificate.')
+  await expect(page.getByRole('heading', { name: 'Revoke certificate for 123456 on Broker-Demo?' })).toBeVisible()
+  await expect(page.locator('.worker-action-status')).toContainText('Certificate revocation failed. Confirm the worker state and try again.')
 })
 
 test('administrator can scan a realistic fleet, including stale and human-action workers, on a narrow screen', async ({ page }) => {
@@ -244,16 +266,14 @@ test('administrator can scan a realistic fleet, including stale and human-action
   await page.getByLabel('Administrator account').fill('ABCDEF')
   await page.getByLabel('Password').fill('A-secure-admin-password!')
   await page.getByRole('button', { name: 'Sign in' }).click()
+  await page.getByRole('link', { name: 'Workers' }).click()
 
-  const fleet = page.getByLabel('Fleet health by account')
-  await expect(page.getByLabel('Worker summary').getByRole('row')).toHaveCount(9)
-  await page.getByRole('button', { name: 'Show worker actions and reconciliation' }).click()
+  const fleet = page.getByLabel('Workers by account')
   await expect(fleet.getByRole('listitem')).toHaveCount(8)
   await expect(fleet.getByText('Healthy', { exact: true })).toHaveCount(4)
-  await expect(fleet.getByText('Idle — no snapshot', { exact: true })).toBeVisible()
-  await expect(fleet.getByText('Stale data', { exact: true })).toBeVisible()
-  await expect(fleet.getByText('Revoked — human action', { exact: true })).toBeVisible()
-  await expect(fleet.getByText('Human action needed', { exact: true })).toBeVisible()
+  await expect(fleet.getByText('Stale', { exact: true })).toHaveCount(2)
+  await expect(fleet.getByText('Revoked', { exact: true })).toBeVisible()
+  await expect(fleet.getByText('Action needed', { exact: true })).toBeVisible()
   await expect(fleet.getByText(/Freshness/).first()).toBeVisible()
   await expect(page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).resolves.toBe(true)
 })
@@ -265,9 +285,10 @@ test('administrator sees a useful fleet-health empty state', async ({ page }) =>
   await page.getByLabel('Administrator account').fill('ABCDEF')
   await page.getByLabel('Password').fill('A-secure-admin-password!')
   await page.getByRole('button', { name: 'Sign in' }).click()
+  await page.getByRole('link', { name: 'Workers' }).click()
 
-  await expect(page.getByRole('heading', { name: 'Fleet health' })).toBeVisible()
-  await expect(page.getByLabel('Worker summary')).toContainText('No account workers have reported yet.')
+  await expect(page.getByRole('heading', { name: 'Fleet' })).toBeVisible()
+  await expect(page.getByText('No approved account workers have reported yet.')).toBeVisible()
 })
 
 test('administrator can launch an analysis with CSRF protection and inspect passing and failing evidence', async ({ page }) => {
@@ -386,7 +407,7 @@ test('administrator sees the worker-provided analysis failure reason as an alert
   await page.getByLabel('Second analysis worker').selectOption('worker-b')
   await page.getByRole('button', { name: 'Launch' }).click()
 
-  await expect(page.getByRole('alert')).toHaveText('Analysis failed: AUDNZDC M15 evidence is unavailable.')
+  await expect(page.getByRole('alert').filter({ hasText: 'Analysis failed:' })).toHaveText('Analysis failed: AUDNZDC M15 evidence is unavailable.')
 })
 
 test('administrator can inspect immutable evidence, build a pair, and retire it without any broker-write path', async ({ page }) => {
@@ -895,7 +916,8 @@ test('administrator can submit a manual re-test with valid endpoint workers and 
   await expect(pairCard).toContainText('Pair pair-1 exceeded drift threshold.')
   await expect(pairCard.locator('.conflict-panel').filter({ hasText: 'Latest failed re-test' })).not.toContainText('Latest re-test failed for pair-1')
   await expect(pairCard).toContainText('Active')
-  await expect(page.getByRole('heading', { name: 'Worker alerts' }).locator('..')).toContainText('product_pair_retest_failed')
+  await page.getByRole('link', { name: 'Workers' }).click()
+  await expect(page.getByLabel('Worker intervention queue')).toContainText('Pair pair-1 exceeded drift threshold.')
 })
 
 test('administrator sees validation feedback when no cross-server pair is available', async ({ page }) => {
@@ -1031,8 +1053,8 @@ test('administrator sees stale-connection feedback and retains prior management 
 
   await page.clock.fastForward(30_000)
   await expect(page.getByRole('alert')).toContainText('Management data could not be loaded. Your previous data is still shown.')
-  await page.getByRole('button', { name: 'Show worker actions and reconciliation' }).click()
-  await expect(page.getByLabel('Fleet health by account').getByRole('listitem').filter({ hasText: '123456 on Broker-Demo' })).toBeVisible()
+  await page.getByRole('link', { name: 'Workers' }).click()
+  await expect(page.getByLabel('Workers by account').getByRole('listitem').filter({ hasText: '123456 on Broker-Demo' })).toBeVisible()
 })
 
 test('administrator actions defer live refresh until the action is complete', async ({ page }) => {
@@ -1068,6 +1090,7 @@ test('administrator actions defer live refresh until the action is complete', as
   await page.getByLabel('Administrator account').fill('ABCDEF')
   await page.getByLabel('Password').fill('A-secure-admin-password!')
   await page.getByRole('button', { name: 'Sign in' }).click()
+  await page.getByRole('link', { name: 'Workers' }).click()
 
   const approveButton = page.getByRole('button', { name: 'Approve registration for 12345678 on Broker-Demo' }).first()
   await approveButton.click()
@@ -1116,7 +1139,13 @@ test('administrator can search worker snapshots and retrieve raw evidence on dem
   await mockLogin(page)
   await mockManagementData(page)
   await page.route('**/api/admin/worker-snapshots/snapshot-1', async (route) => {
-    await route.fulfill({ contentType: 'application/json', body: JSON.stringify({ account: { currency: 'USD' }, positions: [] }) })
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({
+        account: { currency: 'USD' },
+        positions: Array.from({ length: 100 }, (_, index) => ({ symbol: 'EURUSD', ticket: index })),
+      }),
+    })
   })
   await page.route('**/api/admin/worker-snapshots?**', async (route) => {
     const query = new URL(route.request().url()).searchParams
@@ -1142,11 +1171,14 @@ test('administrator can search worker snapshots and retrieve raw evidence on dem
 
   await signIn(page)
   await page.getByRole('link', { name: 'Workers' }).click()
-  await expect(page.locator('h1')).toHaveCount(0)
+  await expect(page.getByRole('heading', { level: 1, name: 'Workers' })).toBeVisible()
+  await page.getByRole('button', { name: 'Search snapshot history' }).click()
   await expect(page.getByText('Broker-A')).toBeVisible()
   await expect(page.getByText('1,000')).toBeVisible()
   await page.getByRole('button', { name: 'View raw JSON' }).click()
-  await expect(page.getByRole('dialog', { name: 'Raw snapshot JSON' }).getByText('"currency": "USD"')).toBeVisible()
+  const rawSnapshotDialog = page.getByRole('dialog', { name: 'Raw snapshot JSON' })
+  await expect(rawSnapshotDialog.getByText('"currency": "USD"')).toBeVisible()
+  await expect.poll(() => rawSnapshotDialog.locator('.console-raw-detail').evaluate((element) => element.scrollHeight > element.clientHeight)).toBe(true)
   await page.getByRole('button', { name: 'Close raw snapshot JSON' }).click()
   await expect(page.getByRole('dialog', { name: 'Raw snapshot JSON' })).toHaveCount(0)
   await page.getByLabel('Search').fill('Broker-A')
@@ -1272,6 +1304,10 @@ test('administrator can issue, reveal once, and revoke an unused registration in
   await page.getByRole('button', { name: 'Issue invite' }).click()
   const disclosure = page.getByRole('dialog', { name: 'Registration invite issued' })
   await expect(disclosure.getByText('one-time-trader-invite')).toBeVisible()
+  await page.context().grantPermissions(['clipboard-read', 'clipboard-write'])
+  await disclosure.getByRole('button', { name: 'Copy invite code' }).click()
+  await expect(disclosure.getByRole('status')).toContainText('Invite copied to clipboard.')
+  await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe('one-time-trader-invite')
   await disclosure.getByRole('button', { name: 'I have saved this invite' }).click()
   await expect(disclosure).toHaveCount(0)
   expect(createHeaders?.['x-csrf-token']).toBe('csrf-token')
@@ -1355,7 +1391,18 @@ test('administrator previews intent actions, reads immutable events, and sees co
       await route.fulfill({ status: 503, contentType: 'application/json', body: JSON.stringify({ detail: 'The controller timed out before replying.' }) })
       return
     }
-    await route.fulfill({ status: 201, contentType: 'application/json', body: JSON.stringify(buildIntent({ intent_id: 'intent-created' })) })
+    await route.fulfill({
+      status: 201,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        status: 'rejected_preflight',
+        reason: 'A broker rejected the intent order check.',
+        preflight: [
+          { worker_id: 'worker-a', server: 'Broker-A', status: 'accepted', order: { symbol: 'EURUSD', direction: 'LONG' }, response: { diagnostics: { retcode: 0 } } },
+          { worker_id: 'worker-b', server: 'Broker-B', status: 'rejected', order: { symbol: 'EURUSD', direction: 'SHORT' }, response: { diagnostics: { retcode: 10015, comment: 'Invalid price', quote: { bid: 1.2344, ask: 1.2346 } } } },
+        ],
+      }),
+    })
   })
   await page.route('**/api/admin/intents/intent-zero', async (route) => {
     await route.fulfill({ contentType: 'application/json', body: JSON.stringify({
@@ -1387,8 +1434,12 @@ test('administrator previews intent actions, reads immutable events, and sees co
   await expect(page.getByRole('alert')).toContainText('The controller timed out before replying.')
   await createPreview.getByRole('button', { name: 'Confirm create' }).click()
   expect(createBodies).toHaveLength(2)
-  expect(createBodies[0]).toMatchObject({ pair_id: 'pair-1', filling_mode: 'FOK' })
+  expect(createBodies[0]).toMatchObject({ type: 'intent', pair_id: 'pair-1', filling_mode: 'FOK' })
   expect(createBodies[0].command_id).toEqual(createBodies[1].command_id)
+  await expect(page.getByRole('alert')).toContainText('Intent preflight rejected')
+  await expect(page.getByRole('alert')).toContainText('Broker-B')
+  await expect(page.getByRole('alert')).toContainText('Retcode 10015: Invalid price')
+  await page.getByRole('button', { name: 'Dismiss preflight result' }).click()
 
   await page.getByRole('button', { name: 'Timeline' }).first().click()
   await expect(page.locator('[role="dialog"]').filter({ hasText: 'Immutable intent timeline' }).getByText('intent_accepted')).toBeVisible()

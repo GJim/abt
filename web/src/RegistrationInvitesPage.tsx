@@ -15,6 +15,7 @@ export function RegistrationInvitesPage({ csrfToken }: { csrfToken: string }) {
   const [invites, setInvites] = useState<RegistrationInvite[]>([])
   const [role, setRole] = useState<RegistrationInvite['role']>('worker')
   const [revealedInvite, setRevealedInvite] = useState<string | null>(null)
+  const [copyStatus, setCopyStatus] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
 
   const load = async () => {
@@ -42,9 +43,20 @@ export function RegistrationInvitesPage({ csrfToken }: { csrfToken: string }) {
       if (!response.ok) throw new Error(await responseDetail(response, 'Invite issuance failed.'))
       const created = await response.json() as RegistrationInvite & { invite: string }
       setRevealedInvite(created.invite)
+      setCopyStatus(null)
       await load()
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : 'Invite issuance failed.')
+    }
+  }
+
+  const copyInvite = async () => {
+    if (!revealedInvite) return
+    try {
+      await navigator.clipboard.writeText(revealedInvite)
+      setCopyStatus('Invite copied to clipboard.')
+    } catch {
+      setCopyStatus('Copy failed. Select the invite value and copy it manually.')
     }
   }
 
@@ -99,8 +111,17 @@ export function RegistrationInvitesPage({ csrfToken }: { csrfToken: string }) {
           <section aria-modal="true" className="snapshot-json-dialog" role="dialog" aria-label="Registration invite issued">
             <h2>Registration invite issued</h2>
             <p>Copy this value now. It cannot be displayed again.</p>
-            <pre className="console-raw-detail">{revealedInvite}</pre>
-            <button type="button" onClick={() => setRevealedInvite(null)}>I have saved this invite</button>
+            <div className="invite-secret">
+              <pre className="console-raw-detail">{revealedInvite}</pre>
+              <button aria-label="Copy invite code" className="console-icon-button" onClick={() => void copyInvite()} title="Copy invite code" type="button">
+                <svg aria-hidden="true" fill="none" height="18" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" viewBox="0 0 24 24" width="18">
+                  <rect height="13" rx="2" width="13" x="8" y="8" />
+                  <path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3" />
+                </svg>
+              </button>
+            </div>
+            {copyStatus ? <p role="status">{copyStatus}</p> : null}
+            <button type="button" onClick={() => { setRevealedInvite(null); setCopyStatus(null) }}>I have saved this invite</button>
           </section>
         </div>
       ) : null}

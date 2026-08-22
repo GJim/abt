@@ -15,8 +15,7 @@ import { ProductPairsListPage } from './ProductPairsListPage'
 import { IntentWorkspacePage } from './IntentWorkspacePage'
 import { RegistrationInvitesPage } from './RegistrationInvitesPage'
 import { TraderManagementPage } from './TraderManagementPage'
-import { WorkerSnapshotsPage } from './WorkerSnapshotsPage'
-import { WorkerSummaryTable } from './WorkerSummaryTable'
+import { WorkerManagementPage } from './WorkerManagementPage'
 import './App.css'
 import './Console.css'
 
@@ -40,7 +39,7 @@ type AuditEvent = {
 
 type EnrollmentEvidence = Record<string, unknown>
 
-type Enrollment = {
+export type Enrollment = {
   enrollment_id: string
   login: number
   server: string
@@ -62,7 +61,7 @@ type ReconciliationDelta = {
   record: Record<string, unknown>
 }
 
-type AccountWorker = {
+export type AccountWorker = {
   worker_id: string
   login: number
   server: string
@@ -79,7 +78,7 @@ type AccountWorker = {
   deltas: ReconciliationDelta[]
 }
 
-type WorkerAlert = {
+export type WorkerAlert = {
   alert_id: number
   worker_id: string | null
   product_pair_id?: string | null
@@ -90,7 +89,7 @@ type WorkerAlert = {
   occurred_at: string
 }
 
-type InterventionItem =
+export type InterventionItem =
   | {
     id: string
     kind: string
@@ -755,9 +754,9 @@ function App() {
     }
   }
 
-  async function revokeWorker(workerId: string) {
+  async function revokeWorker(workerId: string): Promise<boolean> {
     if (!csrfToken) {
-      return
+      return false
     }
     setError(null)
     try {
@@ -770,8 +769,10 @@ function App() {
         throw new Error('Certificate revocation failed.')
       }
       await refreshManagementData()
+      return true
     } catch {
       setError('Could not revoke this worker certificate. Please try again.')
+      return false
     }
   }
 
@@ -945,7 +946,7 @@ function App() {
           <main className="console-main management-content">
           <header className={isAnalysisRoute ? 'analysis-page-header' : undefined}>
             {consolePage === 'main' && <h1>Management console</h1>}
-            {consolePage === 'main' && <p>Launch and inspect cross-server product-pair analyses alongside worker health and audit events.</p>}
+            {consolePage === 'main' && <p>Launch and inspect cross-server product-pair analyses and their audit trail.</p>}
             {isAnalysisRoute && analysisRouteId && <Link className="new-analysis-button" to="/analysis">+ New</Link>}
           </header>
           {error && <p className="error" role="alert">{error}</p>}
@@ -980,7 +981,17 @@ function App() {
               </section>
             </div>
           )}
-          {consolePage === 'audit' ? <AuditEventsPage /> : consolePage === 'snapshots' ? <WorkerSnapshotsPage /> : consolePage === 'invites' ? (
+          {consolePage === 'audit' ? <AuditEventsPage /> : consolePage === 'snapshots' ? (
+            <WorkerManagementPage
+              alerts={alerts}
+              enrollments={enrollments}
+              interventionQueue={interventionQueue}
+              isProcessingEnrollment={(enrollmentId) => processingEnrollmentId === enrollmentId}
+              onReviewEnrollment={(enrollmentId, action) => void reviewEnrollment(enrollmentId, action)}
+              onRevokeWorker={revokeWorker}
+              workers={workers}
+            />
+          ) : consolePage === 'invites' ? (
             <RegistrationInvitesPage csrfToken={csrfToken} />
           ) : consolePage === 'traders' ? (
             <TraderManagementPage csrfToken={csrfToken} />
@@ -998,57 +1009,6 @@ function App() {
               }}
             />
           ) : <>
-
-          {consolePage !== 'launch' && <>
-          <section aria-labelledby="intervention-queue-heading" className="intervention-queue">
-            <div className="section-header">
-              <div>
-                <h2 id="intervention-queue-heading">Needs attention</h2>
-                <p>Only control-plane conditions that need an operator action appear here.</p>
-              </div>
-              <span className="status-badge status-failed">{interventionQueue.length} open</span>
-            </div>
-            {interventionQueue.length === 0 ? (
-              <p>No operator action is needed.</p>
-            ) : (
-              <ul aria-label="Intervention queue">
-                {interventionQueue.map((item) => (
-                  <li key={item.id} className="intervention-item">
-                    <div>
-                      <strong>{item.kind}</strong>
-                      <p>{item.reason}</p>
-                      <time dateTime={item.occurredAt}>{formatDateTime(item.occurredAt)}</time>
-                    </div>
-                    {'enrollment' in item ? (
-                      <div className="enrollment-actions">
-                        <button
-                          aria-label={`Approve registration for ${item.enrollment.login} on ${item.enrollment.server}`}
-                          disabled={processingEnrollmentId === item.enrollment.enrollment_id}
-                          onClick={() => void reviewEnrollment(item.enrollment!.enrollment_id, 'approve')}
-                          type="button"
-                        >
-                          Approve
-                        </button>
-                        <button
-                          aria-label={`Reject registration for ${item.enrollment.login} on ${item.enrollment.server}`}
-                          className="reject-button"
-                          disabled={processingEnrollmentId === item.enrollment.enrollment_id}
-                          onClick={() => void reviewEnrollment(item.enrollment!.enrollment_id, 'reject')}
-                          type="button"
-                        >
-                          Reject
-                        </button>
-                      </div>
-                    ) : (
-                      <a href="#account-workers-heading">Review worker</a>
-                    )}
-                    {'enrollment' in item && <a href={`#enrollment-${item.enrollment.enrollment_id}`}>Review evidence</a>}
-                  </li>
-                ))}
-              </ul>
-            )}
-          </section>
-          </>}
 
           {isAnalysisRoute && <section aria-label={analysisRouteId ? 'Analysis result' : 'Launch'} className="analysis-section">
             {!analysisRouteId && <div className="section-header">
@@ -1177,159 +1137,6 @@ function App() {
             workers={workers}
           />
 
-          <section aria-labelledby="worker-alerts-heading">
-            <h2 id="worker-alerts-heading">Worker alerts</h2>
-            {alerts.length === 0 ? <p>No worker alerts.</p> : (
-              <ul className="worker-alerts" aria-label="Worker alerts">
-                {alerts.map((alert) => (
-                  <li key={alert.alert_id}>
-                    <strong>{alert.priority}: {alert.alert_type}</strong>
-                    <span>{alert.reason}</span>
-                    <time dateTime={alert.occurred_at}>{formatDateTime(alert.occurred_at)}</time>
-                  </li>
-                ))}
-              </ul>
-            )}
-          </section>
-          <section aria-labelledby="pending-enrollments-heading">
-            <h2 id="pending-enrollments-heading">Pending worker registrations</h2>
-            {enrollments.length === 0 ? (
-              <p>No worker registrations are awaiting review.</p>
-            ) : (
-              <ul className="enrollment-list" aria-label="Pending worker registrations">
-                {enrollments.map((enrollment) => {
-                  const isProcessing = processingEnrollmentId === enrollment.enrollment_id
-                  const registrationName = `${enrollment.login} on ${enrollment.server}`
-
-                  return (
-                    <li id={`enrollment-${enrollment.enrollment_id}`} key={enrollment.enrollment_id} className="enrollment">
-                      <dl>
-                        <div><dt>Login</dt><dd>{enrollment.login}</dd></div>
-                        <div><dt>Server</dt><dd>{enrollment.server}</dd></div>
-                        <div><dt>Pairing code</dt><dd>{enrollment.pairing_code}</dd></div>
-                        <div><dt>Created</dt><dd><time dateTime={enrollment.created_at}>{formatDateTime(enrollment.created_at)}</time></dd></div>
-                        <div><dt>Expires</dt><dd><time dateTime={enrollment.expires_at}>{formatDateTime(enrollment.expires_at)}</time></dd></div>
-                      </dl>
-                      <Collapsible defaultIsOpen={false} trigger="View registration evidence">
-                        <div className="enrollment-evidence">
-                          <section aria-label={`Account information for ${registrationName}`}>
-                            <h3>Account information</h3>
-                            <pre>{JSON.stringify(enrollment.account_info, null, 2)}</pre>
-                          </section>
-                          <section aria-label={`Terminal information for ${registrationName}`}>
-                            <h3>Terminal information</h3>
-                            <pre>{JSON.stringify(enrollment.terminal_info, null, 2)}</pre>
-                          </section>
-                        </div>
-                      </Collapsible>
-                      <div className="enrollment-actions">
-                        <button
-                          aria-label={`Approve registration for ${registrationName}`}
-                          disabled={isProcessing}
-                          onClick={() => void reviewEnrollment(enrollment.enrollment_id, 'approve')}
-                          type="button"
-                        >
-                          Approve
-                        </button>
-                        <button
-                          aria-label={`Reject registration for ${registrationName}`}
-                          className="reject-button"
-                          disabled={isProcessing}
-                          onClick={() => void reviewEnrollment(enrollment.enrollment_id, 'reject')}
-                          type="button"
-                        >
-                          Reject
-                        </button>
-                      </div>
-                    </li>
-                  )
-                })}
-              </ul>
-            )}
-          </section>
-          <section aria-labelledby="account-workers-heading" className="fleet-health">
-            <div className="section-header">
-              <div>
-                <h2 id="account-workers-heading">Fleet health</h2>
-                <p>Scan worker state and snapshot freshness before opening reconciliation evidence.</p>
-              </div>
-              <span className="fleet-count">{workers.length} {workers.length === 1 ? 'worker' : 'workers'}</span>
-            </div>
-            <WorkerSummaryTable workers={workers} onOpenSnapshots={() => navigate('/workers')} />
-            <Collapsible defaultIsOpen={false} trigger="Show worker actions and reconciliation">
-            {workers.length === 0 ? (
-              <p className="empty-state">No approved account workers have reported yet. Approved workers will appear here after their first connection.</p>
-            ) : (
-              <ul className="worker-list" aria-label="Fleet health by account">
-                {[...workers].sort((first, second) => {
-                  const priority = workerHealthPriority(first) - workerHealthPriority(second)
-                  return priority || `${first.server}:${first.login}`.localeCompare(`${second.server}:${second.login}`)
-                }).map((worker) => {
-                  const health = describeWorkerHealth(worker)
-                  const accountName = `${worker.login} on ${worker.server}`
-                  const snapshot = worker.latest_snapshot
-                  return (
-                    <li key={worker.worker_id} className="worker">
-                      <div className="worker-summary">
-                        <div>
-                          <h3>{accountName}</h3>
-                          <p>{health.description}</p>
-                        </div>
-                        <span className={`status-badge worker-health-${health.tone}`}>{health.label}</span>
-                      </div>
-                      <dl className="worker-facts">
-                        <div><dt>Freshness</dt><dd>{snapshot ? <time dateTime={snapshot.observed_at}>{formatSnapshotFreshness(snapshot.observed_at)}</time> : 'No snapshot received'}</dd></div>
-                        <div><dt>Account</dt><dd>{snapshot ? formatAccountSummary(snapshot.account) : 'Awaiting snapshot'}</dd></div>
-                        <div><dt>Reconciliation</dt><dd>{formatReconciliationSummary(worker)}</dd></div>
-                      </dl>
-                      <div className="worker-actions">
-                        <Collapsible defaultIsOpen={false} trigger={`View snapshot and reconciliation evidence for ${accountName}`}>
-                          <div className="worker-evidence">
-                            {snapshot ? (
-                              <section aria-label={`Latest snapshot for ${accountName}`}>
-                                <h4>Latest snapshot</h4>
-                                <time dateTime={snapshot.observed_at}>{formatDateTime(snapshot.observed_at)}</time>
-                                <pre>{JSON.stringify({
-                                  account: snapshot.account,
-                                  terminal: snapshot.terminal,
-                                  orders: snapshot.orders,
-                                  positions: snapshot.positions,
-                                }, null, 2)}</pre>
-                              </section>
-                            ) : <p>No raw snapshot has been received.</p>}
-                            <section aria-label={`Lifecycle deltas for ${accountName}`}>
-                              <h4>Lifecycle deltas</h4>
-                              {worker.deltas.length === 0 ? <p>No lifecycle or volume changes reported.</p> : (
-                                <ul className="worker-deltas">
-                                  {worker.deltas.map((delta) => (
-                                    <li key={delta.cursor}>
-                                      <strong>{delta.change}</strong> {delta.entity} {delta.ticket}
-                                      <time dateTime={delta.observed_at}>{formatDateTime(delta.observed_at)}</time>
-                                    </li>
-                                  ))}
-                                </ul>
-                              )}
-                            </section>
-                          </div>
-                        </Collapsible>
-                        {worker.connectivity !== 'revoked' && (
-                          <button
-                            aria-label={`Revoke certificate for ${accountName}`}
-                            className="reject-button"
-                            onClick={() => void revokeWorker(worker.worker_id)}
-                            type="button"
-                          >
-                            Revoke certificate
-                          </button>
-                        )}
-                      </div>
-                    </li>
-                  )
-                })}
-              </ul>
-            )}
-            </Collapsible>
-          </section>
           <section aria-labelledby="audit-events-heading">
             <h2 id="audit-events-heading">Audit events</h2>
             <ul className="audit-events" aria-label="Audit events">
@@ -2757,91 +2564,6 @@ function describeRetiredReason(reason: string | null) {
     return 'Replaced'
   }
   return humanizeToken(reason)
-}
-
-const SNAPSHOT_STALE_AFTER_MS = 15 * 60 * 1000
-
-function describeWorkerHealth(worker: AccountWorker) {
-  if (worker.connectivity === 'revoked') {
-    return {
-      label: 'Revoked — human action',
-      tone: 'human-action',
-      description: 'Its certificate is revoked. Re-enrol the worker before it can report again.',
-    }
-  }
-  if (worker.safety_state !== 'connected' || worker.connectivity === 'disconnected') {
-    return {
-      label: 'Human action needed',
-      tone: 'human-action',
-      description: `Connectivity is ${humanizeToken(worker.connectivity)} and safety state is ${humanizeToken(worker.safety_state)}.`,
-    }
-  }
-  if (worker.connectivity === 'stale' || isSnapshotStale(worker.latest_snapshot?.observed_at)) {
-    return {
-      label: 'Stale data',
-      tone: 'stale',
-      description: 'The latest snapshot is too old to use for live operational decisions.',
-    }
-  }
-  if (worker.latest_snapshot === null) {
-    return {
-      label: 'Idle — no snapshot',
-      tone: 'idle',
-      description: 'Connected, but waiting for its first account snapshot.',
-    }
-  }
-  return {
-    label: 'Healthy',
-    tone: 'healthy',
-    description: 'Connected with a current account snapshot.',
-  }
-}
-
-function workerHealthPriority(worker: AccountWorker) {
-  const tone = describeWorkerHealth(worker).tone
-  return { 'human-action': 0, stale: 1, idle: 2, healthy: 3 }[tone] ?? 3
-}
-
-function isSnapshotStale(observedAt: string | undefined) {
-  if (!observedAt) {
-    return false
-  }
-  const timestamp = Date.parse(observedAt)
-  return !Number.isFinite(timestamp) || Date.now() - timestamp > SNAPSHOT_STALE_AFTER_MS
-}
-
-function formatSnapshotFreshness(observedAt: string) {
-  const timestamp = Date.parse(observedAt)
-  if (!Number.isFinite(timestamp)) {
-    return 'Snapshot time unavailable'
-  }
-  const ageInMinutes = Math.max(0, Math.floor((Date.now() - timestamp) / 60_000))
-  const age = ageInMinutes === 0 ? 'just now' : `${ageInMinutes} ${ageInMinutes === 1 ? 'minute' : 'minutes'} ago`
-  return `${isSnapshotStale(observedAt) ? 'Stale' : 'Current'}: ${age} (${formatDateTime(observedAt)})`
-}
-
-function formatAccountSummary(account: EnrollmentEvidence) {
-  const balance = account.balance
-  const currency = account.currency
-  if (typeof balance === 'number') {
-    return `Balance ${balance.toLocaleString()}${typeof currency === 'string' ? ` ${currency}` : ''}`
-  }
-  return 'Account snapshot received'
-}
-
-function formatReconciliationSummary(worker: AccountWorker) {
-  const snapshot = worker.latest_snapshot
-  if (snapshot === null) {
-    return 'Awaiting reconciliation'
-  }
-  const counts = `${snapshot.positions.length} positions, ${snapshot.orders.length} orders`
-  if (worker.deltas.length === 0) {
-    return `${counts}; no changes`
-  }
-  const latestDelta = worker.deltas.reduce((latest, delta) => (
-    delta.observed_at > latest.observed_at ? delta : latest
-  ))
-  return `${counts}; ${worker.deltas.length} change${worker.deltas.length === 1 ? '' : 's'}, latest ${humanizeToken(latestDelta.change)}`
 }
 
 export default App

@@ -267,7 +267,7 @@ export function WorkerSnapshotsPage() {
           <section
             aria-labelledby="snapshot-json-dialog-title"
             aria-modal="true"
-            className="snapshot-json-dialog"
+            className="snapshot-json-dialog snapshot-json-dialog-scrollable"
             role="dialog"
           >
             <div className="snapshot-json-dialog-header">
