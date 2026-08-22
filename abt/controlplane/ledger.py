@@ -1483,6 +1483,118 @@ class ControlLedger:
             ).fetchall()
         return {str(row[0]) for row in rows}
 
+    def request_worker_recovery(
+        self, username: str, command_id: str, worker_id: str, operation: str
+    ) -> tuple[dict[str, Any], bool]:
+        if operation not in {"cleanup", "release"}:
+            raise LedgerError("Worker recovery operation is invalid.")
+        payload = {"worker_id": worker_id, "operation": operation}
+        payload_hash = _hash(json.dumps(payload, sort_keys=True))
+        with self._transaction():
+            existing = self._connection.execute(
+                """SELECT payload_hash, result FROM worker_recovery_commands
+                   WHERE username = ? AND command_id = ?""",
+                [username, command_id],
+            ).fetchone()
+            if existing is not None:
+                if existing[0] != payload_hash:
+                    raise LedgerError("Worker recovery command ID was already used with a different payload.")
+                return json.loads(existing[1]), False
+            state = self._connection.execute(
+                "SELECT safety_state FROM workers WHERE worker_id = ? AND status = 'active'", [worker_id]
+            ).fetchone()
+            if state is None:
+                raise LedgerError("Worker is not active.")
+            if state[0] != "frozen":
+                raise LedgerError("Worker recovery is available only for frozen workers.")
+            result = {
+                "worker_id": worker_id,
+                "operation": operation,
+                "operation_id": str(uuid4()),
+                "status": f"{operation}_scheduled",
+            }
+            self._connection.execute(
+                """INSERT INTO worker_recovery_commands
+                   (username, command_id, payload_hash, worker_id, operation, result, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                [username, command_id, payload_hash, worker_id, operation, json.dumps(result, sort_keys=True), _utc_now()],
+            )
+            self._event(
+                f"worker_{operation}_requested",
+                {"worker_id": worker_id, "operation_id": result["operation_id"], "requested_by": username},
+            )
+            return result, True
+
+    def record_worker_cleanup(
+        self, worker_id: str, operation_id: str, requested_by: str, state: dict[str, object], succeeded: bool
+    ) -> None:
+        with self._transaction():
+            self._event(
+                "worker_cleanup_completed" if succeeded else "worker_cleanup_failed",
+                {
+                    "worker_id": worker_id,
+                    "operation_id": operation_id,
+                    "requested_by": requested_by,
+                    "state": state,
+                },
+            )
+
+    def release_frozen_worker(
+        self, worker_id: str, operation_id: str, released_by: str, state: dict[str, object]
+    ) -> None:
+        if state.get("orders") or state.get("positions"):
+            raise LedgerError("Worker release requires an empty broker-account reconciliation.")
+        with self._transaction():
+            changed = self._connection.execute(
+                """UPDATE workers SET safety_state = 'connected', last_seen_at = ?
+                   WHERE worker_id = ? AND status = 'active' AND safety_state = 'frozen'
+                   RETURNING worker_id""",
+                [_utc_now(), worker_id],
+            ).fetchone()
+            if changed is None:
+                raise LedgerError("Worker recovery is available only for frozen workers.")
+            self._event(
+                "worker_released",
+                {
+                    "worker_id": worker_id,
+                    "operation_id": operation_id,
+                    "released_by": released_by,
+                    "reconciled_at": _utc_now().isoformat(),
+                },
+            )
+
+    def record_empty_account_reconciliation(
+        self, worker_id: str, operation_id: str, requested_by: str, state: dict[str, object]
+    ) -> None:
+        if state.get("orders") or state.get("positions"):
+            raise LedgerError("Empty-account reconciliation contains broker exposure.")
+        with self._transaction():
+            self._event(
+                "worker_empty_account_reconciled",
+                {
+                    "worker_id": worker_id,
+                    "operation_id": operation_id,
+                    "requested_by": requested_by,
+                    "orders": [],
+                    "positions": [],
+                    "reconciled_at": _utc_now().isoformat(),
+                },
+            )
+
+    def record_worker_release_failure(
+        self, worker_id: str, operation_id: str, requested_by: str, reason: str
+    ) -> None:
+        with self._transaction():
+            self._event(
+                "worker_release_failed",
+                {
+                    "worker_id": worker_id,
+                    "operation_id": operation_id,
+                    "requested_by": requested_by,
+                    "reason": reason,
+                },
+            )
+
     def revoke_worker(self, worker_id: str, revoked_by: str) -> None:
         with self._transaction():
             active = self._connection.execute(
@@ -3407,6 +3519,16 @@ class ControlLedger:
                     orders JSON NOT NULL,
                     positions JSON NOT NULL,
                     received_at TIMESTAMPTZ NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS worker_recovery_commands (
+                    username VARCHAR NOT NULL,
+                    command_id VARCHAR NOT NULL,
+                    payload_hash VARCHAR NOT NULL,
+                    worker_id VARCHAR NOT NULL,
+                    operation VARCHAR NOT NULL,
+                    result JSON NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL,
+                    PRIMARY KEY (username, command_id)
                 );
                 CREATE SEQUENCE IF NOT EXISTS events_sequence START 1;
                 CREATE TABLE IF NOT EXISTS events (

@@ -351,8 +351,12 @@ def reconcile_authenticated_worker(
         reconciliation = MT5ReconciliationAdapter(
             mt5, emit=session.send_reconciliation, initial_cursor=getattr(session, "reconciliation_cursor", 0)
         )
-        watched_symbols = _visible_symbols(mt5)
-        live_state = LiveWorkerMarketStateAdapter(mt5, watched_symbols=watched_symbols, emit=session.send_live_state)
+        send_live_state = getattr(session, "send_live_state", None)
+        live_state = None
+        if callable(send_live_state):
+            live_state = LiveWorkerMarketStateAdapter(
+                mt5, watched_symbols=_visible_symbols(mt5), emit=send_live_state
+            )
         if callable(getattr(session, "receive_product_catalog_analysis", None)) and callable(
             getattr(session, "send_product_catalog_analysis", None)
         ):
@@ -636,6 +640,13 @@ def _serve_execution_recovery(mt5: ReadOnlyMT5, session: AnalysisWorkerSession, 
     request_id = _request_text(request, "request_id")
     operation = _request_text(request, "type").removesuffix("_request")
     try:
+        if operation == "worker_cleanup_reconcile":
+            result = {
+                "orders": list(_records(mt5.orders_get(), "order")),
+                "positions": list(_records(mt5.positions_get(), "position")),
+            }
+            session.send_execution_recovery(request_id=request_id, operation=operation, accepted=True, result=result)
+            return
         if operation == "execution_reconcile":
             execution_id = _request_text(request, "execution_id")
             result = {
@@ -648,9 +659,9 @@ def _serve_execution_recovery(mt5: ReadOnlyMT5, session: AnalysisWorkerSession, 
         volume = float(_request_text(request, "volume"))
         if volume <= 0:
             raise ValueError
-        if operation == "execution_cancel":
+        if operation in {"execution_cancel", "worker_cleanup_cancel"}:
             result = _evidence(mt5.order_send({"action": getattr(mt5, "TRADE_ACTION_REMOVE"), "order": ticket}), "order cancellation")
-        elif operation == "execution_close":
+        elif operation in {"execution_close", "worker_cleanup_close"}:
             position = next((item for item in _records(mt5.positions_get(), "position") if str(item.get("ticket")) == str(ticket)), None)
             if position is None or position.get("symbol") is None or position.get("type") is None:
                 raise WorkerEnrollmentError("The execution position is no longer observable.")

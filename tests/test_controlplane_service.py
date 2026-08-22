@@ -41,6 +41,7 @@ from abt.controlplane.secrets import SecretStore, SecretStoreError
 from abt.controlplane.service import (
     _analyze_product_catalogs,
     _cancel_intent,
+    _cleanup_frozen_worker,
     _dispatch_accepted_trader_intent,
     _delete_expired_pending_secrets,
     _market_data_statistics,

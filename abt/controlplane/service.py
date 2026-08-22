@@ -197,6 +197,10 @@ class ManagementIntentCommandRequest(BaseModel):
     command_id: str = Field(min_length=1, max_length=128)
 
 
+class WorkerRecoveryCommandRequest(BaseModel):
+    command_id: str = Field(min_length=1, max_length=128)
+
+
 class ManagementIntentCreateRequest(TraderIntentPayload):
     command_id: str = Field(min_length=1, max_length=128)
 
@@ -864,6 +868,38 @@ def create_app(
     ) -> list[dict[str, object]]:
         _require_admin(ledger, abt_admin_session)
         return ledger.worker_reconciliation()
+
+    @app.post("/api/admin/workers/{worker_id}/cleanup")
+    async def cleanup_worker(
+        worker_id: str,
+        body: WorkerRecoveryCommandRequest,
+        abt_admin_session: Annotated[str | None, Cookie()] = None,
+        x_csrf_token: Annotated[str | None, Header()] = None,
+    ) -> dict[str, object]:
+        username = _require_admin(ledger, abt_admin_session, x_csrf_token, require_csrf=True)
+        try:
+            result, scheduled = ledger.request_worker_recovery(username, body.command_id, worker_id, "cleanup")
+            if scheduled:
+                asyncio.create_task(_cleanup_frozen_worker(ledger, worker_connections, worker_execution_locks, worker_id, result, username))
+            return result
+        except LedgerError as error:
+            raise HTTPException(status_code=_ledger_error_status(error), detail=str(error)) from error
+
+    @app.post("/api/admin/workers/{worker_id}/release")
+    async def release_worker(
+        worker_id: str,
+        body: WorkerRecoveryCommandRequest,
+        abt_admin_session: Annotated[str | None, Cookie()] = None,
+        x_csrf_token: Annotated[str | None, Header()] = None,
+    ) -> dict[str, object]:
+        username = _require_admin(ledger, abt_admin_session, x_csrf_token, require_csrf=True)
+        try:
+            result, scheduled = ledger.request_worker_recovery(username, body.command_id, worker_id, "release")
+            if scheduled:
+                asyncio.create_task(_release_frozen_worker(ledger, worker_connections, worker_execution_locks, worker_id, result, username))
+            return result
+        except LedgerError as error:
+            raise HTTPException(status_code=_ledger_error_status(error), detail=str(error)) from error
 
     @app.get("/api/admin/alerts")
     def list_alerts(
@@ -1720,7 +1756,7 @@ def create_app(
             return FileResponse(spa_directory / "index.html")
 
         for spa_route in (
-            "/analysis", "/analysis/{analysis_path:path}", "/audit", "/workers", "/traders", "/intents",
+            "/analysis", "/analysis/{analysis_path:path}", "/audit", "/workers", "/worker-recovery", "/traders", "/intents",
             "/pairs/{pair_status:path}",
         ):
             app.add_api_route(spa_route, management_spa_route, methods=["GET"], include_in_schema=False)
@@ -2000,7 +2036,8 @@ def _record_execution_recovery_response(connection: _WorkerSessionConnection, re
     pending = connection.pending.pop(request_id, None)
     if pending is None:
         return
-    if pending.stage not in {"execution_reconcile", "execution_cancel", "execution_close"} or set(request) != {
+    if pending.stage not in {"execution_reconcile", "execution_cancel", "execution_close", "worker_cleanup_reconcile",
+                             "worker_cleanup_cancel", "worker_cleanup_close"} or set(request) != {
         "type", "request_id", "operation", "accepted", "result"
     } or request["operation"] != pending.stage or not isinstance(request["accepted"], bool) or not isinstance(request["result"], dict):
         raise ValueError("Invalid worker execution recovery response.")
@@ -2013,7 +2050,8 @@ def _record_execution_recovery_error(connection: _WorkerSessionConnection, reque
     pending = connection.pending.pop(request_id, None)
     if pending is None:
         return
-    if pending.stage not in {"execution_reconcile", "execution_cancel", "execution_close"} or set(request) != {
+    if pending.stage not in {"execution_reconcile", "execution_cancel", "execution_close", "worker_cleanup_reconcile",
+                             "worker_cleanup_cancel", "worker_cleanup_close"} or set(request) != {
         "type", "request_id", "operation", "reason"
     } or request["operation"] != pending.stage:
         raise ValueError("Invalid worker execution recovery error.")
@@ -2739,6 +2777,84 @@ async def _execution_recovery_request(
     return response
 
 
+async def _worker_cleanup_request(
+    connection: _WorkerSessionConnection, operation: str, payload: dict[str, str] | None = None
+) -> dict[str, object]:
+    request_id = str(uuid4())
+    response = await _request_worker_analysis(
+        connection,
+        analysis_id=operation,
+        stage=operation,
+        timeout=30,
+        message={"type": f"{operation}_request", "request_id": request_id, **(payload or {})},
+    )
+    if response.get("accepted") is not True or response.get("operation") != operation:
+        raise LedgerError(f"Worker did not confirm {operation}.")
+    return response
+
+
+def _cleanup_state(response: dict[str, object]) -> dict[str, list[dict[str, str]]]:
+    result = response.get("result")
+    if not isinstance(result, dict):
+        raise LedgerError("Worker cleanup reconciliation returned an unknown broker state.")
+    return {"orders": _execution_records(result.get("orders")), "positions": _execution_records(result.get("positions"))}
+
+
+async def _cleanup_frozen_worker(
+    ledger: ControlLedger,
+    worker_connections: dict[str, set[_WorkerSessionConnection]],
+    worker_execution_locks: dict[str, asyncio.Lock],
+    worker_id: str,
+    command: dict[str, object],
+    username: str,
+) -> None:
+    operation_id = str(command["operation_id"])
+    state: dict[str, object] = {"orders": [], "positions": []}
+    try:
+        async with _pair_worker_execution(worker_execution_locks, worker_id, worker_id):
+            connection = _connected_worker_session(
+                worker_connections, worker_id, reason="Frozen worker must be connected for account cleanup."
+            )
+            state = _cleanup_state(await _worker_cleanup_request(connection, "worker_cleanup_reconcile"))
+            for order in state["orders"]:
+                await _worker_cleanup_request(connection, "worker_cleanup_cancel", order)
+            state = _cleanup_state(await _worker_cleanup_request(connection, "worker_cleanup_reconcile"))
+            if state["orders"]:
+                raise LedgerError("Broker did not confirm cancellation of every pending order.")
+            for position in state["positions"]:
+                await _worker_cleanup_request(connection, "worker_cleanup_close", position)
+            state = _cleanup_state(await _worker_cleanup_request(connection, "worker_cleanup_reconcile"))
+            if state["orders"] or state["positions"]:
+                raise LedgerError("Broker cleanup final reconciliation did not prove an empty account.")
+    except (KeyError, LedgerError, ValueError, asyncio.TimeoutError) as error:
+        _LOGGER.warning("Worker cleanup %s failed for %s: %s", operation_id, worker_id, error)
+        ledger.record_worker_cleanup(worker_id, operation_id, username, state, False)
+        return
+    ledger.record_worker_cleanup(worker_id, operation_id, username, state, True)
+
+
+async def _release_frozen_worker(
+    ledger: ControlLedger,
+    worker_connections: dict[str, set[_WorkerSessionConnection]],
+    worker_execution_locks: dict[str, asyncio.Lock],
+    worker_id: str,
+    command: dict[str, object],
+    username: str,
+) -> None:
+    operation_id = str(command["operation_id"])
+    try:
+        async with _pair_worker_execution(worker_execution_locks, worker_id, worker_id):
+            connection = _connected_worker_session(
+                worker_connections, worker_id, reason="Frozen worker must be connected for independent release."
+            )
+            state = _cleanup_state(await _worker_cleanup_request(connection, "worker_cleanup_reconcile"))
+            ledger.record_empty_account_reconciliation(worker_id, operation_id, username, state)
+            ledger.release_frozen_worker(worker_id, operation_id, username, state)
+    except (KeyError, LedgerError, ValueError, asyncio.TimeoutError) as error:
+        _LOGGER.warning("Worker release %s failed for %s: %s", operation_id, worker_id, error)
+        ledger.record_worker_release_failure(worker_id, operation_id, username, str(error))
+
+
 def _execution_records(records: object) -> list[dict[str, str]]:
     if not isinstance(records, list):
         raise ValueError("Execution reconciliation returned an unknown broker state.")
@@ -2746,9 +2862,10 @@ def _execution_records(records: object) -> list[dict[str, str]]:
     for record in records:
         if not isinstance(record, dict) or not isinstance(record.get("ticket"), (str, int)) or isinstance(record.get("ticket"), bool):
             raise ValueError("Execution reconciliation returned an unknown broker record.")
+        volume_value = record.get("volume", record.get("volume_current", record.get("volume_initial")))
         try:
-            volume = Decimal(str(record["volume"]))
-        except (KeyError, ValueError, ArithmeticError) as error:
+            volume = Decimal(str(volume_value))
+        except (ValueError, ArithmeticError) as error:
             raise ValueError("Execution reconciliation returned an unknown broker volume.") from error
         if volume <= 0:
             raise ValueError("Execution reconciliation returned an unknown broker volume.")

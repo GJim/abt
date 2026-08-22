@@ -8,13 +8,12 @@ one worker.
 
 **Blocked by:** 01 — Publish live worker market state; 02 — Expand worker-level trading isolation.
 
-**Status:** ready-for-agent
+**Status:** ready-for-human
 
-- [ ] The workspace lists frozen workers, their source, and their current
+- [x] The workspace lists frozen workers, their source, and their current
   broker-visible orders/positions, with filterable operational state.
-- [ ] Cleanup requires preview and confirmation, confirms cancellation before
+- [x] Cleanup requires preview and confirmation, confirms cancellation before
   closing positions, and remains frozen after any failed or uncertain step.
-- [ ] Release is idempotent and available only after broker reconciliation
+- [x] Release is idempotent and available only after broker reconciliation
   proves zero pending orders and zero positions; audit records identity, time,
   and operation ID.
-

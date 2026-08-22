@@ -198,6 +198,40 @@ class ControlLedgerTests(unittest.TestCase):
         self.assertEqual(frozen[0], replay[0])
         self.assertEqual(2, len([event for event in self.ledger.events() if event["event_type"] == "worker_frozen"]))
 
+    def test_worker_recovery_is_idempotent_and_release_requires_a_proven_empty_account(self) -> None:
+        with self.ledger._transaction():
+            self.ledger._connection.execute(
+                """INSERT INTO workers
+                   (worker_id, enrollment_id, login, server, certificate, status, approved_at, safety_state)
+                   VALUES ('worker-a', 'enrollment-a', 123456, 'Broker-A', 'certificate:a', 'active', ?, 'frozen')""",
+                [datetime.now(UTC)],
+            )
+
+        requested, scheduled = self.ledger.request_worker_recovery("ABCDEF", "cleanup-1", "worker-a", "cleanup")
+        replay, replay_scheduled = self.ledger.request_worker_recovery("ABCDEF", "cleanup-1", "worker-a", "cleanup")
+        self.assertTrue(scheduled)
+        self.assertFalse(replay_scheduled)
+        self.assertEqual(requested, replay)
+        with self.assertRaisesRegex(LedgerError, "different payload"):
+            self.ledger.request_worker_recovery("ABCDEF", "cleanup-1", "worker-a", "release")
+        with self.assertRaisesRegex(LedgerError, "empty broker-account"):
+            self.ledger.release_frozen_worker(
+                "worker-a", "release-operation", "ABCDEF", {"orders": [{"ticket": "1"}], "positions": []}
+            )
+
+        self.ledger.release_frozen_worker("worker-a", "release-operation", "ABCDEF", {"orders": [], "positions": []})
+        worker = self.ledger.worker_reconciliation()[0]
+        self.assertEqual("connected", worker["safety_state"])
+        event = next(event for event in self.ledger.events() if event["event_type"] == "worker_released")
+        self.assertEqual("ABCDEF", event["payload"]["released_by"])
+        self.assertEqual("release-operation", event["payload"]["operation_id"])
+        self.ledger.record_empty_account_reconciliation("worker-a", "reconcile-operation", "ABCDEF", {"orders": [], "positions": []})
+        reconciliation = next(
+            event for event in self.ledger.events() if event["event_type"] == "worker_empty_account_reconciled"
+        )
+        self.assertEqual([], reconciliation["payload"]["orders"])
+        self.assertEqual([], reconciliation["payload"]["positions"])
+
     def test_management_operation_requires_zero_fills_to_cancel_and_fills_to_flatten(self) -> None:
         payload = {
             "type": "intent",

@@ -296,6 +296,17 @@ class AuthenticatedWorkerSession:
 
     def _parse_execution_recovery(self, response: dict[str, object]) -> dict[str, object]:
         request_type = response.get("type")
+        if request_type == "worker_cleanup_reconcile_request" and set(response) == {"type", "request_id"}:
+            return {"type": request_type, "request_id": _required_text(response, "request_id")}
+        if request_type in {"worker_cleanup_cancel_request", "worker_cleanup_close_request"} and set(response) == {
+            "type", "request_id", "ticket", "volume"
+        }:
+            return {
+                "type": request_type,
+                "request_id": _required_text(response, "request_id"),
+                "ticket": _required_text(response, "ticket"),
+                "volume": _required_text(response, "volume"),
+            }
         if request_type == "execution_reconcile_request" and set(response) == {"type", "request_id", "execution_id"}:
             return {"type": request_type, "request_id": _required_text(response, "request_id"),
                     "execution_id": _required_text(response, "execution_id")}
