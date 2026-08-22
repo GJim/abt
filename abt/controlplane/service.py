@@ -1645,28 +1645,15 @@ def create_app(
                     await websocket.send_json({"type": "heartbeat_ack"})
                 elif (
                     message_type == "safety_state"
-                    and set(request) in (
-                        {"type", "state", "reason"},
-                        {"type", "state", "reason", "source", "affected_worker_ids"},
-                    )
+                    and set(request) == {"type", "state", "reason"}
                     and isinstance(request.get("state"), str)
                     and isinstance(request.get("reason"), str)
                     and request["reason"]
                 ):
                     if request["state"] == "frozen":
-                        source = request.get("source")
-                        affected_worker_ids = request.get("affected_worker_ids")
-                        if (
-                            not isinstance(source, str)
-                            or not source
-                            or not isinstance(affected_worker_ids, list)
-                            or not all(isinstance(item, str) and item for item in affected_worker_ids)
-                            or worker.worker_id not in affected_worker_ids
-                        ):
-                            raise ValueError("Frozen worker safety state is invalid.")
                         ledger.freeze_workers(
-                            source,
-                            affected_worker_ids,
+                            "worker_reported_safety_state",
+                            [worker.worker_id],
                             {"reason": request["reason"]},
                         )
                     else:
@@ -2388,9 +2375,7 @@ async def _preflight_intent(
             raise LedgerError("Intent filling mode is not supported by both endpoints.")
         sources = cast(dict[str, dict[str, Any]], pair["source_workers"])
         workers = [sources["first_worker"], sources["second_worker"]]
-        frozen_worker_ids = getattr(ledger, "frozen_worker_ids", lambda _worker_ids: set())(
-            [str(worker["worker_id"]) for worker in workers]
-        )
+        frozen_worker_ids = ledger.frozen_worker_ids([str(worker["worker_id"]) for worker in workers])
         if frozen_worker_ids:
             raise LedgerError(
                 f"Frozen worker cannot be selected for a new trade: {', '.join(sorted(frozen_worker_ids))}."
@@ -2512,6 +2497,11 @@ async def _dispatch_accepted_trader_intent(
             for worker_id in worker_ids
         ]
         async with _pair_worker_execution(worker_execution_locks, *worker_ids):
+            frozen_worker_ids = ledger.frozen_worker_ids(worker_ids)
+            if frozen_worker_ids:
+                raise LedgerError(
+                    f"Frozen worker cannot receive a new trade: {', '.join(sorted(frozen_worker_ids))}."
+                )
             responses = await asyncio.gather(
                 *(
                     _request_order_execute(connection, cast(dict[str, object], outcome["order"]))

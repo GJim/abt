@@ -171,6 +171,9 @@ class TraderIntentPreflightTests(unittest.IsolatedAsyncioTestCase):
             def trader_command_result(self, *_: object) -> None:
                 return None
 
+            def frozen_worker_ids(self, _worker_ids: list[str]) -> set[str]:
+                return set()
+
             def product_pairs(self) -> list[dict[str, object]]:
                 first_specification = {
                     "filling_modes": ["FOK", "IOC"],
@@ -367,6 +370,45 @@ class TraderIntentPreflightTests(unittest.IsolatedAsyncioTestCase):
 
 
 class IocRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_dispatch_does_not_send_orders_when_a_worker_freezes_after_preflight(self) -> None:
+        events: list[tuple[str, str | None]] = []
+
+        class Ledger:
+            def claim_accepted_intent_dispatch(self, _intent_id: str) -> bool:
+                return True
+
+            def frozen_worker_ids(self, _worker_ids: list[str]) -> set[str]:
+                return {"worker-a"}
+
+            def record_intent_execution(
+                self, _intent_id: str, event_type: str, _payload: dict[str, object], *, status: str | None = None
+            ) -> None:
+                events.append((event_type, status))
+
+        async def order_execute_must_not_run(*_: object, **__: object) -> dict[str, object]:
+            self.fail("a frozen worker must not receive a new order")
+
+        with (
+            patch("abt.controlplane.service._connected_worker_session", side_effect=[object(), object()]),
+            patch("abt.controlplane.service._request_order_execute", side_effect=order_execute_must_not_run),
+        ):
+            await _dispatch_accepted_trader_intent(
+                Ledger(),  # type: ignore[arg-type]
+                {"worker-a": {object()}, "worker-b": {object()}},
+                {},
+                "intent-123",
+                "FOK",
+                [
+                    {"worker_id": "worker-a", "order": {"symbol": "EURUSD"}},
+                    {"worker_id": "worker-b", "order": {"symbol": "EURUSD"}},
+                ],
+            )
+
+        self.assertEqual(
+            [("intent_dispatch_started", None), ("intent_execution_frozen", "needs_human")],
+            events,
+        )
+
     async def test_cancels_then_reconciles_then_closes_only_unmatched_exposure(self) -> None:
         events: list[tuple[str, dict[str, object], str | None]] = []
 
@@ -562,6 +604,9 @@ class IntentCancellationTests(unittest.IsolatedAsyncioTestCase):
         class Ledger:
             def claim_accepted_intent_dispatch(self, _intent_id: str) -> bool:
                 return True
+
+            def frozen_worker_ids(self, _worker_ids: list[str]) -> set[str]:
+                return set()
 
             def record_intent_execution(
                 self, _intent_id: str, event_type: str, _payload: dict[str, object], *, status: str | None = None
@@ -1518,8 +1563,6 @@ class ControlPlaneServiceTests(unittest.TestCase):
                     "type": "safety_state",
                     "state": "frozen",
                     "reason": "Broker response could not be verified.",
-                    "source": "execution_anomaly",
-                    "affected_worker_ids": [worker_id],
                 }
             )
             self.assertEqual({"type": "accepted", "state": "frozen"}, websocket.receive_json())
@@ -1527,7 +1570,7 @@ class ControlPlaneServiceTests(unittest.TestCase):
         workers = self.client.get("/api/admin/workers").json()
         self.assertEqual("connected", workers[0]["connectivity"])
         self.assertEqual("frozen", workers[0]["safety_state"])
-        self.assertEqual("execution_anomaly", workers[0]["freeze"]["source"])
+        self.assertEqual("worker_reported_safety_state", workers[0]["freeze"]["source"])
         self.assertEqual([worker_id], workers[0]["freeze"]["affected_worker_ids"])
         self.assertEqual(
             {"reason": "Broker response could not be verified."},

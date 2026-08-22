@@ -7,13 +7,12 @@ are recorded with their source and affected workers.
 
 **Blocked by:** None — can start immediately.
 
-**Status:** ready-for-agent
+**Status:** ready-for-human
 
-- [ ] A worker can enter and expose a durable frozen state with immutable
+- [x] A worker can enter and expose a durable frozen state with immutable
   source, affected-worker, and audit information.
-- [ ] A frozen worker cannot be selected for a new management or automated
+- [x] A frozen worker cannot be selected for a new management or automated
   trade, while non-frozen workers retain existing behavior.
-- [ ] Existing pair-level recovery remains compatible during the migration,
+- [x] Existing pair-level recovery remains compatible during the migration,
   with service and browser tests proving the new isolation visibility and
   selection exclusion.
-
