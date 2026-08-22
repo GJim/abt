@@ -1567,6 +1567,78 @@ class ControlPlaneServiceTests(unittest.TestCase):
             live_state,
         )
 
+    def test_admin_can_configure_and_observe_a_persistent_manual_trading_target(self) -> None:
+        ledger = self.app.state.ledger
+        _first_key, first_worker_id, _first_certificate = self._approved_worker(123456, "Broker-A")
+        _second_key, second_worker_id, _second_certificate = self._approved_worker(654321, "Broker-B")
+        with ledger._transaction():
+            ledger._connection.execute(
+                """INSERT INTO product_pairs (
+                       product_pair_id, status, endpoint_a_server, endpoint_a_symbol, endpoint_b_server, endpoint_b_symbol,
+                       active_pair_key, lot_relationship, policy_snapshot, analysis_period, reference_specifications,
+                       approval_evidence, source_workers, built_from_analysis_id, built_from_confirmation_id, built_by, created_at
+                   ) VALUES (?, 'active', 'Broker-A', 'EURUSD', 'Broker-B', 'EURUSD.a', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                [
+                    "pair-1", "Broker-A:EURUSD|Broker-B:EURUSD.a", json.dumps({"first_to_second": "1"}),
+                    json.dumps({}), json.dumps({}), json.dumps([]), json.dumps({}),
+                    json.dumps({}), "analysis-1", "confirmation-1", "ABCDEF", datetime.now(UTC),
+                ],
+            )
+        for worker_id in (first_worker_id, second_worker_id):
+            ledger.record_worker_session(worker_id)
+        ledger.record_live_state(
+            first_worker_id, "2026-08-22T00:00:00+00:00", True,
+            [{"symbol": "EURUSD", "bid": 1.1000, "ask": 1.1002, "broker_time": "2026-08-22T00:00:00+00:00"}],
+            [{"ticket": 101, "symbol": "EURUSD"}], [],
+        )
+        ledger.record_live_state(
+            second_worker_id, "2026-08-22T00:00:00+00:00", True,
+            [{"symbol": "EURUSD.a", "bid": 1.0998, "ask": 1.1000, "broker_time": "2026-08-22T00:00:00+00:00"}],
+            [], [{"ticket": 202, "symbol": "EURUSD.a"}],
+        )
+        login = self.client.post(
+            "/api/admin/login", json={"username": "ABCDEF", "password": "A-secure-admin-password!"}
+        )
+
+        configured = self.client.put(
+            "/api/admin/manual-trading-target",
+            headers={"X-CSRF-Token": login.json()["csrf_token"]},
+            json={
+                "pair_id": "pair-1",
+                "first_worker_id": first_worker_id,
+                "second_worker_id": second_worker_id,
+                "leg_order": "buy_to_sell",
+                "interval_seconds": 7,
+                "expected_revision": 0,
+            },
+        )
+
+        self.assertEqual(200, configured.status_code)
+        target = configured.json()
+        self.assertEqual("pair-1", target["pair"]["product_pair_id"])
+        self.assertEqual([first_worker_id, second_worker_id], [worker["worker_id"] for worker in target["workers"]])
+        self.assertEqual("buy_to_sell", target["leg_order"])
+        self.assertEqual(7, target["interval_seconds"])
+        self.assertEqual("EURUSD", target["workers"][0]["live_state"]["quotes"][0]["symbol"])
+        self.assertEqual(target, self.client.get("/api/admin/manual-trading-target").json())
+        ledger.freeze_workers("execution_anomaly", [first_worker_id], {"reason": "broker timeout"})
+        rejected = self.client.put(
+            "/api/admin/manual-trading-target",
+            headers={"X-CSRF-Token": login.json()["csrf_token"]},
+            json={
+                "pair_id": "pair-1",
+                "first_worker_id": first_worker_id,
+                "second_worker_id": second_worker_id,
+                "leg_order": "sell_to_buy",
+                "interval_seconds": 0,
+                "expected_revision": 1,
+            },
+        )
+        self.assertEqual(409, rejected.status_code)
+        self.assertEqual("Frozen workers cannot be selected for manual trading.", rejected.json()["detail"])
+        ledger.retire_product_pair("pair-1", "ABCDEF")
+        self.assertIsNone(self.client.get("/api/admin/manual-trading-target").json())
+
     def test_admin_read_models_paginate_search_and_keep_snapshot_payloads_in_detail(self) -> None:
         _key, worker_id, _certificate = self._approved_worker(123456, "Broker-Search")
         ledger = self.app.state.ledger

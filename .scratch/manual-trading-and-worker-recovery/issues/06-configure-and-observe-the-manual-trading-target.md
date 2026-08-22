@@ -10,11 +10,10 @@ orders/positions.
 
 **Status:** ready-for-agent
 
-- [ ] Only active product pairs and their applicable, connected, non-frozen
+- [x] Only active product pairs and their applicable, connected, non-frozen
   endpoint workers can form the shared current target.
-- [ ] The target persists its two workers, pair, Buy/Sell dispatch order, and
+- [x] The target persists its two workers, pair, Buy/Sell dispatch order, and
   non-negative integral-second interval across management sessions.
-- [ ] The page presents live quote timestamps and all worker orders/positions,
+- [x] The page presents live quote timestamps and all worker orders/positions,
   visibly identifies target-related records, and rejects target replacement
   while a manual trade is active.
-

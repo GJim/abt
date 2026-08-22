@@ -201,6 +201,17 @@ class WorkerRecoveryCommandRequest(BaseModel):
     command_id: str = Field(min_length=1, max_length=128)
 
 
+class ManualTradingTargetRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    pair_id: str = Field(min_length=1)
+    first_worker_id: str = Field(min_length=1)
+    second_worker_id: str = Field(min_length=1)
+    leg_order: Literal["buy_to_sell", "sell_to_buy"]
+    interval_seconds: int = Field(ge=0)
+    expected_revision: int = Field(ge=0)
+
+
 class ManagementIntentCreateRequest(TraderIntentPayload):
     command_id: str = Field(min_length=1, max_length=128)
 
@@ -848,6 +859,25 @@ def create_app(
     ) -> list[dict[str, object]]:
         _require_admin(ledger, abt_admin_session)
         return ledger.worker_reconciliation()
+
+    @app.get("/api/admin/manual-trading-target")
+    def get_manual_trading_target(
+        abt_admin_session: Annotated[str | None, Cookie()] = None,
+    ) -> dict[str, object] | None:
+        _require_admin(ledger, abt_admin_session)
+        return ledger.manual_trading_target()
+
+    @app.put("/api/admin/manual-trading-target")
+    def configure_manual_trading_target(
+        body: ManualTradingTargetRequest,
+        abt_admin_session: Annotated[str | None, Cookie()] = None,
+        x_csrf_token: Annotated[str | None, Header()] = None,
+    ) -> dict[str, object]:
+        username = _require_admin(ledger, abt_admin_session, x_csrf_token, require_csrf=True)
+        try:
+            return ledger.configure_manual_trading_target(username, **body.model_dump())
+        except LedgerError as error:
+            raise HTTPException(status_code=_ledger_error_status(error), detail=str(error)) from error
 
     @app.post("/api/admin/workers/{worker_id}/cleanup")
     async def cleanup_worker(

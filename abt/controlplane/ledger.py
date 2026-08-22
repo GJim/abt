@@ -1832,6 +1832,109 @@ class ControlLedger:
                 )
         return result
 
+    def manual_trading_target(self) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._connection.execute(
+                """SELECT pair_id, first_worker_id, second_worker_id, leg_order, interval_seconds,
+                          revision, active_manual_trade_id, configured_by, configured_at
+                   FROM manual_trading_target WHERE singleton = TRUE"""
+            ).fetchone()
+            if row is None:
+                return None
+            pair = self._product_pair_by_id(row[0])
+            workers_by_id = {worker["worker_id"]: worker for worker in self.worker_reconciliation()}
+            worker_ids = [row[1], row[2]]
+            if any(worker_id not in workers_by_id for worker_id in worker_ids):
+                raise LedgerError("Manual-trading target references a worker that no longer exists.")
+            return {
+                "pair": pair,
+                "workers": [
+                    {**workers_by_id[worker_id], "endpoint": pair["endpoints"][index]}
+                    for index, worker_id in enumerate(worker_ids)
+                ],
+                "leg_order": row[3],
+                "interval_seconds": row[4],
+                "revision": row[5],
+                "active_manual_trade_id": row[6],
+                "configured_by": row[7],
+                "configured_at": row[8],
+            }
+
+    def configure_manual_trading_target(
+        self,
+        username: str,
+        *,
+        pair_id: str,
+        first_worker_id: str,
+        second_worker_id: str,
+        leg_order: str,
+        interval_seconds: int,
+        expected_revision: int,
+    ) -> dict[str, Any]:
+        if leg_order not in {"buy_to_sell", "sell_to_buy"}:
+            raise LedgerError("Manual-trading leg order is invalid.")
+        if isinstance(interval_seconds, bool) or interval_seconds < 0:
+            raise LedgerError("Manual-trading interval must be a non-negative integer.")
+        with self._transaction():
+            current = self._connection.execute(
+                """SELECT revision, active_manual_trade_id FROM manual_trading_target WHERE singleton = TRUE"""
+            ).fetchone()
+            actual_revision = 0 if current is None else current[0]
+            if expected_revision != actual_revision:
+                raise LedgerError("Manual-trading target revision does not match the current target.")
+            if current is not None and current[1] is not None:
+                raise LedgerError("Manual-trading target cannot be replaced while its manual trade is active.")
+            if first_worker_id == second_worker_id:
+                raise LedgerError("Manual-trading target requires two different workers.")
+            pair = self._product_pair_by_id(pair_id)
+            if pair["status"] != "active":
+                raise LedgerError("Manual-trading target requires an active product pair.")
+            applicability = {
+                worker["worker_id"]: worker
+                for worker in self._product_pair_with_worker_applicability(pair)["worker_applicability"]
+            }
+            workers_by_id = {worker["worker_id"]: worker for worker in self.worker_reconciliation()}
+            for index, worker_id in enumerate((first_worker_id, second_worker_id)):
+                worker = workers_by_id.get(worker_id)
+                eligible = applicability.get(worker_id)
+                if worker is None or eligible is None or eligible["applicability_status"] != "applicable":
+                    raise LedgerError("Manual-trading target worker is not applicable to the selected product pair.")
+                if worker["server"] != pair["endpoints"][index]["server"]:
+                    raise LedgerError("Manual-trading target workers must match the selected endpoint order.")
+                if worker["connectivity"] != "connected" or worker["live_state"] is None or not worker["live_state"]["connectivity"]:
+                    raise LedgerError("Manual-trading target workers must be connected.")
+                if worker["safety_state"] != "connected":
+                    raise LedgerError("Frozen workers cannot be selected for manual trading.")
+            revision = actual_revision + 1
+            now = _utc_now()
+            self._connection.execute(
+                """INSERT INTO manual_trading_target
+                       (singleton, pair_id, first_worker_id, second_worker_id, leg_order, interval_seconds,
+                        revision, active_manual_trade_id, configured_by, configured_at)
+                   VALUES (TRUE, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+                   ON CONFLICT (singleton) DO UPDATE SET
+                       pair_id = excluded.pair_id, first_worker_id = excluded.first_worker_id,
+                       second_worker_id = excluded.second_worker_id, leg_order = excluded.leg_order,
+                       interval_seconds = excluded.interval_seconds, revision = excluded.revision,
+                       configured_by = excluded.configured_by, configured_at = excluded.configured_at""",
+                [pair_id, first_worker_id, second_worker_id, leg_order, interval_seconds, revision, username, now],
+            )
+            self._event(
+                "manual_trading_target_configured",
+                {
+                    "pair_id": pair_id,
+                    "first_worker_id": first_worker_id,
+                    "second_worker_id": second_worker_id,
+                    "leg_order": leg_order,
+                    "interval_seconds": interval_seconds,
+                    "revision": revision,
+                    "configured_by": username,
+                },
+            )
+        target = self.manual_trading_target()
+        assert target is not None
+        return target
+
     def _worker_freeze(self, worker_id: str) -> dict[str, Any] | None:
         row = self._connection.execute(
             """SELECT source, affected_worker_ids, audit, frozen_at, event_id
@@ -2297,6 +2400,7 @@ class ControlLedger:
                 "UPDATE product_pair_build_confirmations SET used_at = ? WHERE confirmation_id = ?",
                 [_utc_now(), confirmation_id],
             )
+            self._clear_manual_trading_target_for_retired_pair(product_pair_id)
             self._event(
                 "product_pair_built",
                 {
@@ -2395,6 +2499,7 @@ class ControlLedger:
                 """,
                 [_utc_now(), retired_by, product_pair_id],
             )
+            self._clear_manual_trading_target_for_retired_pair(product_pair_id)
             self._event(
                 "product_pair_retired",
                 {
@@ -2404,6 +2509,22 @@ class ControlLedger:
                 },
             )
             return self._product_pair_by_id(product_pair_id)
+
+    def _clear_manual_trading_target_for_retired_pair(self, product_pair_id: str) -> None:
+        target = self._connection.execute(
+            """SELECT active_manual_trade_id FROM manual_trading_target
+               WHERE singleton = TRUE AND pair_id = ?""",
+            [product_pair_id],
+        ).fetchone()
+        if target is None:
+            return
+        if target[0] is not None:
+            raise LedgerError("An active manual-trading target cannot be retired.")
+        self._connection.execute(
+            "DELETE FROM manual_trading_target WHERE singleton = TRUE AND pair_id = ?",
+            [product_pair_id],
+        )
+        self._event("manual_trading_target_cleared", {"pair_id": product_pair_id, "reason": "product_pair_retired"})
 
     def product_pairs(self) -> list[dict[str, Any]]:
         with self._lock:
@@ -3591,6 +3712,18 @@ class ControlLedger:
                     orders JSON NOT NULL,
                     positions JSON NOT NULL,
                     received_at TIMESTAMPTZ NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS manual_trading_target (
+                    singleton BOOLEAN PRIMARY KEY CHECK (singleton = TRUE),
+                    pair_id VARCHAR NOT NULL,
+                    first_worker_id VARCHAR NOT NULL,
+                    second_worker_id VARCHAR NOT NULL,
+                    leg_order VARCHAR NOT NULL,
+                    interval_seconds BIGINT NOT NULL CHECK (interval_seconds >= 0),
+                    revision BIGINT NOT NULL,
+                    active_manual_trade_id VARCHAR,
+                    configured_by VARCHAR NOT NULL,
+                    configured_at TIMESTAMPTZ NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS worker_recovery_commands (
                     username VARCHAR NOT NULL,

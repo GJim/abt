@@ -1489,6 +1489,94 @@ test('launch analysis is isolated from main-page operational summaries', async (
   await expect(page.getByRole('heading', { name: 'Needs attention' })).not.toBeVisible()
 })
 
+test('administrator configures and observes the shared manual-trading target', async ({ page }) => {
+  let target: object | null = null
+  const workers = [
+    buildWorker({
+      worker_id: 'worker-a',
+      login: 123456,
+      server: 'Broker-A',
+      live_state: {
+        observed_at: '2026-08-22T00:00:00Z',
+        received_at: '2026-08-22T00:00:00Z',
+        connectivity: true,
+        quotes: [{ symbol: 'EURUSD', bid: 1.1, ask: 1.1002, broker_time: '2026-08-22T00:00:00Z', controller_received_at: '2026-08-22T00:00:01Z' }],
+        orders: [{ ticket: 101, symbol: 'EURUSD' }],
+        positions: [],
+      },
+    }),
+    buildWorker({
+      worker_id: 'worker-b',
+      login: 654321,
+      server: 'Broker-B',
+      live_state: {
+        observed_at: '2026-08-22T00:00:00Z',
+        received_at: '2026-08-22T00:00:00Z',
+        connectivity: true,
+        quotes: [{ symbol: 'EURUSD.a', bid: 1.0998, ask: 1.1, broker_time: '2026-08-22T00:00:00Z', controller_received_at: '2026-08-22T00:00:01Z' }],
+        orders: [],
+        positions: [{ ticket: 202, symbol: 'EURUSD.a' }],
+      },
+    }),
+  ]
+  await mockLogin(page)
+  await mockManagementData(page, {
+    workers,
+    productPairs: [{
+      product_pair_id: 'pair-1',
+      status: 'active',
+      endpoints: [{ server: 'Broker-A', symbol: 'EURUSD' }, { server: 'Broker-B', symbol: 'EURUSD.a' }],
+      worker_applicability: [
+        { worker_id: 'worker-a', server: 'Broker-A', applicability_status: 'applicable' },
+        { worker_id: 'worker-b', server: 'Broker-B', applicability_status: 'applicable' },
+      ],
+    }],
+  })
+  await page.route('**/api/admin/session', async (route) => {
+    await route.fulfill({ contentType: 'application/json', body: JSON.stringify({ csrf_token: 'resumed-csrf-token' }) })
+  })
+  await page.route('**/api/admin/manual-trading-target', async (route) => {
+    if (route.request().method() === 'PUT') {
+      expect(route.request().headers()['x-csrf-token']).toBe('resumed-csrf-token')
+      expect(route.request().postDataJSON()).toMatchObject({
+        pair_id: 'pair-1', first_worker_id: 'worker-a', second_worker_id: 'worker-b',
+        leg_order: 'buy_to_sell', interval_seconds: 7, expected_revision: 0,
+      })
+      target = {
+        pair: {
+          product_pair_id: 'pair-1',
+          status: 'active',
+          endpoints: [{ server: 'Broker-A', symbol: 'EURUSD' }, { server: 'Broker-B', symbol: 'EURUSD.a' }],
+          worker_applicability: [],
+        },
+        workers: [
+          { ...workers[0], endpoint: { server: 'Broker-A', symbol: 'EURUSD' } },
+          { ...workers[1], endpoint: { server: 'Broker-B', symbol: 'EURUSD.a' } },
+        ],
+        leg_order: 'buy_to_sell',
+        interval_seconds: 7,
+        revision: 1,
+        active_manual_trade_id: null,
+      }
+      await route.fulfill({ contentType: 'application/json', body: JSON.stringify(target) })
+      return
+    }
+    await route.fulfill({ contentType: 'application/json', body: JSON.stringify(target) })
+  })
+
+  await page.goto('http://127.0.0.1:4173/manual-trading')
+  await page.getByLabel('Active product pair').selectOption('pair-1')
+  await page.getByLabel('Buy endpoint worker').selectOption('worker-a')
+  await page.getByLabel('Sell endpoint worker').selectOption('worker-b')
+  await page.getByLabel('Leg interval (seconds)').fill('7')
+  await page.getByRole('button', { name: 'Save shared target' }).click()
+
+  await expect(page.getByText('Shared target saved at revision 1.')).toBeVisible()
+  await expect(page.getByText('123456 on Broker-A — EURUSD')).toBeVisible()
+  await expect(page.getByText('current target product pair')).toHaveCount(2)
+  await expect(page.getByText('2026-08-22T00:00:01Z').first()).toBeVisible()
+})
+
 async function signIn(page: Parameters<typeof test>[0]['page']) {
   await page.goto('http://127.0.0.1:4173/')
   await page.getByLabel('Administrator account').fill('ABCDEF')
