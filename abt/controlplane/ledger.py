@@ -2100,6 +2100,8 @@ class ControlLedger:
                     "take_profit_pips": str(take_profit_pips),
                 }
             )
+            if Decimal(legs[-1]["estimated_stop_loss"]) <= 0 or Decimal(legs[-1]["estimated_take_profit"]) <= 0:
+                raise LedgerError("Manual-trade protection prices must remain positive.")
         first_direction = "BUY" if target["leg_order"] == "buy_to_sell" else "SELL"
         ordered = sorted(legs, key=lambda leg: 0 if leg["direction"] == first_direction else 1)
         return {
@@ -2111,6 +2113,17 @@ class ControlLedger:
             "take_profit_pips": str(take_profit_pips),
             "legs": ordered,
         }
+
+    def manual_trades_for_recovery(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._connection.execute(
+                """SELECT manual_trade_id, status, plan FROM manual_trades
+                   WHERE status IN ('scheduled', 'dispatching')"""
+            ).fetchall()
+            return [
+                {"manual_trade_id": row[0], "status": row[1], "plan": json.loads(row[2])}
+                for row in rows
+            ]
 
     def _worker_freeze(self, worker_id: str) -> dict[str, Any] | None:
         row = self._connection.execute(

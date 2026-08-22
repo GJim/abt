@@ -1764,6 +1764,11 @@ def create_app(
                             ledger, startup_reconciliation_started_at, worker_connections, worker_execution_locks
                         )
                     )
+                    asyncio.create_task(
+                        _recover_manual_trades_after_startup_reconciliation(
+                            ledger, startup_reconciliation_started_at, worker_connections, worker_execution_locks
+                        )
+                    )
                 elif message_type == "delta":
                     _record_delta(ledger, worker.worker_id, request)
                     await websocket.send_json({"type": "accepted", "cursor": request["cursor"]})
@@ -2731,7 +2736,7 @@ def _manual_market_order(leg: dict[str, object], execution_id: str) -> dict[str,
         "symbol": str(leg["symbol"]),
         "volume": str(leg["lots"]),
         "direction": "LONG" if leg["direction"] == "BUY" else "SHORT",
-        "filling_mode": "IOC",
+        "filling_mode": "FOK",
         "control_plane_command_id": execution_id,
     }
 
@@ -3030,6 +3035,36 @@ async def _fail_undispatched_accepted_intents_after_startup_reconciliation(
                 "intent_dispatch_abandoned",
                 {"reason": "Controller restarted before dispatch; preflight does not reserve broker liquidity."},
                 status="failed_before_dispatch",
+            )
+
+
+async def _recover_manual_trades_after_startup_reconciliation(
+    ledger: ControlLedger,
+    startup_reconciliation_started_at: datetime,
+    worker_connections: dict[str, set[_WorkerSessionConnection]],
+    worker_execution_locks: dict[str, asyncio.Lock],
+) -> None:
+    """Resume definitely undispatched manual work and isolate interrupted broker dispatches."""
+
+    for record in ledger.manual_trades_for_recovery():
+        plan = cast(dict[str, object], record["plan"])
+        legs = cast(list[dict[str, object]], plan.get("legs", []))
+        worker_ids = [str(leg["worker_id"]) for leg in legs if isinstance(leg.get("worker_id"), str)]
+        if len(worker_ids) != 2 or len(set(worker_ids)) != 2:
+            _freeze_manual_trade(
+                ledger, str(record["manual_trade_id"]), worker_ids, "Interrupted manual trade has malformed leg evidence."
+            )
+            continue
+        if not ledger.workers_reconciled_since(worker_ids, startup_reconciliation_started_at):
+            continue
+        if record["status"] == "scheduled":
+            await _dispatch_manual_trade(
+                ledger, worker_connections, worker_execution_locks, str(record["manual_trade_id"])
+            )
+        else:
+            _freeze_manual_trade(
+                ledger, str(record["manual_trade_id"]), worker_ids,
+                "Controller restarted during manual broker dispatch; broker state is uncertain.",
             )
 
 
