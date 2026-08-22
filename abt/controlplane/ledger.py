@@ -1388,15 +1388,29 @@ class ControlLedger:
     def record_worker_safety_state(self, worker_id: str, state: str, reason: str) -> None:
         if state not in {"connected", "lost_link_safety", "needs_human"}:
             raise LedgerError("Worker safety state is invalid.")
+        if state in {"lost_link_safety", "needs_human"}:
+            self.freeze_worker_and_active_counterparts(
+                worker_id,
+                "worker_safety_state",
+                {"reason": reason, "reported_state": state},
+            )
+            return
         with self._transaction():
             self.active_worker(worker_id)
+            current = self._connection.execute(
+                "SELECT safety_state FROM workers WHERE worker_id = ?", [worker_id]
+            ).fetchone()
+            if current is not None and current[0] == "frozen":
+                self._event(
+                    "worker_safety_state_ignored",
+                    {"worker_id": worker_id, "state": state, "reason": reason},
+                )
+                return
             self._connection.execute(
                 "UPDATE workers SET safety_state = ?, last_seen_at = ? WHERE worker_id = ?",
                 [state, _utc_now(), worker_id],
             )
             self._event("worker_safety_state_changed", {"worker_id": worker_id, "state": state, "reason": reason})
-            if state in {"lost_link_safety", "needs_human"}:
-                self._alert(worker_id, "high", state, reason)
 
     def freeze_workers(
         self,
@@ -1406,6 +1420,15 @@ class ControlLedger:
     ) -> list[dict[str, Any]]:
         """Durably isolate active worker accounts without replacing their original freeze evidence."""
 
+        with self._transaction():
+            return self._freeze_workers(source, affected_worker_ids, audit)
+
+    def _freeze_workers(
+        self,
+        source: str,
+        affected_worker_ids: list[str],
+        audit: dict[str, object],
+    ) -> list[dict[str, Any]]:
         if not source or not affected_worker_ids:
             raise LedgerError("Worker freeze source and affected workers are required.")
         if any(not worker_id for worker_id in affected_worker_ids):
@@ -1414,63 +1437,108 @@ class ControlLedger:
             raise LedgerError("Worker freeze audit reason is required.")
         worker_ids = list(dict.fromkeys(affected_worker_ids))
         frozen: list[dict[str, Any]] = []
-        with self._transaction():
-            for worker_id in worker_ids:
-                existing = self._connection.execute(
-                    """SELECT source, affected_worker_ids, audit, frozen_at, event_id
-                       FROM worker_freezes WHERE worker_id = ? ORDER BY frozen_at DESC LIMIT 1""",
-                    [worker_id],
-                ).fetchone()
-                if existing is not None:
-                    frozen.append(
-                        {
-                            "worker_id": worker_id,
-                            "source": existing[0],
-                            "affected_worker_ids": json.loads(existing[1]),
-                            "audit": json.loads(existing[2]),
-                            "frozen_at": existing[3],
-                            "event_id": existing[4],
-                        }
-                    )
-                    continue
-                active = self._connection.execute(
-                    "SELECT 1 FROM workers WHERE worker_id = ? AND status = 'active'", [worker_id]
-                ).fetchone()
-                if active is None:
-                    raise LedgerError("Worker is not active.")
-                frozen_at = _utc_now()
-                payload = {
+        for worker_id in worker_ids:
+            existing = self._connection.execute(
+                """SELECT source, affected_worker_ids, audit, frozen_at, event_id
+                   FROM worker_freezes WHERE worker_id = ? ORDER BY frozen_at DESC LIMIT 1""",
+                [worker_id],
+            ).fetchone()
+            if existing is not None:
+                frozen.append(
+                    {
+                        "worker_id": worker_id,
+                        "source": existing[0],
+                        "affected_worker_ids": json.loads(existing[1]),
+                        "audit": json.loads(existing[2]),
+                        "frozen_at": existing[3],
+                        "event_id": existing[4],
+                    }
+                )
+                continue
+            status = self._connection.execute(
+                "SELECT status FROM workers WHERE worker_id = ?", [worker_id]
+            ).fetchone()
+            if status is None:
+                raise LedgerError("Worker is not active.")
+            if status[0] != "active":
+                continue
+            frozen_at = _utc_now()
+            payload = {
+                "worker_id": worker_id,
+                "source": source,
+                "affected_worker_ids": worker_ids,
+                "audit": audit,
+            }
+            event_id = self._event("worker_frozen", payload)
+            self._connection.execute(
+                """INSERT INTO worker_freezes
+                   (freeze_id, worker_id, source, affected_worker_ids, audit, frozen_at, event_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                [
+                    str(uuid4()), worker_id, source, json.dumps(worker_ids, sort_keys=True),
+                    json.dumps(audit, sort_keys=True), frozen_at, event_id,
+                ],
+            )
+            self._connection.execute(
+                "UPDATE workers SET safety_state = 'frozen', last_seen_at = ? WHERE worker_id = ?",
+                [frozen_at, worker_id],
+            )
+            self._alert(worker_id, "high", "worker_frozen", source)
+            frozen.append(
+                {
                     "worker_id": worker_id,
                     "source": source,
                     "affected_worker_ids": worker_ids,
                     "audit": audit,
+                    "frozen_at": frozen_at,
+                    "event_id": event_id,
                 }
-                event_id = self._event("worker_frozen", payload)
-                self._connection.execute(
-                    """INSERT INTO worker_freezes
-                       (freeze_id, worker_id, source, affected_worker_ids, audit, frozen_at, event_id)
-                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                    [
-                        str(uuid4()), worker_id, source, json.dumps(worker_ids, sort_keys=True),
-                        json.dumps(audit, sort_keys=True), frozen_at, event_id,
-                    ],
-                )
-                self._connection.execute(
-                    "UPDATE workers SET safety_state = 'frozen', last_seen_at = ? WHERE worker_id = ?",
-                    [frozen_at, worker_id],
-                )
-                self._alert(worker_id, "high", "worker_frozen", source)
-                frozen.append(
-                    {
-                        "worker_id": worker_id,
-                        "source": source,
-                        "affected_worker_ids": worker_ids,
-                        "audit": audit,
-                        "frozen_at": frozen_at,
-                        "event_id": event_id,
-                    }
-                )
+            )
         return frozen
+
+    def freeze_worker_and_active_counterparts(
+        self, worker_id: str, source: str, audit: dict[str, object]
+    ) -> list[dict[str, Any]]:
+        """Freeze a worker and every account sharing an active execution with it."""
+
+        with self._transaction():
+            if self._connection.execute(
+                "SELECT 1 FROM workers WHERE worker_id = ? AND status = 'active'", [worker_id]
+            ).fetchone() is None:
+                raise LedgerError("Worker is not active.")
+            return self._freeze_workers(source, self._active_counterpart_worker_ids(worker_id), audit)
+
+    def _active_counterpart_worker_ids(self, worker_id: str) -> list[str]:
+        counterparts = {worker_id}
+        rows = self._connection.execute(
+            """SELECT preflight FROM trader_intents
+               WHERE status IN ('dispatching', 'working', 'cancelling', 'cancellation_executing', 'needs_human')"""
+        ).fetchall()
+        for (preflight_json,) in rows:
+            preflight = json.loads(preflight_json)
+            worker_ids = [
+                item["worker_id"]
+                for item in preflight
+                if isinstance(item, dict) and isinstance(item.get("worker_id"), str)
+            ]
+            if worker_id in worker_ids:
+                counterparts.update(worker_ids)
+        return sorted(counterparts)
+
+    def freeze_intent_workers(
+        self, intent_id: str, source: str, audit: dict[str, object]
+    ) -> list[dict[str, Any]]:
+        """Freeze every valid participant retained in an intent's preflight evidence."""
+
+        with self._transaction():
+            worker_ids = list(dict.fromkeys(
+                item["worker_id"]
+                for item in self._intent_preflight(intent_id)
+                if isinstance(item, dict) and isinstance(item.get("worker_id"), str) and item["worker_id"]
+            ))
+            if not worker_ids:
+                raise LedgerError("Intent has no worker isolation evidence.")
+            return self._freeze_workers(source, worker_ids, audit)
 
     def frozen_worker_ids(self, worker_ids: list[str]) -> set[str]:
         if not worker_ids:
@@ -1657,14 +1725,10 @@ class ControlLedger:
                         "INSERT INTO trader_events (trader_id, event_id) VALUES (?, ?)", [trader_id, event_id]
                     )
             else:
-                self._connection.execute(
-                    "UPDATE workers SET safety_state = 'needs_human' WHERE worker_id = ?", [worker_id]
-                )
                 self._event(
                     "external_broker_change",
                     {"worker_id": worker_id, "cursor": cursor, "entity": entity, "ticket": ticket, "change": change},
                 )
-                self._alert(worker_id, "high", "external_broker_change", "unattributed_broker_change")
                 affected = self._connection.execute(
                     """SELECT intent_id, trader_id FROM trader_intents
                        WHERE status IN ('dispatching', 'working')
@@ -1699,6 +1763,16 @@ class ControlLedger:
                         "UPDATE trader_intents SET status = 'needs_human' WHERE intent_id = ?",
                         [intent_id],
                     )
+                self._freeze_workers(
+                    "external_broker_change",
+                    self._active_counterpart_worker_ids(worker_id),
+                    {
+                        "reason": "Unattributed external broker change requires account isolation.",
+                        "cursor": cursor,
+                        "entity": entity,
+                        "ticket": ticket,
+                    },
+                )
 
     def worker_reconciliation(self) -> list[dict[str, Any]]:
         now = _utc_now()

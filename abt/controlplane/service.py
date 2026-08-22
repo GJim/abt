@@ -313,7 +313,7 @@ def _operations_dashboard(
 
 
 def _worker_dashboard_classification(worker: dict[str, Any]) -> dict[str, str]:
-    if worker["safety_state"] in {"lost_link_safety", "needs_human"}:
+    if worker["safety_state"] in {"frozen", "lost_link_safety", "needs_human"}:
         return {"category": "intervention_required", "classification_reason": worker["safety_state"]}
     if worker["connectivity"] == "stale":
         return {"category": "intervention_required", "classification_reason": "worker_stale"}
@@ -1687,9 +1687,9 @@ def create_app(
                     and request["reason"]
                 ):
                     if request["state"] == "frozen":
-                        ledger.freeze_workers(
+                        ledger.freeze_worker_and_active_counterparts(
+                            worker.worker_id,
                             "worker_reported_safety_state",
-                            [worker.worker_id],
                             {"reason": request["reason"]},
                         )
                     else:
@@ -1732,12 +1732,33 @@ def create_app(
                     raise ValueError("Invalid protocol message.")
         except WebSocketDisconnect as error:
             _LOGGER.info("Worker session disconnected with code %s.", error.code)
+            if "worker" in locals():
+                _freeze_worker_session(
+                    ledger,
+                    worker.worker_id,
+                    "worker_session_disconnected",
+                    f"Worker session disconnected with code {error.code}.",
+                )
             await _close_policy_violation(websocket)
         except (LedgerError, ProofError, SecretStoreError, ValueError) as error:
             _LOGGER.warning("Worker session authentication or request failed: %s", error)
+            if "worker" in locals():
+                _freeze_worker_session(
+                    ledger,
+                    worker.worker_id,
+                    "worker_session_failure",
+                    f"Worker session request failed: {error}",
+                )
             await _close_policy_violation(websocket)
         except Exception:
             _LOGGER.exception("Worker session authentication or request failed unexpectedly.")
+            if "worker" in locals():
+                _freeze_worker_session(
+                    ledger,
+                    worker.worker_id,
+                    "worker_session_failure",
+                    "Worker session request failed unexpectedly.",
+                )
             await _close_policy_violation(websocket)
         finally:
             if sender_task is not None:
@@ -2548,9 +2569,7 @@ async def _dispatch_accepted_trader_intent(
                 return_exceptions=True,
             )
     except LedgerError as error:
-        ledger.record_intent_execution(
-            intent_id, "intent_execution_frozen", {"reason": str(error)}, status="needs_human"
-        )
+        _freeze_intent_execution(ledger, intent_id, str(error), worker_ids)
         return
 
     accepted = True
@@ -2596,7 +2615,9 @@ async def _recover_ioc_partial_fill(
     worker_ids = [str(outcome["worker_id"]) for outcome in outcomes]
     execution_ids = {str(cast(dict[str, object], outcome["order"])["control_plane_command_id"]) for outcome in outcomes}
     if len(execution_ids) != 1:
-        _freeze_intent_execution(ledger, intent_id, "IOC recovery has inconsistent execution correlation IDs.")
+        _freeze_intent_execution(
+            ledger, intent_id, "IOC recovery has inconsistent execution correlation IDs.", worker_ids
+        )
         return
     execution_id = execution_ids.pop()
     try:
@@ -2649,7 +2670,9 @@ async def _recover_ioc_partial_fill(
                 status="working",
             )
     except (KeyError, LedgerError, ValueError, asyncio.TimeoutError) as error:
-        _freeze_intent_execution(ledger, intent_id, f"IOC recovery could not be proven safe: {error}")
+        _freeze_intent_execution(
+            ledger, intent_id, f"IOC recovery could not be proven safe: {error}", worker_ids
+        )
 
 
 async def _cancel_intent(
@@ -2694,6 +2717,7 @@ async def _operate_on_intent_exposure(
     if callable(claim) and not claim(intent_id):
         return
     fill_observed = False
+    worker_ids: list[str] = []
     try:
         worker_ids = [str(outcome["worker_id"]) for outcome in outcomes]
         execution_ids = {
@@ -2738,14 +2762,32 @@ async def _operate_on_intent_exposure(
                     status="cancelled",
                 )
     except (KeyError, LedgerError, ValueError, asyncio.TimeoutError) as error:
-        _freeze_intent_execution(ledger, intent_id, f"{operation} could not be proven safe: {error}")
+        _freeze_intent_execution(ledger, intent_id, f"{operation} could not be proven safe: {error}", worker_ids)
         return
     if fill_observed:
         await _recover_ioc_partial_fill(ledger, worker_connections, worker_execution_locks, intent_id, outcomes)
 
 
-def _freeze_intent_execution(ledger: ControlLedger, intent_id: str, reason: str) -> None:
+def _freeze_intent_execution(
+    ledger: ControlLedger, intent_id: str, reason: str, worker_ids: list[str] | None = None
+) -> None:
     ledger.record_intent_execution(intent_id, "intent_execution_frozen", {"reason": reason}, status="needs_human")
+    if worker_ids:
+        freeze_workers = getattr(ledger, "freeze_workers", None)
+        if callable(freeze_workers):
+            freeze_workers(
+                "intent_execution_anomaly",
+                worker_ids,
+                {"intent_id": intent_id, "reason": reason},
+            )
+        return
+    freeze_intent_workers = getattr(ledger, "freeze_intent_workers", None)
+    if callable(freeze_intent_workers):
+        freeze_intent_workers(
+            intent_id,
+            "intent_execution_anomaly",
+            {"intent_id": intent_id, "reason": reason},
+        )
 
 
 async def _reconcile_execution(
@@ -2900,7 +2942,10 @@ async def _fail_undispatched_accepted_intents_after_startup_reconciliation(
             continue
         if record["status"] == "dispatching":
             _freeze_intent_execution(
-                ledger, str(record["intent_id"]), "Controller restarted during broker dispatch; broker state is uncertain."
+                ledger,
+                str(record["intent_id"]),
+                "Controller restarted during broker dispatch; broker state is uncertain.",
+                worker_ids,
             )
         else:
             ledger.record_intent_execution(
@@ -3450,6 +3495,13 @@ def _record_delta(ledger: ControlLedger, worker_id: str, message: dict[str, obje
         worker_id, message["cursor"], message["observed_at"], message["entity"], message["ticket"],
         message["change"], message["record"],
     )
+
+
+def _freeze_worker_session(ledger: ControlLedger, worker_id: str, source: str, reason: str) -> None:
+    try:
+        ledger.freeze_worker_and_active_counterparts(worker_id, source, {"reason": reason})
+    except LedgerError as error:
+        _LOGGER.warning("Could not isolate worker %s after %s: %s", worker_id, source, error)
 
 
 async def _close_policy_violation(websocket: WebSocket) -> None:

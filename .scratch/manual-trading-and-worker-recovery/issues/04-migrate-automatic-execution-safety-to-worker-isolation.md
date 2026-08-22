@@ -7,12 +7,11 @@ freeze the affected workers and route recovery through the new workspace.
 
 **Blocked by:** 02 — Expand worker-level trading isolation; 03 — Deliver worker cleanup and independent release.
 
-**Status:** ready-for-agent
+**Status:** ready-for-human
 
-- [ ] Every pre-existing trading and reconciliation failure path freezes its
+- [x] Every pre-existing trading and reconciliation failure path freezes its
   participating workers instead of making a pair-level recovery decision.
-- [ ] A worker loss of connection freezes that worker and every counterpart
+- [x] A worker loss of connection freezes that worker and every counterpart
   with which it has an active trade.
-- [ ] Contract tests cover each migrated failure class and prove no frozen
+- [x] Contract tests cover each migrated failure class and prove no frozen
   worker can resume trading before cleanup and explicit release.
-

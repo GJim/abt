@@ -232,6 +232,78 @@ class ControlLedgerTests(unittest.TestCase):
         self.assertEqual([], reconciliation["payload"]["orders"])
         self.assertEqual([], reconciliation["payload"]["positions"])
 
+    def test_freezing_an_anomaly_with_a_revoked_participant_still_isolates_active_workers(self) -> None:
+        with self.ledger._transaction():
+            for worker_id, login, server in [
+                ("worker-a", 123456, "Broker-A"),
+                ("worker-b", 654321, "Broker-B"),
+            ]:
+                self.ledger._connection.execute(
+                    """INSERT INTO workers
+                       (worker_id, enrollment_id, login, server, certificate, status, approved_at)
+                       VALUES (?, ?, ?, ?, ?, 'active', ?)""",
+                    [worker_id, f"enrollment-{worker_id}", login, server, f"certificate:{worker_id}", datetime.now(UTC)],
+                )
+
+        self.ledger.revoke_worker("worker-a", "ABCDEF")
+        frozen = self.ledger.freeze_workers(
+            "intent_execution_anomaly",
+            ["worker-a", "worker-b"],
+            {"intent_id": "intent-123", "reason": "broker dispatch failed"},
+        )
+
+        self.assertEqual(["worker-b"], [record["worker_id"] for record in frozen])
+        self.assertEqual({"worker-b"}, self.ledger.frozen_worker_ids(["worker-a", "worker-b"]))
+
+    def test_lost_worker_isolation_freezes_active_trade_counterparts(self) -> None:
+        with self.ledger._transaction():
+            for worker_id, login, server in [
+                ("worker-a", 123456, "Broker-A"),
+                ("worker-b", 654321, "Broker-B"),
+            ]:
+                self.ledger._connection.execute(
+                    """INSERT INTO workers
+                       (worker_id, enrollment_id, login, server, certificate, status, approved_at)
+                       VALUES (?, ?, ?, ?, ?, 'active', ?)""",
+                    [worker_id, f"enrollment-{worker_id}", login, server, f"certificate:{worker_id}", datetime.now(UTC)],
+                )
+        enrollment = self.ledger.create_trader_enrollment(
+            strategy_name="mean-reversion",
+            claimed_public_ip="203.0.113.4",
+            public_key_pem="public-key",
+        )
+        trader_id = self.ledger.approve_trader_enrollment(
+            enrollment["registration_id"], "ABCDEF", lambda trader_id, *_: f"certificate:{trader_id}"
+        )
+        accepted = self.ledger.accept_trader_intent(
+            trader_id,
+            "intent-lost-connection",
+            {
+                "type": "intent", "pair_id": "pair-123", "primary_direction": "LONG", "lots": "0.1",
+                "entry_price": "1.23450", "stop_loss_pips": "10", "take_profit_pips": "20",
+                "filling_mode": "IOC", "expires_at": "2026-08-20T00:05:00+00:00",
+            },
+            [
+                {"worker_id": "worker-a", "status": "accepted", "order": {"symbol": "EURUSD.a"}},
+                {"worker_id": "worker-b", "status": "accepted", "order": {"symbol": "EURUSD"}},
+            ],
+        )
+        self.ledger.record_intent_execution(accepted["intent_id"], "ioc_orders_placed", {}, status="working")
+
+        self.ledger.freeze_worker_and_active_counterparts(
+            "worker-a",
+            "worker_safety_state",
+            {"reason": "five_minute_missed_heartbeat", "reported_state": "lost_link_safety"},
+        )
+
+        workers = {worker["worker_id"]: worker for worker in self.ledger.worker_reconciliation()}
+        self.assertEqual("frozen", workers["worker-a"]["safety_state"])
+        self.assertEqual("frozen", workers["worker-b"]["safety_state"])
+        freeze = workers["worker-a"]["freeze"]
+        assert freeze is not None
+        self.assertEqual("worker_safety_state", freeze["source"])
+        self.assertEqual(["worker-a", "worker-b"], freeze["affected_worker_ids"])
+
     def test_management_operation_requires_zero_fills_to_cancel_and_fills_to_flatten(self) -> None:
         payload = {
             "type": "intent",
@@ -422,6 +494,17 @@ class ControlLedgerTests(unittest.TestCase):
         self.assertIsNotNone(record["execution_records"][0]["occurred_at"])
 
     def test_external_broker_change_freezes_related_working_intent_for_human_recovery(self) -> None:
+        with self.ledger._transaction():
+            for worker_id, login, server in [
+                ("worker-a", 123456, "Broker-A"),
+                ("worker-b", 654321, "Broker-B"),
+            ]:
+                self.ledger._connection.execute(
+                    """INSERT INTO workers
+                       (worker_id, enrollment_id, login, server, certificate, status, approved_at)
+                       VALUES (?, ?, ?, ?, ?, 'active', ?)""",
+                    [worker_id, f"enrollment-{worker_id}", login, server, f"certificate:{worker_id}", datetime.now(UTC)],
+                )
         enrollment = self.ledger.create_trader_enrollment(
             strategy_name="mean-reversion",
             claimed_public_ip="203.0.113.4",
@@ -437,7 +520,10 @@ class ControlLedgerTests(unittest.TestCase):
                 "entry_price": "1.23450", "stop_loss_pips": "10", "take_profit_pips": "20",
                 "filling_mode": "IOC", "expires_at": "2026-08-20T00:05:00+00:00",
             },
-            [{"worker_id": "worker-a", "status": "accepted"}, {"worker_id": "worker-b", "status": "accepted"}],
+            [
+                {"worker_id": "worker-a", "status": "accepted", "order": {"symbol": "EURUSD.a"}},
+                {"worker_id": "worker-b", "status": "accepted", "order": {"symbol": "EURUSD"}},
+            ],
         )
         self.ledger.record_intent_execution(accepted["intent_id"], "ioc_orders_placed", {}, status="working")
 
@@ -448,6 +534,7 @@ class ControlLedgerTests(unittest.TestCase):
         record = self.ledger.intent_record(accepted["intent_id"])
         self.assertEqual("needs_human", record["status"])
         self.assertEqual("intent_execution_frozen", record["execution_records"][-1]["event_type"])
+        self.assertEqual({"worker-a", "worker-b"}, self.ledger.frozen_worker_ids(["worker-a", "worker-b"]))
         events = self.ledger.trader_events_after(trader_id, 0)
         self.assertIn("intent_execution_frozen", [event["event_type"] for event in events])
 

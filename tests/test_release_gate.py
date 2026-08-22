@@ -120,7 +120,7 @@ class TwoWorkerReleaseExerciseTests(unittest.TestCase):
                 self._exercise_session(client, second_key, second_worker, second_certificate, cursor=0, external_change=False)
 
                 alerts = client.get("/api/admin/alerts").json()
-                self.assertEqual("external_broker_change", alerts[-1]["alert_type"])
+                self.assertEqual("worker_frozen", alerts[-1]["alert_type"])
                 self.assertEqual(
                     204,
                     client.post(f"/api/admin/workers/{first_worker}/revoke", headers={"X-CSRF-Token": csrf}).status_code,

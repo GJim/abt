@@ -459,12 +459,18 @@ class IocRecoveryTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_cancellation_or_reconciliation_failure_freezes_for_human_recovery(self) -> None:
         events: list[tuple[str, dict[str, object], str | None]] = []
+        freezes: list[tuple[str, list[str], dict[str, object]]] = []
 
         class Ledger:
             def record_intent_execution(
                 self, _intent_id: str, event_type: str, payload: dict[str, object], *, status: str | None = None
             ) -> None:
                 events.append((event_type, payload, status))
+
+            def freeze_workers(
+                self, source: str, worker_ids: list[str], audit: dict[str, object]
+            ) -> None:
+                freezes.append((source, worker_ids, audit))
 
         async def failed_recovery(*_: object, **__: object) -> dict[str, object]:
             raise LedgerError("Worker did not confirm execution_cancel.")
@@ -486,6 +492,17 @@ class IocRecoveryTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(("intent_execution_frozen", "needs_human"), (events[-1][0], events[-1][2]))
+        self.assertEqual(
+            [(
+                "intent_execution_anomaly",
+                ["worker-a", "worker-b"],
+                {
+                    "intent_id": "intent-123",
+                    "reason": "IOC recovery could not be proven safe: Worker did not confirm execution_cancel.",
+                },
+            )],
+            freezes,
+        )
 
 
 class IntentCancellationTests(unittest.IsolatedAsyncioTestCase):
@@ -1571,10 +1588,15 @@ class ControlPlaneServiceTests(unittest.TestCase):
         workers = self.client.get("/api/admin/workers").json()
         self.assertEqual("connected", workers[0]["connectivity"])
         self.assertEqual("frozen", workers[0]["safety_state"])
-        self.assertEqual("worker_reported_safety_state", workers[0]["freeze"]["source"])
+        self.assertEqual("external_broker_change", workers[0]["freeze"]["source"])
         self.assertEqual([worker_id], workers[0]["freeze"]["affected_worker_ids"])
         self.assertEqual(
-            {"reason": "Broker response could not be verified."},
+            {
+                "cursor": 1,
+                "entity": "position",
+                "reason": "Unattributed external broker change requires account isolation.",
+                "ticket": "51",
+            },
             workers[0]["freeze"]["audit"],
         )
         self.assertEqual({"balance": 1000}, workers[0]["latest_snapshot"]["account"])
@@ -1710,12 +1732,12 @@ class ControlPlaneServiceTests(unittest.TestCase):
         enrollment_alert = next(
             alert for alert in dashboard["alerts"] if alert["alert_type"] == "worker_enrollment_pending_approval"
         )
-        safety_alert = next(alert for alert in dashboard["alerts"] if alert["alert_type"] == "lost_link_safety")
+        safety_alert = next(alert for alert in dashboard["alerts"] if alert["alert_type"] == "worker_frozen")
         self.assertEqual("intervention_required", enrollment_alert["category"])
         self.assertEqual("administrator_approval_required", enrollment_alert["classification_reason"])
         self.assertEqual(pending_enrollment_id, enrollment_alert["enrollment_id"])
         self.assertEqual("intervention_required", safety_alert["category"])
-        self.assertEqual("controller_signal_lost", safety_alert["classification_reason"])
+        self.assertEqual("worker_safety_state", safety_alert["classification_reason"])
         self.assertEqual("intervention_required", dashboard["pending_enrollments"][0]["category"])
         self.assertEqual("approval_required", dashboard["pending_enrollments"][0]["classification_reason"])
         enrollment_intervention = next(
@@ -1740,7 +1762,7 @@ class ControlPlaneServiceTests(unittest.TestCase):
                 "item_type": "worker_alert",
                 "item_id": safety_alert["alert_id"],
                 "category": "intervention_required",
-                "reason": "controller_signal_lost",
+                "reason": "worker_safety_state",
             },
             {
                 key: value
@@ -1748,8 +1770,9 @@ class ControlPlaneServiceTests(unittest.TestCase):
                 if key in {"item_type", "item_id", "category", "reason"}
             },
         )
-        self.assertEqual("intervention_required", dashboard["workers"][0]["category"])
-        self.assertEqual("lost_link_safety", dashboard["workers"][0]["classification_reason"])
+        worker = next(worker for worker in dashboard["workers"] if worker["worker_id"] == worker_id)
+        self.assertEqual("intervention_required", worker["category"])
+        self.assertEqual("frozen", worker["classification_reason"])
         self.assertEqual(UTC, datetime.fromisoformat(dashboard["generated_at"]).tzinfo)
 
     def test_enrollment_does_not_apply_a_client_ip_rate_limit(self) -> None:
@@ -1828,7 +1851,7 @@ class ControlPlaneServiceTests(unittest.TestCase):
         self.assertNotIn(secret_ref, retrying_store.passwords)
         self.assertEqual([], self.app.state.ledger.expire_pending_enrollments())
 
-    def test_unattributed_broker_delta_alerts_needs_human_and_revocation_blocks_wss(self) -> None:
+    def test_unattributed_broker_delta_freezes_worker_and_revocation_blocks_wss(self) -> None:
         private_key = ec.generate_private_key(ec.SECP256R1())
         public_key_pem = private_key.public_key().public_bytes(
             serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
@@ -1860,9 +1883,9 @@ class ControlPlaneServiceTests(unittest.TestCase):
             )
             self.assertEqual({"type": "accepted", "cursor": 1}, websocket.receive_json())
             worker = self.client.get("/api/admin/workers").json()[0]
-            self.assertEqual("needs_human", worker["safety_state"])
+            self.assertEqual("frozen", worker["safety_state"])
             alerts = self.client.get("/api/admin/alerts").json()
-            self.assertEqual(("high", "external_broker_change"), (alerts[-1]["priority"], alerts[-1]["alert_type"]))
+            self.assertEqual(("high", "worker_frozen"), (alerts[-1]["priority"], alerts[-1]["alert_type"]))
             self.assertEqual(
                 204,
                 self.client.post(
