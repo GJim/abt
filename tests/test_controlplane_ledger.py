@@ -164,6 +164,40 @@ class ControlLedgerTests(unittest.TestCase):
         with self.assertRaisesRegex(LedgerError, "different payload"):
             self.ledger.accept_management_intent("ABCDEF", "create-001", {**payload, "lots": "0.20"}, [])
 
+    def test_freeze_records_immutable_worker_isolation_and_excludes_trading_selection(self) -> None:
+        with self.ledger._transaction():
+            for worker_id, login, server in [
+                ("worker-a", 123456, "Broker-A"),
+                ("worker-b", 654321, "Broker-B"),
+            ]:
+                self.ledger._connection.execute(
+                    """INSERT INTO workers
+                       (worker_id, enrollment_id, login, server, certificate, status, approved_at)
+                       VALUES (?, ?, ?, ?, ?, 'active', ?)""",
+                    [worker_id, f"enrollment-{worker_id}", login, server, f"certificate:{worker_id}", datetime.now(UTC)],
+                )
+
+        frozen = self.ledger.freeze_workers(
+            "execution_anomaly",
+            ["worker-a", "worker-b"],
+            {"intent_id": "intent-123", "reason": "broker timeout"},
+        )
+
+        self.assertEqual(["worker-a", "worker-b"], [record["worker_id"] for record in frozen])
+        self.assertEqual({"worker-a", "worker-b"}, self.ledger.frozen_worker_ids(["worker-a", "worker-b"]))
+        self.assertEqual("execution_anomaly", frozen[0]["source"])
+        self.assertEqual(["worker-a", "worker-b"], frozen[0]["affected_worker_ids"])
+        self.assertEqual({"intent_id": "intent-123", "reason": "broker timeout"}, frozen[0]["audit"])
+        self.assertEqual("frozen", self.ledger.worker_reconciliation()[0]["safety_state"])
+
+        replay = self.ledger.freeze_workers(
+            "different_source",
+            ["worker-a"],
+            {"reason": "must not replace the original freeze"},
+        )
+        self.assertEqual(frozen[0], replay[0])
+        self.assertEqual(2, len([event for event in self.ledger.events() if event["event_type"] == "worker_frozen"]))
+
     def test_management_operation_requires_zero_fills_to_cancel_and_fills_to_flatten(self) -> None:
         payload = {
             "type": "intent",

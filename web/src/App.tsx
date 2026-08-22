@@ -76,6 +76,12 @@ export type AccountWorker = {
   server: string
   connectivity: string
   safety_state: string
+  freeze: {
+    source: string
+    affected_worker_ids: string[]
+    audit: { reason: string }
+    frozen_at: string
+  } | null
   latest_snapshot: {
     cursor: number
     observed_at: string

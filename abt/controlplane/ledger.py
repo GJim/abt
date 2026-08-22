@@ -1398,6 +1398,91 @@ class ControlLedger:
             if state in {"lost_link_safety", "needs_human"}:
                 self._alert(worker_id, "high", state, reason)
 
+    def freeze_workers(
+        self,
+        source: str,
+        affected_worker_ids: list[str],
+        audit: dict[str, object],
+    ) -> list[dict[str, Any]]:
+        """Durably isolate active worker accounts without replacing their original freeze evidence."""
+
+        if not source or not affected_worker_ids:
+            raise LedgerError("Worker freeze source and affected workers are required.")
+        if any(not worker_id for worker_id in affected_worker_ids):
+            raise LedgerError("Affected worker IDs are invalid.")
+        if not isinstance(audit.get("reason"), str) or not audit["reason"]:
+            raise LedgerError("Worker freeze audit reason is required.")
+        worker_ids = list(dict.fromkeys(affected_worker_ids))
+        frozen: list[dict[str, Any]] = []
+        with self._transaction():
+            for worker_id in worker_ids:
+                existing = self._connection.execute(
+                    """SELECT source, affected_worker_ids, audit, frozen_at, event_id
+                       FROM worker_freezes WHERE worker_id = ? ORDER BY frozen_at DESC LIMIT 1""",
+                    [worker_id],
+                ).fetchone()
+                if existing is not None:
+                    frozen.append(
+                        {
+                            "worker_id": worker_id,
+                            "source": existing[0],
+                            "affected_worker_ids": json.loads(existing[1]),
+                            "audit": json.loads(existing[2]),
+                            "frozen_at": existing[3],
+                            "event_id": existing[4],
+                        }
+                    )
+                    continue
+                active = self._connection.execute(
+                    "SELECT 1 FROM workers WHERE worker_id = ? AND status = 'active'", [worker_id]
+                ).fetchone()
+                if active is None:
+                    raise LedgerError("Worker is not active.")
+                frozen_at = _utc_now()
+                payload = {
+                    "worker_id": worker_id,
+                    "source": source,
+                    "affected_worker_ids": worker_ids,
+                    "audit": audit,
+                }
+                event_id = self._event("worker_frozen", payload)
+                self._connection.execute(
+                    """INSERT INTO worker_freezes
+                       (freeze_id, worker_id, source, affected_worker_ids, audit, frozen_at, event_id)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    [
+                        str(uuid4()), worker_id, source, json.dumps(worker_ids, sort_keys=True),
+                        json.dumps(audit, sort_keys=True), frozen_at, event_id,
+                    ],
+                )
+                self._connection.execute(
+                    "UPDATE workers SET safety_state = 'frozen', last_seen_at = ? WHERE worker_id = ?",
+                    [frozen_at, worker_id],
+                )
+                self._alert(worker_id, "high", "worker_frozen", source)
+                frozen.append(
+                    {
+                        "worker_id": worker_id,
+                        "source": source,
+                        "affected_worker_ids": worker_ids,
+                        "audit": audit,
+                        "frozen_at": frozen_at,
+                        "event_id": event_id,
+                    }
+                )
+        return frozen
+
+    def frozen_worker_ids(self, worker_ids: list[str]) -> set[str]:
+        if not worker_ids:
+            return set()
+        placeholders = ", ".join("?" for _ in worker_ids)
+        with self._lock:
+            rows = self._connection.execute(
+                f"SELECT worker_id FROM workers WHERE worker_id IN ({placeholders}) AND safety_state = 'frozen'",
+                worker_ids,
+            ).fetchall()
+        return {str(row[0]) for row in rows}
+
     def revoke_worker(self, worker_id: str, revoked_by: str) -> None:
         with self._transaction():
             active = self._connection.execute(
@@ -1540,6 +1625,7 @@ class ControlLedger:
                             else "connected" if last_seen_at and now - last_seen_at <= timedelta(minutes=5) else "stale"
                         ),
                         "safety_state": safety_state,
+                        "freeze": self._worker_freeze(worker_id),
                         "live_state": None if live_state is None else {
                             "observed_at": live_state[0],
                             "connectivity": bool(live_state[1]),
@@ -1561,6 +1647,22 @@ class ControlLedger:
                     }
                 )
         return result
+
+    def _worker_freeze(self, worker_id: str) -> dict[str, Any] | None:
+        row = self._connection.execute(
+            """SELECT source, affected_worker_ids, audit, frozen_at, event_id
+               FROM worker_freezes WHERE worker_id = ? ORDER BY frozen_at DESC LIMIT 1""",
+            [worker_id],
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "source": row[0],
+            "affected_worker_ids": json.loads(row[1]),
+            "audit": json.loads(row[2]),
+            "frozen_at": row[3],
+            "event_id": row[4],
+        }
 
     def worker_snapshot_page(self, *, limit: int, cursor: str | None, query: str | None) -> dict[str, Any]:
         cursor_values = _decode_page_cursor(cursor, "worker_snapshots")
@@ -3256,6 +3358,15 @@ class ControlLedger:
                     last_seen_at TIMESTAMPTZ,
                     safety_state VARCHAR NOT NULL DEFAULT 'connected',
                     revoked_at TIMESTAMPTZ
+                );
+                CREATE TABLE IF NOT EXISTS worker_freezes (
+                    freeze_id VARCHAR PRIMARY KEY,
+                    worker_id VARCHAR NOT NULL,
+                    source VARCHAR NOT NULL,
+                    affected_worker_ids JSON NOT NULL,
+                    audit JSON NOT NULL,
+                    frozen_at TIMESTAMPTZ NOT NULL,
+                    event_id BIGINT NOT NULL UNIQUE
                 );
                 CREATE TABLE IF NOT EXISTS certificate_overlaps (
                     role VARCHAR NOT NULL,

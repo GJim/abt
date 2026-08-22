@@ -309,6 +309,15 @@ function WorkerRoster({
                     </ul>
                   )}
                 </section>
+                {worker.freeze ? (
+                  <section aria-label={`Freeze record for ${accountName}`}>
+                    <h3>Worker isolation</h3>
+                    <p>Frozen by {worker.freeze.source.replaceAll('_', ' ')}.</p>
+                    <p>Affected workers: {worker.freeze.affected_worker_ids.join(', ')}.</p>
+                    <p>{worker.freeze.audit.reason}</p>
+                    <time dateTime={worker.freeze.frozen_at}>{formatDateTime(worker.freeze.frozen_at)}</time>
+                  </section>
+                ) : null}
                 {worker.connectivity !== 'revoked' ? (
                   <button className="reject-button" onClick={() => onRevoke(worker)} type="button">Revoke certificate</button>
                 ) : null}
@@ -342,6 +351,9 @@ function formatAccountSummary(account: Record<string, unknown>) {
 }
 
 function describeWorkerHealth(worker: AccountWorker, hasAlert: boolean) {
+  if (worker.safety_state === 'frozen') {
+    return { description: 'Account is isolated until an administrator completes recovery.', label: 'Frozen', tone: 'human-action' }
+  }
   if (worker.connectivity === 'revoked') {
     return { description: 'Certificate revoked; connection is blocked.', label: 'Revoked', tone: 'human-action' }
   }

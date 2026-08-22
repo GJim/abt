@@ -1645,12 +1645,32 @@ def create_app(
                     await websocket.send_json({"type": "heartbeat_ack"})
                 elif (
                     message_type == "safety_state"
-                    and set(request) == {"type", "state", "reason"}
+                    and set(request) in (
+                        {"type", "state", "reason"},
+                        {"type", "state", "reason", "source", "affected_worker_ids"},
+                    )
                     and isinstance(request.get("state"), str)
                     and isinstance(request.get("reason"), str)
                     and request["reason"]
                 ):
-                    ledger.record_worker_safety_state(worker.worker_id, request["state"], request["reason"])
+                    if request["state"] == "frozen":
+                        source = request.get("source")
+                        affected_worker_ids = request.get("affected_worker_ids")
+                        if (
+                            not isinstance(source, str)
+                            or not source
+                            or not isinstance(affected_worker_ids, list)
+                            or not all(isinstance(item, str) and item for item in affected_worker_ids)
+                            or worker.worker_id not in affected_worker_ids
+                        ):
+                            raise ValueError("Frozen worker safety state is invalid.")
+                        ledger.freeze_workers(
+                            source,
+                            affected_worker_ids,
+                            {"reason": request["reason"]},
+                        )
+                    else:
+                        ledger.record_worker_safety_state(worker.worker_id, request["state"], request["reason"])
                     await websocket.send_json({"type": "accepted", "state": request["state"]})
                 elif message_type == "live_state_snapshot":
                     _record_live_state_snapshot(ledger, worker.worker_id, request)
@@ -2368,6 +2388,13 @@ async def _preflight_intent(
             raise LedgerError("Intent filling mode is not supported by both endpoints.")
         sources = cast(dict[str, dict[str, Any]], pair["source_workers"])
         workers = [sources["first_worker"], sources["second_worker"]]
+        frozen_worker_ids = getattr(ledger, "frozen_worker_ids", lambda _worker_ids: set())(
+            [str(worker["worker_id"]) for worker in workers]
+        )
+        if frozen_worker_ids:
+            raise LedgerError(
+                f"Frozen worker cannot be selected for a new trade: {', '.join(sorted(frozen_worker_ids))}."
+            )
         endpoint_by_server = {str(item["server"]): item for item in specifications}
         if set(endpoint_by_server) != {str(worker["server"]) for worker in workers}:
             raise LedgerError("Product pair source workers do not match its endpoints.")

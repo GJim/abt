@@ -278,6 +278,34 @@ test('administrator can scan a realistic fleet, including stale and human-action
   await expect(page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).resolves.toBe(true)
 })
 
+test('administrator can inspect a frozen worker and its immutable isolation record', async ({ page }) => {
+  await mockLogin(page)
+  await mockManagementData(page, {
+    workers: [buildWorker({
+      worker_id: 'worker-frozen',
+      login: 100008,
+      server: 'Broker-H',
+      safety_state: 'frozen',
+      freeze: {
+        source: 'execution_anomaly',
+        affected_worker_ids: ['worker-frozen', 'worker-counterpart'],
+        audit: { reason: 'Broker response could not be verified.' },
+        frozen_at: '2026-08-22T09:00:00Z',
+      },
+    })],
+  })
+
+  await signIn(page)
+  await page.getByRole('link', { name: 'Workers' }).click()
+
+  const workerCard = page.getByLabel('Workers by account').getByRole('listitem')
+  await expect(workerCard.getByText('Frozen', { exact: true })).toBeVisible()
+  await workerCard.getByRole('button', { name: /100008 on Broker-H/ }).click()
+  await expect(workerCard.getByText('Frozen by execution anomaly.')).toBeVisible()
+  await expect(workerCard.getByText('Affected workers: worker-frozen, worker-counterpart.')).toBeVisible()
+  await expect(workerCard.getByText('Broker response could not be verified.')).toBeVisible()
+})
+
 test('administrator sees a useful fleet-health empty state', async ({ page }) => {
   await mockLogin(page)
   await mockManagementData(page, { workers: [] })

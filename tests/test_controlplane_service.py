@@ -44,6 +44,7 @@ from abt.controlplane.service import (
     _dispatch_accepted_trader_intent,
     _delete_expired_pending_secrets,
     _market_data_statistics,
+    _preflight_management_intent,
     _preflight_trader_intent,
     _recover_ioc_partial_fill,
     _request_market_data_with_retry,
@@ -298,6 +299,71 @@ class TraderIntentPreflightTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual({"status": "rejected_preflight"}, result)
+
+    async def test_rejects_a_frozen_worker_before_management_or_trader_preflight_dispatch(self) -> None:
+        class Ledger:
+            rejected: tuple[object, ...] | None = None
+            management_rejected: tuple[object, ...] | None = None
+
+            def trader_command_result(self, *_: object) -> None:
+                return None
+
+            def management_command_result(self, *_: object) -> None:
+                return None
+
+            def frozen_worker_ids(self, _worker_ids: list[str]) -> set[str]:
+                return {"worker-a"}
+
+            def product_pairs(self) -> list[dict[str, object]]:
+                specification = {
+                    "allowed_directions": ["LONG", "SHORT"], "trade_stops_level": 5,
+                    "volume_min": "0.1", "volume_max": "100", "volume_step": "0.1",
+                    "point": "0.00001", "digits": 5, "filling_modes": ["FOK", "IOC"],
+                }
+                return [{
+                    "product_pair_id": "pair-123",
+                    "status": "active",
+                    "reference_specifications": [
+                        {"server": "Broker-A", "symbol": "EURUSD.a", "specification": specification},
+                        {"server": "Broker-B", "symbol": "EURUSD", "specification": specification},
+                    ],
+                    "source_workers": {
+                        "first_worker": {"worker_id": "worker-a", "server": "Broker-A"},
+                        "second_worker": {"worker_id": "worker-b", "server": "Broker-B"},
+                    },
+                }]
+
+            def reject_trader_command(self, *args: object) -> dict[str, object]:
+                self.rejected = args
+                return {"status": "rejected_preflight"}
+
+            def reject_management_intent(self, *args: object) -> dict[str, object]:
+                self.management_rejected = args
+                return {"status": "rejected_preflight"}
+
+        ledger = Ledger()
+        payload = {
+            "type": "intent", "pair_id": "pair-123", "primary_direction": "LONG", "lots": "0.1",
+            "entry_price": "1.23450", "stop_loss_pips": "10", "take_profit_pips": "20",
+            "filling_mode": "FOK", "expires_at": (datetime.now(UTC) + timedelta(minutes=1)).isoformat(),
+        }
+        result = await _preflight_trader_intent(
+            ledger,  # type: ignore[arg-type]
+            {}, {},
+            "trader-123", "intent-frozen-worker", payload,
+        )
+        management_result = await _preflight_management_intent(
+            ledger,  # type: ignore[arg-type]
+            {}, {},
+            "ABCDEF", "management-intent-frozen-worker", payload,
+        )
+
+        self.assertEqual({"status": "rejected_preflight"}, result)
+        self.assertEqual({"status": "rejected_preflight"}, management_result)
+        assert ledger.rejected is not None
+        assert ledger.management_rejected is not None
+        self.assertEqual("Frozen worker cannot be selected for a new trade: worker-a.", ledger.rejected[3])
+        self.assertEqual("Frozen worker cannot be selected for a new trade: worker-a.", ledger.management_rejected[3])
 
 
 class IocRecoveryTests(unittest.IsolatedAsyncioTestCase):
@@ -1447,9 +1513,26 @@ class ControlPlaneServiceTests(unittest.TestCase):
                                  "entity": "position", "ticket": "51", "change": "modified",
                                  "record": {"ticket": 51, "volume": 1.0, "tp": 1.5}})
             self.assertEqual({"type": "accepted", "cursor": 2}, websocket.receive_json())
+            websocket.send_json(
+                {
+                    "type": "safety_state",
+                    "state": "frozen",
+                    "reason": "Broker response could not be verified.",
+                    "source": "execution_anomaly",
+                    "affected_worker_ids": [worker_id],
+                }
+            )
+            self.assertEqual({"type": "accepted", "state": "frozen"}, websocket.receive_json())
 
         workers = self.client.get("/api/admin/workers").json()
         self.assertEqual("connected", workers[0]["connectivity"])
+        self.assertEqual("frozen", workers[0]["safety_state"])
+        self.assertEqual("execution_anomaly", workers[0]["freeze"]["source"])
+        self.assertEqual([worker_id], workers[0]["freeze"]["affected_worker_ids"])
+        self.assertEqual(
+            {"reason": "Broker response could not be verified."},
+            workers[0]["freeze"]["audit"],
+        )
         self.assertEqual({"balance": 1000}, workers[0]["latest_snapshot"]["account"])
         self.assertEqual(["volume_changed", "modified"], [delta["change"] for delta in workers[0]["deltas"]])
         live_state = workers[0]["live_state"]
