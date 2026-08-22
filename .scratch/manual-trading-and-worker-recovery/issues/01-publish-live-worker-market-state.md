@@ -8,13 +8,12 @@ reconnection.
 
 **Blocked by:** None — can start immediately.
 
-**Status:** ready-for-agent
+**Status:** ready-for-human
 
-- [ ] Administrators can see each watched symbol's bid, ask, broker quote
+- [x] Administrators can see each watched symbol's bid, ask, broker quote
   time, and controller receipt time, plus current worker connectivity.
-- [ ] Administrators can see all open orders and positions for a worker, with
+- [x] Administrators can see all open orders and positions for a worker, with
   freshness that remains understandable after worker or WSS reconnection.
-- [ ] Contract tests prove diff-only updates, complete reconnect snapshots,
+- [x] Contract tests prove diff-only updates, complete reconnect snapshots,
   preserved broker timestamps, and the 500 ms quote, 1 s order/position, and
   5 s connection polling contracts.
-
