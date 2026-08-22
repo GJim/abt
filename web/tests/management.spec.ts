@@ -1398,7 +1398,6 @@ test('administrator previews intent actions, reads immutable events, and sees co
   let intents = [zeroFillIntent, filledIntent]
   const createBodies: Record<string, unknown>[] = []
   let cancelHeaders: Record<string, string> | undefined
-  let flattenHeaders: Record<string, string> | undefined
   const intentQueries: string[] = []
 
   await mockLogin(page)
@@ -1442,11 +1441,6 @@ test('administrator previews intent actions, reads immutable events, and sees co
     cancelHeaders = route.request().headers()
     await route.fulfill({ status: 409, contentType: 'application/json', body: JSON.stringify({ detail: 'A fill was observed while cancelling.' }) })
   })
-  await page.route('**/api/admin/intents/intent-filled/emergency-flatten', async (route) => {
-    flattenHeaders = route.request().headers()
-    await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ status: 'scheduled' }) })
-  })
-
   await signIn(page)
   await page.getByRole('link', { name: 'Intents' }).click()
   await page.getByLabel('Active pair').selectOption('pair-1')
@@ -1478,9 +1472,7 @@ test('administrator previews intent actions, reads immutable events, and sees co
   expect(cancelHeaders?.['x-csrf-token']).toBe('csrf-token')
   await page.locator('[role="dialog"]').filter({ hasText: 'Confirm cancel' }).getByRole('button', { name: 'Back' }).click()
 
-  await page.getByRole('button', { name: 'Preview emergency flatten' }).click()
-  await page.locator('[role="dialog"]').filter({ hasText: 'Confirm emergency flatten' }).getByRole('button', { name: 'Confirm emergency flatten' }).click()
-  expect(flattenHeaders?.['x-csrf-token']).toBe('csrf-token')
+  await expect(page.getByRole('button', { name: 'Preview emergency flatten' })).toHaveCount(0)
   await page.getByLabel('Show complete history').check()
   await expect.poll(() => intentQueries.some((query) => query.includes('active_only=false'))).toBe(true)
 })

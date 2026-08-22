@@ -47,11 +47,9 @@ from abt.controlplane.service import (
     _market_data_statistics,
     _preflight_management_intent,
     _preflight_trader_intent,
-    _recover_ioc_partial_fill,
     _request_market_data_with_retry,
     _shared_supported_filling_modes,
     _intent_order,
-    _flatten_intent,
     TraderIntentPayload,
     _validated_market_data_response,
     _validated_product_catalog_response,
@@ -370,7 +368,7 @@ class TraderIntentPreflightTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("Frozen worker cannot be selected for a new trade: worker-a.", ledger.management_rejected[3])
 
 
-class IocRecoveryTests(unittest.IsolatedAsyncioTestCase):
+class WorkerIsolationTests(unittest.IsolatedAsyncioTestCase):
     async def test_dispatch_does_not_send_orders_when_a_worker_freezes_after_preflight(self) -> None:
         events: list[tuple[str, str | None]] = []
 
@@ -410,95 +408,63 @@ class IocRecoveryTests(unittest.IsolatedAsyncioTestCase):
             events,
         )
 
-    async def test_cancels_then_reconciles_then_closes_only_unmatched_exposure(self) -> None:
-        events: list[tuple[str, dict[str, object], str | None]] = []
-
-        class Ledger:
-            def record_intent_execution(
-                self, _intent_id: str, event_type: str, payload: dict[str, object], *, status: str | None = None
-            ) -> None:
-                events.append((event_type, payload, status))
-
-        observations = [
-            [{"orders": [{"ticket": "101", "volume": "0.1"}], "positions": [{"ticket": "201", "volume": "0.1"}]},
-             {"orders": [], "positions": []}],
-            [{"orders": [], "positions": [{"ticket": "201", "volume": "0.1"}]}, {"orders": [], "positions": []}],
-            [{"orders": [], "positions": []}, {"orders": [], "positions": []}],
-        ]
-        operations: list[tuple[str, dict[str, str]]] = []
-
-        async def recover(_connection: object, operation: str, payload: dict[str, str]) -> dict[str, object]:
-            operations.append((operation, payload))
-            return {"accepted": True, "operation": operation, "result": {"retcode": 10009}}
-
-        with (
-            patch("abt.controlplane.service._connected_worker_session", side_effect=[object(), object()]),
-            patch("abt.controlplane.service._reconcile_execution", side_effect=observations),
-            patch("abt.controlplane.service._execution_recovery_request", side_effect=recover),
-        ):
-            await _recover_ioc_partial_fill(
-                Ledger(),  # type: ignore[arg-type]
-                {"worker-a": {object()}, "worker-b": {object()}},  # type: ignore[arg-type]
-                {},
-                "intent-123",
-                [
-                    {"worker_id": "worker-a", "order": {"control_plane_command_id": "abt:correlated"}},
-                    {"worker_id": "worker-b", "order": {"control_plane_command_id": "abt:correlated"}},
-                ],
-            )
-
-        self.assertEqual(
-            [("execution_cancel", {"ticket": "101", "volume": "0.1"}), ("execution_close", {"ticket": "201", "volume": "0.1"})],
-            operations,
-        )
-        self.assertEqual(
-            ["ioc_reconciled", "ioc_residual_cancelled", "ioc_reconciled_after_cancellation",
-             "ioc_unmatched_exposure_closed", "ioc_recovery_completed"],
-            [event[0] for event in events],
-        )
-
-    async def test_cancellation_or_reconciliation_failure_freezes_for_human_recovery(self) -> None:
+    async def test_partial_ioc_execution_freezes_workers_without_attempting_pair_recovery(self) -> None:
         events: list[tuple[str, dict[str, object], str | None]] = []
         freezes: list[tuple[str, list[str], dict[str, object]]] = []
 
         class Ledger:
+            def claim_accepted_intent_dispatch(self, _intent_id: str) -> bool:
+                return True
+
+            def frozen_worker_ids(self, _worker_ids: list[str]) -> set[str]:
+                return set()
+
             def record_intent_execution(
                 self, _intent_id: str, event_type: str, payload: dict[str, object], *, status: str | None = None
             ) -> None:
                 events.append((event_type, payload, status))
 
-            def freeze_workers(
-                self, source: str, worker_ids: list[str], audit: dict[str, object]
-            ) -> None:
+            def freeze_workers(self, source: str, worker_ids: list[str], audit: dict[str, object]) -> None:
                 freezes.append((source, worker_ids, audit))
 
-        async def failed_recovery(*_: object, **__: object) -> dict[str, object]:
-            raise LedgerError("Worker did not confirm execution_cancel.")
+        async def execute(_connection: object, order: dict[str, object]) -> dict[str, object]:
+            return {
+                "accepted": order["symbol"] == "EURUSD.a",
+                "order": order,
+                "result": {"ticket": 101},
+            }
 
         with (
             patch("abt.controlplane.service._connected_worker_session", side_effect=[object(), object()]),
-            patch("abt.controlplane.service._reconcile_execution", side_effect=[
-                [{"orders": [{"ticket": "101", "volume": "0.1"}], "positions": []}, {"orders": [], "positions": []}],
-            ]),
-            patch("abt.controlplane.service._execution_recovery_request", side_effect=failed_recovery),
+            patch("abt.controlplane.service._request_order_execute", side_effect=execute),
+            patch(
+                "abt.controlplane.service._execution_recovery_request",
+                side_effect=AssertionError("an anomaly must not attempt pair recovery"),
+            ),
         ):
-            await _recover_ioc_partial_fill(
+            await _dispatch_accepted_trader_intent(
                 Ledger(),  # type: ignore[arg-type]
-                {"worker-a": {object()}, "worker-b": {object()}}, {}, "intent-123",
+                {"worker-a": {object()}, "worker-b": {object()}},
+                {},
+                "intent-123",
+                "IOC",
                 [
-                    {"worker_id": "worker-a", "order": {"control_plane_command_id": "abt:correlated"}},
-                    {"worker_id": "worker-b", "order": {"control_plane_command_id": "abt:correlated"}},
+                    {"worker_id": "worker-a", "order": {"symbol": "EURUSD.a"}},
+                    {"worker_id": "worker-b", "order": {"symbol": "EURUSD"}},
                 ],
             )
 
-        self.assertEqual(("intent_execution_frozen", "needs_human"), (events[-1][0], events[-1][2]))
+        self.assertEqual(
+            ("intent_execution_frozen", "needs_human"),
+            (events[-1][0], events[-1][2]),
+        )
         self.assertEqual(
             [(
                 "intent_execution_anomaly",
                 ["worker-a", "worker-b"],
                 {
                     "intent_id": "intent-123",
-                    "reason": "IOC recovery could not be proven safe: Worker did not confirm execution_cancel.",
+                    "reason": "Incomplete IOC entry requires worker isolation.",
                 },
             )],
             freezes,
@@ -546,6 +512,7 @@ class IntentCancellationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_rejects_cancellation_when_reconciliation_observes_a_fill(self) -> None:
         events: list[tuple[str, str | None]] = []
+        freezes: list[tuple[str, list[str], dict[str, object]]] = []
 
         class Ledger:
             def record_intent_execution(
@@ -553,12 +520,14 @@ class IntentCancellationTests(unittest.IsolatedAsyncioTestCase):
             ) -> None:
                 events.append((event_type, status))
 
+            def freeze_workers(self, source: str, worker_ids: list[str], audit: dict[str, object]) -> None:
+                freezes.append((source, worker_ids, audit))
+
         with (
             patch("abt.controlplane.service._connected_worker_session", side_effect=[object(), object()]),
             patch("abt.controlplane.service._reconcile_execution", return_value=[
                 {"orders": [], "positions": [{"ticket": "201", "volume": "0.1"}]}, {"orders": [], "positions": []}
             ]),
-            patch("abt.controlplane.service._recover_ioc_partial_fill"),
         ):
             await _cancel_intent(
                 Ledger(),  # type: ignore[arg-type]
@@ -570,54 +539,20 @@ class IntentCancellationTests(unittest.IsolatedAsyncioTestCase):
                 ],
             )
 
-        self.assertEqual(("rejected_due_to_fill", "working"), events[-1])
-
-    async def test_emergency_flatten_cancels_orders_and_closes_all_positions(self) -> None:
-        events: list[tuple[str, str | None]] = []
-        operations: list[tuple[str, dict[str, str]]] = []
-
-        class Ledger:
-            def record_intent_execution(
-                self, _intent_id: str, event_type: str, _payload: dict[str, object], *, status: str | None = None
-            ) -> None:
-                events.append((event_type, status))
-
-        async def recover(_connection: object, operation: str, payload: dict[str, str]) -> dict[str, object]:
-            operations.append((operation, payload))
-            return {"accepted": True, "operation": operation, "result": {"retcode": 10009}}
-
-        with (
-            patch("abt.controlplane.service._connected_worker_session", side_effect=[object(), object()]),
-            patch("abt.controlplane.service._reconcile_execution", side_effect=[
-                [{"orders": [{"ticket": "101", "volume": "0.1"}], "positions": [{"ticket": "201", "volume": "0.1"}]},
-                 {"orders": [], "positions": [{"ticket": "202", "volume": "0.1"}]}],
-                [{"orders": [], "positions": []}, {"orders": [], "positions": []}],
-            ]),
-            patch("abt.controlplane.service._execution_recovery_request", side_effect=recover),
-        ):
-            await _flatten_intent(
-                Ledger(),  # type: ignore[arg-type]
-                {"worker-a": {object()}, "worker-b": {object()}}, {},
-                "intent-123",
-                [
-                    {"worker_id": "worker-a", "order": {"control_plane_command_id": "abt:correlated"}},
-                    {"worker_id": "worker-b", "order": {"control_plane_command_id": "abt:correlated"}},
-                ],
-            )
-
         self.assertEqual(
             [
-                ("execution_cancel", {"ticket": "101", "volume": "0.1"}),
-                ("execution_close", {"ticket": "201", "volume": "0.1"}),
-                ("execution_close", {"ticket": "202", "volume": "0.1"}),
+                ("intent_execution_anomaly", ["worker-a", "worker-b"], {
+                    "intent_id": "intent-123",
+                    "reason": "Cancellation observed broker exposure.",
+                }),
             ],
-            operations,
+            freezes,
         )
-        self.assertEqual(("emergency_flattened", "cancelled"), events[-1])
+        self.assertEqual(("intent_execution_frozen", "needs_human"), events[-1])
 
-    async def test_single_leg_execution_timeout_enters_incomplete_entry_recovery(self) -> None:
+    async def test_single_leg_execution_timeout_freezes_participating_workers(self) -> None:
         events: list[tuple[str, str | None]] = []
-        recovered: list[str] = []
+        freezes: list[tuple[str, list[str], dict[str, object]]] = []
 
         class Ledger:
             def claim_accepted_intent_dispatch(self, _intent_id: str) -> bool:
@@ -631,13 +566,13 @@ class IntentCancellationTests(unittest.IsolatedAsyncioTestCase):
             ) -> None:
                 events.append((event_type, status))
 
+            def freeze_workers(self, source: str, worker_ids: list[str], audit: dict[str, object]) -> None:
+                freezes.append((source, worker_ids, audit))
+
         async def execution(*args: object, **_: object) -> dict[str, object]:
             if args[0] == "first":
                 raise asyncio.TimeoutError
             return {"accepted": True, "order": args[1], "result": {"ticket": 12}}
-
-        async def recovery(*args: object, **_: object) -> None:
-            recovered.append(str(args[3]))
 
         outcomes = [
             {"worker_id": "worker-a", "order": {"control_plane_command_id": "abt:correlated"}},
@@ -646,7 +581,6 @@ class IntentCancellationTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch("abt.controlplane.service._connected_worker_session", side_effect=["first", "second"]),
             patch("abt.controlplane.service._request_order_execute", side_effect=execution),
-            patch("abt.controlplane.service._recover_ioc_partial_fill", side_effect=recovery),
         ):
             await _dispatch_accepted_trader_intent(
                 Ledger(),  # type: ignore[arg-type]
@@ -654,7 +588,18 @@ class IntentCancellationTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertIn(("incomplete_entry_detected", "working"), events)
-        self.assertEqual(["intent-123"], recovered)
+        self.assertIn(("intent_execution_frozen", "needs_human"), events)
+        self.assertEqual(
+            [(
+                "intent_execution_anomaly",
+                ["worker-a", "worker-b"],
+                {
+                    "intent_id": "intent-123",
+                    "reason": "Incomplete FOK entry requires worker isolation.",
+                },
+            )],
+            freezes,
+        )
 
 
 class MemoryCertificateIssuer:

@@ -853,9 +853,9 @@ class ControlLedger:
     def request_management_intent_operation(
         self, username: str, command_id: str, intent_id: str, operation: str
     ) -> tuple[dict[str, Any], list[dict[str, Any]], bool]:
-        """Durably schedule an administrator cancellation or emergency flatten."""
+        """Durably schedule an administrator cancellation of a zero-fill intent."""
 
-        if operation not in {"cancel", "emergency_flatten"}:
+        if operation != "cancel":
             raise LedgerError("Management intent operation is invalid.")
         payload = {"intent_id": intent_id, "type": operation}
         payload_hash = _hash(json.dumps(payload, separators=(",", ":"), sort_keys=True))
@@ -876,12 +876,10 @@ class ControlLedger:
             has_fill = self._intent_has_fill(intent_id)
             if operation == "cancel" and (has_fill or intent[2] not in {"accepted", "dispatching", "working"}):
                 raise LedgerError("Only zero-fill intents are eligible for ordinary cancellation.")
-            if operation == "emergency_flatten" and (not has_fill and intent[2] != "needs_human"):
-                raise LedgerError("Only filled or frozen intents are eligible for emergency flatten.")
             self._connection.execute(
                 "UPDATE trader_intents SET status = 'cancelling' WHERE intent_id = ?", [intent_id]
             )
-            event_type = "emergency_flatten_scheduled" if operation == "emergency_flatten" else "cancellation_scheduled"
+            event_type = "cancellation_scheduled"
             event_id = self._event(
                 event_type, {"username": username, "command_id": command_id, "intent_id": intent_id}
             )
@@ -895,7 +893,7 @@ class ControlLedger:
             )
             result = {
                 "command_id": command_id,
-                "status": "emergency_flatten_scheduled" if operation == "emergency_flatten" else "cancellation_scheduled",
+                "status": "cancellation_scheduled",
                 "intent_id": intent_id,
                 "event_id": event_id,
             }

@@ -818,26 +818,6 @@ def create_app(
         except LedgerError as error:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
 
-    @app.post("/api/admin/intents/{intent_id}/emergency-flatten")
-    async def flatten_intent(
-        intent_id: str,
-        body: ManagementIntentCommandRequest,
-        abt_admin_session: Annotated[str | None, Cookie()] = None,
-        x_csrf_token: Annotated[str | None, Header()] = None,
-    ) -> dict[str, object]:
-        username = _require_admin(ledger, abt_admin_session, x_csrf_token, require_csrf=True)
-        try:
-            result, preflight, scheduled = ledger.request_management_intent_operation(
-                username, body.command_id, intent_id, "emergency_flatten"
-            )
-            if scheduled:
-                asyncio.create_task(
-                    _flatten_intent(ledger, worker_connections, worker_execution_locks, intent_id, preflight)
-                )
-            return result
-        except LedgerError as error:
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
-
     @app.get("/api/admin/worker-snapshots")
     def list_worker_snapshots(
         limit: Annotated[int, Query(ge=1, le=50)] = 50,
@@ -2590,7 +2570,12 @@ async def _dispatch_accepted_trader_intent(
 
     if not accepted:
         ledger.record_intent_execution(intent_id, "incomplete_entry_detected", {}, status="working")
-        await _recover_ioc_partial_fill(ledger, worker_connections, worker_execution_locks, intent_id, outcomes)
+        _freeze_intent_execution(
+            ledger,
+            intent_id,
+            f"Incomplete {filling_mode} entry requires worker isolation.",
+            worker_ids,
+        )
     elif filling_mode == "FOK":
         ledger.record_intent_execution(intent_id, "fok_orders_placed", {}, status="working")
     else:
@@ -2599,79 +2584,6 @@ async def _dispatch_accepted_trader_intent(
             "ioc_orders_placed",
             {"notice": "Matched volume is established only by reconciliation; placement acknowledgements are not fills."},
             status="working",
-        )
-        await _recover_ioc_partial_fill(ledger, worker_connections, worker_execution_locks, intent_id, outcomes)
-
-
-async def _recover_ioc_partial_fill(
-    ledger: ControlLedger,
-    worker_connections: dict[str, set[_WorkerSessionConnection]],
-    worker_execution_locks: dict[str, asyncio.Lock],
-    intent_id: str,
-    outcomes: list[dict[str, object]],
-) -> None:
-    """Use broker observations, never execution acknowledgements, to flatten IOC imbalance."""
-
-    worker_ids = [str(outcome["worker_id"]) for outcome in outcomes]
-    execution_ids = {str(cast(dict[str, object], outcome["order"])["control_plane_command_id"]) for outcome in outcomes}
-    if len(execution_ids) != 1:
-        _freeze_intent_execution(
-            ledger, intent_id, "IOC recovery has inconsistent execution correlation IDs.", worker_ids
-        )
-        return
-    execution_id = execution_ids.pop()
-    try:
-        connections = [_connected_worker_session(worker_connections, worker_id) for worker_id in worker_ids]
-        async with _pair_worker_execution(worker_execution_locks, *worker_ids):
-            observed = await _reconcile_execution(connections, execution_id)
-            ledger.record_intent_execution(
-                intent_id, "ioc_reconciled", {"execution_id": execution_id, "legs": observed}
-            )
-            for connection, leg in zip(connections, observed, strict=True):
-                for order in leg["orders"]:
-                    await _execution_recovery_request(
-                        connection, "execution_cancel", {"ticket": order["ticket"], "volume": order["volume"]}
-                    )
-            if any(leg["orders"] for leg in observed):
-                ledger.record_intent_execution(intent_id, "ioc_residual_cancelled", {"execution_id": execution_id})
-            observed = await _reconcile_execution(connections, execution_id)
-            ledger.record_intent_execution(
-                intent_id, "ioc_reconciled_after_cancellation", {"execution_id": execution_id, "legs": observed}
-            )
-            if any(leg["orders"] for leg in observed):
-                raise LedgerError("IOC residual order remains after cancellation.")
-            volumes = [_execution_volume(leg["positions"]) for leg in observed]
-            if volumes[0] != volumes[1]:
-                unmatched_index = 0 if volumes[0] > volumes[1] else 1
-                remaining = abs(volumes[0] - volumes[1])
-                for position in observed[unmatched_index]["positions"]:
-                    close_volume = min(remaining, Decimal(position["volume"]))
-                    if close_volume:
-                        await _execution_recovery_request(
-                            connections[unmatched_index], "execution_close",
-                            {"ticket": position["ticket"], "volume": str(close_volume)},
-                        )
-                        remaining -= close_volume
-                    if remaining == 0:
-                        break
-                if remaining != 0:
-                    raise LedgerError("IOC reconciliation could not identify unmatched market exposure.")
-                ledger.record_intent_execution(
-                    intent_id, "ioc_unmatched_exposure_closed",
-                    {"execution_id": execution_id, "worker_id": worker_ids[unmatched_index]},
-                )
-            observed = await _reconcile_execution(connections, execution_id)
-            final_volumes = [_execution_volume(leg["positions"]) for leg in observed]
-            if any(leg["orders"] for leg in observed) or final_volumes[0] != final_volumes[1]:
-                raise LedgerError("IOC final reconciliation does not prove matched exposure.")
-            ledger.record_intent_execution(
-                intent_id, "ioc_recovery_completed",
-                {"execution_id": execution_id, "matched_volume": str(final_volumes[0]), "legs": observed},
-                status="working",
-            )
-    except (KeyError, LedgerError, ValueError, asyncio.TimeoutError) as error:
-        _freeze_intent_execution(
-            ledger, intent_id, f"IOC recovery could not be proven safe: {error}", worker_ids
         )
 
 
@@ -2684,23 +2596,7 @@ async def _cancel_intent(
 ) -> None:
     """Cancel zero-fill orders and prove both legs remain unfilled before terminalizing."""
 
-    await _operate_on_intent_exposure(
-        ledger, worker_connections, worker_execution_locks, intent_id, outcomes, emergency_flatten=False
-    )
-
-
-async def _flatten_intent(
-    ledger: ControlLedger,
-    worker_connections: dict[str, set[_WorkerSessionConnection]],
-    worker_execution_locks: dict[str, asyncio.Lock],
-    intent_id: str,
-    outcomes: list[dict[str, object]],
-) -> None:
-    """Cancel remaining orders and close all observed exposure for an administrator."""
-
-    await _operate_on_intent_exposure(
-        ledger, worker_connections, worker_execution_locks, intent_id, outcomes, emergency_flatten=True
-    )
+    await _operate_on_intent_exposure(ledger, worker_connections, worker_execution_locks, intent_id, outcomes)
 
 
 async def _operate_on_intent_exposure(
@@ -2709,14 +2605,11 @@ async def _operate_on_intent_exposure(
     worker_execution_locks: dict[str, asyncio.Lock],
     intent_id: str,
     outcomes: list[dict[str, object]],
-    *,
-    emergency_flatten: bool,
 ) -> None:
-    operation = "Emergency flatten" if emergency_flatten else "Cancellation"
+    operation = "Cancellation"
     claim = getattr(ledger, "claim_scheduled_intent_operation", None)
     if callable(claim) and not claim(intent_id):
         return
-    fill_observed = False
     worker_ids: list[str] = []
     try:
         worker_ids = [str(outcome["worker_id"]) for outcome in outcomes]
@@ -2731,43 +2624,37 @@ async def _operate_on_intent_exposure(
             observed = await _reconcile_execution(connections, execution_id)
             ledger.record_intent_execution(
                 intent_id,
-                "emergency_flatten_reconciled" if emergency_flatten else "cancellation_reconciled",
+                "cancellation_reconciled",
                 {"execution_id": execution_id, "legs": observed},
             )
-            if not emergency_flatten and any(leg["positions"] for leg in observed):
+            if any(leg["positions"] for leg in observed):
                 ledger.record_intent_execution(
                     intent_id, "rejected_due_to_fill", {"execution_id": execution_id, "legs": observed}, status="working"
                 )
-                fill_observed = True
-            if not fill_observed:
-                if emergency_flatten and not any(leg["positions"] for leg in observed):
-                    raise LedgerError("Emergency flatten requires filled exposure.")
-                for connection, leg in zip(connections, observed, strict=True):
-                    for order in leg["orders"]:
-                        await _execution_recovery_request(
-                            connection, "execution_cancel", {"ticket": order["ticket"], "volume": order["volume"]}
-                        )
-                for connection, leg in zip(connections, observed, strict=True):
-                    for position in leg["positions"]:
-                        await _execution_recovery_request(
-                            connection, "execution_close", {"ticket": position["ticket"], "volume": position["volume"]}
-                        )
-                final = await _reconcile_execution(connections, execution_id)
-                if any(leg["orders"] or leg["positions"] for leg in final):
-                    raise LedgerError(f"{operation} final reconciliation did not prove zero exposure.")
-                ledger.record_intent_execution(
+                _freeze_intent_execution(
+                    ledger,
                     intent_id,
-                    "emergency_flattened" if emergency_flatten else "cancelled",
-                    {"execution_id": execution_id, "legs": final},
-                    status="cancelled",
+                    "Cancellation observed broker exposure.",
+                    worker_ids,
                 )
+                return
+            for connection, leg in zip(connections, observed, strict=True):
+                for order in leg["orders"]:
+                    await _execution_recovery_request(
+                        connection, "execution_cancel", {"ticket": order["ticket"], "volume": order["volume"]}
+                    )
+            final = await _reconcile_execution(connections, execution_id)
+            if any(leg["orders"] or leg["positions"] for leg in final):
+                raise LedgerError(f"{operation} final reconciliation did not prove zero exposure.")
+            ledger.record_intent_execution(
+                intent_id,
+                "cancelled",
+                {"execution_id": execution_id, "legs": final},
+                status="cancelled",
+            )
     except (KeyError, LedgerError, ValueError, asyncio.TimeoutError) as error:
         _freeze_intent_execution(ledger, intent_id, f"{operation} could not be proven safe: {error}", worker_ids)
         return
-    if fill_observed:
-        await _recover_ioc_partial_fill(ledger, worker_connections, worker_execution_locks, intent_id, outcomes)
-
-
 def _freeze_intent_execution(
     ledger: ControlLedger, intent_id: str, reason: str, worker_ids: list[str] | None = None
 ) -> None:
@@ -2913,10 +2800,6 @@ def _execution_records(records: object) -> list[dict[str, str]]:
             raise ValueError("Execution reconciliation returned an unknown broker volume.")
         normalized.append({"ticket": str(record["ticket"]), "volume": str(volume)})
     return normalized
-
-
-def _execution_volume(positions: list[dict[str, str]]) -> Decimal:
-    return sum((Decimal(position["volume"]) for position in positions), Decimal())
 
 
 async def _fail_undispatched_accepted_intents_after_startup_reconciliation(

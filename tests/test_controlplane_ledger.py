@@ -304,7 +304,7 @@ class ControlLedgerTests(unittest.TestCase):
         self.assertEqual("worker_safety_state", freeze["source"])
         self.assertEqual(["worker-a", "worker-b"], freeze["affected_worker_ids"])
 
-    def test_management_operation_requires_zero_fills_to_cancel_and_fills_to_flatten(self) -> None:
+    def test_management_operation_accepts_only_zero_fill_cancellation(self) -> None:
         payload = {
             "type": "intent",
             "pair_id": "pair-123",
@@ -327,11 +327,10 @@ class ControlLedgerTests(unittest.TestCase):
         self.ledger.record_intent_execution(str(filled["intent_id"]), "intent_leg_filled", {}, status="working")
         with self.assertRaisesRegex(LedgerError, "zero-fill"):
             self.ledger.request_management_intent_operation("ABCDEF", "cancel-filled", str(filled["intent_id"]), "cancel")
-        result, _, scheduled = self.ledger.request_management_intent_operation(
-            "ABCDEF", "flatten-filled", str(filled["intent_id"]), "emergency_flatten"
-        )
-        self.assertEqual("emergency_flatten_scheduled", result["status"])
-        self.assertTrue(scheduled)
+        with self.assertRaisesRegex(LedgerError, "operation is invalid"):
+            self.ledger.request_management_intent_operation(
+                "ABCDEF", "flatten-filled", str(filled["intent_id"]), "emergency_flatten"
+            )
 
     def test_trader_ack_cannot_skip_an_event_unseen_by_this_connection(self) -> None:
         with self.ledger._transaction():
