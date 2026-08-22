@@ -7,6 +7,7 @@ import unittest
 from abt.worker.enrollment import WorkerEnrollmentError, WorkerSessionDisconnected
 from abt.worker.reconciliation import (
     AccountMismatchError,
+    LiveWorkerMarketStateAdapter,
     MT5ReconciliationAdapter,
     WorkerSafetyAdapter,
     _order_check_diagnostics,
@@ -45,6 +46,33 @@ class ReadOnlyMT5:
 
 
 class WorkerReconciliationTests(unittest.TestCase):
+    def test_publishes_diff_only_live_market_state_on_the_required_schedules(self) -> None:
+        class LiveMT5(ReadOnlyMT5):
+            def symbol_info_tick(self, symbol: str) -> object:
+                self.calls.append(f"symbol_info_tick:{symbol}")
+                return {"bid": 1.0821, "ask": 1.0823, "time": 1_787_068_740}
+
+        mt5 = LiveMT5()
+        emitted: list[dict[str, object]] = []
+        adapter = LiveWorkerMarketStateAdapter(mt5, watched_symbols=["EURUSD"], emit=emitted.append)
+        started = datetime(2026, 8, 16, tzinfo=UTC)
+
+        adapter.poll(started)
+        adapter.poll(started + timedelta(milliseconds=500))
+        adapter.poll(started + timedelta(seconds=1))
+        adapter.poll(started + timedelta(seconds=5))
+
+        self.assertEqual("live_state_snapshot", emitted[0]["type"])
+        self.assertEqual(
+            {"symbol": "EURUSD", "bid": 1.0821, "ask": 1.0823, "broker_time": "2026-08-18T15:59:00+00:00"},
+            emitted[0]["quotes"][0],
+        )
+        self.assertEqual([], emitted[1:])
+        self.assertEqual(4, mt5.calls.count("symbol_info_tick:EURUSD"))
+        self.assertEqual(3, mt5.calls.count("orders_get"))
+        self.assertEqual(3, mt5.calls.count("positions_get"))
+        self.assertEqual(2, mt5.calls.count("terminal_info"))
+
     def test_order_check_diagnostics_include_rejection_and_quote(self) -> None:
         class OrderCheckMT5:
             def symbol_info_tick(self, symbol: str) -> dict[str, object]:

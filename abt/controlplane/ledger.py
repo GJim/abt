@@ -1317,6 +1317,65 @@ class ControlLedger:
             self._connection.execute("UPDATE workers SET last_seen_at = ? WHERE worker_id = ?", [_utc_now(), worker_id])
             self._event("worker_session_authenticated", {"worker_id": worker_id})
 
+    def record_live_state(
+        self,
+        worker_id: str,
+        observed_at: str,
+        connectivity: bool,
+        quotes: list[object],
+        orders: list[object],
+        positions: list[object],
+    ) -> None:
+        with self._transaction():
+            self.active_worker(worker_id)
+            received_at = _utc_now()
+            self._connection.execute(
+                """
+                INSERT INTO worker_live_state
+                    (worker_id, observed_at, connectivity, quotes, orders, positions, received_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (worker_id) DO UPDATE SET
+                    observed_at = excluded.observed_at, connectivity = excluded.connectivity, quotes = excluded.quotes,
+                    orders = excluded.orders, positions = excluded.positions, received_at = excluded.received_at
+                """,
+                [
+                    worker_id, observed_at, connectivity, json.dumps(quotes, sort_keys=True), json.dumps(orders, sort_keys=True),
+                    json.dumps(positions, sort_keys=True), received_at,
+                ],
+            )
+            self._connection.execute("UPDATE workers SET last_seen_at = ? WHERE worker_id = ?", [received_at, worker_id])
+            self._event("worker_live_state_snapshot", {"worker_id": worker_id})
+
+    def record_live_state_diff(self, worker_id: str, observed_at: str, entity: str, value: object) -> None:
+        if entity not in {"connectivity", "quotes", "orders", "positions"}:
+            raise LedgerError("Worker live-state entity is invalid.")
+        with self._transaction():
+            current = self._connection.execute(
+                "SELECT connectivity, quotes, orders, positions FROM worker_live_state WHERE worker_id = ?", [worker_id]
+            ).fetchone()
+            if current is None:
+                raise LedgerError("Worker live-state snapshot is required before a diff.")
+            state = {
+                "connectivity": bool(current[0]),
+                "quotes": json.loads(current[1]),
+                "orders": json.loads(current[2]),
+                "positions": json.loads(current[3]),
+            }
+            state[entity] = value
+            received_at = _utc_now()
+            self._connection.execute(
+                """UPDATE worker_live_state
+                   SET observed_at = ?, connectivity = ?, quotes = ?, orders = ?, positions = ?, received_at = ?
+                   WHERE worker_id = ?""",
+                [
+                    observed_at, state["connectivity"], json.dumps(state["quotes"], sort_keys=True),
+                    json.dumps(state["orders"], sort_keys=True), json.dumps(state["positions"], sort_keys=True),
+                    received_at, worker_id,
+                ],
+            )
+            self._connection.execute("UPDATE workers SET last_seen_at = ? WHERE worker_id = ?", [received_at, worker_id])
+            self._event("worker_live_state_diff", {"worker_id": worker_id, "entity": entity})
+
     def record_worker_heartbeat(self, worker_id: str) -> None:
         with self._transaction():
             self.active_worker(worker_id)
@@ -1449,6 +1508,11 @@ class ControlLedger:
             ).fetchall()
             result = []
             for worker_id, login, server, status, safety_state, last_seen_at in workers:
+                live_state = self._connection.execute(
+                    """SELECT observed_at, connectivity, quotes, orders, positions
+                       FROM worker_live_state WHERE worker_id = ?""",
+                    [worker_id],
+                ).fetchone()
                 snapshot = self._connection.execute(
                     """
                     SELECT snapshot_id, cursor, observed_at, account, terminal, orders, positions
@@ -1473,6 +1537,13 @@ class ControlLedger:
                             else "connected" if last_seen_at and now - last_seen_at <= timedelta(minutes=5) else "stale"
                         ),
                         "safety_state": safety_state,
+                        "live_state": None if live_state is None else {
+                            "observed_at": live_state[0],
+                            "connectivity": bool(live_state[1]),
+                            "quotes": json.loads(live_state[2]),
+                            "orders": json.loads(live_state[3]),
+                            "positions": json.loads(live_state[4]),
+                        },
                         "latest_snapshot": None if snapshot is None else {
                             "snapshot_id": snapshot[0], "cursor": snapshot[1], "observed_at": snapshot[2],
                             "account": json.loads(snapshot[3]), "terminal": json.loads(snapshot[4]),
@@ -3212,6 +3283,15 @@ class ControlLedger:
                     record JSON NOT NULL,
                     received_at TIMESTAMPTZ NOT NULL,
                     PRIMARY KEY (worker_id, cursor)
+                );
+                CREATE TABLE IF NOT EXISTS worker_live_state (
+                    worker_id VARCHAR PRIMARY KEY,
+                    observed_at VARCHAR NOT NULL,
+                    connectivity BOOLEAN NOT NULL,
+                    quotes JSON NOT NULL,
+                    orders JSON NOT NULL,
+                    positions JSON NOT NULL,
+                    received_at TIMESTAMPTZ NOT NULL
                 );
                 CREATE SEQUENCE IF NOT EXISTS events_sequence START 1;
                 CREATE TABLE IF NOT EXISTS events (

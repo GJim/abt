@@ -234,6 +234,77 @@ class MT5ReconciliationAdapter:
                 sleep(30)
 
 
+class LiveWorkerMarketStateAdapter:
+    """Publish the latest terminal state at the live-management polling cadences."""
+
+    def __init__(
+        self,
+        mt5: ReadOnlyMT5,
+        *,
+        watched_symbols: list[str],
+        emit: Callable[[dict[str, object]], None],
+    ) -> None:
+        if not watched_symbols or not all(isinstance(symbol, str) and symbol for symbol in watched_symbols):
+            raise ValueError("Watched symbols must be non-empty text values.")
+        self._mt5 = mt5
+        self._watched_symbols = list(dict.fromkeys(watched_symbols))
+        self._emit = emit
+        self._last_quotes_at: datetime | None = None
+        self._last_exposure_at: datetime | None = None
+        self._last_connectivity_at: datetime | None = None
+        self._quotes: dict[str, dict[str, object]] = {}
+        self._orders: list[dict[str, object]] = []
+        self._positions: list[dict[str, object]] = []
+        self._connectivity: bool | None = None
+        self._sent_snapshot = False
+
+    def poll(self, observed_at: datetime) -> None:
+        """Poll due sources and publish only state that differs from the last observation."""
+
+        changes: list[tuple[str, object]] = []
+        if self._last_quotes_at is None or observed_at - self._last_quotes_at >= timedelta(milliseconds=500):
+            quotes = {symbol: _live_quote(self._mt5, symbol) for symbol in self._watched_symbols}
+            self._last_quotes_at = observed_at
+            if quotes != self._quotes:
+                self._quotes = quotes
+                changes.append(("quotes", list(quotes.values())))
+        if self._last_exposure_at is None or observed_at - self._last_exposure_at >= timedelta(seconds=1):
+            orders = list(_records(self._mt5.orders_get(), "order").values())
+            positions = list(_records(self._mt5.positions_get(), "position").values())
+            self._last_exposure_at = observed_at
+            if orders != self._orders:
+                self._orders = orders
+                changes.append(("orders", orders))
+            if positions != self._positions:
+                self._positions = positions
+                changes.append(("positions", positions))
+        if self._last_connectivity_at is None or observed_at - self._last_connectivity_at >= timedelta(seconds=5):
+            terminal = _evidence(self._mt5.terminal_info(), "terminal")
+            connected = terminal.get("connected")
+            if not isinstance(connected, bool):
+                raise WorkerEnrollmentError("The local MT5 terminal returned invalid connectivity evidence.")
+            self._last_connectivity_at = observed_at
+            if connected != self._connectivity:
+                self._connectivity = connected
+                changes.append(("connectivity", connected))
+
+        if not self._sent_snapshot:
+            self._emit(
+                {
+                    "type": "live_state_snapshot",
+                    "observed_at": observed_at.isoformat(),
+                    "connectivity": self._connectivity,
+                    "quotes": list(self._quotes.values()),
+                    "orders": self._orders,
+                    "positions": self._positions,
+                }
+            )
+            self._sent_snapshot = True
+            return
+        for entity, value in changes:
+            self._emit({"type": "live_state_diff", "observed_at": observed_at.isoformat(), "entity": entity, "value": value})
+
+
 def reconcile_authenticated_worker(
     *,
     mt5: ReadOnlyMT5,
@@ -650,6 +721,25 @@ def _evidence(value: object, kind: str) -> dict[str, object]:
     if callable(as_dict):
         return dict(as_dict())
     raise WorkerEnrollmentError(f"The local MT5 terminal returned invalid {kind} evidence.")
+
+
+def _live_quote(mt5: ReadOnlyMT5, symbol: str) -> dict[str, object]:
+    tick = _evidence(mt5.symbol_info_tick(symbol), "symbol tick")
+    bid = tick.get("bid")
+    ask = tick.get("ask")
+    timestamp = tick.get("time")
+    if (
+        isinstance(bid, bool) or not isinstance(bid, (int, float))
+        or isinstance(ask, bool) or not isinstance(ask, (int, float))
+        or isinstance(timestamp, bool) or not isinstance(timestamp, (int, float))
+    ):
+        raise WorkerEnrollmentError("The local MT5 terminal returned invalid symbol tick evidence.")
+    return {
+        "symbol": symbol,
+        "bid": float(bid),
+        "ask": float(ask),
+        "broker_time": datetime.fromtimestamp(timestamp, UTC).isoformat(),
+    }
 
 
 def _records(value: object, kind: str) -> dict[str, dict[str, object]]:

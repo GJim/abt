@@ -1391,6 +1391,33 @@ class ControlPlaneServiceTests(unittest.TestCase):
                                  "account": {"balance": 1000}, "terminal": {"connected": True},
                                  "orders": [], "positions": []})
             self.assertEqual({"type": "accepted", "cursor": 0}, websocket.receive_json())
+            websocket.send_json(
+                {
+                    "type": "live_state_snapshot",
+                    "observed_at": "2026-08-16T00:00:00+00:00",
+                    "connectivity": True,
+                    "quotes": [
+                        {
+                            "symbol": "EURUSD",
+                            "bid": 1.0821,
+                            "ask": 1.0823,
+                            "broker_time": "2026-08-16T00:00:00+00:00",
+                        }
+                    ],
+                    "orders": [{"ticket": 41}],
+                    "positions": [{"ticket": 51}],
+                }
+            )
+            self.assertEqual({"type": "live_state_accepted"}, websocket.receive_json())
+            websocket.send_json(
+                {
+                    "type": "live_state_diff",
+                    "observed_at": "2026-08-16T00:00:05+00:00",
+                    "entity": "connectivity",
+                    "value": False,
+                }
+            )
+            self.assertEqual({"type": "live_state_accepted"}, websocket.receive_json())
             first_snapshot_id = self.client.get("/api/admin/workers").json()[0]["latest_snapshot"]["snapshot_id"]
             websocket.send_json({"type": "snapshot", "cursor": 0, "observed_at": "2026-08-16T00:10:00+00:00",
                                  "account": {"balance": 1000}, "terminal": {"connected": True},
@@ -1425,6 +1452,23 @@ class ControlPlaneServiceTests(unittest.TestCase):
         self.assertEqual("connected", workers[0]["connectivity"])
         self.assertEqual({"balance": 1000}, workers[0]["latest_snapshot"]["account"])
         self.assertEqual(["volume_changed", "modified"], [delta["change"] for delta in workers[0]["deltas"]])
+        self.assertEqual(
+            {
+                "connectivity": False,
+                "quotes": [
+                    {
+                        "symbol": "EURUSD",
+                        "bid": 1.0821,
+                        "ask": 1.0823,
+                        "broker_time": "2026-08-16T00:00:00+00:00",
+                    }
+                ],
+                "orders": [{"ticket": 41}],
+                "positions": [{"ticket": 51}],
+                "observed_at": "2026-08-16T00:00:05+00:00",
+            },
+            workers[0]["live_state"],
+        )
 
     def test_admin_read_models_paginate_search_and_keep_snapshot_payloads_in_detail(self) -> None:
         _key, worker_id, _certificate = self._approved_worker(123456, "Broker-Search")

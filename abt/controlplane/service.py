@@ -1652,6 +1652,12 @@ def create_app(
                 ):
                     ledger.record_worker_safety_state(worker.worker_id, request["state"], request["reason"])
                     await websocket.send_json({"type": "accepted", "state": request["state"]})
+                elif message_type == "live_state_snapshot":
+                    _record_live_state_snapshot(ledger, worker.worker_id, request)
+                    await websocket.send_json({"type": "live_state_accepted"})
+                elif message_type == "live_state_diff":
+                    _record_live_state_diff(ledger, worker.worker_id, request)
+                    await websocket.send_json({"type": "live_state_accepted"})
                 elif message_type == "snapshot":
                     _record_snapshot(ledger, worker.worker_id, request)
                     await websocket.send_json({"type": "accepted", "cursor": request["cursor"]})
@@ -3265,6 +3271,33 @@ def _record_snapshot(ledger: ControlLedger, worker_id: str, message: dict[str, o
         worker_id, message["cursor"], message["observed_at"], message["account"], message["terminal"],
         message["orders"], message["positions"],
     )
+
+
+def _record_live_state_snapshot(ledger: ControlLedger, worker_id: str, message: dict[str, object]) -> None:
+    required = {"type", "observed_at", "connectivity", "quotes", "orders", "positions"}
+    if set(message) != required or not isinstance(message["observed_at"], str) or not isinstance(message["connectivity"], bool):
+        raise ValueError("Invalid protocol message.")
+    if not all(isinstance(message[field], list) for field in ("quotes", "orders", "positions")):
+        raise ValueError("Invalid protocol message.")
+    if not all(isinstance(quote, dict) for quote in message["quotes"]):
+        raise ValueError("Invalid protocol message.")
+    ledger.record_live_state(
+        worker_id, message["observed_at"], message["connectivity"], message["quotes"], message["orders"], message["positions"]
+    )
+
+
+def _record_live_state_diff(ledger: ControlLedger, worker_id: str, message: dict[str, object]) -> None:
+    if set(message) != {"type", "observed_at", "entity", "value"} or not isinstance(message["observed_at"], str):
+        raise ValueError("Invalid protocol message.")
+    entity = message["entity"]
+    if entity not in {"connectivity", "quotes", "orders", "positions"}:
+        raise ValueError("Invalid protocol message.")
+    if entity == "connectivity":
+        if not isinstance(message["value"], bool):
+            raise ValueError("Invalid protocol message.")
+    elif not isinstance(message["value"], list):
+        raise ValueError("Invalid protocol message.")
+    ledger.record_live_state_diff(worker_id, message["observed_at"], entity, message["value"])
 
 
 def _record_delta(ledger: ControlLedger, worker_id: str, message: dict[str, object]) -> None:
