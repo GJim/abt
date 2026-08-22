@@ -259,8 +259,8 @@ class LiveWorkerMarketStateAdapter:
         watched_symbols: list[str],
         emit: Callable[[dict[str, object]], None],
     ) -> None:
-        if not watched_symbols or not all(isinstance(symbol, str) and symbol for symbol in watched_symbols):
-            raise ValueError("Watched symbols must be non-empty text values.")
+        if not all(isinstance(symbol, str) and symbol for symbol in watched_symbols):
+            raise ValueError("Watched symbols must be text values.")
         self._mt5 = mt5
         self._watched_symbols = list(dict.fromkeys(watched_symbols))
         self._emit = emit
@@ -352,11 +352,7 @@ def reconcile_authenticated_worker(
             mt5, emit=session.send_reconciliation, initial_cursor=getattr(session, "reconciliation_cursor", 0)
         )
         watched_symbols = _visible_symbols(mt5)
-        live_state = (
-            LiveWorkerMarketStateAdapter(mt5, watched_symbols=watched_symbols, emit=session.send_live_state)
-            if watched_symbols
-            else None
-        )
+        live_state = LiveWorkerMarketStateAdapter(mt5, watched_symbols=watched_symbols, emit=session.send_live_state)
         if callable(getattr(session, "receive_product_catalog_analysis", None)) and callable(
             getattr(session, "send_product_catalog_analysis", None)
         ):

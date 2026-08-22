@@ -235,6 +235,7 @@ function WorkerRoster({
         const health = describeWorkerHealth(worker, workerIdsWithAlerts.has(worker.worker_id))
         const accountName = `${worker.login} on ${worker.server}`
         const snapshot = worker.latest_snapshot
+        const liveState = worker.live_state
 
         return (
           <li id={`worker-${worker.worker_id}`} key={worker.worker_id} className="worker">
@@ -258,6 +259,29 @@ function WorkerRoster({
             </dl>
             {isSelected ? (
               <div id={`worker-detail-${worker.worker_id}`} className="worker-evidence">
+                <section aria-label={`Live market state for ${accountName}`}>
+                  <h3>Live market state</h3>
+                  {liveState ? (
+                    <>
+                      <p>
+                        Terminal {liveState.connectivity ? 'connected' : 'disconnected'}; controller received{' '}
+                        <time dateTime={liveState.received_at}>{formatSnapshotFreshness(liveState.received_at)}</time>.
+                      </p>
+                      {liveState.quotes.length === 0 ? <p>No watched-symbol quotes are available.</p> : (
+                        <dl className="worker-live-quotes">
+                          {liveState.quotes.map((quote) => (
+                            <div key={quote.symbol}>
+                              <dt>{quote.symbol}</dt>
+                              <dd>Bid {quote.bid}; ask {quote.ask}</dd>
+                              <dd>Broker <time dateTime={quote.broker_time}>{formatDateTime(quote.broker_time)}</time></dd>
+                            </div>
+                          ))}
+                        </dl>
+                      )}
+                      <p>{liveState.orders.length} open orders; {liveState.positions.length} open positions.</p>
+                    </>
+                  ) : <p>Awaiting the worker’s live-state snapshot.</p>}
+                </section>
                 <section aria-label={`Latest snapshot for ${accountName}`}>
                   <h3>Latest report</h3>
                   {snapshot ? (

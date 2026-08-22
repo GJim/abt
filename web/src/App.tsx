@@ -61,6 +61,15 @@ type ReconciliationDelta = {
   record: Record<string, unknown>
 }
 
+type LiveWorkerState = {
+  observed_at: string
+  received_at: string
+  connectivity: boolean
+  quotes: Array<{ symbol: string; bid: number; ask: number; broker_time: string }>
+  orders: EnrollmentEvidence[]
+  positions: EnrollmentEvidence[]
+}
+
 export type AccountWorker = {
   worker_id: string
   login: number
@@ -75,6 +84,7 @@ export type AccountWorker = {
     orders: EnrollmentEvidence[]
     positions: EnrollmentEvidence[]
   } | null
+  live_state: LiveWorkerState | null
   deltas: ReconciliationDelta[]
 }
 
