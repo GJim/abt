@@ -1509,7 +1509,7 @@ class ControlLedger:
             result = []
             for worker_id, login, server, status, safety_state, last_seen_at in workers:
                 live_state = self._connection.execute(
-                    """SELECT observed_at, connectivity, quotes, orders, positions
+                    """SELECT observed_at, connectivity, quotes, orders, positions, received_at
                        FROM worker_live_state WHERE worker_id = ?""",
                     [worker_id],
                 ).fetchone()
@@ -1543,6 +1543,7 @@ class ControlLedger:
                             "quotes": json.loads(live_state[2]),
                             "orders": json.loads(live_state[3]),
                             "positions": json.loads(live_state[4]),
+                            "received_at": live_state[5],
                         },
                         "latest_snapshot": None if snapshot is None else {
                             "snapshot_id": snapshot[0], "cursor": snapshot[1], "observed_at": snapshot[2],

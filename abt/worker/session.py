@@ -84,6 +84,14 @@ class AuthenticatedWorkerSession:
         except Exception as error:
             _raise_closed_connection(error, "reconciliation")
 
+    def send_live_state(self, message: dict[str, object]) -> None:
+        try:
+            _send(self.socket, message)
+            if self._response() != {"type": "live_state_accepted"}:
+                raise WorkerEnrollmentError("The controller rejected worker live state.")
+        except Exception as error:
+            _raise_closed_connection(error, "live-state publication")
+
     def heartbeat(self) -> bool:
         try:
             _send(self.socket, {"type": "heartbeat"})

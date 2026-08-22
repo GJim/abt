@@ -1452,6 +1452,8 @@ class ControlPlaneServiceTests(unittest.TestCase):
         self.assertEqual("connected", workers[0]["connectivity"])
         self.assertEqual({"balance": 1000}, workers[0]["latest_snapshot"]["account"])
         self.assertEqual(["volume_changed", "modified"], [delta["change"] for delta in workers[0]["deltas"]])
+        live_state = workers[0]["live_state"]
+        self.assertIsNotNone(live_state.pop("received_at"))
         self.assertEqual(
             {
                 "connectivity": False,
@@ -1467,7 +1469,7 @@ class ControlPlaneServiceTests(unittest.TestCase):
                 "positions": [{"ticket": 51}],
                 "observed_at": "2026-08-16T00:00:05+00:00",
             },
-            workers[0]["live_state"],
+            live_state,
         )
 
     def test_admin_read_models_paginate_search_and_keep_snapshot_payloads_in_detail(self) -> None:

@@ -38,6 +38,8 @@ class AuthenticatedReconciliationSession(Protocol):
 
     def send_reconciliation(self, message: dict[str, object]) -> None: ...
 
+    def send_live_state(self, message: dict[str, object]) -> None: ...
+
 
 class WorkerSafetySession(Protocol):
     def heartbeat(self) -> bool: ...
@@ -215,15 +217,28 @@ class MT5ReconciliationAdapter:
         sleep: Callable[[float], None] = _sleep,
         heartbeat: Callable[[], bool] | None = None,
         maintenance: Callable[[], None] | None = None,
+        live_state: LiveWorkerMarketStateAdapter | None = None,
     ) -> None:
         """Run the required one-minute read-only polling cadence and 30-second heartbeats."""
 
         next_maintenance = now()
+        next_reconciliation = next_maintenance
+        next_heartbeat = next_maintenance
         while True:
             observed_at = now()
             if maintenance is not None and observed_at >= next_maintenance:
                 maintenance()
                 next_maintenance = observed_at + timedelta(days=1)
+            if live_state is not None:
+                if observed_at >= next_reconciliation:
+                    self.poll(observed_at)
+                    next_reconciliation = observed_at + timedelta(minutes=1)
+                live_state.poll(observed_at)
+                if heartbeat is not None and observed_at >= next_heartbeat:
+                    heartbeat()
+                    next_heartbeat = observed_at + timedelta(seconds=30)
+                sleep(0.5)
+                continue
             self.poll(observed_at)
             if heartbeat is None:
                 sleep(60)
@@ -336,6 +351,12 @@ def reconcile_authenticated_worker(
         reconciliation = MT5ReconciliationAdapter(
             mt5, emit=session.send_reconciliation, initial_cursor=getattr(session, "reconciliation_cursor", 0)
         )
+        watched_symbols = _visible_symbols(mt5)
+        live_state = (
+            LiveWorkerMarketStateAdapter(mt5, watched_symbols=watched_symbols, emit=session.send_live_state)
+            if watched_symbols
+            else None
+        )
         if callable(getattr(session, "receive_product_catalog_analysis", None)) and callable(
             getattr(session, "send_product_catalog_analysis", None)
         ):
@@ -346,6 +367,7 @@ def reconcile_authenticated_worker(
                 now=now,
                 safety=safety,
                 maintenance=maintenance,
+                live_state=live_state,
             )
         else:
             reconciliation.run_forever(
@@ -353,6 +375,7 @@ def reconcile_authenticated_worker(
                 sleep=sleep,
                 heartbeat=None if safety is None else lambda: safety.heartbeat(now()),
                 maintenance=maintenance,
+                live_state=live_state,
             )
     finally:
         password = ""
@@ -429,16 +452,22 @@ def _run_reconciliation_with_analysis(
     now: Callable[[], datetime],
     safety: WorkerSafetyAdapter | None,
     maintenance: Callable[[], None] | None,
+    live_state: LiveWorkerMarketStateAdapter | None,
 ) -> None:
     next_maintenance = now()
+    next_reconciliation = next_maintenance
     while True:
         observed_at = now()
         if maintenance is not None and observed_at >= next_maintenance:
             maintenance()
             next_maintenance = observed_at + timedelta(days=1)
-        reconciliation.poll(observed_at)
+        if observed_at >= next_reconciliation:
+            reconciliation.poll(observed_at)
+            next_reconciliation = observed_at + timedelta(minutes=1)
+        if live_state is not None:
+            live_state.poll(observed_at)
         for _ in range(2):
-            request = session.receive_product_catalog_analysis(timeout=30.0)
+            request = session.receive_product_catalog_analysis(timeout=0.25 if live_state is not None else 30.0)
             if request is not None:
                 _serve_product_catalog_analysis(mt5, session, request, now)
             receive_order_check = getattr(session, "receive_order_check", None)
@@ -721,6 +750,29 @@ def _evidence(value: object, kind: str) -> dict[str, object]:
     if callable(as_dict):
         return dict(as_dict())
     raise WorkerEnrollmentError(f"The local MT5 terminal returned invalid {kind} evidence.")
+
+
+def _visible_symbols(mt5: object) -> list[str]:
+    symbols_get = getattr(mt5, "symbols_get", None)
+    if not callable(symbols_get):
+        return []
+    try:
+        symbols = symbols_get()
+    except Exception:
+        _LOGGER.warning("Unable to enumerate watched MT5 symbols for live-state publication.")
+        return []
+    if not isinstance(symbols, (list, tuple)):
+        return []
+    watched: list[str] = []
+    for symbol in symbols:
+        try:
+            evidence = _evidence(symbol, "symbol")
+        except WorkerEnrollmentError:
+            continue
+        name = evidence.get("name", evidence.get("symbol"))
+        if evidence.get("visible") is True and isinstance(name, str) and name:
+            watched.append(name)
+    return watched
 
 
 def _live_quote(mt5: ReadOnlyMT5, symbol: str) -> dict[str, object]:
