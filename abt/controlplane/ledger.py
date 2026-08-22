@@ -1329,6 +1329,7 @@ class ControlLedger:
         with self._transaction():
             self.active_worker(worker_id)
             received_at = _utc_now()
+            quoted = [_quote_with_receipt(quote, received_at) for quote in quotes]
             self._connection.execute(
                 """
                 INSERT INTO worker_live_state
@@ -1339,7 +1340,7 @@ class ControlLedger:
                     orders = excluded.orders, positions = excluded.positions, received_at = excluded.received_at
                 """,
                 [
-                    worker_id, observed_at, connectivity, json.dumps(quotes, sort_keys=True), json.dumps(orders, sort_keys=True),
+                    worker_id, observed_at, connectivity, json.dumps(quoted, sort_keys=True), json.dumps(orders, sort_keys=True),
                     json.dumps(positions, sort_keys=True), received_at,
                 ],
             )
@@ -1363,6 +1364,8 @@ class ControlLedger:
             }
             state[entity] = value
             received_at = _utc_now()
+            if entity == "quotes":
+                state["quotes"] = [_quote_with_receipt(quote, received_at) for quote in value]
             self._connection.execute(
                 """UPDATE worker_live_state
                    SET observed_at = ?, connectivity = ?, quotes = ?, orders = ?, positions = ?, received_at = ?
@@ -3626,6 +3629,12 @@ def _decode_page_cursor(cursor: str | None, resource: str) -> dict[str, Any] | N
     except (Base64Error, KeyError, TypeError, ValueError, UnicodeDecodeError):
         raise LedgerError("Invalid pagination cursor.") from None
     return {"timestamp": timestamp, "id": identifier}
+
+
+def _quote_with_receipt(quote: object, received_at: datetime) -> object:
+    if not isinstance(quote, dict):
+        return quote
+    return {**quote, "controller_received_at": received_at.isoformat()}
 
 
 def _summary_string(value: object) -> str | None:

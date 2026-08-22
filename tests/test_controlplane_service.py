@@ -1454,6 +1454,7 @@ class ControlPlaneServiceTests(unittest.TestCase):
         self.assertEqual(["volume_changed", "modified"], [delta["change"] for delta in workers[0]["deltas"]])
         live_state = workers[0]["live_state"]
         self.assertIsNotNone(live_state.pop("received_at"))
+        self.assertIsNotNone(live_state["quotes"][0].pop("controller_received_at"))
         self.assertEqual(
             {
                 "connectivity": False,
