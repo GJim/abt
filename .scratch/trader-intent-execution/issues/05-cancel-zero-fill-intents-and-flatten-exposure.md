@@ -5,17 +5,16 @@ management origins, plus management-only emergency flatten.
 
 **Blocked by:** 04 — Execute paired FOK and IOC limit intents safely.
 
-**Status:** ready-for-agent
+**Status:** ready-for-human
 
-- [ ] Ordinary cancellation accepts only while both legs are zero-fill and
+- [x] Ordinary cancellation accepts only while both legs are zero-fill and
   atomically blocks undispatched orders before broker work begins.
-- [ ] Already-hung zero-fill orders are cancelled and immediately reconciled;
+- [x] Already-hung zero-fill orders are cancelled and immediately reconciled;
   `cancelled` is emitted only after both broker acknowledgements and zero-fill
   evidence.
-- [ ] A fill racing cancellation emits `rejected_due_to_fill` and enters the
+- [x] A fill racing cancellation emits `rejected_due_to_fill` and enters the
   normal FOK/IOC safety path.
-- [ ] Trader cancellation is WSS-only and limited to its own intents.
-- [ ] Emergency flatten is available only to management for filled exposure;
+- [x] Trader cancellation is WSS-only and limited to its own intents.
+- [x] Emergency flatten is available only to management for filled exposure;
   it cancels unfilled legs, closes filled legs, freezes on failure, and does
   not require a reason.
-
