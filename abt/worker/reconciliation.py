@@ -620,7 +620,7 @@ def _serve_order_execute(mt5: ReadOnlyMT5, session: AnalysisWorkerSession, reque
         session.send_order_execute_error(request_id=request_id, reason="The controller requested an invalid order execution.")
         return
     try:
-        broker_request = _broker_limit_request(mt5, order)
+        broker_request = _broker_order_request(mt5, order)
         sent = mt5.order_send(broker_request)
         result = _evidence(sent, "order execution")
         retcode = result.get("retcode")
@@ -682,6 +682,41 @@ def _serve_execution_recovery(mt5: ReadOnlyMT5, session: AnalysisWorkerSession, 
     except Exception:
         _LOGGER.exception("MT5 execution recovery failed.")
         session.send_execution_recovery_error(request_id=request_id, operation=operation, reason="The local MT5 execution recovery failed.")
+
+
+def _broker_order_request(mt5: object, order: dict[str, object]) -> dict[str, object]:
+    if order.get("action") == "market":
+        required = ("symbol", "volume", "direction", "filling_mode", "control_plane_command_id")
+        if set(order) != {"action", *required} or order.get("direction") not in {"LONG", "SHORT"}:
+            raise WorkerEnrollmentError("The controller requested an invalid market order.")
+        if order.get("filling_mode") not in {"FOK", "IOC"} or not all(isinstance(order[field], str) and order[field] for field in required):
+            raise WorkerEnrollmentError("The controller requested an invalid market order.")
+        try:
+            return {
+                "action": getattr(mt5, "TRADE_ACTION_DEAL"),
+                "symbol": order["symbol"],
+                "volume": float(str(order["volume"])),
+                "type": getattr(mt5, "ORDER_TYPE_BUY" if order["direction"] == "LONG" else "ORDER_TYPE_SELL"),
+                "type_filling": getattr(mt5, "ORDER_FILLING_FOK" if order["filling_mode"] == "FOK" else "ORDER_FILLING_IOC"),
+                "comment": order["control_plane_command_id"],
+            }
+        except (TypeError, ValueError, AttributeError) as error:
+            raise WorkerEnrollmentError("The controller requested an invalid market order.") from error
+    if order.get("action") == "protect":
+        required = ("symbol", "position", "sl", "tp")
+        if set(order) != {"action", *required} or not all(isinstance(order[field], str) and order[field] for field in required):
+            raise WorkerEnrollmentError("The controller requested an invalid protection update.")
+        try:
+            return {
+                "action": getattr(mt5, "TRADE_ACTION_SLTP"),
+                "symbol": order["symbol"],
+                "position": int(order["position"]),
+                "sl": float(order["sl"]),
+                "tp": float(order["tp"]),
+            }
+        except (TypeError, ValueError, AttributeError) as error:
+            raise WorkerEnrollmentError("The controller requested an invalid protection update.") from error
+    return _broker_limit_request(mt5, order)
 
 
 def _broker_limit_request(mt5: object, order: dict[str, object]) -> dict[str, object]:

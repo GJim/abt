@@ -9,6 +9,7 @@ import threading
 from base64 import urlsafe_b64decode, urlsafe_b64encode
 from binascii import Error as Base64Error
 from dataclasses import dataclass, replace
+from decimal import Decimal, InvalidOperation
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable
@@ -1935,6 +1936,182 @@ class ControlLedger:
         assert target is not None
         return target
 
+    def preview_manual_trade(self, payload: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            return self._manual_trade_plan(payload)
+
+    def request_manual_trade(self, username: str, command_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        canonical_payload = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+        payload_hash = _hash(canonical_payload)
+        with self._transaction():
+            existing = self._connection.execute(
+                """SELECT payload_hash, result FROM manual_trade_commands
+                   WHERE username = ? AND command_id = ?""",
+                [username, command_id],
+            ).fetchone()
+            if existing is not None:
+                if existing[0] != payload_hash:
+                    raise LedgerError("Manual-trade command ID was reused with a different payload.")
+                return json.loads(existing[1])
+            plan = self._manual_trade_plan(payload)
+            manual_trade_id = str(uuid4())
+            now = _utc_now()
+            self._connection.execute(
+                """INSERT INTO manual_trades
+                   (manual_trade_id, username, command_id, target_revision, pair_id, plan, status, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, 'scheduled', ?)""",
+                [
+                    manual_trade_id, username, command_id, plan["target_revision"], plan["pair_id"],
+                    json.dumps(plan, separators=(",", ":"), sort_keys=True), now,
+                ],
+            )
+            updated = self._connection.execute(
+                """UPDATE manual_trading_target SET active_manual_trade_id = ?
+                   WHERE singleton = TRUE AND revision = ? AND active_manual_trade_id IS NULL
+                   RETURNING pair_id""",
+                [manual_trade_id, plan["target_revision"]],
+            ).fetchone()
+            if updated is None:
+                raise LedgerError("Manual-trading target changed or already has an active manual trade.")
+            event_id = self._event(
+                "manual_trade_scheduled",
+                {"manual_trade_id": manual_trade_id, "username": username, "command_id": command_id, "plan": plan},
+            )
+            result = {
+                "command_id": command_id,
+                "manual_trade_id": manual_trade_id,
+                "status": "scheduled",
+                "event_id": event_id,
+                "plan": plan,
+            }
+            self._connection.execute(
+                """INSERT INTO manual_trade_commands (username, command_id, payload_hash, result, created_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                [username, command_id, payload_hash, json.dumps(result, separators=(",", ":"), sort_keys=True), now],
+            )
+            return result
+
+    def claim_manual_trade_dispatch(self, manual_trade_id: str) -> bool:
+        with self._transaction():
+            return self._connection.execute(
+                """UPDATE manual_trades SET status = 'dispatching'
+                   WHERE manual_trade_id = ? AND status = 'scheduled'
+                   RETURNING manual_trade_id""",
+                [manual_trade_id],
+            ).fetchone() is not None
+
+    def manual_trade_plan(self, manual_trade_id: str) -> dict[str, Any]:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT plan FROM manual_trades WHERE manual_trade_id = ?", [manual_trade_id]
+            ).fetchone()
+            if row is None:
+                raise LedgerError("Manual trade does not exist.")
+            return json.loads(row[0])
+
+    def record_manual_trade_event(
+        self, manual_trade_id: str, event_type: str, payload: dict[str, Any], *, status: str | None = None
+    ) -> None:
+        with self._transaction():
+            if self._connection.execute(
+                "SELECT 1 FROM manual_trades WHERE manual_trade_id = ?", [manual_trade_id]
+            ).fetchone() is None:
+                raise LedgerError("Manual trade does not exist.")
+            self._event(event_type, {"manual_trade_id": manual_trade_id, **payload})
+            if status is not None:
+                self._connection.execute(
+                    "UPDATE manual_trades SET status = ? WHERE manual_trade_id = ?", [status, manual_trade_id]
+                )
+
+    def _manual_trade_plan(self, payload: dict[str, Any]) -> dict[str, Any]:
+        required = {
+            "target_revision", "buy_worker_id", "sell_worker_id", "base_lots", "stop_loss_pips", "take_profit_pips"
+        }
+        if set(payload) != required:
+            raise LedgerError("Manual-trade entry payload is invalid.")
+        target = self.manual_trading_target()
+        if target is None:
+            raise LedgerError("Manual-trading target is not configured.")
+        if target["active_manual_trade_id"] is not None:
+            raise LedgerError("Manual-trading target already has an active manual trade.")
+        if payload["target_revision"] != target["revision"]:
+            raise LedgerError("Manual-trading target revision does not match the current target.")
+        try:
+            base_lots = Decimal(str(payload["base_lots"]))
+            stop_loss_pips = Decimal(str(payload["stop_loss_pips"]))
+            take_profit_pips = Decimal(str(payload["take_profit_pips"]))
+        except (InvalidOperation, ValueError) as error:
+            raise LedgerError("Manual-trade lots and protection distances must be decimal values.") from error
+        if min(base_lots, stop_loss_pips, take_profit_pips) <= 0:
+            raise LedgerError("Manual-trade lots and protection distances must be positive.")
+        workers = {str(worker["worker_id"]): worker for worker in target["workers"]}
+        buy_worker_id, sell_worker_id = str(payload["buy_worker_id"]), str(payload["sell_worker_id"])
+        if {buy_worker_id, sell_worker_id} != set(workers) or buy_worker_id == sell_worker_id:
+            raise LedgerError("Manual-trade directions must use the two selected target workers exactly once.")
+        pair = target["pair"]
+        specifications = {
+            (str(item["server"]), str(item["symbol"])): item["specification"]
+            for item in pair["reference_specifications"]
+            if isinstance(item, dict) and isinstance(item.get("specification"), dict)
+        }
+        ratio = pair["lot_relationship"]
+        try:
+            first_ratio = Decimal(str(ratio["first_lots"]))
+            second_ratio = Decimal(str(ratio["second_lots"]))
+        except (KeyError, InvalidOperation, ValueError) as error:
+            raise LedgerError("Product pair has an invalid fixed lot relationship.") from error
+        if first_ratio <= 0 or second_ratio <= 0:
+            raise LedgerError("Product pair has an invalid fixed lot relationship.")
+        legs: list[dict[str, Any]] = []
+        for index, worker in enumerate(target["workers"]):
+            worker_id = str(worker["worker_id"])
+            endpoint = worker["endpoint"]
+            specification = specifications.get((str(endpoint["server"]), str(endpoint["symbol"])))
+            if specification is None:
+                raise LedgerError("Product pair is missing endpoint trading specifications.")
+            lots = base_lots if index == 0 else base_lots * second_ratio / first_ratio
+            if not _exact_volume(lots, specification):
+                raise LedgerError("Derived manual-trade lots are not exactly valid for both endpoints.")
+            direction = "BUY" if worker_id == buy_worker_id else "SELL"
+            quote = next(
+                (item for item in (worker["live_state"] or {}).get("quotes", []) if item.get("symbol") == endpoint["symbol"]),
+                None,
+            )
+            if not isinstance(quote, dict):
+                raise LedgerError("Manual-trade quote is unavailable for a selected endpoint.")
+            try:
+                estimate = Decimal(str(quote["ask"] if direction == "BUY" else quote["bid"]))
+                pip_size = _pip_size(specification)
+            except (KeyError, InvalidOperation, ValueError) as error:
+                raise LedgerError("Manual-trade quote or endpoint specification is invalid.") from error
+            if estimate <= 0:
+                raise LedgerError("Manual-trade quote is unavailable for a selected endpoint.")
+            legs.append(
+                {
+                    "worker_id": worker_id,
+                    "symbol": endpoint["symbol"],
+                    "direction": direction,
+                    "lots": str(lots),
+                    "estimated_entry_price": str(estimate),
+                    "estimated_stop_loss": str(estimate - stop_loss_pips * pip_size if direction == "BUY" else estimate + stop_loss_pips * pip_size),
+                    "estimated_take_profit": str(estimate + take_profit_pips * pip_size if direction == "BUY" else estimate - take_profit_pips * pip_size),
+                    "pip_size": str(pip_size),
+                    "stop_loss_pips": str(stop_loss_pips),
+                    "take_profit_pips": str(take_profit_pips),
+                }
+            )
+        first_direction = "BUY" if target["leg_order"] == "buy_to_sell" else "SELL"
+        ordered = sorted(legs, key=lambda leg: 0 if leg["direction"] == first_direction else 1)
+        return {
+            "pair_id": pair["product_pair_id"],
+            "target_revision": target["revision"],
+            "leg_order": target["leg_order"],
+            "interval_seconds": target["interval_seconds"],
+            "stop_loss_pips": str(stop_loss_pips),
+            "take_profit_pips": str(take_profit_pips),
+            "legs": ordered,
+        }
+
     def _worker_freeze(self, worker_id: str) -> dict[str, Any] | None:
         row = self._connection.execute(
             """SELECT source, affected_worker_ids, audit, frozen_at, event_id
@@ -3725,6 +3902,24 @@ class ControlLedger:
                     configured_by VARCHAR NOT NULL,
                     configured_at TIMESTAMPTZ NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS manual_trades (
+                    manual_trade_id VARCHAR PRIMARY KEY,
+                    username VARCHAR NOT NULL,
+                    command_id VARCHAR NOT NULL,
+                    target_revision BIGINT NOT NULL,
+                    pair_id VARCHAR NOT NULL,
+                    plan JSON NOT NULL,
+                    status VARCHAR NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS manual_trade_commands (
+                    username VARCHAR NOT NULL,
+                    command_id VARCHAR NOT NULL,
+                    payload_hash VARCHAR NOT NULL,
+                    result JSON NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL,
+                    PRIMARY KEY (username, command_id)
+                );
                 CREATE TABLE IF NOT EXISTS worker_recovery_commands (
                     username VARCHAR NOT NULL,
                     command_id VARCHAR NOT NULL,
@@ -4085,6 +4280,27 @@ def _summary_number(value: object) -> int | float | None:
 
 def _summary_boolean(value: object) -> bool | None:
     return value if isinstance(value, bool) else None
+
+
+def _exact_volume(lots: Decimal, specification: dict[str, Any]) -> bool:
+    try:
+        minimum = Decimal(str(specification["volume_min"]))
+        maximum = Decimal(str(specification["volume_max"]))
+        step = Decimal(str(specification["volume_step"]))
+    except (KeyError, InvalidOperation, ValueError):
+        return False
+    return step > 0 and minimum <= lots <= maximum and (lots - minimum) % step == 0
+
+
+def _pip_size(specification: dict[str, Any]) -> Decimal:
+    try:
+        point = Decimal(str(specification["point"]))
+        digits = int(specification["digits"])
+    except (KeyError, InvalidOperation, ValueError) as error:
+        raise LedgerError("Product pair has an invalid endpoint pip specification.") from error
+    if point <= 0:
+        raise LedgerError("Product pair has an invalid endpoint pip specification.")
+    return point * Decimal(10) ** max(0, digits - (2 if digits in {2, 3} else 4))
 
 
 def _hash(value: str) -> str:

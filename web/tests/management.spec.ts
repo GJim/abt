@@ -1572,9 +1572,52 @@ test('administrator configures and observes the shared manual-trading target', a
   await page.getByRole('button', { name: 'Save shared target' }).click()
 
   await expect(page.getByText('Shared target saved at revision 1.')).toBeVisible()
-  await expect(page.getByText('123456 on Broker-A — EURUSD')).toBeVisible()
+  await expect(page.getByRole('heading', { name: '123456 on Broker-A — EURUSD' })).toBeVisible()
   await expect(page.getByText('current target product pair')).toHaveCount(2)
   await expect(page.getByText('2026-08-22T00:00:01Z').first()).toBeVisible()
+})
+
+test('administrator previews and confirms a protected scheduled manual paired trade', async ({ page }) => {
+  const workers = [
+    buildWorker({ worker_id: 'worker-a', login: 123456, server: 'Broker-A', live_state: { observed_at: '2026-08-22T00:00:00Z', received_at: '2026-08-22T00:00:00Z', connectivity: true, quotes: [{ symbol: 'EURUSD', bid: 1.1, ask: 1.1002, broker_time: '2026-08-22T00:00:00Z' }], orders: [], positions: [] } }),
+    buildWorker({ worker_id: 'worker-b', login: 654321, server: 'Broker-B', live_state: { observed_at: '2026-08-22T00:00:00Z', received_at: '2026-08-22T00:00:00Z', connectivity: true, quotes: [{ symbol: 'EURUSD.a', bid: 1.0998, ask: 1.1, broker_time: '2026-08-22T00:00:00Z' }], orders: [], positions: [] } }),
+  ]
+  const target = {
+    pair: { product_pair_id: 'pair-1', status: 'active', endpoints: [{ server: 'Broker-A', symbol: 'EURUSD' }, { server: 'Broker-B', symbol: 'EURUSD.a' }], worker_applicability: [] },
+    workers: [{ ...workers[0], endpoint: { server: 'Broker-A', symbol: 'EURUSD' } }, { ...workers[1], endpoint: { server: 'Broker-B', symbol: 'EURUSD.a' } }],
+    leg_order: 'buy_to_sell', interval_seconds: 7, revision: 1, active_manual_trade_id: null,
+  }
+  await mockLogin(page)
+  await page.route('**/api/admin/session', async (route) => {
+    await route.fulfill({ contentType: 'application/json', body: JSON.stringify({ csrf_token: 'csrf-token' }) })
+  })
+  await mockManagementData(page, { workers, productPairs: [target.pair] })
+  await page.route('**/api/admin/manual-trading-target', async (route) => {
+    await route.fulfill({ contentType: 'application/json', body: JSON.stringify(target) })
+  })
+  await page.route('**/api/admin/manual-trades/preview', async (route) => {
+    expect(route.request().headers()['x-csrf-token']).toBe('csrf-token')
+    expect(route.request().postDataJSON()).toMatchObject({ target_revision: 1, buy_worker_id: 'worker-a', sell_worker_id: 'worker-b', base_lots: '0.1', stop_loss_pips: '10', take_profit_pips: '20' })
+    await route.fulfill({ contentType: 'application/json', body: JSON.stringify({ pair_id: 'pair-1', target_revision: 1, leg_order: 'buy_to_sell', interval_seconds: 7, legs: [
+      { worker_id: 'worker-a', symbol: 'EURUSD', direction: 'BUY', lots: '0.1', estimated_entry_price: '1.1002', estimated_stop_loss: '1.0992', estimated_take_profit: '1.1022' },
+      { worker_id: 'worker-b', symbol: 'EURUSD.a', direction: 'SELL', lots: '0.2', estimated_entry_price: '1.0998', estimated_stop_loss: '1.1008', estimated_take_profit: '1.0978' },
+    ] }) })
+  })
+  await page.route('**/api/admin/manual-trades', async (route) => {
+    expect(route.request().headers()['x-csrf-token']).toBe('csrf-token')
+    expect(route.request().postDataJSON()).toMatchObject({ target_revision: 1, buy_worker_id: 'worker-a', sell_worker_id: 'worker-b', base_lots: '0.1', stop_loss_pips: '10', take_profit_pips: '20' })
+    await route.fulfill({ contentType: 'application/json', body: JSON.stringify({ manual_trade_id: 'manual-1', status: 'scheduled' }) })
+  })
+
+  await page.goto('http://127.0.0.1:4173/manual-trading')
+  await page.getByLabel('Base lots').fill('0.1')
+  await page.getByLabel('Stop loss (pips)').fill('10')
+  await page.getByLabel('Take profit (pips)').fill('20')
+  await page.getByRole('button', { name: 'Preview protected entry' }).click()
+  await expect(page.getByRole('dialog')).toContainText('Confirm protected paired trade')
+  await expect(page.getByRole('dialog')).toContainText('0.2')
+  await page.getByRole('dialog').getByRole('button', { name: 'Confirm protected entry' }).click()
+  await expect(page.getByText('Manual trade manual-1 was scheduled.')).toBeVisible()
 })
 
 async function signIn(page: Parameters<typeof test>[0]['page']) {

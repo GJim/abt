@@ -1639,6 +1639,80 @@ class ControlPlaneServiceTests(unittest.TestCase):
         ledger.retire_product_pair("pair-1", "ABCDEF")
         self.assertIsNone(self.client.get("/api/admin/manual-trading-target").json())
 
+    def test_admin_can_preview_and_submit_an_idempotent_protected_manual_trade(self) -> None:
+        ledger = self.app.state.ledger
+        _first_key, first_worker_id, _first_certificate = self._approved_worker(123456, "Broker-A")
+        _second_key, second_worker_id, _second_certificate = self._approved_worker(654321, "Broker-B")
+        specification = {
+            "allowed_directions": ["LONG", "SHORT"],
+            "volume_min": "0.1",
+            "volume_max": "100",
+            "volume_step": "0.1",
+            "point": "0.00001",
+            "digits": 5,
+        }
+        with ledger._transaction():
+            ledger._connection.execute(
+                """INSERT INTO product_pairs (
+                       product_pair_id, status, endpoint_a_server, endpoint_a_symbol, endpoint_b_server, endpoint_b_symbol,
+                       active_pair_key, lot_relationship, policy_snapshot, analysis_period, reference_specifications,
+                       approval_evidence, source_workers, built_from_analysis_id, built_from_confirmation_id, built_by, created_at
+                   ) VALUES (?, 'active', 'Broker-A', 'EURUSD', 'Broker-B', 'EURUSD.a', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                [
+                    "pair-manual", "Broker-A:EURUSD|Broker-B:EURUSD.a",
+                    json.dumps({"first_lots": "1", "second_lots": "2"}), json.dumps({}), json.dumps({}),
+                    json.dumps([
+                        {"server": "Broker-A", "symbol": "EURUSD", "specification": specification},
+                        {"server": "Broker-B", "symbol": "EURUSD.a", "specification": specification},
+                    ]),
+                    json.dumps({}), json.dumps({}), "analysis-1", "confirmation-1", "ABCDEF", datetime.now(UTC),
+                ],
+            )
+        for worker_id, symbol, bid, ask in (
+            (first_worker_id, "EURUSD", 1.1000, 1.1002),
+            (second_worker_id, "EURUSD.a", 1.0998, 1.1000),
+        ):
+            ledger.record_worker_session(worker_id)
+            ledger.record_live_state(
+                worker_id, "2026-08-22T00:00:00+00:00", True,
+                [{"symbol": symbol, "bid": bid, "ask": ask, "broker_time": "2026-08-22T00:00:00+00:00"}], [], [],
+            )
+        login = self.client.post(
+            "/api/admin/login", json={"username": "ABCDEF", "password": "A-secure-admin-password!"}
+        )
+        csrf = {"X-CSRF-Token": login.json()["csrf_token"]}
+        configured = self.client.put(
+            "/api/admin/manual-trading-target",
+            headers=csrf,
+            json={
+                "pair_id": "pair-manual",
+                "first_worker_id": first_worker_id,
+                "second_worker_id": second_worker_id,
+                "leg_order": "buy_to_sell",
+                "interval_seconds": 0,
+                "expected_revision": 0,
+            },
+        )
+        self.assertEqual(200, configured.status_code)
+        command = {
+            "command_id": "manual-entry-1",
+            "target_revision": 1,
+            "buy_worker_id": first_worker_id,
+            "sell_worker_id": second_worker_id,
+            "base_lots": "0.1",
+            "stop_loss_pips": "10",
+            "take_profit_pips": "20",
+        }
+        preview = self.client.post("/api/admin/manual-trades/preview", headers=csrf, json=command)
+        self.assertEqual(200, preview.status_code)
+        self.assertEqual(["0.1", "0.2"], [leg["lots"] for leg in preview.json()["legs"]])
+        self.assertEqual(["BUY", "SELL"], [leg["direction"] for leg in preview.json()["legs"]])
+        submitted = self.client.post("/api/admin/manual-trades", headers=csrf, json=command)
+        self.assertEqual(201, submitted.status_code)
+        self.assertEqual("scheduled", submitted.json()["status"])
+        self.assertEqual(submitted.json(), self.client.post("/api/admin/manual-trades", headers=csrf, json=command).json())
+        self.assertEqual(submitted.json()["manual_trade_id"], self.client.get("/api/admin/manual-trading-target").json()["active_manual_trade_id"])
+
     def test_admin_read_models_paginate_search_and_keep_snapshot_payloads_in_detail(self) -> None:
         _key, worker_id, _certificate = self._approved_worker(123456, "Broker-Search")
         ledger = self.app.state.ledger
