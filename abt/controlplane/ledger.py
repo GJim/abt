@@ -2023,6 +2023,20 @@ class ControlLedger:
                     "UPDATE manual_trades SET status = ? WHERE manual_trade_id = ?", [status, manual_trade_id]
                 )
 
+    def activate_manual_trade(self, manual_trade_id: str, active_legs: list[dict[str, str]]) -> None:
+        with self._transaction():
+            row = self._connection.execute(
+                "SELECT plan FROM manual_trades WHERE manual_trade_id = ?", [manual_trade_id]
+            ).fetchone()
+            if row is None:
+                raise LedgerError("Manual trade does not exist.")
+            plan = json.loads(row[0])
+            plan["active_legs"] = active_legs
+            self._connection.execute(
+                "UPDATE manual_trades SET plan = ?, status = 'active' WHERE manual_trade_id = ?",
+                [json.dumps(plan, separators=(",", ":"), sort_keys=True), manual_trade_id],
+            )
+
     def _manual_trade_plan(self, payload: dict[str, Any]) -> dict[str, Any]:
         required = {
             "target_revision", "buy_worker_id", "sell_worker_id", "base_lots", "stop_loss_pips", "take_profit_pips"
@@ -2122,6 +2136,185 @@ class ControlLedger:
             ).fetchall()
             return [
                 {"manual_trade_id": row[0], "status": row[1], "plan": json.loads(row[2])}
+                for row in rows
+            ]
+
+    def preview_active_manual_trade_operation(self, operation: str, payload: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            return self._active_manual_trade_operation_plan(operation, payload)
+
+    def request_active_manual_trade_operation(
+        self, username: str, command_id: str, operation: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        canonical_payload = json.dumps({"operation": operation, **payload}, separators=(",", ":"), sort_keys=True)
+        payload_hash = _hash(canonical_payload)
+        with self._transaction():
+            existing = self._connection.execute(
+                """SELECT payload_hash, result FROM manual_trade_operation_commands
+                   WHERE username = ? AND command_id = ?""",
+                [username, command_id],
+            ).fetchone()
+            if existing is not None:
+                if existing[0] != payload_hash:
+                    raise LedgerError("Manual-trade command ID was reused with a different payload.")
+                return json.loads(existing[1])
+            plan = self._active_manual_trade_operation_plan(operation, payload)
+            in_flight = self._connection.execute(
+                """SELECT 1 FROM manual_trade_operations
+                   WHERE manual_trade_id = ? AND status IN ('scheduled', 'dispatching')""",
+                [plan["manual_trade_id"]],
+            ).fetchone()
+            if in_flight is not None:
+                raise LedgerError("An active manual-trade operation is already in progress.")
+            operation_id = str(uuid4())
+            now = _utc_now()
+            result = {
+                "command_id": command_id,
+                "operation_id": operation_id,
+                "manual_trade_id": plan["manual_trade_id"],
+                "operation": operation,
+                "status": "scheduled",
+                "plan": plan,
+            }
+            self._connection.execute(
+                """INSERT INTO manual_trade_operations
+                   (operation_id, manual_trade_id, username, command_id, operation, plan, status, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, 'scheduled', ?)""",
+                [operation_id, plan["manual_trade_id"], username, command_id, operation,
+                 json.dumps(plan, separators=(",", ":"), sort_keys=True), now],
+            )
+            self._connection.execute(
+                """INSERT INTO manual_trade_operation_commands (username, command_id, payload_hash, result, created_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                [username, command_id, payload_hash, json.dumps(result, separators=(",", ":"), sort_keys=True), now],
+            )
+            self._event("manual_trade_operation_scheduled", result)
+            return result
+
+    def claim_manual_trade_operation_dispatch(self, operation_id: str) -> bool:
+        with self._transaction():
+            return self._connection.execute(
+                """UPDATE manual_trade_operations SET status = 'dispatching'
+                   WHERE operation_id = ? AND status = 'scheduled' RETURNING operation_id""",
+                [operation_id],
+            ).fetchone() is not None
+
+    def manual_trade_operation(self, operation_id: str) -> dict[str, Any]:
+        with self._lock:
+            row = self._connection.execute(
+                """SELECT manual_trade_id, operation, plan FROM manual_trade_operations WHERE operation_id = ?""",
+                [operation_id],
+            ).fetchone()
+            if row is None:
+                raise LedgerError("Manual-trade operation does not exist.")
+            return {"manual_trade_id": row[0], "operation": row[1], "plan": json.loads(row[2])}
+
+    def record_manual_trade_operation(
+        self, operation_id: str, event_type: str, payload: dict[str, Any], *, status: str | None = None
+    ) -> None:
+        with self._transaction():
+            row = self._connection.execute(
+                "SELECT manual_trade_id, operation, plan FROM manual_trade_operations WHERE operation_id = ?",
+                [operation_id],
+            ).fetchone()
+            if row is None:
+                raise LedgerError("Manual-trade operation does not exist.")
+            self._event(event_type, {"operation_id": operation_id, "manual_trade_id": row[0], **payload})
+            if status == "completed":
+                if row[1] == "protection":
+                    operation_plan = json.loads(row[2])
+                    trade = self._connection.execute(
+                        "SELECT plan FROM manual_trades WHERE manual_trade_id = ?", [row[0]]
+                    ).fetchone()
+                    if trade is None:
+                        raise LedgerError("Manual trade does not exist.")
+                    trade_plan = json.loads(trade[0])
+                    for leg, update in zip(trade_plan["legs"], operation_plan["legs"], strict=True):
+                        leg["stop_loss_pips"] = operation_plan["stop_loss_pips"]
+                        leg["take_profit_pips"] = operation_plan["take_profit_pips"]
+                        leg["estimated_stop_loss"] = update["stop_loss"]
+                        leg["estimated_take_profit"] = update["take_profit"]
+                    self._connection.execute(
+                        "UPDATE manual_trades SET plan = ? WHERE manual_trade_id = ?",
+                        [json.dumps(trade_plan, separators=(",", ":"), sort_keys=True), row[0]],
+                    )
+                elif row[1] == "exit":
+                    self._connection.execute(
+                        "UPDATE manual_trades SET status = 'closed' WHERE manual_trade_id = ?", [row[0]]
+                    )
+                    self._connection.execute(
+                        """UPDATE manual_trading_target SET active_manual_trade_id = NULL
+                           WHERE singleton = TRUE AND active_manual_trade_id = ?""",
+                        [row[0]],
+                    )
+            if status is not None:
+                self._connection.execute(
+                    "UPDATE manual_trade_operations SET status = ? WHERE operation_id = ?", [status, operation_id]
+                )
+
+    def _active_manual_trade_operation_plan(self, operation: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if operation == "exit":
+            if payload:
+                raise LedgerError("Manual-trade full-exit payload is invalid.")
+        elif operation == "protection":
+            if set(payload) != {"stop_loss_pips", "take_profit_pips"}:
+                raise LedgerError("Manual-trade protection payload is invalid.")
+            try:
+                stop_loss_pips = Decimal(str(payload["stop_loss_pips"]))
+                take_profit_pips = Decimal(str(payload["take_profit_pips"]))
+            except (InvalidOperation, ValueError) as error:
+                raise LedgerError("Manual-trade protection distances must be decimal values.") from error
+            if min(stop_loss_pips, take_profit_pips) <= 0:
+                raise LedgerError("Manual-trade protection distances must be positive.")
+        else:
+            raise LedgerError("Manual-trade operation is invalid.")
+        target = self.manual_trading_target()
+        if target is None or target["active_manual_trade_id"] is None:
+            raise LedgerError("Manual-trading target has no active manual trade.")
+        row = self._connection.execute(
+            "SELECT plan, status FROM manual_trades WHERE manual_trade_id = ?", [target["active_manual_trade_id"]]
+        ).fetchone()
+        if row is None or row[1] != "active":
+            raise LedgerError("Manual-trading target has no operable active manual trade.")
+        trade_plan = json.loads(row[0])
+        active_by_worker = {item["worker_id"]: item for item in trade_plan.get("active_legs", [])}
+        legs: list[dict[str, Any]] = []
+        for leg in trade_plan.get("legs", []):
+            active = active_by_worker.get(leg.get("worker_id"))
+            if not isinstance(active, dict) or not isinstance(active.get("position"), str) or not active["position"]:
+                raise LedgerError("Active manual trade is missing confirmed position evidence.")
+            item = {
+                "worker_id": leg["worker_id"], "symbol": leg["symbol"], "direction": leg["direction"],
+                "lots": leg["lots"], "position": active["position"], "fill_price": active["fill_price"],
+            }
+            if operation == "protection":
+                pip_size = Decimal(str(leg["pip_size"]))
+                fill_price = Decimal(str(active["fill_price"]))
+                buy = leg["direction"] == "BUY"
+                item["stop_loss"] = str(fill_price - stop_loss_pips * pip_size if buy else fill_price + stop_loss_pips * pip_size)
+                item["take_profit"] = str(fill_price + take_profit_pips * pip_size if buy else fill_price - take_profit_pips * pip_size)
+            legs.append(item)
+        if len(legs) != 2 or len({leg["worker_id"] for leg in legs}) != 2:
+            raise LedgerError("Active manual trade has invalid leg evidence.")
+        result: dict[str, Any] = {
+            "manual_trade_id": target["active_manual_trade_id"], "operation": operation, "legs": legs,
+        }
+        if operation == "protection":
+            result["stop_loss_pips"] = str(stop_loss_pips)
+            result["take_profit_pips"] = str(take_profit_pips)
+        return result
+
+    def manual_trade_operations_for_recovery(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._connection.execute(
+                """SELECT operation_id, manual_trade_id, operation, plan, status FROM manual_trade_operations
+                   WHERE status IN ('scheduled', 'dispatching')"""
+            ).fetchall()
+            return [
+                {
+                    "operation_id": row[0], "manual_trade_id": row[1], "operation": row[2],
+                    "plan": json.loads(row[3]), "status": row[4],
+                }
                 for row in rows
             ]
 
@@ -3926,6 +4119,24 @@ class ControlLedger:
                     created_at TIMESTAMPTZ NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS manual_trade_commands (
+                    username VARCHAR NOT NULL,
+                    command_id VARCHAR NOT NULL,
+                    payload_hash VARCHAR NOT NULL,
+                    result JSON NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL,
+                    PRIMARY KEY (username, command_id)
+                );
+                CREATE TABLE IF NOT EXISTS manual_trade_operations (
+                    operation_id VARCHAR PRIMARY KEY,
+                    manual_trade_id VARCHAR NOT NULL,
+                    username VARCHAR NOT NULL,
+                    command_id VARCHAR NOT NULL,
+                    operation VARCHAR NOT NULL,
+                    plan JSON NOT NULL,
+                    status VARCHAR NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS manual_trade_operation_commands (
                     username VARCHAR NOT NULL,
                     command_id VARCHAR NOT NULL,
                     payload_hash VARCHAR NOT NULL,

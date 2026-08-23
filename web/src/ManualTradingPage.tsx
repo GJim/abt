@@ -40,6 +40,11 @@ type EntryDraft = {
   stop_loss_pips: string
   take_profit_pips: string
 }
+type ActiveOperationPlan = {
+  manual_trade_id: string
+  operation: 'exit' | 'protection'
+  legs: Array<{ worker_id: string; symbol: string; direction: string; lots: string; position: string; fill_price: string; stop_loss?: string; take_profit?: string }>
+}
 
 export function ManualTradingPage({
   csrfToken,
@@ -62,6 +67,8 @@ export function ManualTradingPage({
   const [message, setMessage] = useState<string | null>(null)
   const [entry, setEntry] = useState<EntryDraft>({ buy_worker_id: '', sell_worker_id: '', base_lots: '', stop_loss_pips: '', take_profit_pips: '' })
   const [preview, setPreview] = useState<{ commandId: string; plan: ManualTradePlan } | null>(null)
+  const [activePreview, setActivePreview] = useState<{ commandId: string; plan: ActiveOperationPlan; payload: Record<string, string> } | null>(null)
+  const [protection, setProtection] = useState({ stop_loss_pips: '', take_profit_pips: '' })
 
   useEffect(() => {
     void fetch('/api/admin/manual-trading-target', { credentials: 'same-origin' })
@@ -181,6 +188,55 @@ export function ManualTradingPage({
     }
   }
 
+  async function previewActiveOperation(operation: ActiveOperationPlan['operation']) {
+      if (!target) return
+      setBusy(true)
+      setMessage(null)
+      const commandId = crypto.randomUUID()
+      const payload = operation === 'protection' ? protection : {}
+      try {
+        const response = await fetch(`/api/admin/manual-trades/active/${operation}/preview`, {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: { 'content-type': 'application/json', 'X-CSRF-Token': csrfToken },
+          body: JSON.stringify({ command_id: commandId, ...payload }),
+        })
+        const result = await response.json() as ActiveOperationPlan | { detail?: string }
+        if (!response.ok) throw new Error('detail' in result ? result.detail : 'Manual-trade operation preview was rejected.')
+        setActivePreview({ commandId, plan: result as ActiveOperationPlan, payload })
+      } catch (error) {
+        setMessage(error instanceof Error ? error.message : 'Manual-trade operation preview was rejected.')
+      } finally {
+        setBusy(false)
+      }
+    }
+
+  async function confirmActiveOperation() {
+      if (!activePreview) return
+      setBusy(true)
+      setMessage(null)
+      try {
+        const response = await fetch(`/api/admin/manual-trades/active/${activePreview.plan.operation}`, {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: { 'content-type': 'application/json', 'X-CSRF-Token': csrfToken },
+          body: JSON.stringify({ command_id: activePreview.commandId, ...activePreview.payload }),
+        })
+        const result = await response.json() as { operation_id?: string; detail?: string }
+        if (!response.ok) throw new Error(result.detail ?? 'Manual-trade operation was rejected.')
+        setActivePreview(null)
+        setMessage(`Manual-trade ${activePreview.plan.operation} operation ${result.operation_id ?? ''} was scheduled.`)
+        const refreshed = await fetch('/api/admin/manual-trading-target', { credentials: 'same-origin' })
+        if (!refreshed.ok) throw new Error('Manual-trading target could not be refreshed.')
+        setTarget(await refreshed.json() as Target)
+        await onChanged()
+      } catch (error) {
+        setMessage(error instanceof Error ? error.message : 'Manual-trade operation was rejected.')
+      } finally {
+        setBusy(false)
+    }
+  }
+
   const observedWorkers = useMemo(() => {
     const selected = pair === null ? [] : [
       { workerId: firstWorkerId, endpoint: pair.endpoints[0] },
@@ -267,6 +323,14 @@ export function ManualTradingPage({
       <label>Take profit (pips)<input min="0.00001" required step="any" type="number" value={entry.take_profit_pips} onChange={(event) => setEntry({ ...entry, take_profit_pips: event.target.value })} /></label>
       <button disabled={busy || target.active_manual_trade_id !== null} type="submit">Preview protected entry</button>
     </form> : null}
+    {target?.active_manual_trade_id ? <section className="analysis-form launch-form">
+      <h2>Manage active paired trade</h2>
+      <p>Review the broker-mapped values before operating both confirmed positions.</p>
+      <button disabled={busy} type="button" onClick={() => void previewActiveOperation('exit')}>Preview full exit</button>
+      <label>Updated stop loss (pips)<input min="0.00001" required step="any" type="number" value={protection.stop_loss_pips} onChange={(event) => setProtection({ ...protection, stop_loss_pips: event.target.value })} /></label>
+      <label>Updated take profit (pips)<input min="0.00001" required step="any" type="number" value={protection.take_profit_pips} onChange={(event) => setProtection({ ...protection, take_profit_pips: event.target.value })} /></label>
+      <button disabled={busy || !protection.stop_loss_pips || !protection.take_profit_pips} type="button" onClick={() => void previewActiveOperation('protection')}>Preview protection update</button>
+    </section> : null}
     <h2>Live target state</h2>
     {observedWorkers.length === 0 ? <p>No manual-trading target is configured.</p> : observedWorkers.map((worker) => (
       <section className="worker" key={worker.worker_id}>
@@ -289,6 +353,14 @@ export function ManualTradingPage({
       <p>TP {entry.take_profit_pips} pips and SL {entry.stop_loss_pips} pips are required for both legs.</p>
       <button disabled={busy} type="button" onClick={() => void confirmEntry()}>Confirm protected entry</button>{' '}
       <button disabled={busy} type="button" onClick={() => setPreview(null)}>Back</button>
+    </section></div> : null}
+    {activePreview ? <div className="snapshot-json-dialog-backdrop"><section aria-modal="true" className="snapshot-json-dialog" role="dialog">
+      <h2>Confirm manual-trade {activePreview.plan.operation === 'exit' ? 'full exit' : 'protection update'}</h2>
+      <table className="console-table"><thead><tr><th>Direction</th><th>Symbol</th><th>Position</th><th>Actual fill</th>{activePreview.plan.operation === 'protection' ? <><th>SL</th><th>TP</th></> : null}</tr></thead>
+        <tbody>{activePreview.plan.legs.map((leg) => <tr key={leg.worker_id}><td>{leg.direction}</td><td>{leg.symbol}</td><td>{leg.position}</td><td>{leg.fill_price}</td>{activePreview.plan.operation === 'protection' ? <><td>{leg.stop_loss}</td><td>{leg.take_profit}</td></> : null}</tr>)}</tbody>
+      </table>
+      <button disabled={busy} type="button" onClick={() => void confirmActiveOperation()}>Confirm {activePreview.plan.operation === 'exit' ? 'full exit' : 'protection update'}</button>{' '}
+      <button disabled={busy} type="button" onClick={() => setActivePreview(null)}>Back</button>
     </section></div> : null}
   </section>
 }

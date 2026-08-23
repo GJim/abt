@@ -1713,6 +1713,89 @@ class ControlPlaneServiceTests(unittest.TestCase):
         self.assertEqual(submitted.json(), self.client.post("/api/admin/manual-trades", headers=csrf, json=command).json())
         self.assertEqual(submitted.json()["manual_trade_id"], self.client.get("/api/admin/manual-trading-target").json()["active_manual_trade_id"])
 
+    def test_admin_can_preview_and_submit_idempotent_active_manual_trade_operations(self) -> None:
+        ledger = self.app.state.ledger
+        _first_key, first_worker_id, _first_certificate = self._approved_worker(123456, "Broker-A")
+        _second_key, second_worker_id, _second_certificate = self._approved_worker(654321, "Broker-B")
+        plan = {
+            "pair_id": "pair-manual",
+            "target_revision": 1,
+            "legs": [
+                {
+                    "worker_id": first_worker_id, "symbol": "EURUSD", "direction": "BUY", "lots": "0.1",
+                    "pip_size": "0.0001", "stop_loss_pips": "10", "take_profit_pips": "20",
+                },
+                {
+                    "worker_id": second_worker_id, "symbol": "EURUSD.a", "direction": "SELL", "lots": "0.2",
+                    "pip_size": "0.0001", "stop_loss_pips": "10", "take_profit_pips": "20",
+                },
+            ],
+            "active_legs": [
+                {"worker_id": first_worker_id, "position": "101", "fill_price": "1.1002"},
+                {"worker_id": second_worker_id, "position": "202", "fill_price": "1.0998"},
+            ],
+        }
+        with ledger._transaction():
+            ledger._connection.execute(
+                """INSERT INTO product_pairs (
+                       product_pair_id, status, endpoint_a_server, endpoint_a_symbol, endpoint_b_server, endpoint_b_symbol,
+                       active_pair_key, lot_relationship, policy_snapshot, analysis_period, reference_specifications,
+                       approval_evidence, source_workers, built_from_analysis_id, built_from_confirmation_id, built_by, created_at
+                   ) VALUES (?, 'active', 'Broker-A', 'EURUSD', 'Broker-B', 'EURUSD.a', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                [
+                    "pair-manual", "Broker-A:EURUSD|Broker-B:EURUSD.a", json.dumps({}), json.dumps({}),
+                    json.dumps({}), json.dumps([]), json.dumps({}), json.dumps({}), "analysis-1", "confirmation-1",
+                    "ABCDEF", datetime.now(UTC),
+                ],
+            )
+            ledger._connection.execute(
+                """INSERT INTO manual_trading_target
+                   (singleton, pair_id, first_worker_id, second_worker_id, leg_order, interval_seconds,
+                    revision, active_manual_trade_id, configured_by, configured_at)
+                   VALUES (TRUE, 'pair-manual', ?, ?, 'buy_to_sell', 0, 1, 'manual-active', 'ABCDEF', ?)""",
+                [first_worker_id, second_worker_id, datetime.now(UTC)],
+            )
+            ledger._connection.execute(
+                """INSERT INTO manual_trades
+                   (manual_trade_id, username, command_id, target_revision, pair_id, plan, status, created_at)
+                   VALUES ('manual-active', 'ABCDEF', 'entry-1', 1, 'pair-manual', ?, 'active', ?)""",
+                [json.dumps(plan), datetime.now(UTC)],
+            )
+        login = self.client.post(
+            "/api/admin/login", json={"username": "ABCDEF", "password": "A-secure-admin-password!"}
+        )
+        csrf = {"X-CSRF-Token": login.json()["csrf_token"]}
+
+        protection_preview = self.client.post(
+            "/api/admin/manual-trades/active/protection/preview",
+            headers=csrf,
+            json={"command_id": "protection-1", "stop_loss_pips": "15", "take_profit_pips": "30"},
+        )
+        self.assertEqual(200, protection_preview.status_code)
+        self.assertEqual(
+            [("1.0987", "1.1032"), ("1.1013", "1.0968")],
+            [(leg["stop_loss"], leg["take_profit"]) for leg in protection_preview.json()["legs"]],
+        )
+        protection = self.client.post(
+            "/api/admin/manual-trades/active/protection",
+            headers=csrf,
+            json={"command_id": "protection-1", "stop_loss_pips": "15", "take_profit_pips": "30"},
+        )
+        self.assertEqual(201, protection.status_code)
+        self.assertEqual(
+            protection.json(),
+            self.client.post(
+                "/api/admin/manual-trades/active/protection",
+                headers=csrf,
+                json={"command_id": "protection-1", "stop_loss_pips": "15", "take_profit_pips": "30"},
+            ).json(),
+        )
+        exit_preview = self.client.post(
+            "/api/admin/manual-trades/active/exit/preview", headers=csrf, json={"command_id": "exit-1"}
+        )
+        self.assertEqual(200, exit_preview.status_code)
+        self.assertEqual(["101", "202"], [leg["position"] for leg in exit_preview.json()["legs"]])
+
     def test_admin_read_models_paginate_search_and_keep_snapshot_payloads_in_detail(self) -> None:
         _key, worker_id, _certificate = self._approved_worker(123456, "Broker-Search")
         ledger = self.app.state.ledger

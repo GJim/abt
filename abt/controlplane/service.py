@@ -224,6 +224,17 @@ class ManualTradeEntryRequest(BaseModel):
     take_profit_pips: Decimal = Field(gt=0)
 
 
+class ManualTradeExitRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    command_id: str = Field(min_length=1, max_length=128)
+
+
+class ManualTradeProtectionRequest(ManualTradeExitRequest):
+    stop_loss_pips: Decimal = Field(gt=0)
+    take_profit_pips: Decimal = Field(gt=0)
+
+
 class ManagementIntentCreateRequest(TraderIntentPayload):
     command_id: str = Field(min_length=1, max_length=128)
 
@@ -918,6 +929,74 @@ def create_app(
                 asyncio.create_task(
                     _dispatch_manual_trade(
                         ledger, worker_connections, worker_execution_locks, str(result["manual_trade_id"])
+                    )
+                )
+            return result
+        except LedgerError as error:
+            raise HTTPException(status_code=_ledger_error_status(error), detail=str(error)) from error
+
+    @app.post("/api/admin/manual-trades/active/exit/preview")
+    def preview_active_manual_trade_exit(
+        body: ManualTradeExitRequest,
+        abt_admin_session: Annotated[str | None, Cookie()] = None,
+        x_csrf_token: Annotated[str | None, Header()] = None,
+    ) -> dict[str, object]:
+        _require_admin(ledger, abt_admin_session, x_csrf_token, require_csrf=True)
+        try:
+            return ledger.preview_active_manual_trade_operation("exit", body.model_dump(exclude={"command_id"}))
+        except LedgerError as error:
+            raise HTTPException(status_code=_ledger_error_status(error), detail=str(error)) from error
+
+    @app.post("/api/admin/manual-trades/active/exit", status_code=status.HTTP_201_CREATED)
+    async def exit_active_manual_trade(
+        body: ManualTradeExitRequest,
+        abt_admin_session: Annotated[str | None, Cookie()] = None,
+        x_csrf_token: Annotated[str | None, Header()] = None,
+    ) -> dict[str, object]:
+        username = _require_admin(ledger, abt_admin_session, x_csrf_token, require_csrf=True)
+        try:
+            result = ledger.request_active_manual_trade_operation(
+                username, body.command_id, "exit", body.model_dump(exclude={"command_id"})
+            )
+            if result["status"] == "scheduled":
+                asyncio.create_task(
+                    _dispatch_manual_trade_operation(
+                        ledger, worker_connections, worker_execution_locks, str(result["operation_id"])
+                    )
+                )
+            return result
+        except LedgerError as error:
+            raise HTTPException(status_code=_ledger_error_status(error), detail=str(error)) from error
+
+    @app.post("/api/admin/manual-trades/active/protection/preview")
+    def preview_active_manual_trade_protection(
+        body: ManualTradeProtectionRequest,
+        abt_admin_session: Annotated[str | None, Cookie()] = None,
+        x_csrf_token: Annotated[str | None, Header()] = None,
+    ) -> dict[str, object]:
+        _require_admin(ledger, abt_admin_session, x_csrf_token, require_csrf=True)
+        try:
+            return ledger.preview_active_manual_trade_operation(
+                "protection", body.model_dump(mode="json", exclude={"command_id"})
+            )
+        except LedgerError as error:
+            raise HTTPException(status_code=_ledger_error_status(error), detail=str(error)) from error
+
+    @app.post("/api/admin/manual-trades/active/protection", status_code=status.HTTP_201_CREATED)
+    async def update_active_manual_trade_protection(
+        body: ManualTradeProtectionRequest,
+        abt_admin_session: Annotated[str | None, Cookie()] = None,
+        x_csrf_token: Annotated[str | None, Header()] = None,
+    ) -> dict[str, object]:
+        username = _require_admin(ledger, abt_admin_session, x_csrf_token, require_csrf=True)
+        try:
+            result = ledger.request_active_manual_trade_operation(
+                username, body.command_id, "protection", body.model_dump(mode="json", exclude={"command_id"})
+            )
+            if result["status"] == "scheduled":
+                asyncio.create_task(
+                    _dispatch_manual_trade_operation(
+                        ledger, worker_connections, worker_execution_locks, str(result["operation_id"])
                     )
                 )
             return result
@@ -2717,6 +2796,13 @@ async def _dispatch_manual_trade(
             second_protection_response = await _request_order_execute(connections[1], second_protection)
             if second_protection_response.get("accepted") is not True or second_protection_response.get("order") != second_protection:
                 raise LedgerError("Second manual-trade leg protection was not confirmed.")
+            ledger.activate_manual_trade(
+                manual_trade_id,
+                [
+                    {"worker_id": str(legs[0]["worker_id"]), "position": str(first_protection["position"]), "fill_price": str(first_fill)},
+                    {"worker_id": str(legs[1]["worker_id"]), "position": str(second_protection["position"]), "fill_price": str(second_fill)},
+                ],
+            )
             ledger.record_manual_trade_event(
                 manual_trade_id,
                 "manual_trade_active",
@@ -2724,7 +2810,6 @@ async def _dispatch_manual_trade(
                     "first_leg": {"fill_price": str(first_fill), "protection": first_protection},
                     "second_leg": {"fill_price": str(second_fill), "protection": second_protection},
                 },
-                status="active",
             )
     except (KeyError, LedgerError, ValueError, asyncio.TimeoutError) as error:
         _freeze_manual_trade(ledger, manual_trade_id, worker_ids, str(error))
@@ -2783,6 +2868,75 @@ def _freeze_manual_trade(ledger: ControlLedger, manual_trade_id: str, worker_ids
     if worker_ids:
         ledger.freeze_workers(
             "manual_trade_execution_anomaly", worker_ids, {"manual_trade_id": manual_trade_id, "reason": reason}
+        )
+
+
+async def _dispatch_manual_trade_operation(
+    ledger: ControlLedger,
+    worker_connections: dict[str, set[_WorkerSessionConnection]],
+    worker_execution_locks: dict[str, asyncio.Lock],
+    operation_id: str,
+) -> None:
+    if not ledger.claim_manual_trade_operation_dispatch(operation_id):
+        return
+    record = ledger.manual_trade_operation(operation_id)
+    plan = cast(dict[str, object], record["plan"])
+    legs = cast(list[dict[str, object]], plan["legs"])
+    worker_ids = [str(leg["worker_id"]) for leg in legs]
+    try:
+        if len(legs) != 2 or len(set(worker_ids)) != 2:
+            raise LedgerError("Manual-trade operation has invalid leg evidence.")
+        async with _pair_worker_execution(worker_execution_locks, *worker_ids):
+            if ledger.frozen_worker_ids(worker_ids):
+                raise LedgerError("A participating worker is frozen.")
+            connections = [
+                _connected_worker_session(worker_connections, worker_id, reason="Participating worker disconnected.")
+                for worker_id in worker_ids
+            ]
+            execution_id = f"abt:m:{hashlib.sha256(str(record['manual_trade_id']).encode()).hexdigest()[:24]}"
+            observed = await _reconcile_execution(connections, execution_id)
+            positions = []
+            for leg, observed_leg in zip(legs, observed, strict=True):
+                position = next((item for item in observed_leg["positions"] if item["ticket"] == leg["position"]), None)
+                if position is None:
+                    raise LedgerError("Active manual-trade position could not be reconciled.")
+                positions.append(position)
+            if record["operation"] == "exit":
+                responses = await asyncio.gather(*(
+                    _execution_recovery_request(
+                        connection, "execution_close", {"ticket": position["ticket"], "volume": position["volume"]}
+                    )
+                    for connection, position in zip(connections, positions, strict=True)
+                ))
+                if any(response.get("accepted") is not True for response in responses):
+                    raise LedgerError("Manual-trade full exit was not confirmed for both legs.")
+                final = await _reconcile_execution(connections, execution_id)
+                if any(leg["orders"] or leg["positions"] for leg in final):
+                    raise LedgerError("Manual-trade full exit did not prove zero exposure.")
+            else:
+                orders = [
+                    {
+                        "action": "protect", "symbol": str(leg["symbol"]), "position": str(leg["position"]),
+                        "sl": str(leg["stop_loss"]), "tp": str(leg["take_profit"]),
+                    }
+                    for leg in legs
+                ]
+                responses = await asyncio.gather(*(
+                    _request_order_execute(connection, order) for connection, order in zip(connections, orders, strict=True)
+                ))
+                if any(response.get("accepted") is not True or response.get("order") != order
+                       for response, order in zip(responses, orders, strict=True)):
+                    raise LedgerError("Manual-trade protection update was not confirmed for both legs.")
+            ledger.record_manual_trade_operation(
+                operation_id, "manual_trade_operation_completed", {"plan": plan}, status="completed"
+            )
+    except (KeyError, LedgerError, ValueError, asyncio.TimeoutError) as error:
+        ledger.record_manual_trade_operation(
+            operation_id, "manual_trade_operation_frozen", {"reason": str(error)}, status="needs_human"
+        )
+        ledger.freeze_workers(
+            "manual_trade_operation_anomaly", worker_ids,
+            {"manual_trade_id": record["manual_trade_id"], "operation_id": operation_id, "reason": str(error)},
         )
 
 
@@ -3065,6 +3219,31 @@ async def _recover_manual_trades_after_startup_reconciliation(
             _freeze_manual_trade(
                 ledger, str(record["manual_trade_id"]), worker_ids,
                 "Controller restarted during manual broker dispatch; broker state is uncertain.",
+            )
+    for record in ledger.manual_trade_operations_for_recovery():
+        plan = cast(dict[str, object], record["plan"])
+        legs = cast(list[dict[str, object]], plan.get("legs", []))
+        worker_ids = [str(leg["worker_id"]) for leg in legs if isinstance(leg.get("worker_id"), str)]
+        if len(worker_ids) != 2 or len(set(worker_ids)) != 2:
+            ledger.record_manual_trade_operation(
+                str(record["operation_id"]), "manual_trade_operation_frozen",
+                {"reason": "Interrupted operation has malformed leg evidence."}, status="needs_human",
+            )
+            continue
+        if not ledger.workers_reconciled_since(worker_ids, startup_reconciliation_started_at):
+            continue
+        if record["status"] == "scheduled":
+            await _dispatch_manual_trade_operation(
+                ledger, worker_connections, worker_execution_locks, str(record["operation_id"])
+            )
+        else:
+            reason = "Controller restarted during manual-trade operation; broker state is uncertain."
+            ledger.record_manual_trade_operation(
+                str(record["operation_id"]), "manual_trade_operation_frozen", {"reason": reason}, status="needs_human"
+            )
+            ledger.freeze_workers(
+                "manual_trade_operation_anomaly", worker_ids,
+                {"manual_trade_id": record["manual_trade_id"], "operation_id": record["operation_id"], "reason": reason},
             )
 
 
