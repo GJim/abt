@@ -529,6 +529,7 @@ def create_app(
                 admin_notification_connections,
                 cast(dict[str, object], jsonable_encoder(enrollment_summary)),
             )
+            await _broadcast_management_snapshot(ledger, admin_notification_connections)
             return {"enrollment_id": enrollment.enrollment_id, "expires_at": enrollment.expires_at.isoformat()}
         except ProofError as error:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(error)) from error
@@ -1016,7 +1017,12 @@ def create_app(
         try:
             result, scheduled = ledger.request_worker_recovery(username, body.command_id, worker_id, "cleanup")
             if scheduled:
-                asyncio.create_task(_cleanup_frozen_worker(ledger, worker_connections, worker_execution_locks, worker_id, result, username))
+                asyncio.create_task(
+                    _cleanup_frozen_worker(
+                        ledger, worker_connections, worker_execution_locks, worker_id, result, username,
+                        admin_notification_connections,
+                    )
+                )
             return result
         except LedgerError as error:
             raise HTTPException(status_code=_ledger_error_status(error), detail=str(error)) from error
@@ -1032,7 +1038,12 @@ def create_app(
         try:
             result, scheduled = ledger.request_worker_recovery(username, body.command_id, worker_id, "release")
             if scheduled:
-                asyncio.create_task(_release_frozen_worker(ledger, worker_connections, worker_execution_locks, worker_id, result, username))
+                asyncio.create_task(
+                    _release_frozen_worker(
+                        ledger, worker_connections, worker_execution_locks, worker_id, result, username,
+                        admin_notification_connections,
+                    )
+                )
             return result
         except LedgerError as error:
             raise HTTPException(status_code=_ledger_error_status(error), detail=str(error)) from error
@@ -1431,19 +1442,21 @@ def create_app(
             raise HTTPException(status_code=_ledger_error_status(error), detail=str(error)) from error
 
     @app.post("/api/admin/product-pairs", status_code=status.HTTP_201_CREATED)
-    def build_product_pair(
+    async def build_product_pair(
         body: ProductPairConfirmationUseRequest,
         abt_admin_session: Annotated[str | None, Cookie()] = None,
         x_csrf_token: Annotated[str | None, Header()] = None,
     ) -> dict[str, object]:
         username = _require_admin(ledger, abt_admin_session, x_csrf_token, require_csrf=True)
         try:
-            return ledger.build_product_pair(body.confirmation_id, username)
+            result = ledger.build_product_pair(body.confirmation_id, username)
+            await _broadcast_management_snapshot(ledger, admin_notification_connections)
+            return result
         except LedgerError as error:
             raise HTTPException(status_code=_ledger_error_status(error), detail=str(error)) from error
 
     @app.post("/api/admin/product-pairs/{product_pair_id}/replace", status_code=status.HTTP_201_CREATED)
-    def replace_product_pair(
+    async def replace_product_pair(
         product_pair_id: str,
         body: ProductPairConfirmationUseRequest,
         abt_admin_session: Annotated[str | None, Cookie()] = None,
@@ -1451,23 +1464,27 @@ def create_app(
     ) -> dict[str, object]:
         username = _require_admin(ledger, abt_admin_session, x_csrf_token, require_csrf=True)
         try:
-            return ledger.replace_product_pair(
+            result = ledger.replace_product_pair(
                 product_pair_id,
                 confirmation_id=body.confirmation_id,
                 replaced_by=username,
             )
+            await _broadcast_management_snapshot(ledger, admin_notification_connections)
+            return result
         except LedgerError as error:
             raise HTTPException(status_code=_ledger_error_status(error), detail=str(error)) from error
 
     @app.post("/api/admin/product-pairs/{product_pair_id}/retire")
-    def retire_product_pair(
+    async def retire_product_pair(
         product_pair_id: str,
         abt_admin_session: Annotated[str | None, Cookie()] = None,
         x_csrf_token: Annotated[str | None, Header()] = None,
     ) -> dict[str, object]:
         username = _require_admin(ledger, abt_admin_session, x_csrf_token, require_csrf=True)
         try:
-            return ledger.retire_product_pair(product_pair_id, username)
+            result = ledger.retire_product_pair(product_pair_id, username)
+            await _broadcast_management_snapshot(ledger, admin_notification_connections)
+            return result
         except LedgerError as error:
             raise HTTPException(status_code=_ledger_error_status(error), detail=str(error)) from error
 
@@ -1839,15 +1856,19 @@ def create_app(
                     else:
                         ledger.record_worker_safety_state(worker.worker_id, request["state"], request["reason"])
                     await websocket.send_json({"type": "accepted", "state": request["state"]})
+                    await _broadcast_management_snapshot(ledger, admin_notification_connections)
                 elif message_type == "live_state_snapshot":
                     _record_live_state_snapshot(ledger, worker.worker_id, request)
                     await websocket.send_json({"type": "live_state_accepted"})
+                    await _broadcast_management_snapshot(ledger, admin_notification_connections)
                 elif message_type == "live_state_diff":
                     _record_live_state_diff(ledger, worker.worker_id, request)
                     await websocket.send_json({"type": "live_state_accepted"})
+                    await _broadcast_management_snapshot(ledger, admin_notification_connections)
                 elif message_type == "snapshot":
                     _record_snapshot(ledger, worker.worker_id, request)
                     await websocket.send_json({"type": "accepted", "cursor": request["cursor"]})
+                    await _broadcast_management_snapshot(ledger, admin_notification_connections)
                     asyncio.create_task(
                         _fail_undispatched_accepted_intents_after_startup_reconciliation(
                             ledger, startup_reconciliation_started_at, worker_connections, worker_execution_locks
@@ -1861,6 +1882,7 @@ def create_app(
                 elif message_type == "delta":
                     _record_delta(ledger, worker.worker_id, request)
                     await websocket.send_json({"type": "accepted", "cursor": request["cursor"]})
+                    await _broadcast_management_snapshot(ledger, admin_notification_connections)
                 elif message_type == "product_catalog_analysis_response":
                     _record_product_catalog_analysis_response(connection, request)
                 elif message_type == "product_catalog_analysis_error":
@@ -1927,7 +1949,7 @@ def create_app(
 
         for spa_route in (
             "/analysis", "/analysis/{analysis_path:path}", "/audit", "/workers", "/worker-recovery", "/traders", "/intents",
-            "/pairs/{pair_status:path}",
+            "/manual-trading", "/pairs/{pair_status:path}",
         ):
             app.add_api_route(spa_route, management_spa_route, methods=["GET"], include_in_schema=False)
 
@@ -3099,6 +3121,7 @@ async def _cleanup_frozen_worker(
     worker_id: str,
     command: dict[str, object],
     username: str,
+    admin_notification_connections: set[WebSocket] | None = None,
 ) -> None:
     operation_id = str(command["operation_id"])
     state: dict[str, object] = {"orders": [], "positions": []}
@@ -3121,8 +3144,10 @@ async def _cleanup_frozen_worker(
     except (KeyError, LedgerError, ValueError, asyncio.TimeoutError) as error:
         _LOGGER.warning("Worker cleanup %s failed for %s: %s", operation_id, worker_id, error)
         ledger.record_worker_cleanup(worker_id, operation_id, username, state, False)
-        return
-    ledger.record_worker_cleanup(worker_id, operation_id, username, state, True)
+    else:
+        ledger.record_worker_cleanup(worker_id, operation_id, username, state, True)
+    if admin_notification_connections is not None:
+        await _broadcast_management_snapshot(ledger, admin_notification_connections)
 
 
 async def _release_frozen_worker(
@@ -3132,6 +3157,7 @@ async def _release_frozen_worker(
     worker_id: str,
     command: dict[str, object],
     username: str,
+    admin_notification_connections: set[WebSocket] | None = None,
 ) -> None:
     operation_id = str(command["operation_id"])
     try:
@@ -3145,6 +3171,8 @@ async def _release_frozen_worker(
     except (KeyError, LedgerError, ValueError, asyncio.TimeoutError) as error:
         _LOGGER.warning("Worker release %s failed for %s: %s", operation_id, worker_id, error)
         ledger.record_worker_release_failure(worker_id, operation_id, username, str(error))
+    if admin_notification_connections is not None:
+        await _broadcast_management_snapshot(ledger, admin_notification_connections)
 
 
 def _execution_records(records: object) -> list[dict[str, str]]:
@@ -3721,6 +3749,23 @@ async def _broadcast_pending_enrollment(
     for connection in tuple(connections):
         try:
             await connection.send_json({"type": "pending_enrollment", "item": enrollment})
+        except (RuntimeError, WebSocketDisconnect):
+            connections.discard(connection)
+
+
+async def _broadcast_management_snapshot(ledger: ControlLedger, connections: set[WebSocket]) -> None:
+    snapshot = jsonable_encoder(
+        {
+            "type": "management_snapshot",
+            "enrollments": ledger.pending_enrollments(),
+            "workers": ledger.worker_reconciliation(),
+            "alerts": ledger.alerts(),
+            "product_pairs": ledger.product_pairs(),
+        }
+    )
+    for connection in tuple(connections):
+        try:
+            await connection.send_json(snapshot)
         except (RuntimeError, WebSocketDisconnect):
             connections.discard(connection)
 

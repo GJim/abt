@@ -1,8 +1,16 @@
 import { useEffect, useMemo, useState } from 'react'
 import type { FormEvent } from 'react'
 import type { AccountWorker } from './App'
+import { formatTimestamp } from './formatting'
 
 type Endpoint = { server: string; symbol: string }
+type LiveQuote = {
+  symbol: string
+  bid: number
+  ask: number
+  last?: number
+  broker_time: string
+}
 type ApplicableWorker = { worker_id: string; server?: string; applicability_status?: string }
 type ProductPair = {
   product_pair_id: string
@@ -69,6 +77,8 @@ export function ManualTradingPage({
   const [preview, setPreview] = useState<{ commandId: string; plan: ManualTradePlan } | null>(null)
   const [activePreview, setActivePreview] = useState<{ commandId: string; plan: ActiveOperationPlan; payload: Record<string, string> } | null>(null)
   const [protection, setProtection] = useState({ stop_loss_pips: '', take_profit_pips: '' })
+  const [quoteSearch, setQuoteSearch] = useState('')
+  const [showAllQuotes, setShowAllQuotes] = useState(false)
 
   useEffect(() => {
     void fetch('/api/admin/manual-trading-target', { credentials: 'same-origin' })
@@ -125,6 +135,11 @@ export function ManualTradingPage({
       if (!response.ok) throw new Error('detail' in payload ? payload.detail : 'Manual-trading target was rejected.')
       const configured = payload as Target
       setTarget(configured)
+      setEntry((current) => ({
+        ...current,
+        buy_worker_id: configured.workers[0]?.worker_id ?? '',
+        sell_worker_id: configured.workers[1]?.worker_id ?? '',
+      }))
       setMessage(`Shared target saved at revision ${configured.revision}.`)
       await onChanged()
     } catch (error) {
@@ -253,6 +268,31 @@ export function ManualTradingPage({
       endpoint: targetWorker.endpoint,
     })) ?? []
   }, [firstWorkerId, pair, secondWorkerId, target, workers])
+  const quoteRows = useMemo(() => {
+    const rows = new Map<string, { symbol: string; first?: LiveQuote; second?: LiveQuote }>()
+    observedWorkers.slice(0, 2).forEach((worker, index) => {
+      const quotes = worker.live_state?.quotes ?? []
+      quotes.forEach((quote) => {
+        const liveQuote = quote as LiveQuote
+        const row = rows.get(liveQuote.symbol) ?? { symbol: liveQuote.symbol }
+        if (index === 0) row.first = liveQuote
+        else row.second = liveQuote
+        rows.set(liveQuote.symbol, row)
+      })
+    })
+    return [...rows.values()].sort((left, right) => left.symbol.localeCompare(right.symbol))
+  }, [observedWorkers])
+  const targetSymbols = useMemo(
+    () => new Set((pair ?? target?.pair)?.endpoints.map((endpoint) => endpoint.symbol) ?? []),
+    [pair, target],
+  )
+  const normalizedQuoteSearch = quoteSearch.trim().toLocaleLowerCase()
+  const visibleQuoteRows = quoteRows.filter((row) => (
+    normalizedQuoteSearch
+      ? row.symbol.toLocaleLowerCase().includes(normalizedQuoteSearch)
+      : showAllQuotes || targetSymbols.has(row.symbol)
+  ))
+  const additionalQuoteCount = quoteRows.filter((row) => !targetSymbols.has(row.symbol)).length
   return <section aria-labelledby="manual-trading-heading">
     {message ? <p role="status">{message}</p> : null}
     <form className="analysis-form launch-form" onSubmit={(event) => void save(event)}>
@@ -326,18 +366,64 @@ export function ManualTradingPage({
       <button disabled={busy || !protection.stop_loss_pips || !protection.take_profit_pips} type="button" onClick={() => void previewActiveOperation('protection')}>Preview protection update</button>
     </section> : null}
     <h2>Live target state</h2>
-    {observedWorkers.length === 0 ? <p>No manual-trading target is configured.</p> : observedWorkers.map((worker) => (
+    {observedWorkers.length === 0 ? <p>No manual-trading target is configured.</p> : <>
+      <section className="manual-quote-panel" aria-label="Live quotes">
+        <div className="manual-quote-toolbar">
+          <label>Search symbols
+            <input
+              onChange={(event) => setQuoteSearch(event.target.value)}
+              placeholder="Search symbols"
+              type="search"
+              value={quoteSearch}
+            />
+          </label>
+          {additionalQuoteCount > 0 && !normalizedQuoteSearch ? (
+            <button onClick={() => setShowAllQuotes((visible) => !visible)} type="button">
+              {showAllQuotes ? 'Show target symbols only' : `Show ${additionalQuoteCount} more symbols`}
+            </button>
+          ) : null}
+        </div>
+        <div className="console-table-scroll">
+          <table className="console-table manual-quote-table">
+            <thead>
+              <tr>
+                <th rowSpan={2}>Symbol</th>
+                {observedWorkers.slice(0, 2).map((worker, index) => (
+                  <th className={`manual-quote-account-${index + 1}`} colSpan={4} key={worker.worker_id}>
+                    {worker.login} on {worker.server}
+                  </th>
+                ))}
+              </tr>
+              <tr>
+                {observedWorkers.slice(0, 2).flatMap((worker, index) => [
+                  <th className={`manual-quote-account-${index + 1}`} key={`${worker.worker_id}-bid`}>Bid</th>,
+                  <th className={`manual-quote-account-${index + 1}`} key={`${worker.worker_id}-ask`}>Ask</th>,
+                  <th className={`manual-quote-account-${index + 1}`} key={`${worker.worker_id}-last`}>Last</th>,
+                  <th className={`manual-quote-account-${index + 1}`} key={`${worker.worker_id}-broker-time`}>Broker quote time</th>,
+                ])}
+              </tr>
+            </thead>
+            <tbody>
+              {visibleQuoteRows.length === 0 ? <tr><td colSpan={9}>No matching live quotes.</td></tr> : visibleQuoteRows.map((row) => (
+                <tr className={targetSymbols.has(row.symbol) ? 'manual-quote-target' : undefined} key={row.symbol}>
+                  <td>{row.symbol}</td>
+                  <QuoteCells quote={row.first} account={1} />
+                  <QuoteCells quote={row.second} account={2} />
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </section>
+      {observedWorkers.map((worker) => (
       <section className="worker" key={worker.worker_id}>
         <h3>{worker.login} on {worker.server} — {worker.endpoint.symbol}</h3>
         <p>{worker.connectivity === 'connected' && worker.live_state?.connectivity ? 'Connected' : 'Not connected'}; safety state: {worker.safety_state}.</p>
-        <table className="console-table">
-          <thead><tr><th>Symbol</th><th>Bid</th><th>Ask</th><th>Broker quote time</th><th>Controller receipt time</th></tr></thead>
-          <tbody>{worker.live_state?.quotes.map((quote) => <tr key={quote.symbol}><td>{quote.symbol}</td><td>{quote.bid}</td><td>{quote.ask}</td><td>{quote.broker_time}</td><td>{(quote as { controller_received_at?: string }).controller_received_at ?? '—'}</td></tr>) ?? <tr><td colSpan={5}>No live quotes.</td></tr>}</tbody>
-        </table>
         <Exposure activeManualTradeId={target?.active_manual_trade_id ?? null} title="Open orders" rows={worker.live_state?.orders ?? []} targetSymbol={worker.endpoint.symbol} />
         <Exposure activeManualTradeId={target?.active_manual_trade_id ?? null} title="Open positions" rows={worker.live_state?.positions ?? []} targetSymbol={worker.endpoint.symbol} />
       </section>
-    ))}
+      ))}
+    </>}
     {preview ? <div className="snapshot-json-dialog-backdrop"><section aria-modal="true" className="snapshot-json-dialog" role="dialog">
       <h2>Confirm protected paired trade</h2>
       <p>{preview.plan.leg_order === 'buy_to_sell' ? 'Buy then Sell' : 'Sell then Buy'} with a {preview.plan.interval_seconds}-second interval.</p>
@@ -357,6 +443,16 @@ export function ManualTradingPage({
       <button disabled={busy} type="button" onClick={() => setActivePreview(null)}>Back</button>
     </section></div> : null}
   </section>
+}
+
+function QuoteCells({ quote, account }: { quote?: LiveQuote; account: 1 | 2 }) {
+  const className = `manual-quote-account-${account}`
+  return <>
+    <td className={className}>{quote?.bid ?? '—'}</td>
+    <td className={className}>{quote?.ask ?? '—'}</td>
+    <td className={className}>{quote?.last || '—'}</td>
+    <td className={className}>{quote ? formatTimestamp(quote.broker_time) : '—'}</td>
+  </>
 }
 
 function Exposure({

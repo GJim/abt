@@ -125,7 +125,7 @@ class AuthenticatedWorkerSession:
             if response.get("type") == "order_execute_request":
                 self._order_execute_requests.append(response)
                 continue
-            if response.get("type", "").startswith("execution_"):
+            if _is_execution_recovery_request(response):
                 self._execution_recovery_requests.append(response)
                 continue
             return self._parse_product_catalog_analysis(response)
@@ -143,7 +143,7 @@ class AuthenticatedWorkerSession:
             if response.get("type") == "order_execute_request":
                 self._order_execute_requests.append(response)
                 return None
-            if response.get("type", "").startswith("execution_"):
+            if _is_execution_recovery_request(response):
                 self._execution_recovery_requests.append(response)
                 return None
             self._analysis_requests.append(response)
@@ -162,7 +162,7 @@ class AuthenticatedWorkerSession:
             if response.get("type") == "order_execute_request":
                 self._order_execute_requests.append(response)
                 continue
-            if response.get("type", "").startswith("execution_"):
+            if _is_execution_recovery_request(response):
                 self._execution_recovery_requests.append(response)
                 continue
             return response
@@ -237,7 +237,7 @@ class AuthenticatedWorkerSession:
         if response.get("type") != "order_execute_request":
             if response.get("type") == "order_check_request":
                 self._order_check_requests.append(response)
-            elif response.get("type", "").startswith("execution_"):
+            elif _is_execution_recovery_request(response):
                 self._execution_recovery_requests.append(response)
             else:
                 self._analysis_requests.append(response)
@@ -284,7 +284,7 @@ class AuthenticatedWorkerSession:
             return None
         except Exception as error:
             _raise_closed_connection(error, "execution recovery request")
-        if response.get("type", "").startswith("execution_"):
+        if _is_execution_recovery_request(response):
             return self._parse_execution_recovery(response)
         if response.get("type") == "order_check_request":
             self._order_check_requests.append(response)
@@ -393,6 +393,11 @@ class AuthenticatedWorkerSession:
             _send(self.socket, response)
         except Exception as error:
             _raise_closed_connection(error, "analysis error response")
+
+
+def _is_execution_recovery_request(response: dict[str, object]) -> bool:
+    request_type = response.get("type")
+    return isinstance(request_type, str) and request_type.startswith(("execution_", "worker_cleanup_"))
 
 
 def collect_product_catalog_evidence(

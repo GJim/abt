@@ -261,7 +261,7 @@ test('administrator can view connected worker health and reconciliation', async 
       safety_state: 'connected',
       latest_snapshot: {
         cursor: 1,
-        observed_at: '2026-08-16T00:00:00Z',
+        observed_at: new Date().toISOString(),
         account: { balance: 1000 },
         terminal: { connected: true },
         orders: [],
@@ -288,7 +288,7 @@ test('administrator can view connected worker health and reconciliation', async 
 
   await expect(page.getByRole('heading', { name: 'Fleet' })).toBeVisible()
   const workerCard = page.getByLabel('Workers by account').getByRole('listitem').filter({ hasText: '123456 on Broker-Demo' })
-  await expect(workerCard.getByText('Action needed', { exact: true })).toBeVisible()
+  await expect(workerCard.getByText('Healthy', { exact: true })).toBeVisible()
   await expect(workerCard.getByText('"balance": 1000')).not.toBeVisible()
   await workerCard.getByRole('button', { name: /123456 on Broker-Demo/ }).click()
   await expect(page.getByText('volume_changed')).toBeVisible()
@@ -1592,7 +1592,10 @@ test('administrator configures and observes the shared manual-trading target', a
         observed_at: '2026-08-22T00:00:00Z',
         received_at: '2026-08-22T00:00:00Z',
         connectivity: true,
-        quotes: [{ symbol: 'EURUSD', bid: 1.1, ask: 1.1002, broker_time: '2026-08-22T00:00:00Z', controller_received_at: '2026-08-22T00:00:01Z' }],
+        quotes: [
+          { symbol: 'EURUSD', bid: 1.1, ask: 1.1002, last: 1.1001, broker_time: '2026-08-22T00:00:00Z', controller_received_at: '2026-08-22T00:00:01Z' },
+          { symbol: 'XAUUSD', bid: 2300, ask: 2300.2, broker_time: '2026-08-22T00:00:00Z', controller_received_at: '2026-08-22T00:00:01Z' },
+        ],
         orders: [{ ticket: 101, symbol: 'EURUSD' }],
         positions: [],
       },
@@ -1605,7 +1608,10 @@ test('administrator configures and observes the shared manual-trading target', a
         observed_at: '2026-08-22T00:00:00Z',
         received_at: '2026-08-22T00:00:00Z',
         connectivity: true,
-        quotes: [{ symbol: 'EURUSD.a', bid: 1.0998, ask: 1.1, broker_time: '2026-08-22T00:00:00Z', controller_received_at: '2026-08-22T00:00:01Z' }],
+        quotes: [
+          { symbol: 'EURUSD.a', bid: 1.0998, ask: 1.1, broker_time: '2026-08-22T00:00:00Z', controller_received_at: '2026-08-22T00:00:01Z' },
+          { symbol: 'BTCUSD', bid: 67000, ask: 67010, broker_time: '2026-08-22T00:00:00Z', controller_received_at: '2026-08-22T00:00:01Z' },
+        ],
         orders: [],
         positions: [{ ticket: 202, symbol: 'EURUSD.a' }],
       },
@@ -1664,9 +1670,17 @@ test('administrator configures and observes the shared manual-trading target', a
   await page.getByRole('button', { name: 'Save shared target' }).click()
 
   await expect(page.getByText('Shared target saved at revision 1.')).toBeVisible()
-  await expect(page.getByRole('heading', { name: '123456 on Broker-A — EURUSD' })).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'Live target state' })).toBeVisible()
+  await expect(page.getByRole('columnheader', { name: 'Last' }).first()).toBeVisible()
+  await expect(page.getByText('1.1001')).toBeVisible()
+  await expect(page.getByText('XAUUSD')).toHaveCount(0)
+  await page.getByRole('button', { name: 'Show 2 more symbols' }).click()
+  await expect(page.getByText('XAUUSD')).toBeVisible()
+  await page.getByPlaceholder('Search symbols').fill('BTC')
+  await expect(page.getByText('BTCUSD')).toBeVisible()
+  await expect(page.getByText('XAUUSD')).toHaveCount(0)
   await expect(page.getByText('current target product pair')).toHaveCount(2)
-  await expect(page.getByText('2026-08-22T00:00:01Z').first()).toBeVisible()
+  await expect(page.getByText('2026-08-22 00:00:00').first()).toBeVisible()
 })
 
 test('administrator previews and confirms a protected scheduled manual paired trade', async ({ page }) => {
@@ -1710,6 +1724,57 @@ test('administrator previews and confirms a protected scheduled manual paired tr
   await expect(page.getByRole('dialog')).toContainText('0.2')
   await page.getByRole('dialog').getByRole('button', { name: 'Confirm protected entry' }).click()
   await expect(page.getByText('Manual trade manual-1 was scheduled.')).toBeVisible()
+})
+
+test('administrator can preview a trade immediately after saving a new target', async ({ page }) => {
+  const workers = [
+    buildWorker({ worker_id: 'worker-a', login: 123456, server: 'Broker-A', live_state: { observed_at: '2026-08-22T00:00:00Z', received_at: '2026-08-22T00:00:00Z', connectivity: true, quotes: [{ symbol: 'EURUSD', bid: 1.1, ask: 1.1002, broker_time: '2026-08-22T00:00:00Z' }], orders: [], positions: [] } }),
+    buildWorker({ worker_id: 'worker-b', login: 654321, server: 'Broker-B', live_state: { observed_at: '2026-08-22T00:00:00Z', received_at: '2026-08-22T00:00:00Z', connectivity: true, quotes: [{ symbol: 'EURUSD.a', bid: 1.0998, ask: 1.1, broker_time: '2026-08-22T00:00:00Z' }], orders: [], positions: [] } }),
+  ]
+  const pair = {
+    product_pair_id: 'pair-1',
+    status: 'active',
+    endpoints: [{ server: 'Broker-A', symbol: 'EURUSD' }, { server: 'Broker-B', symbol: 'EURUSD.a' }],
+    worker_applicability: [
+      { worker_id: 'worker-a', server: 'Broker-A', applicability_status: 'applicable' },
+      { worker_id: 'worker-b', server: 'Broker-B', applicability_status: 'applicable' },
+    ],
+  }
+  const target = {
+    pair,
+    workers: [{ ...workers[0], endpoint: pair.endpoints[0] }, { ...workers[1], endpoint: pair.endpoints[1] }],
+    leg_order: 'buy_to_sell',
+    interval_seconds: 0,
+    revision: 1,
+    active_manual_trade_id: null,
+  }
+  await mockLogin(page)
+  await page.route('**/api/admin/session', async (route) => {
+    await route.fulfill({ contentType: 'application/json', body: JSON.stringify({ csrf_token: 'csrf-token' }) })
+  })
+  await mockManagementData(page, { workers, productPairs: [pair] })
+  await page.route('**/api/admin/manual-trading-target', async (route) => {
+    if (route.request().method() === 'PUT') {
+      await route.fulfill({ contentType: 'application/json', body: JSON.stringify(target) })
+      return
+    }
+    await route.fulfill({ contentType: 'application/json', body: JSON.stringify(null) })
+  })
+  await page.route('**/api/admin/manual-trades/preview', async (route) => {
+    expect(route.request().postDataJSON()).toMatchObject({ buy_worker_id: 'worker-a', sell_worker_id: 'worker-b' })
+    await route.fulfill({ contentType: 'application/json', body: JSON.stringify({ pair_id: 'pair-1', target_revision: 1, leg_order: 'buy_to_sell', interval_seconds: 0, legs: [] }) })
+  })
+
+  await page.goto('http://127.0.0.1:4173/manual-trading')
+  await page.getByLabel('Active product pair').selectOption('pair-1')
+  await page.getByLabel('Buy endpoint worker').selectOption('worker-a')
+  await page.getByLabel('Sell endpoint worker').selectOption('worker-b')
+  await page.getByRole('button', { name: 'Save shared target' }).click()
+  await page.getByLabel('Base lots').fill('0.1')
+  await page.getByLabel('Stop loss (pips)').fill('10')
+  await page.getByLabel('Take profit (pips)').fill('20')
+  await page.getByRole('button', { name: 'Preview protected entry' }).click()
+  await expect(page.getByRole('dialog')).toContainText('Confirm protected paired trade')
 })
 
 async function signIn(page: Parameters<typeof test>[0]['page']) {

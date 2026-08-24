@@ -404,6 +404,19 @@ class WorkerEnrollmentTests(unittest.TestCase):
         self.assertEqual("analysis-123", analysis["analysis_id"])
         self.assertEqual({"request_id": "order-check-123", "order": {"symbol": "EURUSD"}}, order_check)
 
+    def test_execution_recovery_helper_accepts_worker_cleanup_requests(self) -> None:
+        session = AuthenticatedWorkerSession(
+            socket=FakeWebSocket([{"type": "worker_cleanup_reconcile_request", "request_id": "cleanup-123"}]),
+            reconciliation_cursor=0,
+        )
+
+        request = session.receive_execution_recovery()
+
+        self.assertEqual(
+            {"type": "worker_cleanup_reconcile_request", "request_id": "cleanup-123"},
+            request,
+        )
+
     def test_order_check_response_includes_broker_diagnostics(self) -> None:
         socket = FakeWebSocket([])
         session = AuthenticatedWorkerSession(socket=socket, reconciliation_cursor=0)

@@ -49,6 +49,9 @@
 **測試 CLI 時間語意**:
 每個測試 CLI context 保存使用者 IANA 時區；建立時必須明確設定且可後續變更。互動輸入以使用者時區表示，未帶 offset 的 datetime 以該時區解讀，帶 offset 的 ISO-8601 優先；DST 歧義必須拒絕。表格時間以使用者時區的 `YYYY-MM-DD HH:mm:ss` 顯示，JSON 保留 epoch、補充 UTC ISO-8601 欄位及該命令即時觀測的時間來源 metadata。市場資料 offset 依跨日 rotation 與 tick drift 偵測校準。交易寫入成功後，CLI 以該次動作前後可信 UTC 的中點與 broker record 秒級時間計算 trade-record 整秒 offset，保存樣本 ticket、來源、校準 UTC 及誤差；查回失敗不得覆寫舊值。交易紀錄呈現依序使用未過期 offset、過期 offset、UTC；offset 在使用者本地跨日後過期。`context time-status` 必須顯示各 API family 的校準、過期與回退狀態。broker 指定到期以該目標商品可取得的最新 tick server epoch 計算。相對到期時間必須保證不早於指定 duration，broker 正規化後若仍提早則取消掛單並回報失敗。
 
+**管理站 UI 時間格式**:
+所有管理站 Web UI 的時間戳一律顯示為 UTC `YYYY-MM-DD HH:mm:ss`，不得附加 `T`、時區 suffix 或 locale-dependent 格式。手動交易報價僅顯示 broker quote time，不顯示 controller receipt time。
+
 **測試 CLI read-only 面**:
 人工測試 CLI 第一版提供交易工作流資料、訂單計算與檢查、市場深度與 broker 狀態的查詢命令；不包含 MetaTrader5 的資料庫、圖表或 global variables 等低層 API。`symbol-select` 與 `symbol-hide` 是明確例外，分別加入或移除 terminal 的 Market Watch 商品，並在操作後驗證可見狀態。
 

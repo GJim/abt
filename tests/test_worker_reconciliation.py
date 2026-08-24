@@ -50,7 +50,7 @@ class WorkerReconciliationTests(unittest.TestCase):
         class LiveMT5(ReadOnlyMT5):
             def symbol_info_tick(self, symbol: str) -> object:
                 self.calls.append(f"symbol_info_tick:{symbol}")
-                return {"bid": 1.0821, "ask": 1.0823, "time": 1_787_068_740}
+                return {"bid": 1.0821, "ask": 1.0823, "last": 1.0822, "time": 1_787_068_740}
 
         mt5 = LiveMT5()
         emitted: list[dict[str, object]] = []
@@ -64,7 +64,13 @@ class WorkerReconciliationTests(unittest.TestCase):
 
         self.assertEqual("live_state_snapshot", emitted[0]["type"])
         self.assertEqual(
-            {"symbol": "EURUSD", "bid": 1.0821, "ask": 1.0823, "broker_time": "2026-08-18T15:59:00+00:00"},
+            {
+                "symbol": "EURUSD",
+                "bid": 1.0821,
+                "ask": 1.0823,
+                "last": 1.0822,
+                "broker_time": "2026-08-18T15:59:00+00:00",
+            },
             emitted[0]["quotes"][0],
         )
         self.assertEqual([], emitted[1:])
@@ -116,6 +122,31 @@ class WorkerReconciliationTests(unittest.TestCase):
 
         self.assertEqual(3, opened)
         self.assertEqual([5.0, 10.0], waits)
+
+    def test_resets_reconnect_backoff_after_five_minutes_of_connected_reconciliation(self) -> None:
+        elapsed_seconds = 0.0
+        waits: list[float] = []
+        runs = 0
+
+        def run_reconciliation(**_: object) -> None:
+            nonlocal elapsed_seconds, runs
+            runs += 1
+            if runs == 2:
+                elapsed_seconds += 300
+            if runs < 4:
+                raise WorkerSessionDisconnected("controller disconnected")
+
+        reconnect_worker_session(
+            open_session=ReconnectSession,
+            mt5=ReadOnlyMT5(),
+            login=123456,
+            server="Broker-Demo",
+            sleep=waits.append,
+            run_reconciliation=run_reconciliation,
+            monotonic_clock=lambda: elapsed_seconds,
+        )
+
+        self.assertEqual([5.0, 5.0, 10.0], waits)
 
     def test_logs_each_session_reconnect_attempt(self) -> None:
         runs = 0

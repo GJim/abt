@@ -176,6 +176,54 @@
   white-space: nowrap;
 }
 
+.manual-quote-panel {
+  margin-bottom: 1.25rem;
+}
+
+.manual-quote-toolbar {
+  display: flex;
+  align-items: end;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin-bottom: 0.75rem;
+}
+
+.manual-quote-toolbar label {
+  display: grid;
+  gap: 0.25rem;
+  color: var(--console-muted);
+  font-size: 0.6875rem;
+  font-weight: 750;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+
+.manual-quote-toolbar input {
+  min-height: 2.25rem;
+  padding: 0.4rem 0.625rem;
+}
+
+.manual-quote-table {
+  min-width: 70rem;
+}
+
+.manual-quote-table .manual-quote-account-1 {
+  background: color-mix(in srgb, var(--console-accent) 7%, var(--console-surface));
+}
+
+.manual-quote-table .manual-quote-account-2 {
+  background: color-mix(in srgb, var(--console-info) 8%, var(--console-surface));
+}
+
+.manual-quote-table tbody .manual-quote-target {
+  background: color-mix(in srgb, var(--console-accent) 6%, transparent);
+  font-weight: 700;
+}
+
+.manual-quote-table tbody .manual-quote-target:hover {
+  background: color-mix(in srgb, var(--console-accent) 10%, transparent);
+}
+
 .console-table-actions {
   flex-wrap: wrap;
   min-height: 2.75rem;

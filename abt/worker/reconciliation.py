@@ -11,6 +11,7 @@ from .session import collect_market_data_evidence, collect_product_catalog_evide
 
 
 _LOGGER = logging.getLogger(__name__)
+_RECONNECT_BACKOFF_RESET_SECONDS = 5 * 60
 
 
 class ReadOnlyMT5(Protocol):
@@ -414,13 +415,16 @@ def reconnect_worker_session(
     sleep: Callable[[float], None] = _sleep,
     run_reconciliation: Callable[..., None] = reconcile_with_safety,
     maintenance: Callable[[AuthenticatedReconciliationSession], None] | None = None,
+    monotonic_clock: Callable[[], float] = monotonic,
 ) -> None:
     """Reconnect an interrupted proved WSS session with a bounded exponential backoff."""
 
     attempts = 0
     while True:
+        connected_at: float | None = None
         try:
             with open_session() as session:
+                connected_at = monotonic_clock()
                 run_reconciliation(
                     mt5=mt5,
                     session=session,
@@ -431,6 +435,8 @@ def reconnect_worker_session(
                 )
             return
         except WorkerSessionDisconnected as error:
+            if connected_at is not None and monotonic_clock() - connected_at >= _RECONNECT_BACKOFF_RESET_SECONDS:
+                attempts = 0
             if attempts >= 10:
                 raise
             delay = float(5 * 2 ** attempts)
@@ -821,10 +827,12 @@ def _live_quote(mt5: ReadOnlyMT5, symbol: str) -> dict[str, object]:
     tick = _evidence(mt5.symbol_info_tick(symbol), "symbol tick")
     bid = tick.get("bid")
     ask = tick.get("ask")
+    last = tick.get("last")
     timestamp = tick.get("time")
     if (
         isinstance(bid, bool) or not isinstance(bid, (int, float))
         or isinstance(ask, bool) or not isinstance(ask, (int, float))
+        or isinstance(last, bool) or not isinstance(last, (int, float))
         or isinstance(timestamp, bool) or not isinstance(timestamp, (int, float))
     ):
         raise WorkerEnrollmentError("The local MT5 terminal returned invalid symbol tick evidence.")
@@ -832,6 +840,7 @@ def _live_quote(mt5: ReadOnlyMT5, symbol: str) -> dict[str, object]:
         "symbol": symbol,
         "bid": float(bid),
         "ask": float(ask),
+        "last": float(last),
         "broker_time": datetime.fromtimestamp(timestamp, UTC).isoformat(),
     }
 

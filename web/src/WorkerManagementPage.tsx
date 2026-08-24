@@ -1,13 +1,13 @@
-import { useMemo, useState } from 'react'
+import { useState } from 'react'
 import { Collapsible } from '@astryxdesign/core/Collapsible'
 import { Icon } from '@astryxdesign/core/Icon'
 import { Tooltip } from '@astryxdesign/core/Tooltip'
 import { Link } from 'react-router-dom'
 import { WorkerSnapshotsPage } from './WorkerSnapshotsPage'
-import type { AccountWorker, Enrollment, InterventionItem, WorkerAlert } from './App'
+import type { AccountWorker, Enrollment, InterventionItem } from './App'
+import { formatTimestamp as formatDateTime } from './formatting'
 
 type WorkerManagementPageProps = {
-  alerts: WorkerAlert[]
   enrollments: Enrollment[]
   interventionQueue: InterventionItem[]
   isProcessingEnrollment: (enrollmentId: string) => boolean
@@ -17,7 +17,6 @@ type WorkerManagementPageProps = {
 }
 
 export function WorkerManagementPage({
-  alerts,
   enrollments,
   interventionQueue,
   isProcessingEnrollment,
@@ -29,11 +28,6 @@ export function WorkerManagementPage({
   const [revokeCandidate, setRevokeCandidate] = useState<AccountWorker | null>(null)
   const [isRevoking, setIsRevoking] = useState(false)
   const [revokeStatus, setRevokeStatus] = useState<string | null>(null)
-  const workerIdsWithAlerts = useMemo(
-    () => new Set(alerts.map((alert) => alert.worker_id).filter((workerId): workerId is string => workerId !== null)),
-    [alerts],
-  )
-
   async function confirmRevoke() {
     if (!revokeCandidate) {
       return
@@ -97,7 +91,6 @@ export function WorkerManagementPage({
                   <dl>
                     <div><dt>Login</dt><dd>{enrollment.login}</dd></div>
                     <div><dt>Server</dt><dd>{enrollment.server}</dd></div>
-                    <div><dt>Pairing code</dt><dd>{enrollment.pairing_code}</dd></div>
                     <div><dt>Created</dt><dd><time dateTime={enrollment.created_at}>{formatDateTime(enrollment.created_at)}</time></dd></div>
                     <div><dt>Expires</dt><dd><time dateTime={enrollment.expires_at}>{formatDateTime(enrollment.expires_at)}</time></dd></div>
                   </dl>
@@ -135,7 +128,6 @@ export function WorkerManagementPage({
           }}
           onSelect={setSelectedWorkerId}
           selectedWorkerId={selectedWorkerId}
-          workerIdsWithAlerts={workerIdsWithAlerts}
           workers={workers}
         />
       </section>
@@ -169,17 +161,15 @@ function WorkerRoster({
   onRevoke,
   onSelect,
   selectedWorkerId,
-  workerIdsWithAlerts,
   workers,
 }: {
   onRevoke: (worker: AccountWorker) => void
   onSelect: (workerId: string | null) => void
   selectedWorkerId: string | null
-  workerIdsWithAlerts: Set<string>
   workers: AccountWorker[]
 }) {
   const sortedWorkers = [...workers].sort((first, second) => {
-    const priority = workerPriority(first, workerIdsWithAlerts) - workerPriority(second, workerIdsWithAlerts)
+    const priority = workerPriority(first) - workerPriority(second)
     return priority || `${first.server}:${first.login}`.localeCompare(`${second.server}:${second.login}`)
   })
 
@@ -191,7 +181,7 @@ function WorkerRoster({
     <ul className="worker-list" aria-label="Workers by account">
       {sortedWorkers.map((worker) => {
         const isSelected = selectedWorkerId === worker.worker_id
-        const health = describeWorkerHealth(worker, workerIdsWithAlerts.has(worker.worker_id))
+        const health = describeWorkerHealth(worker)
         const accountName = `${worker.login} on ${worker.server}`
         const snapshot = worker.latest_snapshot
         const liveState = worker.live_state
@@ -291,8 +281,8 @@ function WorkerRoster({
                 </section>
                 {worker.freeze ? (
                   <section aria-label={`Freeze record for ${accountName}`}>
-                    <h3>Worker isolation</h3>
-                    <p>Frozen by {worker.freeze.source.replaceAll('_', ' ')}.</p>
+                    <h3>Freeze record</h3>
+                    <p>{worker.safety_state === 'frozen' ? 'Frozen' : 'Previously frozen'} by {worker.freeze.source.replaceAll('_', ' ')}.</p>
                     <p>Affected workers: {worker.freeze.affected_worker_ids.join(', ')}.</p>
                     <p>{worker.freeze.audit.reason}</p>
                     <time dateTime={worker.freeze.frozen_at}>{formatDateTime(worker.freeze.frozen_at)}</time>
@@ -310,11 +300,6 @@ function WorkerRoster({
   )
 }
 
-function formatDateTime(value: string) {
-  const date = new Date(value)
-  return Number.isNaN(date.getTime()) ? value : date.toISOString().slice(0, 19).replace('T', ' ') + ' UTC'
-}
-
 function formatSnapshotFreshness(value: string) {
   const timestamp = Date.parse(value)
   if (!Number.isFinite(timestamp)) {
@@ -330,14 +315,14 @@ function formatAccountSummary(account: Record<string, unknown>) {
   return `Balance ${balance}; equity ${equity}`
 }
 
-function describeWorkerHealth(worker: AccountWorker, hasAlert: boolean) {
+function describeWorkerHealth(worker: AccountWorker) {
   if (worker.safety_state === 'frozen') {
     return { description: 'Account is isolated until an administrator completes recovery.', label: 'Frozen', tone: 'human-action' }
   }
   if (worker.connectivity === 'revoked') {
     return { description: 'Certificate revoked; connection is blocked.', label: 'Revoked', tone: 'human-action' }
   }
-  if (hasAlert || worker.safety_state !== 'connected' || worker.connectivity === 'disconnected') {
+  if (worker.safety_state !== 'connected' || worker.connectivity === 'disconnected') {
     return { description: 'Requires operator investigation before further use.', label: 'Action needed', tone: 'human-action' }
   }
   if (worker.connectivity === 'stale' || !worker.latest_snapshot || isSnapshotStale(worker.latest_snapshot.observed_at)) {
@@ -351,7 +336,7 @@ function describeWorkerHealth(worker: AccountWorker, hasAlert: boolean) {
   return { description: 'Connected with a current account report.', label: 'Healthy', tone: 'healthy' }
 }
 
-function workerPriority(worker: AccountWorker, workerIdsWithAlerts: Set<string>) {
-  const health = describeWorkerHealth(worker, workerIdsWithAlerts.has(worker.worker_id))
+function workerPriority(worker: AccountWorker) {
+  const health = describeWorkerHealth(worker)
   return health.tone === 'human-action' ? 0 : health.tone === 'stale' ? 1 : 2
 }

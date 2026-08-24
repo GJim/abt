@@ -18,6 +18,7 @@ import { RegistrationInvitesPage } from './RegistrationInvitesPage'
 import { TraderManagementPage } from './TraderManagementPage'
 import { WorkerManagementPage } from './WorkerManagementPage'
 import { WorkerRecoveryPage } from './WorkerRecoveryPage'
+import { formatTimestamp as formatDateTime } from './formatting'
 import './App.css'
 import './Console.css'
 
@@ -31,7 +32,6 @@ export type Enrollment = {
   enrollment_id: string
   login: number
   server: string
-  pairing_code: string
   created_at: string
   expires_at: string
   account_info: EnrollmentEvidence
@@ -53,7 +53,7 @@ type LiveWorkerState = {
   observed_at: string
   received_at: string
   connectivity: boolean
-  quotes: Array<{ symbol: string; bid: number; ask: number; broker_time: string }>
+  quotes: Array<{ symbol: string; bid: number; ask: number; last?: number; broker_time: string }>
   orders: EnrollmentEvidence[]
   positions: EnrollmentEvidence[]
 }
@@ -439,7 +439,6 @@ const STAGE_LABELS: Record<string, string> = {
   m1_failed: 'M1 verification failed',
 }
 
-const LIVE_REFRESH_INTERVAL_MS = 30_000
 const LIVE_REFRESH_TIMEOUT_MS = 10_000
 type ConsolePage = 'main' | 'launch' | 'audit' | 'snapshots' | 'recovery' | 'manual-trading' | 'history' | 'active-pairs' | 'retired-pairs' | 'invites' | 'traders' | 'intents'
 
@@ -605,11 +604,31 @@ function App() {
       }
       nextSocket.onmessage = (event) => {
         try {
-          const message = JSON.parse(String(event.data)) as { type?: string; items?: Enrollment[]; item?: Enrollment }
+          const message = JSON.parse(String(event.data)) as {
+            type?: string
+            items?: Enrollment[]
+            item?: Enrollment
+            enrollments?: Enrollment[]
+            workers?: AccountWorker[]
+            alerts?: WorkerAlert[]
+            product_pairs?: ProductPair[]
+          }
           if (message.type === 'pending_enrollments' && Array.isArray(message.items)) {
             setNotificationEnrollments(message.items)
           } else if (message.type === 'pending_enrollment' && message.item) {
             mergeEnrollment(message.item)
+          } else if (
+            message.type === 'management_snapshot'
+            && Array.isArray(message.enrollments)
+            && Array.isArray(message.workers)
+            && Array.isArray(message.alerts)
+            && Array.isArray(message.product_pairs)
+          ) {
+            setEnrollments(message.enrollments)
+            setNotificationEnrollments(message.enrollments)
+            setWorkers(message.workers)
+            setAlerts(message.alerts)
+            setProductPairs(message.product_pairs)
           }
         } catch {
           // REST-seeded data remains available when a push message is malformed.
@@ -663,7 +682,6 @@ function App() {
       }
       void refreshManagementData().catch(() => undefined)
     }
-    const timer = window.setInterval(refreshWhenSafe, LIVE_REFRESH_INTERVAL_MS)
     const handleVisibilityChange = () => {
       if (document.visibilityState === 'visible') {
         refreshWhenSafe()
@@ -672,7 +690,6 @@ function App() {
 
     document.addEventListener('visibilitychange', handleVisibilityChange)
     return () => {
-      window.clearInterval(timer)
       document.removeEventListener('visibilitychange', handleVisibilityChange)
     }
   }, [csrfToken])
@@ -1036,7 +1053,6 @@ function App() {
           )}
           {consolePage === 'audit' ? <AuditEventsPage /> : consolePage === 'snapshots' ? (
             <WorkerManagementPage
-              alerts={alerts}
               enrollments={enrollments}
               interventionQueue={interventionQueue}
               isProcessingEnrollment={(enrollmentId) => processingEnrollmentId === enrollmentId}
@@ -2562,14 +2578,6 @@ function humanizeToken(value: string) {
   return value
     .replaceAll('_', ' ')
     .replace(/\b\w/g, (character) => character.toUpperCase())
-}
-
-function formatDateTime(value: string) {
-  const timestamp = Date.parse(value)
-  if (!Number.isFinite(timestamp)) {
-    return value
-  }
-  return new Date(timestamp).toISOString().slice(0, 19).replace('T', ' ')
 }
 
 function formatRatio(value: number | null) {

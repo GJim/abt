@@ -1298,9 +1298,10 @@ class ControlPlaneServiceTests(unittest.TestCase):
             base_url="https://testserver",
         )
         try:
-            response = client.get("/")
-            self.assertEqual(200, response.status_code)
-            self.assertIn("Management access", response.text)
+            for path in ("/", "/manual-trading"):
+                response = client.get(path)
+                self.assertEqual(200, response.status_code)
+                self.assertIn("Management access", response.text)
         finally:
             client.close()
 
