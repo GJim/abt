@@ -20,6 +20,7 @@ export type ProductPairSummary = {
 type ProductPairsResponse = {
   items: ProductPairSummary[]
   next_cursor: string | null
+  total_items: number
 }
 
 type ProductPairsListPageProps = {
@@ -28,7 +29,6 @@ type ProductPairsListPageProps = {
 }
 
 type ProductPairsRequest = {
-  cursor: string
   pageIndex: number
   query: string
   status: ProductPairsListPageProps['status']
@@ -60,9 +60,7 @@ export function ProductPairsListPage({ status }: ProductPairsListPageProps) {
     if (request.query) {
       parameters.set('q', request.query)
     }
-    if (request.cursor) {
-      parameters.set('cursor', request.cursor)
-    }
+    parameters.set('page', String(request.pageIndex + 1))
 
     try {
       const response = await fetch(`/api/admin/product-pairs?${parameters}`, {
@@ -74,12 +72,20 @@ export function ProductPairsListPage({ status }: ProductPairsListPageProps) {
       }
 
       const payload = await response.json() as ProductPairsResponse
-      if (!Array.isArray(payload.items) || (payload.next_cursor !== null && typeof payload.next_cursor !== 'string')) {
+      if (
+        !Array.isArray(payload.items)
+        || (payload.next_cursor !== null && typeof payload.next_cursor !== 'string')
+        || !Number.isSafeInteger(payload.total_items)
+        || payload.total_items < 0
+      ) {
         throw new Error('Product pairs returned an invalid response.')
       }
 
-      setPages((current) => [...current.slice(0, request.pageIndex), payload])
-      setPageIndex(request.pageIndex)
+      setPages((current) => {
+        const next = [...current]
+        next[request.pageIndex] = payload
+        return next
+      })
     } catch (caughtError) {
       if (!controller.signal.aborted) {
         setError(caughtError instanceof Error ? caughtError.message : 'Product pairs could not be loaded.')
@@ -96,7 +102,7 @@ export function ProductPairsListPage({ status }: ProductPairsListPageProps) {
     const delay = window.setTimeout(() => {
       setPages([])
       setPageIndex(0)
-      void loadPage({ cursor: '', pageIndex: 0, query: normalizedSearch, status })
+      void loadPage({ pageIndex: 0, query: normalizedSearch, status })
     }, 250)
     return () => {
       window.clearTimeout(delay)
@@ -119,16 +125,13 @@ export function ProductPairsListPage({ status }: ProductPairsListPageProps) {
       setPageIndex(nextPageIndex)
       return
     }
-    const cursor = pages[pageIndex]?.next_cursor
-    if (cursor) {
-      setPageIndex(nextPageIndex)
-      void loadPage({ cursor, pageIndex: nextPageIndex, query: normalizedSearch, status })
-    }
+    setPageIndex(nextPageIndex)
+    void loadPage({ pageIndex: nextPageIndex, query: normalizedSearch, status })
   }
 
   const currentPage = pages[pageIndex]
   const productPairs = currentPage?.items ?? []
-  const hasNextPage = Boolean(currentPage?.next_cursor || pages[pageIndex + 1])
+  const totalItems = pages[0]?.total_items ?? 0
 
   return (
     <section aria-label={`${status === 'active' ? 'Active' : 'Retired'} product pairs`}>
@@ -200,13 +203,13 @@ export function ProductPairsListPage({ status }: ProductPairsListPageProps) {
 
           <div className="console-pagination">
             <Pagination
-              hasMore={hasNextPage}
               isDisabled={isLoading}
               label="Product pair pages"
               onChange={changePage}
               page={pageIndex + 1}
               pageSize={PAGE_SIZE}
               size="sm"
+              totalItems={totalItems}
             />
           </div>
         </>

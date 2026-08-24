@@ -51,7 +51,6 @@ export function TraderManagementPage({ csrfToken }: { csrfToken: string }) {
 
   return (
     <section aria-label="Trader management">
-      <header className="console-page-header"><div><h1>Traders</h1><p>Review identity enrollments and revoke a Trader certificate when necessary.</p></div></header>
       {error ? <p className="error" role="alert">{error}</p> : null}
       <section aria-labelledby="pending-traders-heading">
         <h2 id="pending-traders-heading">Pending enrollment review</h2>

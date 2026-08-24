@@ -14,7 +14,7 @@ test('analysis history route is not treated as an analysis ID', async ({ page })
   await page.route('**/api/admin/product-catalog-analyses**', async (route) => {
     await route.fulfill({
       contentType: 'application/json',
-      body: JSON.stringify({ items: [], next_cursor: null }),
+      body: JSON.stringify({ items: [], next_cursor: null, total_items: 0 }),
     })
   })
 
@@ -27,13 +27,67 @@ test('analysis history route is not treated as an analysis ID', async ({ page })
   await expect(page.getByRole('heading', { name: 'Analysis result' })).toHaveCount(0)
 })
 
+test('disabled pagination controls do not imply an active load', async ({ page }) => {
+  await mockLogin(page)
+  await mockManagementData(page)
+  await page.route('**/api/admin/product-catalog-analyses?**', async (route) => {
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({
+        items: [{
+          analysis_id: 'analysis-1',
+          requested_by: 'ABCDEF',
+          first_worker: { worker_id: 'worker-a', login: 111111, server: 'Broker-A' },
+          second_worker: { worker_id: 'worker-b', login: 222222, server: 'Broker-B' },
+          policy_label: 'FX catalog v2',
+          status: 'succeeded',
+          current_stage: 'completed',
+          retry_count: 0,
+          requested_at: '2026-08-16T00:00:00Z',
+          completed_at: '2026-08-16T00:08:00Z',
+        }],
+        next_cursor: 'next-page',
+        total_items: 21,
+      }),
+    })
+  })
+
+  await signIn(page)
+  await page.getByRole('link', { name: 'Analysis history' }).click()
+
+  const previous = page.getByRole('button', { name: 'Previous' })
+  await expect(previous).toBeDisabled()
+  await expect(previous).not.toHaveCSS('cursor', 'wait')
+})
+
 test('administrator resumes a cookie-backed session after refresh', async ({ page }) => {
   await mockSessionResume(page)
 
   await page.goto('http://127.0.0.1:4173/')
 
   await expect(page.getByRole('heading', { name: 'Management console' })).toBeVisible()
-  await expect(page.getByRole('heading', { name: 'Audit events' })).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'Audit events' })).toHaveCount(0)
+})
+
+test('resuming a session does not flash the sign-in screen', async ({ page }) => {
+  await page.addInitScript(() => {
+    const markLoginScreen = () => {
+      if (document.body?.textContent?.includes('Management access')) {
+        window.sessionStorage.setItem('sign-in-screen-seen', 'true')
+      }
+    }
+    new MutationObserver(markLoginScreen).observe(document, { childList: true, subtree: true })
+    markLoginScreen()
+  })
+  await page.route('**/api/admin/session', async (route) => {
+    await new Promise((resolve) => setTimeout(resolve, 600))
+    await route.fulfill({ contentType: 'application/json', body: JSON.stringify({ csrf_token: 'resumed-csrf-token' }) })
+  })
+  await mockManagementData(page)
+
+  await page.goto('http://127.0.0.1:4173/', { waitUntil: 'domcontentloaded' })
+  await expect(page.getByRole('heading', { name: 'Management console' })).toBeVisible()
+  await expect(page.evaluate(() => window.sessionStorage.getItem('sign-in-screen-seen'))).resolves.toBeNull()
 })
 
 test('administrator can sign in and view audit events', async ({ page }) => {
@@ -51,6 +105,33 @@ test('administrator can sign in and view audit events', async ({ page }) => {
 
   await expect(page.getByRole('heading', { name: 'Audit events' })).toBeVisible()
   await expect(page.getByText('admin_login_succeeded')).toBeVisible()
+})
+
+test('administrator can sign out from the console header', async ({ page }) => {
+  await mockLogin(page)
+  await mockManagementData(page)
+  await page.route('**/api/admin/logout', async (route) => {
+    expect(route.request().method()).toBe('POST')
+    expect(route.request().headers()['x-csrf-token']).toBe('csrf-token')
+    await route.fulfill({ status: 204 })
+  })
+
+  await signIn(page)
+  await page.getByRole('button', { name: 'Sign out' }).click()
+
+  await expect(page.getByRole('heading', { name: 'Management access' })).toBeVisible()
+})
+
+test('expired sessions return to the sign-in screen without management data', async ({ page }) => {
+  await page.route('**/api/admin/session', async (route) => {
+    await route.fulfill({ status: 401, contentType: 'application/json', body: JSON.stringify({ detail: 'Administrator login is required.' }) })
+  })
+
+  await page.goto('http://127.0.0.1:4173/workers')
+
+  await expect(page.getByRole('heading', { name: 'Management access' })).toBeVisible()
+  await expect(page.getByText('Your session has expired. Please sign in again.')).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'Workers' })).toHaveCount(0)
 })
 
 test('administrator can review and approve a pending worker registration', async ({ page }) => {
@@ -110,8 +191,7 @@ test('administrator can review and approve a pending worker registration', async
   await page.getByRole('button', { name: 'Sign in' }).click()
   await page.getByRole('link', { name: 'Workers' }).click()
 
-  await expect(page.getByRole('heading', { name: 'Needs attention' })).toBeVisible()
-  await expect(page.getByText('Pending approval')).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'Action required' })).toHaveCount(0)
   await expect(page.getByRole('heading', { name: 'Pending registrations' })).toBeVisible()
   await expect(page.getByText('12345678')).toBeVisible()
   await expect(page.getByText('Broker-Demo')).toBeVisible()
@@ -135,8 +215,8 @@ test('administrator can review and approve a pending worker registration', async
   expect(actionsBox!.y).toBeGreaterThan(evidenceBox!.y + evidenceBox!.height)
   await page.getByRole('button', { name: 'Approve registration for 12345678 on Broker-Demo' }).first().click()
 
-  await expect(page.getByText('No operator action is needed.')).toBeVisible()
-  await expect(page.getByText('No worker registrations are awaiting review.')).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'Action required' })).toHaveCount(0)
+  await expect(page.getByRole('heading', { name: 'Pending registrations' })).toHaveCount(0)
   expect(enrollmentRequests).toBe(2)
 })
 
@@ -274,7 +354,11 @@ test('administrator can scan a realistic fleet, including stale and human-action
   await expect(fleet.getByText('Stale', { exact: true })).toHaveCount(2)
   await expect(fleet.getByText('Revoked', { exact: true })).toBeVisible()
   await expect(fleet.getByText('Action needed', { exact: true })).toBeVisible()
-  await expect(fleet.getByText(/Freshness/).first()).toBeVisible()
+  const firstWorker = fleet.getByRole('listitem').first()
+  await expect(firstWorker.locator('.worker-signal')).toHaveCount(3)
+  await expect(firstWorker.getByRole('button', { name: /Latest report: .*Account: .*Reconciliation:/ })).toBeVisible()
+  await firstWorker.locator('.worker-signal').first().hover()
+  await expect(page.getByRole('tooltip')).toHaveText(/Latest report:/)
   await expect(page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).resolves.toBe(true)
 })
 
@@ -316,7 +400,7 @@ test('administrator sees a useful fleet-health empty state', async ({ page }) =>
   await page.getByRole('link', { name: 'Workers' }).click()
 
   await expect(page.getByRole('heading', { name: 'Fleet' })).toBeVisible()
-  await expect(page.getByText('No approved account workers have reported yet.')).toBeVisible()
+  await expect(page.getByText('No reports yet.')).toBeVisible()
 })
 
 test('administrator can launch an analysis with CSRF protection and inspect passing and failing evidence', async ({ page }) => {
@@ -1139,12 +1223,14 @@ test('administrator can search, paginate, and disclose audit evidence', async ({
     expect(query.get('limit')).toBe('50')
     await route.fulfill({
       contentType: 'application/json',
-      body: JSON.stringify(query.get('cursor') ? {
+      body: JSON.stringify(query.get('page') === '2' ? {
         items: [{ event_id: 2, event_type: 'worker_reconciled', payload: {}, occurred_at: '2026-08-16T00:01:00Z' }],
         next_cursor: null,
+        total_items: 51,
       } : {
         items: [{ event_id: 1, event_type: 'worker_enrollment_approved', payload: { reason: 'administrator_approval_required' }, occurred_at: '2026-08-16T00:00:00Z' }],
         next_cursor: 'next-events',
+        total_items: 51,
       }),
     })
   })
@@ -1193,6 +1279,7 @@ test('administrator can search worker snapshots and retrieve raw evidence on dem
           timestamp: '2026-08-16T00:00:00Z',
         }],
         next_cursor: null,
+        total_items: 1,
       }),
     })
   })
@@ -1200,10 +1287,13 @@ test('administrator can search worker snapshots and retrieve raw evidence on dem
   await signIn(page)
   await page.getByRole('link', { name: 'Workers' }).click()
   await expect(page.getByRole('heading', { level: 1, name: 'Workers' })).toBeVisible()
-  await page.getByRole('button', { name: 'Search snapshot history' }).click()
+  await page.getByRole('button', { name: 'Open archive' }).click()
   await expect(page.getByText('Broker-A')).toBeVisible()
   await expect(page.getByText('1,000')).toBeVisible()
-  await page.getByRole('button', { name: 'View raw JSON' }).click()
+  const openJson = page.getByRole('button', { name: 'View raw JSON for Broker-A 123456' })
+  await expect(openJson).toHaveText('JSON')
+  await expect(openJson).toHaveCSS('border-radius', '999px')
+  await openJson.click()
   const rawSnapshotDialog = page.getByRole('dialog', { name: 'Raw snapshot JSON' })
   await expect(rawSnapshotDialog.getByText('"currency": "USD"')).toBeVisible()
   await expect.poll(() => rawSnapshotDialog.locator('.console-raw-detail').evaluate((element) => element.scrollHeight > element.clientHeight)).toBe(true)
@@ -1224,7 +1314,7 @@ test('administrator can filter, paginate, and open analysis history from its row
   await page.route('**/api/admin/product-catalog-analyses?**', async (route) => {
     const query = new URL(route.request().url()).searchParams
     expect(query.get('limit')).toBe('20')
-    const isNextPage = query.get('cursor') === 'next-page'
+    const isNextPage = query.get('page') === '2'
     await route.fulfill({
       contentType: 'application/json',
       body: JSON.stringify({
@@ -1241,6 +1331,7 @@ test('administrator can filter, paginate, and open analysis history from its row
           completed_at: '2026-08-16T00:08:00Z',
         }],
         next_cursor: isNextPage ? null : 'next-page',
+        total_items: 21,
       }),
     })
   })
@@ -1274,6 +1365,7 @@ test('administrator can browse current and retired product-pair lists', async ({
       body: JSON.stringify({
         items: [buildProductPair(retired ? { product_pair_id: 'pair-retired', status: 'retired', retired_reason: 'policy_replaced' } : {})],
         next_cursor: null,
+        total_items: 1,
       }),
     })
   })

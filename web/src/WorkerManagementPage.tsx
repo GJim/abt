@@ -1,5 +1,7 @@
 import { useMemo, useState } from 'react'
 import { Collapsible } from '@astryxdesign/core/Collapsible'
+import { Icon } from '@astryxdesign/core/Icon'
+import { Tooltip } from '@astryxdesign/core/Tooltip'
 import { Link } from 'react-router-dom'
 import { WorkerSnapshotsPage } from './WorkerSnapshotsPage'
 import type { AccountWorker, Enrollment, InterventionItem, WorkerAlert } from './App'
@@ -56,72 +58,36 @@ export function WorkerManagementPage({
       <header className="console-page-header">
         <div>
           <h1 id="workers-heading">Workers</h1>
-          <p>Approve registrations, assess the latest account state, and contain workers that need intervention.</p>
         </div>
         <Link className="secondary-button" to="/registration-invites">Registration invites</Link>
       </header>
       {revokeStatus ? <p className="worker-action-status" role="status">{revokeStatus}</p> : null}
 
-      <section aria-labelledby="worker-attention-heading" className="worker-attention">
+      {interventionQueue.length > 0 ? <section aria-labelledby="worker-attention-heading" className="worker-attention">
         <div className="section-header">
-          <div>
-            <h2 id="worker-attention-heading">Needs attention</h2>
-            <p>Open items are limited to worker registrations and operating conditions that require an accountable action.</p>
-          </div>
+          <h2 id="worker-attention-heading"><Icon aria-hidden="true" icon="warning" size="sm" />Action required</h2>
           <span className="status-badge status-failed">{interventionQueue.length} open</span>
         </div>
-        {interventionQueue.length === 0 ? (
-          <p>No operator action is needed.</p>
-        ) : (
-          <ul aria-label="Worker intervention queue" className="intervention-list">
-            {interventionQueue.map((item) => (
-              <li key={item.id}>
-                <div>
-                  <strong>{item.kind}</strong>
-                  <p>{item.reason}</p>
-                  <time dateTime={item.occurredAt}>{formatDateTime(item.occurredAt)}</time>
-                </div>
-                {'enrollment' in item ? (
-                  <div className="enrollment-actions">
-                    <button
-                      aria-label={`Approve registration for ${item.enrollment.login} on ${item.enrollment.server}`}
-                      disabled={isProcessingEnrollment(item.enrollment.enrollment_id)}
-                      onClick={() => onReviewEnrollment(item.enrollment.enrollment_id, 'approve')}
-                      type="button"
-                    >
-                      Approve
-                    </button>
-                    <button
-                      aria-label={`Reject registration for ${item.enrollment.login} on ${item.enrollment.server}`}
-                      className="reject-button"
-                      disabled={isProcessingEnrollment(item.enrollment.enrollment_id)}
-                      onClick={() => onReviewEnrollment(item.enrollment.enrollment_id, 'reject')}
-                      type="button"
-                    >
-                      Reject
-                    </button>
-                  </div>
-                ) : (
-                  <a href={`#worker-${item.alert.worker_id ?? ''}`}>Review worker</a>
-                )}
-              </li>
-            ))}
-          </ul>
-        )}
-      </section>
+        <ul aria-label="Worker intervention queue" className="intervention-list">
+          {interventionQueue.map((item) => (
+            <li key={item.id}>
+              <div>
+                <strong>{item.kind}</strong>
+                <p>{item.reason}</p>
+                <time dateTime={item.occurredAt}>{formatDateTime(item.occurredAt)}</time>
+              </div>
+              {'alert' in item ? <a href={`#worker-${item.alert.worker_id ?? ''}`}>Review worker</a> : null}
+            </li>
+          ))}
+        </ul>
+      </section> : null}
 
-      <section aria-labelledby="pending-enrollments-heading" className="worker-enrollments">
+      {enrollments.length > 0 ? <section aria-labelledby="pending-enrollments-heading" className="worker-enrollments">
         <div className="section-header">
-          <div>
-            <h2 id="pending-enrollments-heading">Pending registrations</h2>
-            <p>Verify account, terminal, and pairing evidence before issuing a device certificate.</p>
-          </div>
+          <h2 id="pending-enrollments-heading"><Icon aria-hidden="true" icon="clock" size="sm" />Pending registrations</h2>
           <span className="console-tag">{enrollments.length} pending</span>
         </div>
-        {enrollments.length === 0 ? (
-          <p>No worker registrations are awaiting review.</p>
-        ) : (
-          <ul className="enrollment-list" aria-label="Pending worker registrations">
+        <ul className="enrollment-list" aria-label="Pending worker registrations">
             {enrollments.map((enrollment) => {
               const registrationName = `${enrollment.login} on ${enrollment.server}`
               const isProcessing = isProcessingEnrollment(enrollment.enrollment_id)
@@ -154,16 +120,12 @@ export function WorkerManagementPage({
                 </li>
               )
             })}
-          </ul>
-        )}
-      </section>
+        </ul>
+      </section> : null}
 
       <section aria-labelledby="fleet-heading" className="fleet-health">
         <div className="section-header">
-          <div>
-            <h2 id="fleet-heading">Fleet</h2>
-            <p>Latest report only. Open a worker to review its reconciliation evidence or historical snapshots.</p>
-          </div>
+          <h2 id="fleet-heading"><Icon aria-hidden="true" icon="checkDouble" size="sm" />Fleet</h2>
           <span className="fleet-count">{workers.length} reporting</span>
         </div>
         <WorkerRoster
@@ -193,12 +155,9 @@ export function WorkerManagementPage({
 
       <section aria-labelledby="worker-history-heading" className="worker-history">
         <div className="section-header">
-          <div>
-            <h2 id="worker-history-heading">Snapshot history</h2>
-            <p>Use this diagnostic archive only when the latest worker state needs investigation.</p>
-          </div>
+          <h2 id="worker-history-heading"><Icon aria-hidden="true" icon="clock" size="sm" />Archive</h2>
         </div>
-        <Collapsible defaultIsOpen={false} trigger="Search snapshot history">
+        <Collapsible defaultIsOpen={false} trigger="Open archive">
           <WorkerSnapshotsPage />
         </Collapsible>
       </section>
@@ -225,7 +184,7 @@ function WorkerRoster({
   })
 
   if (sortedWorkers.length === 0) {
-    return <p className="empty-state">No approved account workers have reported yet. Approved workers will appear here after their first connection.</p>
+    return <p className="empty-state">No reports yet.</p>
   }
 
   return (
@@ -236,27 +195,48 @@ function WorkerRoster({
         const accountName = `${worker.login} on ${worker.server}`
         const snapshot = worker.latest_snapshot
         const liveState = worker.live_state
+        const reportSummary = snapshot
+          ? `Latest report: ${formatSnapshotFreshness(snapshot.observed_at)}`
+          : 'Latest report: no snapshot received'
+        const accountSummary = snapshot
+          ? `Account: ${formatAccountSummary(snapshot.account)}`
+          : 'Account: awaiting snapshot'
+        const reconciliationSummary = worker.deltas.length === 0
+          ? 'Reconciliation: no recent changes'
+          : `Reconciliation: ${worker.deltas.length} recent changes`
 
         return (
           <li id={`worker-${worker.worker_id}`} key={worker.worker_id} className="worker">
             <button
+              aria-label={`${accountName}. ${health.description}. ${reportSummary}. ${accountSummary}. ${reconciliationSummary}. ${isSelected ? 'Collapse' : 'Expand'} worker details.`}
               aria-controls={`worker-detail-${worker.worker_id}`}
               aria-expanded={isSelected}
               className="worker-summary"
               onClick={() => onSelect(isSelected ? null : worker.worker_id)}
               type="button"
             >
-              <span dir="auto">
-                <strong>{accountName}</strong>
-                <span>{health.description}</span>
+              <span className="worker-account" dir="auto">
+                {accountName}
+              </span>
+              <span className="worker-signals" aria-hidden="true">
+                <Tooltip content={`${reportSummary}.`}>
+                  <span className="worker-signal">
+                    <Icon icon="clock" size="sm" />
+                  </span>
+                </Tooltip>
+                <Tooltip content={`${accountSummary}.`}>
+                  <span className="worker-signal">
+                    <Icon icon="info" size="sm" />
+                  </span>
+                </Tooltip>
+                <Tooltip content={`${reconciliationSummary}.`}>
+                  <span className="worker-signal">
+                    <Icon icon="checkDouble" size="sm" />
+                  </span>
+                </Tooltip>
               </span>
               <span className={`status-badge worker-health-${health.tone}`}>{health.label}</span>
             </button>
-            <dl className="worker-facts">
-              <div><dt>Freshness</dt><dd>{snapshot ? <time dateTime={snapshot.observed_at}>{formatSnapshotFreshness(snapshot.observed_at)}</time> : 'No snapshot received'}</dd></div>
-              <div><dt>Account</dt><dd>{snapshot ? formatAccountSummary(snapshot.account) : 'Awaiting snapshot'}</dd></div>
-              <div><dt>Reconciliation</dt><dd>{worker.deltas.length === 0 ? 'No recent changes' : `${worker.deltas.length} recent changes`}</dd></div>
-            </dl>
             {isSelected ? (
               <div id={`worker-detail-${worker.worker_id}`} className="worker-evidence">
                 <section aria-label={`Live market state for ${accountName}`}>

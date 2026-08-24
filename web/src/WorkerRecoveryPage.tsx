@@ -47,15 +47,9 @@ export function WorkerRecoveryPage({ csrfToken, onChanged, workers }: WorkerReco
   }
 
   return (
-    <section aria-labelledby="recovery-heading">
-      <header className="console-page-header">
-        <div>
-          <h1 id="recovery-heading">Worker recovery</h1>
-          <p>Cancel every pending order, prove cancellation, close positions, and independently release only empty accounts.</p>
-        </div>
-      </header>
+    <section aria-label="Worker recovery">
       {message ? <p role="status">{message}</p> : null}
-      <label>
+      <label className="worker-recovery-filter">
         Freeze source
         <select aria-label="Freeze source" onChange={(event) => setSource(event.target.value)} value={source}>
           <option value="">All freeze sources</option>

@@ -789,13 +789,14 @@ def create_app(
     def list_events(
         limit: Annotated[int, Query(ge=1, le=50)] = 50,
         cursor: Annotated[str | None, Query(min_length=1, max_length=512)] = None,
+        page: Annotated[int | None, Query(ge=1)] = None,
         event_type: Annotated[str | None, Query(min_length=1, max_length=128)] = None,
         q: Annotated[str | None, Query(min_length=1, max_length=256)] = None,
         abt_admin_session: Annotated[str | None, Cookie()] = None,
     ) -> dict[str, object]:
         _require_admin(ledger, abt_admin_session)
         try:
-            return ledger.event_page(limit=limit, cursor=cursor, event_type=event_type, query=q)
+            return ledger.event_page(limit=limit, cursor=cursor, page=page, event_type=event_type, query=q)
         except LedgerError as error:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(error)) from error
 
@@ -856,12 +857,13 @@ def create_app(
     def list_worker_snapshots(
         limit: Annotated[int, Query(ge=1, le=50)] = 50,
         cursor: Annotated[str | None, Query(min_length=1, max_length=512)] = None,
+        page: Annotated[int | None, Query(ge=1)] = None,
         q: Annotated[str | None, Query(min_length=1, max_length=256)] = None,
         abt_admin_session: Annotated[str | None, Cookie()] = None,
     ) -> dict[str, object]:
         _require_admin(ledger, abt_admin_session)
         try:
-            return ledger.worker_snapshot_page(limit=limit, cursor=cursor, query=q)
+            return ledger.worker_snapshot_page(limit=limit, cursor=cursor, page=page, query=q)
         except LedgerError as error:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(error)) from error
 
@@ -1179,13 +1181,20 @@ def create_app(
     def list_product_catalog_analyses(
         limit: Annotated[int, Query(ge=1, le=50)] = 50,
         cursor: Annotated[str | None, Query(min_length=1, max_length=512)] = None,
+        page: Annotated[int | None, Query(ge=1)] = None,
         status_filter: Annotated[str | None, Query(alias="status", min_length=1, max_length=32)] = None,
         q: Annotated[str | None, Query(min_length=1, max_length=256)] = None,
         abt_admin_session: Annotated[str | None, Cookie()] = None,
     ) -> dict[str, object]:
         _require_admin(ledger, abt_admin_session)
         try:
-            return ledger.product_catalog_analysis_page(limit=limit, cursor=cursor, status=status_filter, query=q)
+            return ledger.product_catalog_analysis_page(
+                limit=limit,
+                cursor=cursor,
+                page=page,
+                status=status_filter,
+                query=q,
+            )
         except LedgerError as error:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(error)) from error
 
@@ -1223,12 +1232,13 @@ def create_app(
         status_filter: Annotated[Literal["active", "retired", "all"], Query(alias="status")] = "all",
         limit: Annotated[int, Query(ge=1, le=50)] = 50,
         cursor: Annotated[str | None, Query(min_length=1, max_length=512)] = None,
+        page: Annotated[int | None, Query(ge=1)] = None,
         q: Annotated[str | None, Query(min_length=1, max_length=256)] = None,
         abt_admin_session: Annotated[str | None, Cookie()] = None,
     ) -> dict[str, object]:
         _require_admin(ledger, abt_admin_session)
         try:
-            return ledger.product_pairs_page(limit=limit, cursor=cursor, status=status_filter, query=q)
+            return ledger.product_pairs_page(limit=limit, cursor=cursor, page=page, status=status_filter, query=q)
         except LedgerError as error:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(error)) from error
 

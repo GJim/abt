@@ -25,20 +25,6 @@ type LoginResponse = {
   csrf_token: string
 }
 
-type AuditEventPayload = {
-  analysis_id?: string
-  stage?: string
-  reason?: string
-  [key: string]: unknown
-}
-
-type AuditEvent = {
-  event_id: number
-  event_type: string
-  occurred_at: string
-  payload?: AuditEventPayload
-}
-
 type EnrollmentEvidence = Record<string, unknown>
 
 export type Enrollment = {
@@ -466,7 +452,6 @@ function App() {
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
   const [csrfToken, setCsrfToken] = useState<string | null>(null)
-  const [events, setEvents] = useState<AuditEvent[]>([])
   const [enrollments, setEnrollments] = useState<Enrollment[]>([])
   const [notificationEnrollments, setNotificationEnrollments] = useState<Enrollment[]>([])
   const [isNotificationListOpen, setIsNotificationListOpen] = useState(false)
@@ -485,6 +470,8 @@ function App() {
   const [analysisError, setAnalysisError] = useState<string | null>(null)
   const [isLaunchingAnalysis, setIsLaunchingAnalysis] = useState(false)
   const [isLoadingAnalysis, setIsLoadingAnalysis] = useState(false)
+  const [isSigningOut, setIsSigningOut] = useState(false)
+  const [isRestoringSession, setIsRestoringSession] = useState(true)
   const refreshInFlight = useRef(false)
   const operatorActionInProgress = useRef(false)
   const notificationRetryTimer = useRef<number | null>(null)
@@ -518,32 +505,33 @@ function App() {
   const interventionQueue = useMemo<InterventionItem[]>(
     () => [
       ...alerts
-        .filter((alert) => alert.priority === 'high' || alert.priority === 'critical')
+        .filter((alert) => (alert.priority === 'high' || alert.priority === 'critical') && !alert.enrollment_id)
         .map((alert) => {
-          const enrollment = alert.enrollment_id
-            ? enrollments.find((candidate) => candidate.enrollment_id === alert.enrollment_id)
-            : undefined
-          return enrollment
-            ? {
-              id: `alert-${alert.alert_id}`,
-              kind: 'Pending approval',
-              reason: 'Worker registration needs operator approval before it can receive a device certificate.',
-              occurredAt: alert.occurred_at,
-              priorityRank: alert.priority === 'critical' ? 3 : 2,
-              enrollment,
-            }
-            : {
-              id: `alert-${alert.alert_id}`,
-              kind: `${alert.priority} priority alert`,
-              reason: alert.reason,
-              occurredAt: alert.occurred_at,
-              priorityRank: alert.priority === 'critical' ? 3 : 2,
-              alert,
-            }
+          return {
+            id: `alert-${alert.alert_id}`,
+            kind: `${alert.priority} priority alert`,
+            reason: alert.reason,
+            occurredAt: alert.occurred_at,
+            priorityRank: alert.priority === 'critical' ? 3 : 2,
+            alert,
+          }
         }),
     ].sort((first, second) => second.priorityRank - first.priorityRank || second.occurredAt.localeCompare(first.occurredAt)),
-    [alerts, enrollments],
+    [alerts],
   )
+
+  function endSession(message: string | null) {
+    setCsrfToken(null)
+    setEnrollments([])
+    setNotificationEnrollments([])
+    setAlerts([])
+    setWorkers([])
+    setProductPairs([])
+    setSelectedNotificationEnrollment(null)
+    setIsNotificationListOpen(false)
+    setRefreshError(null)
+    setError(message)
+  }
 
   useEffect(() => {
     if (eligibleWorkers.length === 0) {
@@ -571,6 +559,7 @@ function App() {
       try {
         const response = await fetch('/api/admin/session', { credentials: 'same-origin' })
         if (!response.ok) {
+          endSession('Your session has expired. Please sign in again.')
           return
         }
         const payload = (await response.json()) as LoginResponse
@@ -580,7 +569,9 @@ function App() {
           await loadAnalysisById(analysisRouteId, { replaceUrl: false })
         }
       } catch {
-        setError('Your session could not be restored. Please sign in again.')
+        endSession('The console could not restore your session. Please sign in again.')
+      } finally {
+        setIsRestoringSession(false)
       }
     }
 
@@ -695,29 +686,26 @@ function App() {
     const controller = new AbortController()
     const timeout = window.setTimeout(() => controller.abort(), LIVE_REFRESH_TIMEOUT_MS)
     try {
-      const [eventsResponse, enrollmentsResponse, workersResponse, alertsResponse, productPairsResponse] = await Promise.all([
-        fetch('/api/admin/events', { credentials: 'same-origin', signal: controller.signal }),
+      const [enrollmentsResponse, workersResponse, alertsResponse, productPairsResponse] = await Promise.all([
         fetch('/api/admin/enrollments', { credentials: 'same-origin', signal: controller.signal }),
         fetch('/api/admin/workers', { credentials: 'same-origin', signal: controller.signal }),
         fetch('/api/admin/alerts', { credentials: 'same-origin', signal: controller.signal }),
         fetch('/api/admin/product-pairs', { credentials: 'same-origin', signal: controller.signal }),
       ])
-      if ([eventsResponse, enrollmentsResponse, workersResponse, alertsResponse, productPairsResponse].some((response) => response.status === 401)) {
-        setCsrfToken(null)
-        throw new Error('Your session has expired. Please sign in again.')
+      if ([enrollmentsResponse, workersResponse, alertsResponse, productPairsResponse].some((response) => response.status === 401)) {
+        endSession('Your session has expired. Please sign in again.')
+        return
       }
-      if (!eventsResponse.ok || !enrollmentsResponse.ok || !workersResponse.ok || !alertsResponse.ok || !productPairsResponse.ok) {
+      if (!enrollmentsResponse.ok || !workersResponse.ok || !alertsResponse.ok || !productPairsResponse.ok) {
         throw new Error('Management data could not be loaded. Your previous data is still shown.')
       }
 
-      const [eventPayload, enrollmentPayload, workerPayload, alertPayload, productPairPayload] = await Promise.all([
-        eventsResponse.json() as Promise<AuditEvent[] | { items: AuditEvent[] }>,
+      const [enrollmentPayload, workerPayload, alertPayload, productPairPayload] = await Promise.all([
         enrollmentsResponse.json() as Promise<Enrollment[]>,
         workersResponse.json() as Promise<AccountWorker[]>,
         alertsResponse.json() as Promise<WorkerAlert[]>,
         productPairsResponse.json() as Promise<ProductPair[] | { items: ProductPair[] }>,
       ])
-      setEvents(Array.isArray(eventPayload) ? eventPayload : eventPayload.items)
       setEnrollments(enrollmentPayload)
       setNotificationEnrollments(enrollmentPayload)
       setWorkers(workerPayload)
@@ -820,6 +808,35 @@ function App() {
     }
   }
 
+  async function signOut() {
+    if (!csrfToken) {
+      endSession(null)
+      return
+    }
+
+    setIsSigningOut(true)
+    try {
+      const response = await fetch('/api/admin/logout', {
+        method: 'POST',
+        headers: { 'X-CSRF-Token': csrfToken },
+        credentials: 'same-origin',
+      })
+      if (response.status === 401) {
+        endSession('Your session has expired. Please sign in again.')
+        return
+      }
+      if (!response.ok) {
+        throw new Error('Could not sign out. Please try again.')
+      }
+      endSession(null)
+      navigate('/')
+    } catch (signOutError) {
+      setError(signOutError instanceof Error ? signOutError.message : 'Could not sign out. Please try again.')
+    } finally {
+      setIsSigningOut(false)
+    }
+  }
+
   async function reviewEnrollment(enrollmentId: string, action: EnrollmentAction) {
     if (!csrfToken) {
       return
@@ -897,6 +914,14 @@ function App() {
     }
   }
 
+  if (isRestoringSession) {
+    return (
+      <main aria-busy="true" className="management session-restoring">
+        <p role="status">Restoring session…</p>
+      </main>
+    )
+  }
+
   if (csrfToken) {
     return (
       <AppShell
@@ -906,6 +931,14 @@ function App() {
           <TopNav
             endContent={
               <div className="console-notifications">
+                <button
+                  className="console-sign-out-button"
+                  disabled={isSigningOut}
+                  onClick={() => void signOut()}
+                  type="button"
+                >
+                  {isSigningOut ? 'Signing out…' : 'Sign out'}
+                </button>
                 <button
                   aria-controls="pending-enrollment-notifications"
                   aria-expanded={isNotificationListOpen}
@@ -1025,9 +1058,17 @@ function App() {
             <AnalysisHistoryPage onOpenAnalysis={(analysisId) => {
               navigate(`/analysis/${encodeURIComponent(analysisId)}`)
             }} />
-          ) : consolePage === 'active-pairs' || consolePage === 'retired-pairs' ? (
+          ) : consolePage === 'active-pairs' ? (
+            <ProductPairsSection
+              alerts={alerts}
+              csrfToken={csrfToken}
+              onProductPairsChanged={refreshManagementData}
+              productPairs={productPairs}
+              workers={workers}
+            />
+          ) : consolePage === 'retired-pairs' ? (
             <ProductPairsListPage
-              status={consolePage === 'active-pairs' ? 'active' : 'retired'}
+              status="retired"
               onOpenPair={() => {
                 navigate('/pairs/active')
               }}
@@ -1152,27 +1193,6 @@ function App() {
           </section>
           }
 
-          {consolePage !== 'launch' && <>
-          <ProductPairsSection
-            alerts={alerts}
-            csrfToken={csrfToken}
-            onProductPairsChanged={refreshManagementData}
-            productPairs={productPairs}
-            workers={workers}
-          />
-
-          <section aria-labelledby="audit-events-heading">
-            <h2 id="audit-events-heading">Audit events</h2>
-            <ul className="audit-events" aria-label="Audit events">
-              {events.map((event) => (
-                <li key={event.event_id}>
-                  <strong>{event.event_type}</strong>
-                  <time dateTime={event.occurred_at}>{formatDateTime(event.occurred_at)}</time>
-                </li>
-              ))}
-            </ul>
-          </section>
-          </>}
           </>}
           </main>
         </div>
@@ -1549,7 +1569,7 @@ function BuildableVerificationCard({
   )
 }
 
-function ProductPairsSection({
+export function ProductPairsSection({
   alerts,
   csrfToken,
   onProductPairsChanged,
@@ -1584,6 +1604,9 @@ function ProductPairsSection({
           throw new Error(await readResponseDetail(response, 'The operational overview could not be loaded.'))
         }
         const payload = (await response.json()) as OperationsDashboard
+        if (!payload.paired_trade_lifecycle) {
+          throw new Error('The operational overview returned incomplete data.')
+        }
         if (!cancelled) {
           setDashboard(payload)
         }

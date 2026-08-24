@@ -1830,6 +1830,12 @@ class ControlPlaneServiceTests(unittest.TestCase):
             "/api/admin/worker-snapshots", params={"limit": 1, "cursor": first_page["next_cursor"]}
         ).json()
         self.assertEqual(1, len(second_page["items"]))
+        numbered_snapshot_page = self.client.get(
+            "/api/admin/worker-snapshots",
+            params={"limit": 1, "page": 2, "q": "broker-search"},
+        ).json()
+        self.assertEqual(2, numbered_snapshot_page["total_items"])
+        self.assertNotEqual(first_page["items"][0]["snapshot_id"], numbered_snapshot_page["items"][0]["snapshot_id"])
         detail = self.client.get(f"/api/admin/worker-snapshots/{first_page['items'][0]['snapshot_id']}")
         self.assertEqual([{"ticket": 2}], detail.json()["orders"])
         self.assertEqual(422, self.client.get("/api/admin/worker-snapshots", params={"cursor": "invalid"}).status_code)
@@ -1839,6 +1845,11 @@ class ControlPlaneServiceTests(unittest.TestCase):
         events = self.client.get("/api/admin/events", params={"limit": 1, "event_type": "read_model_match", "q": "newer"})
         self.assertEqual(["read_model_match"], [item["event_type"] for item in events.json()["items"]])
         self.assertIsNone(events.json()["next_cursor"])
+        numbered_events = self.client.get(
+            "/api/admin/events",
+            params={"limit": 1, "page": 1, "event_type": "read_model_match", "q": "newer"},
+        ).json()
+        self.assertEqual(1, numbered_events["total_items"])
         self.assertEqual(422, self.client.get("/api/admin/events", params={"limit": 51}).status_code)
 
         ledger._connection.execute(
@@ -1855,11 +1866,45 @@ class ControlPlaneServiceTests(unittest.TestCase):
             "/api/admin/product-catalog-analyses", params={"status": "succeeded", "q": "search catalog"}
         ).json()
         self.assertEqual(["analysis-search"], [item["analysis_id"] for item in analyses["items"]])
+        self.assertEqual(1, analyses["total_items"])
         date_analyses = self.client.get(
             "/api/admin/product-catalog-analyses", params={"status": "succeeded", "q": "20260819"}
         ).json()
         self.assertEqual(["analysis-search"], [item["analysis_id"] for item in date_analyses["items"]])
+        self.assertEqual(1, date_analyses["total_items"])
         self.assertEqual(422, self.client.get("/api/admin/product-catalog-analyses", params={"limit": 0}).status_code)
+
+        ledger._connection.executemany(
+            """
+            INSERT INTO product_catalog_analyses (
+                analysis_id, requested_by, first_worker_id, first_login, first_server, second_worker_id, second_login,
+                second_server, policy, status, requested_at
+            ) VALUES (?, 'ABCDEF', 'worker-a', 1, 'Broker-Search', 'worker-b', 2,
+                      'Broker-Other', '{"label":"Pageable catalog"}', 'succeeded', ?)
+            """,
+            [
+                ("analysis-page-one", datetime(2026, 8, 20, tzinfo=UTC)),
+                ("analysis-page-two", datetime(2026, 8, 21, tzinfo=UTC)),
+            ],
+        )
+        first_analysis_page = self.client.get(
+            "/api/admin/product-catalog-analyses",
+            params={"limit": 1, "page": 1, "q": "pageable catalog"},
+        ).json()
+        second_analysis_page = self.client.get(
+            "/api/admin/product-catalog-analyses",
+            params={"limit": 1, "page": 2, "q": "pageable catalog"},
+        ).json()
+        self.assertEqual(2, first_analysis_page["total_items"])
+        self.assertEqual(2, second_analysis_page["total_items"])
+        self.assertNotEqual(first_analysis_page["items"][0]["analysis_id"], second_analysis_page["items"][0]["analysis_id"])
+        self.assertEqual(
+            422,
+            self.client.get(
+                "/api/admin/product-catalog-analyses",
+                params={"cursor": "invalid", "page": 1},
+            ).status_code,
+        )
 
         ledger._connection.execute(
             """

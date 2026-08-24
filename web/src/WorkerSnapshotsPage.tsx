@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { Icon } from '@astryxdesign/core/Icon'
 import { Pagination } from '@astryxdesign/core/Pagination'
+import { Tooltip } from '@astryxdesign/core/Tooltip'
 import './Console.css'
 
 export type SnapshotSummary = {
@@ -17,10 +19,10 @@ export type SnapshotSummary = {
 type SnapshotResponse = {
   items: SnapshotSummary[]
   next_cursor: string | null
+  total_items: number
 }
 
 type SnapshotRequest = {
-  cursor: string
   pageIndex: number
   query: string
 }
@@ -53,9 +55,7 @@ export function WorkerSnapshotsPage() {
     if (request.query) {
       parameters.set('q', request.query)
     }
-    if (request.cursor) {
-      parameters.set('cursor', request.cursor)
-    }
+    parameters.set('page', String(request.pageIndex + 1))
 
     try {
       const response = await fetch(`/api/admin/worker-snapshots?${parameters}`, {
@@ -67,12 +67,20 @@ export function WorkerSnapshotsPage() {
       }
 
       const payload = await response.json() as SnapshotResponse
-      if (!Array.isArray(payload.items) || (payload.next_cursor !== null && typeof payload.next_cursor !== 'string')) {
+      if (
+        !Array.isArray(payload.items)
+        || (payload.next_cursor !== null && typeof payload.next_cursor !== 'string')
+        || !Number.isSafeInteger(payload.total_items)
+        || payload.total_items < 0
+      ) {
         throw new Error('Worker snapshots returned an invalid response.')
       }
 
-      setPages((current) => [...current.slice(0, request.pageIndex), payload])
-      setPageIndex(request.pageIndex)
+      setPages((current) => {
+        const next = [...current]
+        next[request.pageIndex] = payload
+        return next
+      })
     } catch (caughtError) {
       if (!controller.signal.aborted) {
         setError(caughtError instanceof Error ? caughtError.message : 'Worker snapshots could not be loaded.')
@@ -89,7 +97,7 @@ export function WorkerSnapshotsPage() {
     const delay = window.setTimeout(() => {
       setPages([])
       setPageIndex(0)
-      void loadPage({ cursor: '', pageIndex: 0, query: normalizedSearch })
+      void loadPage({ pageIndex: 0, query: normalizedSearch })
     }, 250)
     return () => {
       window.clearTimeout(delay)
@@ -113,11 +121,8 @@ export function WorkerSnapshotsPage() {
       setPageIndex(nextPageIndex)
       return
     }
-    const cursor = pages[pageIndex]?.next_cursor
-    if (cursor) {
-      setPageIndex(nextPageIndex)
-      void loadPage({ cursor, pageIndex: nextPageIndex, query: normalizedSearch })
-    }
+    setPageIndex(nextPageIndex)
+    void loadPage({ pageIndex: nextPageIndex, query: normalizedSearch })
   }
 
   async function loadRawSnapshot(snapshotId: SnapshotSummary['snapshot_id']) {
@@ -161,7 +166,7 @@ export function WorkerSnapshotsPage() {
 
   const currentPage = pages[pageIndex]
   const snapshots = currentPage?.items ?? []
-  const hasNextPage = Boolean(currentPage?.next_cursor || pages[pageIndex + 1])
+  const totalItems = pages[0]?.total_items ?? 0
   const selectedRawSnapshot = selectedSnapshotId === null ? undefined : rawSnapshots[selectedSnapshotId]
   const selectedRawError = selectedSnapshotId === null ? undefined : detailError[selectedSnapshotId]
   const isSelectedRawSnapshotLoading = selectedSnapshotId !== null && loadingDetailId === selectedSnapshotId
@@ -235,12 +240,17 @@ export function WorkerSnapshotsPage() {
                       <td><BooleanTag value={snapshot.tradeapi_disabled} /></td>
                       <td>
                         <time dateTime={snapshot.timestamp}>{formatDateTime(snapshot.timestamp)}</time>
-                        <button
-                          type="button"
-                          onClick={() => openRawSnapshot(snapshot.snapshot_id)}
-                        >
-                          View raw JSON
-                        </button>
+                        <Tooltip content="View raw snapshot JSON">
+                          <button
+                            aria-label={`View raw JSON for ${displayValue(snapshot.server)} ${displayValue(snapshot.login)}`}
+                            className="snapshot-json-button"
+                            type="button"
+                            onClick={() => openRawSnapshot(snapshot.snapshot_id)}
+                          >
+                            <Icon aria-hidden="true" icon="info" size="xsm" />
+                            JSON
+                          </button>
+                        </Tooltip>
                       </td>
                     </tr>
                   )
@@ -251,13 +261,13 @@ export function WorkerSnapshotsPage() {
 
           <div className="console-pagination">
             <Pagination
-              hasMore={hasNextPage}
               isDisabled={isLoading}
               label="Worker snapshot pages"
               onChange={changePage}
               page={pageIndex + 1}
               pageSize={PAGE_SIZE}
               size="sm"
+              totalItems={totalItems}
             />
           </div>
         </>

@@ -2334,21 +2334,43 @@ class ControlLedger:
             "event_id": row[4],
         }
 
-    def worker_snapshot_page(self, *, limit: int, cursor: str | None, query: str | None) -> dict[str, Any]:
+    def worker_snapshot_page(
+        self, *, limit: int, cursor: str | None, page: int | None, query: str | None
+    ) -> dict[str, Any]:
+        if cursor is not None and page is not None:
+            raise LedgerError("Specify either a cursor or a page, not both.")
         cursor_values = _decode_page_cursor(cursor, "worker_snapshots")
-        clauses: list[str] = []
-        parameters: list[Any] = []
+        filter_clauses: list[str] = []
+        filter_parameters: list[Any] = []
         if query is not None:
-            clauses.append(
+            filter_clauses.append(
                 """lower(concat_ws(' ', s.worker_id, w.server, CAST(w.login AS VARCHAR),
                    CAST(s.account AS VARCHAR), CAST(s.terminal AS VARCHAR))) LIKE ?"""
             )
-            parameters.append(f"%{query.lower()}%")
+            filter_parameters.append(f"%{query.lower()}%")
+        clauses = list(filter_clauses)
+        parameters = list(filter_parameters)
         if cursor_values is not None:
             clauses.append("(s.received_at < ? OR (s.received_at = ? AND s.snapshot_id < ?))")
             parameters.extend([cursor_values["timestamp"], cursor_values["timestamp"], cursor_values["id"]])
         where = "" if not clauses else f"WHERE {' AND '.join(clauses)}"
+        filter_where = "" if not filter_clauses else f"WHERE {' AND '.join(filter_clauses)}"
         with self._lock:
+            total_items = self._connection.execute(
+                f"""
+                SELECT count(*)
+                FROM reconciliation_snapshots s
+                JOIN workers w ON w.worker_id = s.worker_id
+                {filter_where}
+                """,
+                filter_parameters,
+            ).fetchone()[0]
+            row_limit = limit if page is not None else limit + 1
+            query_parameters = [*parameters, row_limit]
+            offset = ""
+            if page is not None:
+                offset = "OFFSET ?"
+                query_parameters.append((page - 1) * limit)
             rows = self._connection.execute(
                 f"""
                 SELECT s.snapshot_id, s.worker_id, s.cursor, s.observed_at, s.account, s.terminal, s.received_at,
@@ -2358,10 +2380,11 @@ class ControlLedger:
                 {where}
                 ORDER BY s.received_at DESC, s.snapshot_id DESC
                 LIMIT ?
+                {offset}
                 """,
-                [*parameters, limit + 1],
+                query_parameters,
             ).fetchall()
-        has_more = len(rows) > limit
+        has_more = page * limit < total_items if page is not None else len(rows) > limit
         items = []
         for row in rows[:limit]:
             account = json.loads(row[4])
@@ -2382,7 +2405,9 @@ class ControlLedger:
                     "received_at": row[6],
                 }
             )
-        return _page(items, has_more, "worker_snapshots", "received_at", "snapshot_id")
+        result = _page(items, has_more, "worker_snapshots", "received_at", "snapshot_id")
+        result["total_items"] = total_items
+        return result
 
     def worker_snapshot(self, snapshot_id: str) -> dict[str, Any]:
         with self._lock:
@@ -2647,36 +2672,51 @@ class ControlLedger:
         }
 
     def product_catalog_analysis_page(
-        self, *, limit: int, cursor: str | None, status: str | None, query: str | None
+        self, *, limit: int, cursor: str | None, page: int | None, status: str | None, query: str | None
     ) -> dict[str, Any]:
+        if cursor is not None and page is not None:
+            raise LedgerError("Specify either a cursor or a page, not both.")
         cursor_values = _decode_page_cursor(cursor, "product_catalog_analyses")
-        clauses: list[str] = []
-        parameters: list[Any] = []
+        filter_clauses: list[str] = []
+        filter_parameters: list[Any] = []
         if status is not None:
-            clauses.append("status = ?")
-            parameters.append(status)
+            filter_clauses.append("status = ?")
+            filter_parameters.append(status)
         if query is not None:
             normalized_date_query = "".join(character for character in query if character.isdigit())
             if normalized_date_query:
-                clauses.append(
+                filter_clauses.append(
                     """(lower(concat_ws(' ', analysis_id, requested_by, first_worker_id, first_server,
                        second_worker_id, second_server, CAST(first_login AS VARCHAR), CAST(second_login AS VARCHAR),
                        CAST(policy AS VARCHAR))) LIKE ?
                        OR strftime(requested_at, '%Y%m%d') LIKE ?)"""
                 )
-                parameters.extend([f"%{query.lower()}%", f"%{normalized_date_query}%"])
+                filter_parameters.extend([f"%{query.lower()}%", f"%{normalized_date_query}%"])
             else:
-                clauses.append(
+                filter_clauses.append(
                     """lower(concat_ws(' ', analysis_id, requested_by, first_worker_id, first_server,
                        second_worker_id, second_server, CAST(first_login AS VARCHAR), CAST(second_login AS VARCHAR),
                        CAST(policy AS VARCHAR))) LIKE ?"""
                 )
-                parameters.append(f"%{query.lower()}%")
+                filter_parameters.append(f"%{query.lower()}%")
+        clauses = list(filter_clauses)
+        parameters = list(filter_parameters)
         if cursor_values is not None:
             clauses.append("(requested_at < ? OR (requested_at = ? AND analysis_id < ?))")
             parameters.extend([cursor_values["timestamp"], cursor_values["timestamp"], cursor_values["id"]])
         where = "" if not clauses else f"WHERE {' AND '.join(clauses)}"
+        filter_where = "" if not filter_clauses else f"WHERE {' AND '.join(filter_clauses)}"
         with self._lock:
+            total_items = self._connection.execute(
+                f"SELECT count(*) FROM product_catalog_analyses {filter_where}",
+                filter_parameters,
+            ).fetchone()[0]
+            row_limit = limit if page is not None else limit + 1
+            offset_parameters = [*parameters, row_limit]
+            offset = ""
+            if page is not None:
+                offset = "OFFSET ?"
+                offset_parameters.append((page - 1) * limit)
             rows = self._connection.execute(
                 f"""
                 SELECT analysis_id, requested_by, first_worker_id, first_login, first_server,
@@ -2685,10 +2725,11 @@ class ControlLedger:
                 FROM product_catalog_analyses {where}
                 ORDER BY requested_at DESC, analysis_id DESC
                 LIMIT ?
+                {offset}
                 """,
-                [*parameters, limit + 1],
+                offset_parameters,
             ).fetchall()
-        has_more = len(rows) > limit
+        has_more = page * limit < total_items if page is not None else len(rows) > limit
         items = [
             {
                 "analysis_id": row[0],
@@ -2704,7 +2745,9 @@ class ControlLedger:
             }
             for row in rows[:limit]
         ]
-        return _page(items, has_more, "product_catalog_analyses", "requested_at", "analysis_id")
+        result = _page(items, has_more, "product_catalog_analyses", "requested_at", "analysis_id")
+        result["total_items"] = total_items
+        return result
 
     def create_product_pair_build_confirmation(
         self,
@@ -2923,24 +2966,41 @@ class ControlLedger:
             ).fetchall()
             return [self._product_pair_with_worker_applicability(self._product_pair_from_row(row)) for row in rows]
 
-    def product_pairs_page(self, *, limit: int, cursor: str | None, status: str, query: str | None) -> dict[str, Any]:
+    def product_pairs_page(
+        self, *, limit: int, cursor: str | None, page: int | None, status: str, query: str | None
+    ) -> dict[str, Any]:
+        if cursor is not None and page is not None:
+            raise LedgerError("Specify either a cursor or a page, not both.")
         cursor_values = _decode_page_cursor(cursor, "product_pairs")
-        clauses: list[str] = []
-        parameters: list[Any] = []
+        filter_clauses: list[str] = []
+        filter_parameters: list[Any] = []
         if status != "all":
-            clauses.append("status = ?")
-            parameters.append(status)
+            filter_clauses.append("status = ?")
+            filter_parameters.append(status)
         if query is not None:
-            clauses.append(
+            filter_clauses.append(
                 """lower(concat_ws(' ', product_pair_id, status, endpoint_a_server, endpoint_a_symbol,
                    endpoint_b_server, endpoint_b_symbol, built_from_analysis_id)) LIKE ?"""
             )
-            parameters.append(f"%{query.lower()}%")
+            filter_parameters.append(f"%{query.lower()}%")
+        clauses = list(filter_clauses)
+        parameters = list(filter_parameters)
         if cursor_values is not None:
             clauses.append("(created_at < ? OR (created_at = ? AND product_pair_id < ?))")
             parameters.extend([cursor_values["timestamp"], cursor_values["timestamp"], cursor_values["id"]])
         where = "" if not clauses else f"WHERE {' AND '.join(clauses)}"
+        filter_where = "" if not filter_clauses else f"WHERE {' AND '.join(filter_clauses)}"
         with self._lock:
+            total_items = self._connection.execute(
+                f"SELECT count(*) FROM product_pairs {filter_where}",
+                filter_parameters,
+            ).fetchone()[0]
+            row_limit = limit if page is not None else limit + 1
+            query_parameters = [*parameters, row_limit]
+            offset = ""
+            if page is not None:
+                offset = "OFFSET ?"
+                query_parameters.append((page - 1) * limit)
             rows = self._connection.execute(
                 f"""
                 SELECT product_pair_id, status, endpoint_a_server, endpoint_a_symbol, endpoint_b_server, endpoint_b_symbol,
@@ -2950,15 +3010,18 @@ class ControlLedger:
                 FROM product_pairs {where}
                 ORDER BY created_at DESC, product_pair_id DESC
                 LIMIT ?
+                {offset}
                 """,
-                [*parameters, limit + 1],
+                query_parameters,
             ).fetchall()
-            has_more = len(rows) > limit
+            has_more = page * limit < total_items if page is not None else len(rows) > limit
             items = [
                 self._product_pair_with_worker_applicability(self._product_pair_from_row(row))
                 for row in rows[:limit]
             ]
-        return _page(items, has_more, "product_pairs", "created_at", "product_pair_id")
+        result = _page(items, has_more, "product_pairs", "created_at", "product_pair_id")
+        result["total_items"] = total_items
+        return result
 
     def product_pair_worker_reference(self, product_pair_id: str, worker_id: str) -> dict[str, Any]:
         with self._lock:
@@ -3845,35 +3908,55 @@ class ControlLedger:
             for row in rows
         ]
 
-    def event_page(self, *, limit: int, cursor: str | None, event_type: str | None, query: str | None) -> dict[str, Any]:
+    def event_page(
+        self, *, limit: int, cursor: str | None, page: int | None, event_type: str | None, query: str | None
+    ) -> dict[str, Any]:
+        if cursor is not None and page is not None:
+            raise LedgerError("Specify either a cursor or a page, not both.")
         cursor_values = _decode_page_cursor(cursor, "events")
-        clauses: list[str] = []
-        parameters: list[Any] = []
+        filter_clauses: list[str] = []
+        filter_parameters: list[Any] = []
         if event_type is not None:
-            clauses.append("event_type = ?")
-            parameters.append(event_type)
+            filter_clauses.append("event_type = ?")
+            filter_parameters.append(event_type)
         if query is not None:
-            clauses.append("lower(concat_ws(' ', event_type, CAST(payload AS VARCHAR))) LIKE ?")
-            parameters.append(f"%{query.lower()}%")
+            filter_clauses.append("lower(concat_ws(' ', event_type, CAST(payload AS VARCHAR))) LIKE ?")
+            filter_parameters.append(f"%{query.lower()}%")
+        clauses = list(filter_clauses)
+        parameters = list(filter_parameters)
         if cursor_values is not None:
             clauses.append("(occurred_at < ? OR (occurred_at = ? AND event_id < ?))")
             parameters.extend([cursor_values["timestamp"], cursor_values["timestamp"], cursor_values["id"]])
         where = "" if not clauses else f"WHERE {' AND '.join(clauses)}"
+        filter_where = "" if not filter_clauses else f"WHERE {' AND '.join(filter_clauses)}"
         with self._lock:
+            total_items = self._connection.execute(
+                f"SELECT count(*) FROM events {filter_where}",
+                filter_parameters,
+            ).fetchone()[0]
+            row_limit = limit if page is not None else limit + 1
+            query_parameters = [*parameters, row_limit]
+            offset = ""
+            if page is not None:
+                offset = "OFFSET ?"
+                query_parameters.append((page - 1) * limit)
             rows = self._connection.execute(
                 f"""
                 SELECT event_id, event_type, payload, occurred_at FROM events {where}
                 ORDER BY occurred_at DESC, event_id DESC
                 LIMIT ?
+                {offset}
                 """,
-                [*parameters, limit + 1],
+                query_parameters,
             ).fetchall()
-        has_more = len(rows) > limit
+        has_more = page * limit < total_items if page is not None else len(rows) > limit
         items = [
             {"event_id": row[0], "event_type": row[1], "payload": json.loads(row[2]), "occurred_at": row[3]}
             for row in rows[:limit]
         ]
-        return _page(items, has_more, "events", "occurred_at", "event_id")
+        result = _page(items, has_more, "events", "occurred_at", "event_id")
+        result["total_items"] = total_items
+        return result
 
     def _event(self, event_type: str, payload: dict[str, Any]) -> int:
         row = self._connection.execute(

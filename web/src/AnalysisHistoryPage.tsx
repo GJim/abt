@@ -27,6 +27,7 @@ export type AnalysisSummary = {
 type AnalysisHistoryResponse = {
   items: AnalysisSummary[]
   next_cursor: string | null
+  total_items: number
 }
 
 type AnalysisHistoryPageProps = {
@@ -36,7 +37,6 @@ type AnalysisHistoryPageProps = {
 type AnalysisPage = AnalysisHistoryResponse
 
 type AnalysisRequest = {
-  cursor: string
   pageIndex: number
   query: string
   status: string
@@ -76,9 +76,7 @@ export function AnalysisHistoryPage({ onOpenAnalysis }: AnalysisHistoryPageProps
     if (request.status) {
       parameters.set('status', request.status)
     }
-    if (request.cursor) {
-      parameters.set('cursor', request.cursor)
-    }
+    parameters.set('page', String(request.pageIndex + 1))
 
     try {
       const response = await fetch(`/api/admin/product-catalog-analyses?${parameters}`, {
@@ -90,15 +88,20 @@ export function AnalysisHistoryPage({ onOpenAnalysis }: AnalysisHistoryPageProps
       }
 
       const payload = await response.json() as AnalysisHistoryResponse
-      if (!Array.isArray(payload.items) || (payload.next_cursor !== null && typeof payload.next_cursor !== 'string')) {
+      if (
+        !Array.isArray(payload.items)
+        || (payload.next_cursor !== null && typeof payload.next_cursor !== 'string')
+        || !Number.isSafeInteger(payload.total_items)
+        || payload.total_items < 0
+      ) {
         throw new Error('Analysis history returned an invalid response.')
       }
 
-      setPages((current) => [
-        ...current.slice(0, request.pageIndex),
-        payload,
-      ])
-      setPageIndex(request.pageIndex)
+      setPages((current) => {
+        const next = [...current]
+        next[request.pageIndex] = payload
+        return next
+      })
     } catch (caughtError) {
       if (controller.signal.aborted) {
         return
@@ -116,7 +119,7 @@ export function AnalysisHistoryPage({ onOpenAnalysis }: AnalysisHistoryPageProps
     const delay = window.setTimeout(() => {
       setPages([])
       setPageIndex(0)
-      void loadPage({ cursor: '', pageIndex: 0, query: normalizedSearch, status })
+      void loadPage({ pageIndex: 0, query: normalizedSearch, status })
     }, 250)
     return () => window.clearTimeout(delay)
   }, [loadPage, normalizedSearch, status])
@@ -136,11 +139,8 @@ export function AnalysisHistoryPage({ onOpenAnalysis }: AnalysisHistoryPageProps
       setPageIndex(nextPageIndex)
       return
     }
-    const cursor = pages[pageIndex]?.next_cursor
-    if (cursor) {
-      setPageIndex(nextPageIndex)
-      void loadPage({ cursor, pageIndex: nextPageIndex, query: normalizedSearch, status })
-    }
+    setPageIndex(nextPageIndex)
+    void loadPage({ pageIndex: nextPageIndex, query: normalizedSearch, status })
   }
 
   function openRow(analysisId: string, event: KeyboardEvent<HTMLTableRowElement>) {
@@ -152,36 +152,40 @@ export function AnalysisHistoryPage({ onOpenAnalysis }: AnalysisHistoryPageProps
 
   const currentPage = pages[pageIndex]
   const analyses = currentPage?.items ?? []
-  const hasNextPage = Boolean(currentPage?.next_cursor || pages[pageIndex + 1])
+  const totalItems = pages[0]?.total_items ?? 0
 
   return (
     <section aria-label="Analysis history">
       <div className="console-table-actions analysis-history-filters" role="search">
-        <label htmlFor="analysis-history-search">Search</label>
-        <input
-          id="analysis-history-search"
-          name="q"
-          type="search"
-          value={search}
-          onChange={(event) => {
-            setSearch(event.target.value)
-            setIsLoading(true)
-          }}
-          placeholder="Worker, server, policy, ID, or YYYYMMDD"
-        />
-        <label htmlFor="analysis-history-status">Status</label>
-        <select
-          id="analysis-history-status"
-          name="status"
-          value={status}
-          onChange={(event) => {
-            setStatus(event.target.value)
-            setIsLoading(true)
-          }}
-          disabled={isLoading}
-        >
-          {statusOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
-        </select>
+        <div className="analysis-history-filter analysis-history-search-filter">
+          <label htmlFor="analysis-history-search">Search</label>
+          <input
+            id="analysis-history-search"
+            name="q"
+            type="search"
+            value={search}
+            onChange={(event) => {
+              setSearch(event.target.value)
+              setIsLoading(true)
+            }}
+            placeholder="Worker, server, policy, ID, or YYYYMMDD"
+          />
+        </div>
+        <div className="analysis-history-filter">
+          <label htmlFor="analysis-history-status">Status</label>
+          <select
+            id="analysis-history-status"
+            name="status"
+            value={status}
+            onChange={(event) => {
+              setStatus(event.target.value)
+              setIsLoading(true)
+            }}
+            disabled={isLoading}
+          >
+            {statusOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+          </select>
+        </div>
       </div>
 
       {isLoading && analyses.length === 0 ? (
@@ -245,13 +249,13 @@ export function AnalysisHistoryPage({ onOpenAnalysis }: AnalysisHistoryPageProps
 
           <div className="console-pagination">
             <Pagination
-              hasMore={hasNextPage}
               isDisabled={isLoading}
               label="Analysis history pages"
               onChange={changePage}
               page={pageIndex + 1}
               pageSize={PAGE_SIZE}
               size="sm"
+              totalItems={totalItems}
             />
           </div>
         </>

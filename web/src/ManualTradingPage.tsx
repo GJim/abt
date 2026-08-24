@@ -254,12 +254,6 @@ export function ManualTradingPage({
     })) ?? []
   }, [firstWorkerId, pair, secondWorkerId, target, workers])
   return <section aria-labelledby="manual-trading-heading">
-    <header className="console-page-header">
-      <div>
-        <h1 id="manual-trading-heading">Manual trading</h1>
-        <p>Configure the shared target, then review both accounts before any paired-trade command.</p>
-      </div>
-    </header>
     {message ? <p role="status">{message}</p> : null}
     <form className="analysis-form launch-form" onSubmit={(event) => void save(event)}>
       <h2>Current target</h2>

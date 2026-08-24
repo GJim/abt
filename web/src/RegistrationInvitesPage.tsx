@@ -77,14 +77,8 @@ export function RegistrationInvitesPage({ csrfToken }: { csrfToken: string }) {
 
   return (
     <section aria-label="Registration invite management">
-      <header className="console-page-header">
-        <div>
-          <h1>Registration invites</h1>
-          <p>Issue role-bound enrollment credentials. The secret is shown exactly once.</p>
-        </div>
-      </header>
       {error ? <p className="error" role="alert">{error}</p> : null}
-      <section aria-labelledby="issue-registration-invite">
+      <section aria-labelledby="issue-registration-invite" className="registration-invite-issue">
         <h2 id="issue-registration-invite">Issue invite</h2>
         <label>Role
           <select value={role} onChange={(event) => setRole(event.target.value as RegistrationInvite['role'])}>
@@ -94,7 +88,7 @@ export function RegistrationInvitesPage({ csrfToken }: { csrfToken: string }) {
         </label>{' '}
         <button type="button" onClick={() => void issue()}>Issue invite</button>
       </section>
-      <section aria-labelledby="registration-invite-history">
+      <section aria-labelledby="registration-invite-history" className="registration-invite-history">
         <h2 id="registration-invite-history">Invite history</h2>
         {invites.length === 0 ? <p>No registration invites have been issued.</p> : (
           <table className="console-table">

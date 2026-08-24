@@ -1,5 +1,6 @@
 # Local Hermes state and generated skill metadata
 .hermes/
+.impeccable
 skills-lock.json
 .venv/
 abt.egg-info/
