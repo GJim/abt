@@ -414,7 +414,8 @@ export function ManualTradingPage({
       {trades.length === 0 ? <p className="console-empty-state">No scheduled, active, or human-review manual trades.</p> : (
         <ul className="manual-trade-list">
           {trades.map((trade) => {
-            const canClose = trade.status === 'active' || trade.status === 'needs_human'
+            const hasConfirmedPosition = trade.legs.some((leg) => leg.position_ticket !== null)
+            const canClose = hasConfirmedPosition && (trade.status === 'active' || trade.status === 'needs_human')
             const canDiscard = trade.status === 'needs_human' && trade.legs.every(
               (leg) => leg.market_order_ticket === null && leg.position_ticket === null,
             )
