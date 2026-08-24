@@ -13,6 +13,7 @@ from abt.worker.reconciliation import (
     _mt5_last_error,
     _broker_order_request,
     _order_check_diagnostics,
+    _serve_order_execute,
     _serve_execution_recovery,
     reconnect_worker_session,
     reconcile_authenticated_worker,
@@ -80,6 +81,45 @@ class WorkerReconciliationTests(unittest.TestCase):
 
         self.assertEqual(1.1002, buy["price"])
         self.assertEqual(1.1, sell["price"])
+
+    def test_order_execution_reports_disabled_terminal_before_sending(self) -> None:
+        class DisabledTerminalMT5:
+            def terminal_info(self) -> object:
+                return {"trade_allowed": False, "tradeapi_disabled": False}
+
+            def order_send(self, _request: dict[str, object]) -> object:
+                raise AssertionError("A disabled terminal must not receive an order.")
+
+        class Session:
+            error: dict[str, object] | None = None
+
+            def send_order_execute_error(self, **kwargs: object) -> None:
+                self.error = kwargs
+
+        session = Session()
+        _serve_order_execute(
+            DisabledTerminalMT5(),  # type: ignore[arg-type]
+            session,  # type: ignore[arg-type]
+            {
+                "request_id": "request-1",
+                "order": {
+                    "action": "market",
+                    "symbol": "USDJPY",
+                    "volume": "5",
+                    "direction": "LONG",
+                    "filling_mode": "FOK",
+                    "control_plane_command_id": "manual-1",
+                },
+            },
+        )
+
+        self.assertEqual(
+            {
+                "request_id": "request-1",
+                "reason": "The local MT5 terminal has algorithmic trading disabled.",
+            },
+            session.error,
+        )
 
     def test_execution_reconciliation_includes_position_open_price(self) -> None:
         class ReconciliationMT5:

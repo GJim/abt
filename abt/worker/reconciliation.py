@@ -626,6 +626,7 @@ def _serve_order_execute(mt5: ReadOnlyMT5, session: AnalysisWorkerSession, reque
         session.send_order_execute_error(request_id=request_id, reason="The controller requested an invalid order execution.")
         return
     try:
+        _require_terminal_trading_permission(mt5)
         broker_request = _broker_order_request(mt5, order)
         sent = mt5.order_send(broker_request)
         result = _evidence(sent, "order execution")
@@ -754,6 +755,17 @@ def _broker_order_request(mt5: object, order: dict[str, object]) -> dict[str, ob
         except (TypeError, ValueError, AttributeError) as error:
             raise WorkerEnrollmentError("The controller requested an invalid protection update.") from error
     return _broker_limit_request(mt5, order)
+
+
+def _require_terminal_trading_permission(mt5: object) -> None:
+    terminal_info = getattr(mt5, "terminal_info", None)
+    if not callable(terminal_info):
+        raise WorkerEnrollmentError("The local MT5 terminal status is unavailable.")
+    terminal = _evidence(terminal_info(), "terminal info")
+    if terminal.get("trade_allowed") is False:
+        raise WorkerEnrollmentError("The local MT5 terminal has algorithmic trading disabled.")
+    if terminal.get("tradeapi_disabled") is True:
+        raise WorkerEnrollmentError("The local MT5 terminal has disabled Python trading.")
 
 
 def _broker_limit_request(mt5: object, order: dict[str, object]) -> dict[str, object]:
