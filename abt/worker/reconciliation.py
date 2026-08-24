@@ -702,7 +702,10 @@ def _serve_execution_recovery(mt5: ReadOnlyMT5, session: AnalysisWorkerSession, 
         if operation in {"execution_cancel", "worker_cleanup_cancel"}:
             result = _evidence(mt5.order_send({"action": getattr(mt5, "TRADE_ACTION_REMOVE"), "order": ticket}), "order cancellation")
         elif operation in {"execution_close", "worker_cleanup_close"}:
-            position = next((item for item in _records(mt5.positions_get(), "position") if str(item.get("ticket")) == str(ticket)), None)
+            position = next(
+                (item for item in _records(mt5.positions_get(), "position").values() if str(item.get("ticket")) == str(ticket)),
+                None,
+            )
             if position is None or position.get("symbol") is None or position.get("type") is None:
                 raise WorkerEnrollmentError("The execution position is no longer observable.")
             close_type = getattr(mt5, "ORDER_TYPE_SELL") if position["type"] == getattr(mt5, "POSITION_TYPE_BUY") else getattr(mt5, "ORDER_TYPE_BUY")

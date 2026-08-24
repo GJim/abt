@@ -172,6 +172,42 @@ class WorkerReconciliationTests(unittest.TestCase):
             session.response,
         )
 
+    def test_execution_close_uses_position_record_not_ticket_key(self) -> None:
+        class CloseMT5:
+            POSITION_TYPE_BUY = 0
+            ORDER_TYPE_SELL = 1
+            ORDER_TYPE_BUY = 0
+            TRADE_ACTION_DEAL = 1
+            ORDER_FILLING_IOC = 1
+            TRADE_RETCODE_DONE = 10009
+
+            def positions_get(self) -> object:
+                return [{"ticket": 901, "symbol": "EURUSD", "type": self.POSITION_TYPE_BUY, "volume": 0.1}]
+
+            def symbol_info_tick(self, _symbol: str) -> object:
+                return {"bid": 1.1, "ask": 1.1002}
+
+            def order_send(self, request: dict[str, object]) -> object:
+                self.request = request
+                return {"retcode": self.TRADE_RETCODE_DONE}
+
+        class Session:
+            response: dict[str, object] | None = None
+
+            def send_execution_recovery(self, **kwargs: object) -> None:
+                self.response = kwargs
+
+        mt5 = CloseMT5()
+        session = Session()
+        _serve_execution_recovery(
+            mt5,  # type: ignore[arg-type]
+            session,  # type: ignore[arg-type]
+            {"type": "execution_close_request", "request_id": "request-1", "ticket": "901", "volume": "0.1"},
+        )
+
+        self.assertEqual(901, mt5.request["position"])
+        self.assertEqual({"request_id": "request-1", "operation": "execution_close", "accepted": True, "result": {"retcode": 10009}}, session.response)
+
     def test_publishes_diff_only_live_market_state_on_the_required_schedules(self) -> None:
         class LiveMT5(ReadOnlyMT5):
             def symbol_info_tick(self, symbol: str) -> object:
