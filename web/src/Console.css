@@ -224,6 +224,155 @@
   background: color-mix(in srgb, var(--console-accent) 10%, transparent);
 }
 
+.manual-trading-page,
+.manual-target-form,
+.manual-entry-form,
+.manual-trades-section,
+.manual-live-state {
+  display: grid;
+  min-width: 0;
+  gap: 0.75rem;
+}
+
+.manual-trading-page {
+  gap: 1.5rem;
+}
+
+.manual-target-form,
+.manual-entry-form,
+.manual-trades-section,
+.manual-live-state {
+  padding-block: 1rem;
+  border-block: 1px solid var(--console-rule);
+}
+
+.manual-target-form h2,
+.manual-entry-form h2,
+.manual-section-header h2,
+.manual-trade-record h3 {
+  margin: 0;
+}
+
+.manual-target-form p,
+.manual-entry-form p,
+.manual-section-header p,
+.manual-trade-record header p {
+  max-width: 75ch;
+  margin: 0.25rem 0 0;
+  color: var(--console-muted);
+  font-size: 0.875rem;
+}
+
+.manual-form-grid,
+.manual-protection-fields {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.75rem;
+}
+
+.manual-form-grid label,
+.manual-protection-fields label {
+  min-width: 0;
+}
+
+.manual-form-actions,
+.manual-trade-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.manual-form-actions > button,
+.manual-trade-actions > button,
+.manual-protection-fields > button {
+  width: fit-content;
+}
+
+.manual-trading-message {
+  margin: 0;
+  padding: 0.75rem;
+  color: var(--console-info);
+  background: color-mix(in srgb, var(--console-info) 7%, var(--console-surface));
+  border: 1px solid color-mix(in srgb, var(--console-info) 35%, var(--console-rule));
+  overflow-wrap: anywhere;
+}
+
+.manual-trade-list {
+  display: grid;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  border-top: 1px solid var(--console-rule);
+}
+
+.manual-trade-list > .manual-trade-record {
+  display: grid;
+  min-width: 0;
+  gap: 0.75rem;
+  padding: 0.875rem 0;
+  border-top: 0;
+  border-bottom: 1px solid var(--console-rule);
+}
+
+.manual-trade-record header {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: 0.75rem;
+  min-width: 0;
+}
+
+.manual-trade-record header > div {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.manual-trade-legs {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.5rem 1rem;
+  min-width: 0;
+  margin: 0;
+}
+
+.manual-trade-legs > div {
+  display: grid;
+  min-width: 0;
+  gap: 0.2rem;
+}
+
+.manual-trade-legs dt {
+  color: var(--console-muted);
+  font-size: 0.6875rem;
+  font-weight: 750;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+
+.manual-trade-legs dd {
+  display: grid;
+  min-width: 0;
+  gap: 0.15rem;
+  margin: 0;
+  color: var(--console-ink);
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+
+.manual-trade-legs dd span {
+  color: var(--console-muted);
+  font-size: 0.8125rem;
+}
+
+.manual-protection-fields {
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
+  align-items: end;
+  padding-top: 0.75rem;
+  border-top: 1px solid var(--console-rule);
+}
+
 .console-table-actions {
   flex-wrap: wrap;
   min-height: 2.75rem;
@@ -931,6 +1080,27 @@
 
   .console-notification-connection {
     display: none;
+  }
+
+  .manual-form-grid,
+  .manual-trade-legs,
+  .manual-protection-fields {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .manual-trade-record header {
+    align-items: start;
+    flex-direction: column;
+  }
+
+  .manual-trade-record header .console-status {
+    align-self: start;
+  }
+
+  .manual-form-actions > button,
+  .manual-trade-actions > button,
+  .manual-protection-fields > button {
+    width: 100%;
   }
 }
 

@@ -205,8 +205,8 @@ class ManualTradingTargetRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     pair_id: str = Field(min_length=1)
-    first_worker_id: str = Field(min_length=1)
-    second_worker_id: str = Field(min_length=1)
+    buy_worker_id: str = Field(min_length=1)
+    sell_worker_id: str = Field(min_length=1)
     leg_order: Literal["buy_to_sell", "sell_to_buy"]
     interval_seconds: int = Field(ge=0)
     expected_revision: int = Field(ge=0)
@@ -217,8 +217,6 @@ class ManualTradeEntryRequest(BaseModel):
 
     command_id: str = Field(min_length=1, max_length=128)
     target_revision: int = Field(ge=1)
-    buy_worker_id: str = Field(min_length=1)
-    sell_worker_id: str = Field(min_length=1)
     base_lots: Decimal = Field(gt=0)
     stop_loss_pips: Decimal = Field(gt=0)
     take_profit_pips: Decimal = Field(gt=0)
@@ -938,20 +936,31 @@ def create_app(
         except LedgerError as error:
             raise HTTPException(status_code=_ledger_error_status(error), detail=str(error)) from error
 
-    @app.post("/api/admin/manual-trades/active/exit/preview")
+    @app.get("/api/admin/manual-trades")
+    def list_active_manual_trades(
+        abt_admin_session: Annotated[str | None, Cookie()] = None,
+    ) -> list[dict[str, object]]:
+        _require_admin(ledger, abt_admin_session)
+        return ledger.active_manual_trades()
+
+    @app.post("/api/admin/manual-trades/{manual_trade_id}/exit/preview")
     def preview_active_manual_trade_exit(
+        manual_trade_id: str,
         body: ManualTradeExitRequest,
         abt_admin_session: Annotated[str | None, Cookie()] = None,
         x_csrf_token: Annotated[str | None, Header()] = None,
     ) -> dict[str, object]:
         _require_admin(ledger, abt_admin_session, x_csrf_token, require_csrf=True)
         try:
-            return ledger.preview_active_manual_trade_operation("exit", body.model_dump(exclude={"command_id"}))
+            return ledger.preview_active_manual_trade_operation(
+                manual_trade_id, "exit", body.model_dump(exclude={"command_id"})
+            )
         except LedgerError as error:
             raise HTTPException(status_code=_ledger_error_status(error), detail=str(error)) from error
 
-    @app.post("/api/admin/manual-trades/active/exit", status_code=status.HTTP_201_CREATED)
+    @app.post("/api/admin/manual-trades/{manual_trade_id}/exit", status_code=status.HTTP_201_CREATED)
     async def exit_active_manual_trade(
+        manual_trade_id: str,
         body: ManualTradeExitRequest,
         abt_admin_session: Annotated[str | None, Cookie()] = None,
         x_csrf_token: Annotated[str | None, Header()] = None,
@@ -959,7 +968,7 @@ def create_app(
         username = _require_admin(ledger, abt_admin_session, x_csrf_token, require_csrf=True)
         try:
             result = ledger.request_active_manual_trade_operation(
-                username, body.command_id, "exit", body.model_dump(exclude={"command_id"})
+                username, body.command_id, manual_trade_id, "exit", body.model_dump(exclude={"command_id"})
             )
             if result["status"] == "scheduled":
                 asyncio.create_task(
@@ -971,8 +980,9 @@ def create_app(
         except LedgerError as error:
             raise HTTPException(status_code=_ledger_error_status(error), detail=str(error)) from error
 
-    @app.post("/api/admin/manual-trades/active/protection/preview")
+    @app.post("/api/admin/manual-trades/{manual_trade_id}/protection/preview")
     def preview_active_manual_trade_protection(
+        manual_trade_id: str,
         body: ManualTradeProtectionRequest,
         abt_admin_session: Annotated[str | None, Cookie()] = None,
         x_csrf_token: Annotated[str | None, Header()] = None,
@@ -980,13 +990,14 @@ def create_app(
         _require_admin(ledger, abt_admin_session, x_csrf_token, require_csrf=True)
         try:
             return ledger.preview_active_manual_trade_operation(
-                "protection", body.model_dump(mode="json", exclude={"command_id"})
+                manual_trade_id, "protection", body.model_dump(mode="json", exclude={"command_id"})
             )
         except LedgerError as error:
             raise HTTPException(status_code=_ledger_error_status(error), detail=str(error)) from error
 
-    @app.post("/api/admin/manual-trades/active/protection", status_code=status.HTTP_201_CREATED)
+    @app.post("/api/admin/manual-trades/{manual_trade_id}/protection", status_code=status.HTTP_201_CREATED)
     async def update_active_manual_trade_protection(
+        manual_trade_id: str,
         body: ManualTradeProtectionRequest,
         abt_admin_session: Annotated[str | None, Cookie()] = None,
         x_csrf_token: Annotated[str | None, Header()] = None,
@@ -994,7 +1005,7 @@ def create_app(
         username = _require_admin(ledger, abt_admin_session, x_csrf_token, require_csrf=True)
         try:
             result = ledger.request_active_manual_trade_operation(
-                username, body.command_id, "protection", body.model_dump(mode="json", exclude={"command_id"})
+                username, body.command_id, manual_trade_id, "protection", body.model_dump(mode="json", exclude={"command_id"})
             )
             if result["status"] == "scheduled":
                 asyncio.create_task(
@@ -2805,6 +2816,8 @@ async def _dispatch_manual_trade(
             first_order = _manual_market_order(legs[0], execution_id)
             first_response = await _request_order_execute(connections[0], first_order)
             first_fill = _manual_fill_price(first_response, first_order)
+            first_market_order_ticket = _manual_market_order_ticket(first_response)
+            first_position_ticket = _manual_position_ticket(first_response)
             first_protection = _manual_protection_order(legs[0], first_response, first_fill)
             protection_response = await _request_order_execute(connections[0], first_protection)
             if protection_response.get("accepted") is not True or protection_response.get("order") != first_protection:
@@ -2824,6 +2837,8 @@ async def _dispatch_manual_trade(
             second_order = _manual_market_order(legs[1], execution_id)
             second_response = await _request_order_execute(connections[1], second_order)
             second_fill = _manual_fill_price(second_response, second_order)
+            second_market_order_ticket = _manual_market_order_ticket(second_response)
+            second_position_ticket = _manual_position_ticket(second_response)
             second_protection = _manual_protection_order(legs[1], second_response, second_fill)
             second_protection_response = await _request_order_execute(connections[1], second_protection)
             if second_protection_response.get("accepted") is not True or second_protection_response.get("order") != second_protection:
@@ -2831,8 +2846,18 @@ async def _dispatch_manual_trade(
             ledger.activate_manual_trade(
                 manual_trade_id,
                 [
-                    {"worker_id": str(legs[0]["worker_id"]), "position": str(first_protection["position"]), "fill_price": str(first_fill)},
-                    {"worker_id": str(legs[1]["worker_id"]), "position": str(second_protection["position"]), "fill_price": str(second_fill)},
+                    {
+                        "worker_id": str(legs[0]["worker_id"]),
+                        "market_order_ticket": first_market_order_ticket,
+                        "position_ticket": first_position_ticket,
+                        "fill_price": str(first_fill),
+                    },
+                    {
+                        "worker_id": str(legs[1]["worker_id"]),
+                        "market_order_ticket": second_market_order_ticket,
+                        "position_ticket": second_position_ticket,
+                        "fill_price": str(second_fill),
+                    },
                 ],
             )
             ledger.record_manual_trade_event(
@@ -2870,13 +2895,28 @@ def _manual_fill_price(response: dict[str, object], order: dict[str, object]) ->
     return fill_price
 
 
-def _manual_protection_order(
-    leg: dict[str, object], market_response: dict[str, object], fill_price: Decimal
-) -> dict[str, object]:
-    result = cast(dict[str, object], market_response["result"])
+def _manual_market_order_ticket(response: dict[str, object]) -> str:
+    result = response.get("result")
+    ticket = None if not isinstance(result, dict) else result.get("order")
+    if isinstance(ticket, bool) or not isinstance(ticket, (str, int)) or not str(ticket):
+        raise LedgerError("Manual-trade market order did not return a broker order ticket.")
+    return str(ticket)
+
+
+def _manual_position_ticket(response: dict[str, object]) -> str:
+    result = response.get("result")
+    if not isinstance(result, dict):
+        raise LedgerError("Manual-trade market order did not return a position reference.")
     ticket = result.get("position", result.get("order"))
     if isinstance(ticket, bool) or not isinstance(ticket, (str, int)) or not str(ticket):
         raise LedgerError("Manual-trade market order did not return a position reference.")
+    return str(ticket)
+
+
+def _manual_protection_order(
+    leg: dict[str, object], market_response: dict[str, object], fill_price: Decimal
+) -> dict[str, object]:
+    ticket = _manual_position_ticket(market_response)
     pip_size = Decimal(str(leg["pip_size"]))
     stop_loss_pips = Decimal(str(cast(dict[str, object], leg).get("stop_loss_pips", "0")))
     take_profit_pips = Decimal(str(cast(dict[str, object], leg).get("take_profit_pips", "0")))
@@ -2886,7 +2926,7 @@ def _manual_protection_order(
     return {
         "action": "protect",
         "symbol": str(leg["symbol"]),
-        "position": str(ticket),
+        "position": ticket,
         "sl": str(fill_price - stop_loss_pips * pip_size if buy else fill_price + stop_loss_pips * pip_size),
         "tp": str(fill_price + take_profit_pips * pip_size if buy else fill_price - take_profit_pips * pip_size),
     }
@@ -2927,25 +2967,38 @@ async def _dispatch_manual_trade_operation(
             ]
             execution_id = f"abt:m:{hashlib.sha256(str(record['manual_trade_id']).encode()).hexdigest()[:24]}"
             observed = await _reconcile_execution(connections, execution_id)
-            positions = []
-            for leg, observed_leg in zip(legs, observed, strict=True):
+            positions: list[tuple[_WorkerSessionConnection, dict[str, str]]] = []
+            externally_closed = False
+            for connection, leg, observed_leg in zip(connections, legs, observed, strict=True):
                 position = next((item for item in observed_leg["positions"] if item["ticket"] == leg["position"]), None)
                 if position is None:
-                    raise LedgerError("Active manual-trade position could not be reconciled.")
-                positions.append(position)
+                    externally_closed = True
+                    continue
+                positions.append((connection, position))
             if record["operation"] == "exit":
                 responses = await asyncio.gather(*(
                     _execution_recovery_request(
                         connection, "execution_close", {"ticket": position["ticket"], "volume": position["volume"]}
                     )
-                    for connection, position in zip(connections, positions, strict=True)
+                    for connection, position in positions
                 ))
                 if any(response.get("accepted") is not True for response in responses):
-                    raise LedgerError("Manual-trade full exit was not confirmed for both legs.")
+                    raise LedgerError("Manual-trade exit was not confirmed for every remaining position.")
                 final = await _reconcile_execution(connections, execution_id)
                 if any(leg["orders"] or leg["positions"] for leg in final):
                     raise LedgerError("Manual-trade full exit did not prove zero exposure.")
+                if externally_closed:
+                    _freeze_manual_trade_operation(
+                        ledger,
+                        operation_id,
+                        record,
+                        worker_ids,
+                        "A manual-trade leg was already closed externally; the verified remaining positions were closed.",
+                    )
+                    return
             else:
+                if externally_closed:
+                    raise LedgerError("Active manual-trade position could not be reconciled.")
                 orders = [
                     {
                         "action": "protect", "symbol": str(leg["symbol"]), "position": str(leg["position"]),
@@ -2963,13 +3016,23 @@ async def _dispatch_manual_trade_operation(
                 operation_id, "manual_trade_operation_completed", {"plan": plan}, status="completed"
             )
     except (KeyError, LedgerError, ValueError, asyncio.TimeoutError) as error:
-        ledger.record_manual_trade_operation(
-            operation_id, "manual_trade_operation_frozen", {"reason": str(error)}, status="needs_human"
-        )
-        ledger.freeze_workers(
-            "manual_trade_operation_anomaly", worker_ids,
-            {"manual_trade_id": record["manual_trade_id"], "operation_id": operation_id, "reason": str(error)},
-        )
+        _freeze_manual_trade_operation(ledger, operation_id, record, worker_ids, str(error))
+
+
+def _freeze_manual_trade_operation(
+    ledger: ControlLedger,
+    operation_id: str,
+    record: dict[str, object],
+    worker_ids: list[str],
+    reason: str,
+) -> None:
+    ledger.record_manual_trade_operation(
+        operation_id, "manual_trade_operation_frozen", {"reason": reason}, status="needs_human"
+    )
+    ledger.freeze_workers(
+        "manual_trade_operation_anomaly", worker_ids,
+        {"manual_trade_id": record["manual_trade_id"], "operation_id": operation_id, "reason": reason},
+    )
 
 
 async def _cancel_intent(

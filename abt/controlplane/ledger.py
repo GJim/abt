@@ -1845,14 +1845,11 @@ class ControlLedger:
             pair = self._product_pair_by_id(row[0])
             workers_by_id = {worker["worker_id"]: worker for worker in self.worker_reconciliation()}
             worker_ids = [row[1], row[2]]
-            if any(worker_id not in workers_by_id for worker_id in worker_ids):
-                raise LedgerError("Manual-trading target references a worker that no longer exists.")
             return {
                 "pair": pair,
-                "workers": [
-                    {**workers_by_id[worker_id], "endpoint": pair["endpoints"][index]}
-                    for index, worker_id in enumerate(worker_ids)
-                ],
+                "workers": self._manual_target_workers(pair, worker_ids, workers_by_id),
+                "buy_worker_id": row[1],
+                "sell_worker_id": row[2],
                 "leg_order": row[3],
                 "interval_seconds": row[4],
                 "revision": row[5],
@@ -1861,13 +1858,82 @@ class ControlLedger:
                 "configured_at": row[8],
             }
 
+    def _manual_target_workers(
+        self, pair: dict[str, Any], worker_ids: list[str], workers_by_id: dict[str, dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        selected: list[dict[str, Any]] = []
+        used_endpoints: set[tuple[str, str]] = set()
+        for worker_id in worker_ids:
+            worker = workers_by_id.get(worker_id)
+            if worker is None:
+                raise LedgerError("Manual-trading target references a worker that no longer exists.")
+            matches = [endpoint for endpoint in pair["endpoints"] if endpoint["server"] == worker["server"]]
+            if len(matches) != 1:
+                raise LedgerError("Manual-trading target worker must match exactly one product-pair endpoint.")
+            endpoint = matches[0]
+            endpoint_key = (str(endpoint["server"]), str(endpoint["symbol"]))
+            if endpoint_key in used_endpoints:
+                raise LedgerError("Manual-trading target requires workers for different product-pair endpoints.")
+            used_endpoints.add(endpoint_key)
+            selected.append({**worker, "endpoint": endpoint})
+        return selected
+
+    def active_manual_trades(self) -> list[dict[str, Any]]:
+        with self._lock:
+            workers_by_id = {worker["worker_id"]: worker for worker in self.worker_reconciliation()}
+            rows = self._connection.execute(
+                """SELECT manual_trade_id, pair_id, plan, status, created_at
+                   FROM manual_trades
+                   WHERE status IN ('scheduled', 'dispatching', 'active', 'needs_human')
+                   ORDER BY created_at DESC"""
+            ).fetchall()
+            trades: list[dict[str, Any]] = []
+            for manual_trade_id, pair_id, serialized_plan, status, created_at in rows:
+                plan = json.loads(serialized_plan)
+                active_by_worker = {
+                    str(leg["worker_id"]): leg for leg in plan.get("active_legs", []) if isinstance(leg, dict)
+                }
+                legs = []
+                for leg in plan.get("legs", []):
+                    worker_id = str(leg["worker_id"])
+                    active = active_by_worker.get(worker_id)
+                    market_order_ticket = None if active is None else active.get(
+                        "market_order_ticket", active.get("order")
+                    )
+                    position_ticket = None if active is None else active.get(
+                        "position_ticket", active.get("position")
+                    )
+                    position = None if position_ticket is None else str(position_ticket)
+                    worker = workers_by_id.get(worker_id)
+                    live_positions = [] if worker is None or worker["live_state"] is None else worker["live_state"]["positions"]
+                    position_open = bool(position) and any(str(item.get("ticket")) == position for item in live_positions)
+                    legs.append({
+                        "worker_id": worker_id,
+                        "login": None if worker is None else worker["login"],
+                        "server": None if worker is None else worker["server"],
+                        "symbol": leg["symbol"],
+                        "direction": leg["direction"],
+                        "lots": leg["lots"],
+                        "market_order_ticket": None if market_order_ticket is None else str(market_order_ticket),
+                        "position_ticket": position,
+                        "position_status": "open" if position_open else "closed" if position else "pending",
+                    })
+                trades.append({
+                    "manual_trade_id": manual_trade_id,
+                    "pair_id": pair_id,
+                    "status": status,
+                    "created_at": created_at,
+                    "legs": legs,
+                })
+            return trades
+
     def configure_manual_trading_target(
         self,
         username: str,
         *,
         pair_id: str,
-        first_worker_id: str,
-        second_worker_id: str,
+        buy_worker_id: str,
+        sell_worker_id: str,
         leg_order: str,
         interval_seconds: int,
         expected_revision: int,
@@ -1883,9 +1949,7 @@ class ControlLedger:
             actual_revision = 0 if current is None else current[0]
             if expected_revision != actual_revision:
                 raise LedgerError("Manual-trading target revision does not match the current target.")
-            if current is not None and current[1] is not None:
-                raise LedgerError("Manual-trading target cannot be replaced while its manual trade is active.")
-            if first_worker_id == second_worker_id:
+            if buy_worker_id == sell_worker_id:
                 raise LedgerError("Manual-trading target requires two different workers.")
             pair = self._product_pair_by_id(pair_id)
             if pair["status"] != "active":
@@ -1895,17 +1959,16 @@ class ControlLedger:
                 for worker in self._product_pair_with_worker_applicability(pair)["worker_applicability"]
             }
             workers_by_id = {worker["worker_id"]: worker for worker in self.worker_reconciliation()}
-            for index, worker_id in enumerate((first_worker_id, second_worker_id)):
+            for worker_id in (buy_worker_id, sell_worker_id):
                 worker = workers_by_id.get(worker_id)
                 eligible = applicability.get(worker_id)
                 if worker is None or eligible is None or eligible["applicability_status"] != "applicable":
                     raise LedgerError("Manual-trading target worker is not applicable to the selected product pair.")
-                if worker["server"] != pair["endpoints"][index]["server"]:
-                    raise LedgerError("Manual-trading target workers must match the selected endpoint order.")
                 if worker["connectivity"] != "connected" or worker["live_state"] is None or not worker["live_state"]["connectivity"]:
                     raise LedgerError("Manual-trading target workers must be connected.")
                 if worker["safety_state"] != "connected":
                     raise LedgerError("Frozen workers cannot be selected for manual trading.")
+            self._manual_target_workers(pair, [buy_worker_id, sell_worker_id], workers_by_id)
             revision = actual_revision + 1
             now = _utc_now()
             self._connection.execute(
@@ -1917,15 +1980,16 @@ class ControlLedger:
                        pair_id = excluded.pair_id, first_worker_id = excluded.first_worker_id,
                        second_worker_id = excluded.second_worker_id, leg_order = excluded.leg_order,
                        interval_seconds = excluded.interval_seconds, revision = excluded.revision,
+                       active_manual_trade_id = NULL,
                        configured_by = excluded.configured_by, configured_at = excluded.configured_at""",
-                [pair_id, first_worker_id, second_worker_id, leg_order, interval_seconds, revision, username, now],
+                [pair_id, buy_worker_id, sell_worker_id, leg_order, interval_seconds, revision, username, now],
             )
             self._event(
                 "manual_trading_target_configured",
                 {
                     "pair_id": pair_id,
-                    "first_worker_id": first_worker_id,
-                    "second_worker_id": second_worker_id,
+                    "buy_worker_id": buy_worker_id,
+                    "sell_worker_id": sell_worker_id,
                     "leg_order": leg_order,
                     "interval_seconds": interval_seconds,
                     "revision": revision,
@@ -1965,14 +2029,6 @@ class ControlLedger:
                     json.dumps(plan, separators=(",", ":"), sort_keys=True), now,
                 ],
             )
-            updated = self._connection.execute(
-                """UPDATE manual_trading_target SET active_manual_trade_id = ?
-                   WHERE singleton = TRUE AND revision = ? AND active_manual_trade_id IS NULL
-                   RETURNING pair_id""",
-                [manual_trade_id, plan["target_revision"]],
-            ).fetchone()
-            if updated is None:
-                raise LedgerError("Manual-trading target changed or already has an active manual trade.")
             event_id = self._event(
                 "manual_trade_scheduled",
                 {"manual_trade_id": manual_trade_id, "username": username, "command_id": command_id, "plan": plan},
@@ -2038,16 +2094,12 @@ class ControlLedger:
             )
 
     def _manual_trade_plan(self, payload: dict[str, Any]) -> dict[str, Any]:
-        required = {
-            "target_revision", "buy_worker_id", "sell_worker_id", "base_lots", "stop_loss_pips", "take_profit_pips"
-        }
+        required = {"target_revision", "base_lots", "stop_loss_pips", "take_profit_pips"}
         if set(payload) != required:
             raise LedgerError("Manual-trade entry payload is invalid.")
         target = self.manual_trading_target()
         if target is None:
             raise LedgerError("Manual-trading target is not configured.")
-        if target["active_manual_trade_id"] is not None:
-            raise LedgerError("Manual-trading target already has an active manual trade.")
         if payload["target_revision"] != target["revision"]:
             raise LedgerError("Manual-trading target revision does not match the current target.")
         try:
@@ -2058,10 +2110,7 @@ class ControlLedger:
             raise LedgerError("Manual-trade lots and protection distances must be decimal values.") from error
         if min(base_lots, stop_loss_pips, take_profit_pips) <= 0:
             raise LedgerError("Manual-trade lots and protection distances must be positive.")
-        workers = {str(worker["worker_id"]): worker for worker in target["workers"]}
-        buy_worker_id, sell_worker_id = str(payload["buy_worker_id"]), str(payload["sell_worker_id"])
-        if {buy_worker_id, sell_worker_id} != set(workers) or buy_worker_id == sell_worker_id:
-            raise LedgerError("Manual-trade directions must use the two selected target workers exactly once.")
+        buy_worker_id, sell_worker_id = (str(worker["worker_id"]) for worker in target["workers"])
         pair = target["pair"]
         specifications = {
             (str(item["server"]), str(item["symbol"])): item["specification"]
@@ -2077,13 +2126,14 @@ class ControlLedger:
         if first_ratio <= 0 or second_ratio <= 0:
             raise LedgerError("Product pair has an invalid fixed lot relationship.")
         legs: list[dict[str, Any]] = []
-        for index, worker in enumerate(target["workers"]):
+        first_endpoint = pair["endpoints"][0]
+        for worker in target["workers"]:
             worker_id = str(worker["worker_id"])
             endpoint = worker["endpoint"]
             specification = specifications.get((str(endpoint["server"]), str(endpoint["symbol"])))
             if specification is None:
                 raise LedgerError("Product pair is missing endpoint trading specifications.")
-            lots = base_lots if index == 0 else base_lots * second_ratio / first_ratio
+            lots = base_lots if endpoint == first_endpoint else base_lots * second_ratio / first_ratio
             if not _exact_volume(lots, specification):
                 raise LedgerError("Derived manual-trade lots are not exactly valid for both endpoints.")
             direction = "BUY" if worker_id == buy_worker_id else "SELL"
@@ -2139,12 +2189,14 @@ class ControlLedger:
                 for row in rows
             ]
 
-    def preview_active_manual_trade_operation(self, operation: str, payload: dict[str, Any]) -> dict[str, Any]:
+    def preview_active_manual_trade_operation(
+        self, manual_trade_id: str, operation: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
         with self._lock:
-            return self._active_manual_trade_operation_plan(operation, payload)
+            return self._active_manual_trade_operation_plan(manual_trade_id, operation, payload)
 
     def request_active_manual_trade_operation(
-        self, username: str, command_id: str, operation: str, payload: dict[str, Any]
+        self, username: str, command_id: str, manual_trade_id: str, operation: str, payload: dict[str, Any]
     ) -> dict[str, Any]:
         canonical_payload = json.dumps({"operation": operation, **payload}, separators=(",", ":"), sort_keys=True)
         payload_hash = _hash(canonical_payload)
@@ -2158,7 +2210,7 @@ class ControlLedger:
                 if existing[0] != payload_hash:
                     raise LedgerError("Manual-trade command ID was reused with a different payload.")
                 return json.loads(existing[1])
-            plan = self._active_manual_trade_operation_plan(operation, payload)
+            plan = self._active_manual_trade_operation_plan(manual_trade_id, operation, payload)
             in_flight = self._connection.execute(
                 """SELECT 1 FROM manual_trade_operations
                    WHERE manual_trade_id = ? AND status IN ('scheduled', 'dispatching')""",
@@ -2247,12 +2299,20 @@ class ControlLedger:
                            WHERE singleton = TRUE AND active_manual_trade_id = ?""",
                         [row[0]],
                     )
+            elif status == "needs_human":
+                self._connection.execute(
+                    """UPDATE manual_trades SET status = 'needs_human'
+                       WHERE manual_trade_id = ? AND status != 'closed'""",
+                    [row[0]],
+                )
             if status is not None:
                 self._connection.execute(
                     "UPDATE manual_trade_operations SET status = ? WHERE operation_id = ?", [status, operation_id]
                 )
 
-    def _active_manual_trade_operation_plan(self, operation: str, payload: dict[str, Any]) -> dict[str, Any]:
+    def _active_manual_trade_operation_plan(
+        self, manual_trade_id: str, operation: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
         if operation == "exit":
             if payload:
                 raise LedgerError("Manual-trade full-exit payload is invalid.")
@@ -2268,24 +2328,30 @@ class ControlLedger:
                 raise LedgerError("Manual-trade protection distances must be positive.")
         else:
             raise LedgerError("Manual-trade operation is invalid.")
-        target = self.manual_trading_target()
-        if target is None or target["active_manual_trade_id"] is None:
-            raise LedgerError("Manual-trading target has no active manual trade.")
         row = self._connection.execute(
-            "SELECT plan, status FROM manual_trades WHERE manual_trade_id = ?", [target["active_manual_trade_id"]]
+            "SELECT plan, status FROM manual_trades WHERE manual_trade_id = ?", [manual_trade_id]
         ).fetchone()
-        if row is None or row[1] != "active":
-            raise LedgerError("Manual-trading target has no operable active manual trade.")
+        if row is None or row[1] not in {"active", "needs_human"}:
+            raise LedgerError("Manual trade has no operable active positions.")
+        if operation == "protection" and row[1] != "active":
+            raise LedgerError("Manual trade needs human review before protections can be updated.")
         trade_plan = json.loads(row[0])
-        active_by_worker = {item["worker_id"]: item for item in trade_plan.get("active_legs", [])}
+        active_by_worker = {
+            item["worker_id"]: item
+            for item in trade_plan.get("active_legs", [])
+            if isinstance(item, dict) and isinstance(item.get("worker_id"), str)
+        }
         legs: list[dict[str, Any]] = []
         for leg in trade_plan.get("legs", []):
             active = active_by_worker.get(leg.get("worker_id"))
-            if not isinstance(active, dict) or not isinstance(active.get("position"), str) or not active["position"]:
+            position_ticket = None if not isinstance(active, dict) else active.get(
+                "position_ticket", active.get("position")
+            )
+            if not isinstance(position_ticket, str) or not position_ticket:
                 raise LedgerError("Active manual trade is missing confirmed position evidence.")
             item = {
                 "worker_id": leg["worker_id"], "symbol": leg["symbol"], "direction": leg["direction"],
-                "lots": leg["lots"], "position": active["position"], "fill_price": active["fill_price"],
+                "lots": leg["lots"], "position": position_ticket, "fill_price": active["fill_price"],
             }
             if operation == "protection":
                 pip_size = Decimal(str(leg["pip_size"]))
@@ -2297,7 +2363,7 @@ class ControlLedger:
         if len(legs) != 2 or len({leg["worker_id"] for leg in legs}) != 2:
             raise LedgerError("Active manual trade has invalid leg evidence.")
         result: dict[str, Any] = {
-            "manual_trade_id": target["active_manual_trade_id"], "operation": operation, "legs": legs,
+            "manual_trade_id": manual_trade_id, "operation": operation, "legs": legs,
         }
         if operation == "protection":
             result["stop_loss_pips"] = str(stop_loss_pips)

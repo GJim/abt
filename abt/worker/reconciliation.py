@@ -671,10 +671,15 @@ def _serve_execution_recovery(mt5: ReadOnlyMT5, session: AnalysisWorkerSession, 
             position = next((item for item in _records(mt5.positions_get(), "position") if str(item.get("ticket")) == str(ticket)), None)
             if position is None or position.get("symbol") is None or position.get("type") is None:
                 raise WorkerEnrollmentError("The execution position is no longer observable.")
+            close_type = getattr(mt5, "ORDER_TYPE_SELL") if position["type"] == getattr(mt5, "POSITION_TYPE_BUY") else getattr(mt5, "ORDER_TYPE_BUY")
+            tick = _evidence(mt5.symbol_info_tick(str(position["symbol"])), "position close tick")
+            price_key = "bid" if close_type == getattr(mt5, "ORDER_TYPE_SELL") else "ask"
+            price = tick.get(price_key)
+            if isinstance(price, bool) or not isinstance(price, (int, float)) or price <= 0:
+                raise WorkerEnrollmentError("The execution close price is unavailable.")
             result = _evidence(mt5.order_send({
                 "action": getattr(mt5, "TRADE_ACTION_DEAL"), "position": ticket, "symbol": position["symbol"],
-                "volume": volume, "type": getattr(mt5, "ORDER_TYPE_SELL")
-                if position["type"] == getattr(mt5, "POSITION_TYPE_BUY") else getattr(mt5, "ORDER_TYPE_BUY"),
+                "volume": volume, "type": close_type, "price": price,
                 "type_filling": getattr(mt5, "ORDER_FILLING_IOC"),
             }), "position close")
         else:
@@ -698,11 +703,18 @@ def _broker_order_request(mt5: object, order: dict[str, object]) -> dict[str, ob
         if order.get("filling_mode") not in {"FOK", "IOC"} or not all(isinstance(order[field], str) and order[field] for field in required):
             raise WorkerEnrollmentError("The controller requested an invalid market order.")
         try:
+            order_type = getattr(mt5, "ORDER_TYPE_BUY" if order["direction"] == "LONG" else "ORDER_TYPE_SELL")
+            tick = _evidence(mt5.symbol_info_tick(str(order["symbol"])), "market order tick")
+            price_key = "ask" if order_type == getattr(mt5, "ORDER_TYPE_BUY") else "bid"
+            price = tick.get(price_key)
+            if isinstance(price, bool) or not isinstance(price, (int, float)) or price <= 0:
+                raise ValueError
             return {
                 "action": getattr(mt5, "TRADE_ACTION_DEAL"),
                 "symbol": order["symbol"],
                 "volume": float(str(order["volume"])),
-                "type": getattr(mt5, "ORDER_TYPE_BUY" if order["direction"] == "LONG" else "ORDER_TYPE_SELL"),
+                "type": order_type,
+                "price": price,
                 "type_filling": getattr(mt5, "ORDER_FILLING_FOK" if order["filling_mode"] == "FOK" else "ORDER_FILLING_IOC"),
                 "comment": order["control_plane_command_id"],
             }

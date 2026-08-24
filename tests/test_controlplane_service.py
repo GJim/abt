@@ -41,6 +41,7 @@ from abt.controlplane.secrets import SecretStore, SecretStoreError
 from abt.controlplane.service import (
     _analyze_product_catalogs,
     _cancel_intent,
+    _dispatch_manual_trade_operation,
     _cleanup_frozen_worker,
     _dispatch_accepted_trader_intent,
     _delete_expired_pending_secrets,
@@ -369,6 +370,97 @@ class TraderIntentPreflightTests(unittest.IsolatedAsyncioTestCase):
 
 
 class WorkerIsolationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_exit_closes_verified_remaining_leg_and_marks_external_closure_for_human_review(self) -> None:
+        first_connection = object()
+        second_connection = object()
+        closed_tickets: list[str] = []
+        events: list[tuple[str, str | None, dict[str, object]]] = []
+        freezes: list[tuple[str, list[str], dict[str, object]]] = []
+
+        class Ledger:
+            def claim_manual_trade_operation_dispatch(self, _operation_id: str) -> bool:
+                return True
+
+            def manual_trade_operation(self, _operation_id: str) -> dict[str, object]:
+                return {
+                    "manual_trade_id": "manual-1",
+                    "operation": "exit",
+                    "plan": {
+                        "manual_trade_id": "manual-1",
+                        "operation": "exit",
+                        "legs": [
+                            {"worker_id": "worker-a", "position": "101"},
+                            {"worker_id": "worker-b", "position": "202"},
+                        ],
+                    },
+                }
+
+            def frozen_worker_ids(self, _worker_ids: list[str]) -> set[str]:
+                return set()
+
+            def record_manual_trade_operation(
+                self, _operation_id: str, event_type: str, payload: dict[str, object], *, status: str | None = None
+            ) -> None:
+                events.append((event_type, status, payload))
+
+            def freeze_workers(self, source: str, worker_ids: list[str], audit: dict[str, object]) -> None:
+                freezes.append((source, worker_ids, audit))
+
+        async def reconcile(
+            _connections: list[object], _execution_id: str
+        ) -> list[dict[str, list[dict[str, str]]]]:
+            if not reconciliation_results:
+                self.fail("The operation reconciled more times than expected.")
+            return reconciliation_results.pop(0)
+
+        async def recovery(
+            _connection: object, operation: str, payload: dict[str, str]
+        ) -> dict[str, object]:
+            self.assertEqual("execution_close", operation)
+            closed_tickets.append(payload["ticket"])
+            return {"accepted": True}
+
+        reconciliation_results = [
+            [
+                {"orders": [], "positions": []},
+                {"orders": [], "positions": [{"ticket": "202", "volume": "0.2"}]},
+            ],
+            [
+                {"orders": [], "positions": []},
+                {"orders": [], "positions": []},
+            ],
+        ]
+        with (
+            patch("abt.controlplane.service._connected_worker_session", side_effect=[first_connection, second_connection]),
+            patch("abt.controlplane.service._reconcile_execution", side_effect=reconcile),
+            patch("abt.controlplane.service._execution_recovery_request", side_effect=recovery),
+        ):
+            await _dispatch_manual_trade_operation(
+                Ledger(),  # type: ignore[arg-type]
+                {"worker-a": {object()}, "worker-b": {object()}},  # type: ignore[arg-type]
+                {},
+                "exit-1",
+            )
+
+        self.assertEqual(["202"], closed_tickets)
+        self.assertEqual(
+            [("manual_trade_operation_frozen", "needs_human")],
+            [(event_type, status) for event_type, status, _payload in events],
+        )
+        self.assertIn("already closed externally", str(events[0][2]["reason"]))
+        self.assertEqual(
+            [(
+                "manual_trade_operation_anomaly",
+                ["worker-a", "worker-b"],
+                {
+                    "manual_trade_id": "manual-1",
+                    "operation_id": "exit-1",
+                    "reason": events[0][2]["reason"],
+                },
+            )],
+            freezes,
+        )
+
     async def test_dispatch_does_not_send_orders_when_a_worker_freezes_after_preflight(self) -> None:
         events: list[tuple[str, str | None]] = []
 
@@ -1606,8 +1698,8 @@ class ControlPlaneServiceTests(unittest.TestCase):
             headers={"X-CSRF-Token": login.json()["csrf_token"]},
             json={
                 "pair_id": "pair-1",
-                "first_worker_id": first_worker_id,
-                "second_worker_id": second_worker_id,
+                "buy_worker_id": first_worker_id,
+                "sell_worker_id": second_worker_id,
                 "leg_order": "buy_to_sell",
                 "interval_seconds": 7,
                 "expected_revision": 0,
@@ -1618,6 +1710,8 @@ class ControlPlaneServiceTests(unittest.TestCase):
         target = configured.json()
         self.assertEqual("pair-1", target["pair"]["product_pair_id"])
         self.assertEqual([first_worker_id, second_worker_id], [worker["worker_id"] for worker in target["workers"]])
+        self.assertEqual(first_worker_id, target["buy_worker_id"])
+        self.assertEqual(second_worker_id, target["sell_worker_id"])
         self.assertEqual("buy_to_sell", target["leg_order"])
         self.assertEqual(7, target["interval_seconds"])
         self.assertEqual("EURUSD", target["workers"][0]["live_state"]["quotes"][0]["symbol"])
@@ -1628,8 +1722,8 @@ class ControlPlaneServiceTests(unittest.TestCase):
             headers={"X-CSRF-Token": login.json()["csrf_token"]},
             json={
                 "pair_id": "pair-1",
-                "first_worker_id": first_worker_id,
-                "second_worker_id": second_worker_id,
+                "buy_worker_id": first_worker_id,
+                "sell_worker_id": second_worker_id,
                 "leg_order": "sell_to_buy",
                 "interval_seconds": 0,
                 "expected_revision": 1,
@@ -1687,19 +1781,57 @@ class ControlPlaneServiceTests(unittest.TestCase):
             headers=csrf,
             json={
                 "pair_id": "pair-manual",
-                "first_worker_id": first_worker_id,
-                "second_worker_id": second_worker_id,
+                "buy_worker_id": first_worker_id,
+                "sell_worker_id": second_worker_id,
                 "leg_order": "buy_to_sell",
                 "interval_seconds": 0,
                 "expected_revision": 0,
             },
         )
         self.assertEqual(200, configured.status_code)
+        active = ledger.request_manual_trade(
+            "ABCDEF",
+            "manual-entry-active",
+            {
+                "target_revision": 1,
+                "base_lots": "0.1",
+                "stop_loss_pips": "10",
+                "take_profit_pips": "20",
+            },
+        )
+        ledger.activate_manual_trade(
+            active["manual_trade_id"],
+            [
+                {
+                    "worker_id": first_worker_id,
+                    "market_order_ticket": "91",
+                    "position_ticket": "101",
+                    "fill_price": "1.1002",
+                },
+                {
+                    "worker_id": second_worker_id,
+                    "market_order_ticket": "92",
+                    "position_ticket": "202",
+                    "fill_price": "1.0998",
+                },
+            ],
+        )
+        updated_target = self.client.put(
+            "/api/admin/manual-trading-target",
+            headers=csrf,
+            json={
+                "pair_id": "pair-manual",
+                "buy_worker_id": second_worker_id,
+                "sell_worker_id": first_worker_id,
+                "leg_order": "sell_to_buy",
+                "interval_seconds": 0,
+                "expected_revision": 1,
+            },
+        )
+        self.assertEqual(200, updated_target.status_code)
         command = {
             "command_id": "manual-entry-1",
-            "target_revision": 1,
-            "buy_worker_id": first_worker_id,
-            "sell_worker_id": second_worker_id,
+            "target_revision": 2,
             "base_lots": "0.1",
             "stop_loss_pips": "10",
             "take_profit_pips": "20",
@@ -1707,12 +1839,15 @@ class ControlPlaneServiceTests(unittest.TestCase):
         preview = self.client.post("/api/admin/manual-trades/preview", headers=csrf, json=command)
         self.assertEqual(200, preview.status_code)
         self.assertEqual(["0.1", "0.2"], [leg["lots"] for leg in preview.json()["legs"]])
-        self.assertEqual(["BUY", "SELL"], [leg["direction"] for leg in preview.json()["legs"]])
+        self.assertEqual(["SELL", "BUY"], [leg["direction"] for leg in preview.json()["legs"]])
         submitted = self.client.post("/api/admin/manual-trades", headers=csrf, json=command)
         self.assertEqual(201, submitted.status_code)
         self.assertEqual("scheduled", submitted.json()["status"])
         self.assertEqual(submitted.json(), self.client.post("/api/admin/manual-trades", headers=csrf, json=command).json())
-        self.assertEqual(submitted.json()["manual_trade_id"], self.client.get("/api/admin/manual-trading-target").json()["active_manual_trade_id"])
+        self.assertEqual(
+            {active["manual_trade_id"], submitted.json()["manual_trade_id"]},
+            {trade["manual_trade_id"] for trade in self.client.get("/api/admin/manual-trades").json()},
+        )
 
     def test_admin_can_preview_and_submit_idempotent_active_manual_trade_operations(self) -> None:
         ledger = self.app.state.ledger
@@ -1732,8 +1867,18 @@ class ControlPlaneServiceTests(unittest.TestCase):
                 },
             ],
             "active_legs": [
-                {"worker_id": first_worker_id, "position": "101", "fill_price": "1.1002"},
-                {"worker_id": second_worker_id, "position": "202", "fill_price": "1.0998"},
+                {
+                    "worker_id": first_worker_id,
+                    "market_order_ticket": "91",
+                    "position_ticket": "101",
+                    "fill_price": "1.1002",
+                },
+                {
+                    "worker_id": second_worker_id,
+                    "market_order_ticket": "92",
+                    "position_ticket": "202",
+                    "fill_price": "1.0998",
+                },
             ],
         }
         with ledger._transaction():
@@ -1749,6 +1894,20 @@ class ControlPlaneServiceTests(unittest.TestCase):
                     "ABCDEF", datetime.now(UTC),
                 ],
             )
+        for worker_id, symbol, position in (
+            (first_worker_id, "EURUSD", 101),
+            (second_worker_id, "EURUSD.a", 202),
+        ):
+            ledger.record_worker_session(worker_id)
+            ledger.record_live_state(
+                worker_id,
+                "2026-08-22T00:00:00+00:00",
+                True,
+                [],
+                [],
+                [{"ticket": position, "symbol": symbol}],
+            )
+        with ledger._transaction():
             ledger._connection.execute(
                 """INSERT INTO manual_trading_target
                    (singleton, pair_id, first_worker_id, second_worker_id, leg_order, interval_seconds,
@@ -1768,7 +1927,7 @@ class ControlPlaneServiceTests(unittest.TestCase):
         csrf = {"X-CSRF-Token": login.json()["csrf_token"]}
 
         protection_preview = self.client.post(
-            "/api/admin/manual-trades/active/protection/preview",
+            "/api/admin/manual-trades/manual-active/protection/preview",
             headers=csrf,
             json={"command_id": "protection-1", "stop_loss_pips": "15", "take_profit_pips": "30"},
         )
@@ -1778,7 +1937,7 @@ class ControlPlaneServiceTests(unittest.TestCase):
             [(leg["stop_loss"], leg["take_profit"]) for leg in protection_preview.json()["legs"]],
         )
         protection = self.client.post(
-            "/api/admin/manual-trades/active/protection",
+            "/api/admin/manual-trades/manual-active/protection",
             headers=csrf,
             json={"command_id": "protection-1", "stop_loss_pips": "15", "take_profit_pips": "30"},
         )
@@ -1786,16 +1945,27 @@ class ControlPlaneServiceTests(unittest.TestCase):
         self.assertEqual(
             protection.json(),
             self.client.post(
-                "/api/admin/manual-trades/active/protection",
+                "/api/admin/manual-trades/manual-active/protection",
                 headers=csrf,
                 json={"command_id": "protection-1", "stop_loss_pips": "15", "take_profit_pips": "30"},
             ).json(),
         )
         exit_preview = self.client.post(
-            "/api/admin/manual-trades/active/exit/preview", headers=csrf, json={"command_id": "exit-1"}
+            "/api/admin/manual-trades/manual-active/exit/preview", headers=csrf, json={"command_id": "exit-1"}
         )
         self.assertEqual(200, exit_preview.status_code)
         self.assertEqual(["101", "202"], [leg["position"] for leg in exit_preview.json()["legs"]])
+        active_trade = self.client.get("/api/admin/manual-trades").json()[0]
+        self.assertEqual(["91", "92"], [leg["market_order_ticket"] for leg in active_trade["legs"]])
+        self.assertEqual(["101", "202"], [leg["position_ticket"] for leg in active_trade["legs"]])
+        self.assertEqual(["open", "open"], [leg["position_status"] for leg in active_trade["legs"]])
+        ledger.record_manual_trade_operation(
+            protection.json()["operation_id"],
+            "manual_trade_operation_frozen",
+            {"reason": "A leg closed externally."},
+            status="needs_human",
+        )
+        self.assertEqual("needs_human", self.client.get("/api/admin/manual-trades").json()[0]["status"])
 
     def test_admin_read_models_paginate_search_and_keep_snapshot_payloads_in_detail(self) -> None:
         _key, worker_id, _certificate = self._approved_worker(123456, "Broker-Search")

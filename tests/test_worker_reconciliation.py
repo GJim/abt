@@ -10,6 +10,7 @@ from abt.worker.reconciliation import (
     LiveWorkerMarketStateAdapter,
     MT5ReconciliationAdapter,
     WorkerSafetyAdapter,
+    _broker_order_request,
     _order_check_diagnostics,
     reconnect_worker_session,
     reconcile_authenticated_worker,
@@ -46,6 +47,29 @@ class ReadOnlyMT5:
 
 
 class WorkerReconciliationTests(unittest.TestCase):
+    def test_market_order_uses_executable_tick_price(self) -> None:
+        class TradingMT5:
+            TRADE_ACTION_DEAL = 1
+            ORDER_TYPE_BUY = 0
+            ORDER_TYPE_SELL = 1
+            ORDER_FILLING_FOK = 0
+            ORDER_FILLING_IOC = 1
+
+            def symbol_info_tick(self, _symbol: str) -> object:
+                return {"bid": 1.1, "ask": 1.1002}
+
+        buy = _broker_order_request(TradingMT5(), {
+            "action": "market", "symbol": "EURUSD", "volume": "0.1", "direction": "LONG",
+            "filling_mode": "FOK", "control_plane_command_id": "manual-1",
+        })
+        sell = _broker_order_request(TradingMT5(), {
+            "action": "market", "symbol": "EURUSD", "volume": "0.1", "direction": "SHORT",
+            "filling_mode": "IOC", "control_plane_command_id": "manual-2",
+        })
+
+        self.assertEqual(1.1002, buy["price"])
+        self.assertEqual(1.1, sell["price"])
+
     def test_publishes_diff_only_live_market_state_on_the_required_schedules(self) -> None:
         class LiveMT5(ReadOnlyMT5):
             def symbol_info_tick(self, symbol: str) -> object:
