@@ -289,6 +289,17 @@
   width: fit-content;
 }
 
+.manual-trade-discard {
+  color: var(--console-danger);
+  background: color-mix(in srgb, var(--console-danger) 6%, var(--console-surface));
+  border-color: color-mix(in srgb, var(--console-danger) 45%, var(--console-rule));
+}
+
+.manual-trade-discard:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--console-danger) 12%, var(--console-surface));
+  border-color: var(--console-danger);
+}
+
 .manual-trading-message {
   margin: 0;
   padding: 0.75rem;

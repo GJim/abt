@@ -2064,6 +2064,47 @@ class ControlPlaneServiceTests(unittest.TestCase):
             {trade["manual_trade_id"] for trade in self.client.get("/api/admin/manual-trades").json()},
         )
 
+    def test_admin_can_discard_unconfirmed_failed_manual_trade(self) -> None:
+        ledger = self.app.state.ledger
+        with ledger._transaction():
+            ledger._connection.execute(
+                """INSERT INTO manual_trades
+                   (manual_trade_id, username, command_id, target_revision, pair_id, plan, status, created_at)
+                   VALUES ('manual-failed', 'ABCDEF', 'entry-failed', 1, 'pair-1', ?, 'needs_human', ?)""",
+                [json.dumps({"legs": [], "active_legs": []}), datetime.now(UTC)],
+            )
+        login = self.client.post(
+            "/api/admin/login", json={"username": "ABCDEF", "password": "A-secure-admin-password!"}
+        )
+        response = self.client.delete(
+            "/api/admin/manual-trades/manual-failed",
+            headers={"X-CSRF-Token": login.json()["csrf_token"]},
+        )
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual({"manual_trade_id": "manual-failed", "status": "discarded"}, response.json())
+        self.assertEqual([], self.client.get("/api/admin/manual-trades").json())
+
+    def test_admin_cannot_discard_manual_trade_with_broker_evidence(self) -> None:
+        ledger = self.app.state.ledger
+        with ledger._transaction():
+            ledger._connection.execute(
+                """INSERT INTO manual_trades
+                   (manual_trade_id, username, command_id, target_revision, pair_id, plan, status, created_at)
+                   VALUES ('manual-evidenced', 'ABCDEF', 'entry-evidenced', 1, 'pair-1', ?, 'needs_human', ?)""",
+                [json.dumps({"legs": [], "active_legs": [{"position_ticket": "123"}]}), datetime.now(UTC)],
+            )
+        login = self.client.post(
+            "/api/admin/login", json={"username": "ABCDEF", "password": "A-secure-admin-password!"}
+        )
+        response = self.client.delete(
+            "/api/admin/manual-trades/manual-evidenced",
+            headers={"X-CSRF-Token": login.json()["csrf_token"]},
+        )
+
+        self.assertEqual(409, response.status_code)
+        self.assertEqual("Manual trade has broker execution evidence and cannot be discarded.", response.json()["detail"])
+
     def test_admin_can_preview_and_submit_idempotent_active_manual_trade_operations(self) -> None:
         ledger = self.app.state.ledger
         _first_key, first_worker_id, _first_certificate = self._approved_worker(123456, "Broker-A")

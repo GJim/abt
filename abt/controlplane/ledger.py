@@ -1927,6 +1927,35 @@ class ControlLedger:
                 })
             return trades
 
+    def discard_unconfirmed_manual_trade(self, username: str, manual_trade_id: str) -> dict[str, Any]:
+        with self._transaction():
+            row = self._connection.execute(
+                "SELECT plan, status FROM manual_trades WHERE manual_trade_id = ?", [manual_trade_id]
+            ).fetchone()
+            if row is None:
+                raise LedgerError("Manual trade does not exist.")
+            plan = json.loads(row[0])
+            if row[1] != "needs_human":
+                raise LedgerError("Only failed manual trades awaiting human review can be discarded.")
+            active_legs = plan.get("active_legs")
+            if not isinstance(active_legs, list) or active_legs:
+                raise LedgerError("Manual trade has broker execution evidence and cannot be discarded.")
+            pending = self._connection.execute(
+                """SELECT 1 FROM manual_trade_operations
+                   WHERE manual_trade_id = ? AND status IN ('scheduled', 'dispatching')""",
+                [manual_trade_id],
+            ).fetchone()
+            if pending is not None:
+                raise LedgerError("Manual trade has an operation still in progress.")
+            self._connection.execute(
+                "UPDATE manual_trades SET status = 'discarded' WHERE manual_trade_id = ?", [manual_trade_id]
+            )
+            self._event(
+                "manual_trade_discarded",
+                {"manual_trade_id": manual_trade_id, "username": username, "reason": "unconfirmed_broker_execution"},
+            )
+            return {"manual_trade_id": manual_trade_id, "status": "discarded"}
+
     def configure_manual_trading_target(
         self,
         username: str,

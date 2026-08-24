@@ -943,6 +943,18 @@ def create_app(
         _require_admin(ledger, abt_admin_session)
         return ledger.active_manual_trades()
 
+    @app.delete("/api/admin/manual-trades/{manual_trade_id}")
+    def discard_unconfirmed_manual_trade(
+        manual_trade_id: str,
+        abt_admin_session: Annotated[str | None, Cookie()] = None,
+        x_csrf_token: Annotated[str | None, Header()] = None,
+    ) -> dict[str, object]:
+        username = _require_admin(ledger, abt_admin_session, x_csrf_token, require_csrf=True)
+        try:
+            return ledger.discard_unconfirmed_manual_trade(username, manual_trade_id)
+        except LedgerError as error:
+            raise HTTPException(status_code=_ledger_error_status(error), detail=str(error)) from error
+
     @app.post("/api/admin/manual-trades/{manual_trade_id}/exit/preview")
     def preview_active_manual_trade_exit(
         manual_trade_id: str,

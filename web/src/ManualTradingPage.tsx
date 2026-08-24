@@ -278,6 +278,30 @@ export function ManualTradingPage({
     }
   }
 
+  async function discardUnconfirmedTrade(manualTradeId: string) {
+    if (!window.confirm('Discard this unconfirmed trade record? It will leave the Paired trades list but remain in the audit trail.')) {
+      return
+    }
+    setBusy(true)
+    setMessage(null)
+    try {
+      const response = await fetch(`/api/admin/manual-trades/${encodeURIComponent(manualTradeId)}`, {
+        method: 'DELETE',
+        credentials: 'same-origin',
+        headers: { 'X-CSRF-Token': csrfToken },
+      })
+      const result = await response.json() as { detail?: string }
+      if (!response.ok) throw new Error(result.detail ?? 'Manual-trade record could not be discarded.')
+      setMessage(`Manual trade ${manualTradeId} was discarded from the active list.`)
+      await refreshManualState()
+      await onChanged()
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : 'Manual-trade record could not be discarded.')
+    } finally {
+      setBusy(false)
+    }
+  }
+
   const observedWorkers = useMemo(() => {
     if (selectedPair === null) return []
     return [buyWorkerId, sellWorkerId].flatMap((workerId) => {
@@ -391,6 +415,9 @@ export function ManualTradingPage({
         <ul className="manual-trade-list">
           {trades.map((trade) => {
             const canClose = trade.status === 'active' || trade.status === 'needs_human'
+            const canDiscard = trade.status === 'needs_human' && trade.legs.every(
+              (leg) => leg.market_order_ticket === null && leg.position_ticket === null,
+            )
             return <li className="manual-trade-record" key={trade.manual_trade_id}>
               <header>
                 <div>
@@ -415,6 +442,9 @@ export function ManualTradingPage({
                 {trade.status === 'active' ? <button className="snapshot-json-button" disabled={busy} onClick={() => setEditingProtectionTradeId(
                   editingProtectionTradeId === trade.manual_trade_id ? null : trade.manual_trade_id,
                 )} type="button">Update protections</button> : null}
+                {canDiscard ? <button className="manual-trade-discard" disabled={busy} onClick={() => void discardUnconfirmedTrade(
+                  trade.manual_trade_id,
+                )} type="button">Discard unconfirmed record</button> : null}
               </div>
               {editingProtectionTradeId === trade.manual_trade_id ? <div className="manual-protection-fields">
                 <label>Updated stop loss (pips)<input min="0.00001" required step="any" type="number" value={protection.stop_loss_pips} onChange={(event) => setProtection({ ...protection, stop_loss_pips: event.target.value })} /></label>
