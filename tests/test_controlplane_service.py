@@ -41,6 +41,7 @@ from abt.controlplane.secrets import SecretStore, SecretStoreError
 from abt.controlplane.service import (
     _analyze_product_catalogs,
     _cancel_intent,
+    _dispatch_manual_trade,
     _dispatch_manual_trade_operation,
     _cleanup_frozen_worker,
     _dispatch_accepted_trader_intent,
@@ -370,6 +371,220 @@ class TraderIntentPreflightTests(unittest.IsolatedAsyncioTestCase):
 
 
 class WorkerIsolationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_manual_trade_reconciles_zero_price_market_response_before_protection(self) -> None:
+        first_connection = object()
+        second_connection = object()
+        calls: list[str] = []
+        activated: list[list[dict[str, object]]] = []
+        freezes: list[tuple[str, list[str], dict[str, object]]] = []
+
+        class Ledger:
+            def claim_manual_trade_dispatch(self, _manual_trade_id: str) -> bool:
+                return True
+
+            def manual_trade_plan(self, _manual_trade_id: str) -> dict[str, object]:
+                return {
+                    "interval_seconds": 0,
+                    "legs": [
+                        {
+                            "worker_id": "worker-a",
+                            "symbol": "EURUSD",
+                            "direction": "BUY",
+                            "lots": "0.1",
+                            "pip_size": "0.0001",
+                            "stop_loss_pips": "10",
+                            "take_profit_pips": "20",
+                        },
+                        {
+                            "worker_id": "worker-b",
+                            "symbol": "EURUSD.a",
+                            "direction": "SELL",
+                            "lots": "0.2",
+                            "pip_size": "0.0001",
+                            "stop_loss_pips": "10",
+                            "take_profit_pips": "20",
+                        },
+                    ],
+                }
+
+            def frozen_worker_ids(self, _worker_ids: list[str]) -> set[str]:
+                return set()
+
+            def record_manual_trade_event(
+                self, _manual_trade_id: str, _event_type: str, _payload: dict[str, object], *, status: str | None = None
+            ) -> None:
+                return None
+
+            def activate_manual_trade(self, _manual_trade_id: str, active_legs: list[dict[str, object]]) -> None:
+                activated.append(active_legs)
+
+            def freeze_workers(self, source: str, worker_ids: list[str], audit: dict[str, object]) -> None:
+                freezes.append((source, worker_ids, audit))
+
+        async def order_execute(connection: object, order: dict[str, object]) -> dict[str, object]:
+            calls.append(str(order["action"]))
+            if order["action"] == "protect":
+                return {"accepted": True, "order": order}
+            ticket = 501 if connection is first_connection else 502
+            return {
+                "accepted": True,
+                "order": order,
+                "result": {
+                    "retcode": 10009,
+                    "order": ticket,
+                    "deal": 0,
+                    "price": 0.0,
+                    "bid": 0.0,
+                    "ask": 0.0,
+                },
+            }
+
+        async def reconcile(
+            connection: object, operation: str, payload: dict[str, str]
+        ) -> dict[str, object]:
+            self.assertEqual("execution_reconcile", operation)
+            self.assertTrue(payload["execution_id"].startswith("abt:m:"))
+            calls.append("reconcile")
+            position = (
+                {"ticket": 901, "volume": "0.1", "price_open": "1.1002"}
+                if connection is first_connection
+                else {"ticket": 902, "volume": "0.2", "price_open": "1.0998"}
+            )
+            return {"accepted": True, "operation": operation, "result": {"orders": [], "positions": [position]}}
+
+        with (
+            patch("abt.controlplane.service._connected_worker_session", side_effect=[first_connection, second_connection]),
+            patch("abt.controlplane.service._request_order_execute", side_effect=order_execute),
+            patch("abt.controlplane.service._execution_recovery_request", side_effect=reconcile),
+        ):
+            await _dispatch_manual_trade(
+                Ledger(),  # type: ignore[arg-type]
+                {"worker-a": {object()}, "worker-b": {object()}},  # type: ignore[arg-type]
+                {},
+                "manual-1",
+            )
+
+        self.assertEqual(
+            ["market", "reconcile", "protect", "reconcile", "market", "reconcile", "protect"],
+            calls,
+        )
+        self.assertEqual([], freezes)
+        self.assertEqual(1, len(activated))
+        self.assertEqual(["501", "502"], [leg["market_order_ticket"] for leg in activated[0]])
+        self.assertEqual(["901", "902"], [leg["position_ticket"] for leg in activated[0]])
+        self.assertEqual(["1.1002", "1.0998"], [leg["fill_price"] for leg in activated[0]])
+        for leg in activated[0]:
+            reconciliation = leg["reconciliation"]
+            self.assertIsInstance(reconciliation, dict)
+            self.assertTrue(str(reconciliation["observed_at"]).endswith("+00:00"))
+            self.assertEqual(str(leg["position_ticket"]), reconciliation["position"]["ticket"])
+
+    async def test_manual_trade_freezes_before_protection_for_unresolved_reconciliation(self) -> None:
+        for positions, reason in (
+            ([], "exactly one open position"),
+            (
+                [
+                    {"ticket": 901, "volume": "0.1", "price_open": "1.1002"},
+                    {"ticket": 902, "volume": "0.1", "price_open": "1.1003"},
+                ],
+                "exactly one open position",
+            ),
+            ([{"ticket": 901, "volume": "0.1", "price_open": "0"}], "positive position fill price"),
+        ):
+            with self.subTest(positions=positions):
+                first_connection = object()
+                calls: list[str] = []
+                events: list[tuple[str, str | None, dict[str, object]]] = []
+                freezes: list[tuple[str, list[str], dict[str, object]]] = []
+
+                class Ledger:
+                    def claim_manual_trade_dispatch(self, _manual_trade_id: str) -> bool:
+                        return True
+
+                    def manual_trade_plan(self, _manual_trade_id: str) -> dict[str, object]:
+                        return {
+                            "interval_seconds": 0,
+                            "legs": [
+                                {
+                                    "worker_id": "worker-a",
+                                    "symbol": "EURUSD",
+                                    "direction": "BUY",
+                                    "lots": "0.1",
+                                    "pip_size": "0.0001",
+                                    "stop_loss_pips": "10",
+                                    "take_profit_pips": "20",
+                                },
+                                {
+                                    "worker_id": "worker-b",
+                                    "symbol": "EURUSD.a",
+                                    "direction": "SELL",
+                                    "lots": "0.2",
+                                    "pip_size": "0.0001",
+                                    "stop_loss_pips": "10",
+                                    "take_profit_pips": "20",
+                                },
+                            ],
+                        }
+
+                    def frozen_worker_ids(self, _worker_ids: list[str]) -> set[str]:
+                        return set()
+
+                    def record_manual_trade_event(
+                        self, _manual_trade_id: str, event_type: str, payload: dict[str, object], *,
+                        status: str | None = None,
+                    ) -> None:
+                        events.append((event_type, status, payload))
+
+                    def activate_manual_trade(self, _manual_trade_id: str, _active_legs: list[dict[str, object]]) -> None:
+                        self.fail("A missing or ambiguous position must not activate the manual trade.")
+
+                    def freeze_workers(self, source: str, worker_ids: list[str], audit: dict[str, object]) -> None:
+                        freezes.append((source, worker_ids, audit))
+
+                async def order_execute(_connection: object, order: dict[str, object]) -> dict[str, object]:
+                    calls.append(str(order["action"]))
+                    return {
+                        "accepted": True,
+                        "order": order,
+                        "result": {
+                            "retcode": 10009,
+                            "order": 501,
+                            "deal": 0,
+                            "price": 0.0,
+                            "bid": 0.0,
+                            "ask": 0.0,
+                        },
+                    }
+
+                async def reconcile(
+                    _connection: object, operation: str, _payload: dict[str, str]
+                ) -> dict[str, object]:
+                    self.assertEqual("execution_reconcile", operation)
+                    calls.append("reconcile")
+                    return {"accepted": True, "operation": operation, "result": {"orders": [], "positions": positions}}
+
+                with (
+                    patch("abt.controlplane.service._connected_worker_session", return_value=first_connection),
+                    patch("abt.controlplane.service._request_order_execute", side_effect=order_execute),
+                    patch("abt.controlplane.service._execution_recovery_request", side_effect=reconcile),
+                ):
+                    await _dispatch_manual_trade(
+                        Ledger(),  # type: ignore[arg-type]
+                        {"worker-a": {object()}, "worker-b": {object()}},  # type: ignore[arg-type]
+                        {},
+                        "manual-1",
+                    )
+
+                self.assertEqual(["market", "reconcile"], calls)
+                self.assertEqual([("manual_trade_execution_frozen", "needs_human")], [
+                    (event_type, status) for event_type, status, _payload in events
+                ])
+                self.assertIn(reason, str(events[0][2]["reason"]))
+                self.assertEqual(
+                    [("manual_trade_execution_anomaly", ["worker-a", "worker-b"])],
+                    [(source, worker_ids) for source, worker_ids, _audit in freezes],
+                )
+
     async def test_exit_closes_verified_remaining_leg_and_marks_external_closure_for_human_review(self) -> None:
         first_connection = object()
         second_connection = object()

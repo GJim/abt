@@ -2079,7 +2079,7 @@ class ControlLedger:
                     "UPDATE manual_trades SET status = ? WHERE manual_trade_id = ?", [status, manual_trade_id]
                 )
 
-    def activate_manual_trade(self, manual_trade_id: str, active_legs: list[dict[str, str]]) -> None:
+    def activate_manual_trade(self, manual_trade_id: str, active_legs: list[dict[str, Any]]) -> None:
         with self._transaction():
             row = self._connection.execute(
                 "SELECT plan FROM manual_trades WHERE manual_trade_id = ?", [manual_trade_id]

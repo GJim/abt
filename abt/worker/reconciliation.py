@@ -634,11 +634,24 @@ def _serve_order_execute(mt5: ReadOnlyMT5, session: AnalysisWorkerSession, reque
             getattr(mt5, "TRADE_RETCODE_DONE", -1),
             getattr(mt5, "TRADE_RETCODE_PLACED", -2),
         }
+        if not accepted:
+            _LOGGER.warning(
+                "MT5 order execution was rejected: action=%s symbol=%s volume=%s retcode=%r comment=%r last_error=%r",
+                order.get("action"), order.get("symbol"), order.get("volume"), retcode, result.get("comment"),
+                _mt5_last_error(mt5),
+            )
         session.send_order_execute(request_id=request_id, order=order, accepted=accepted, result=result)
     except WorkerEnrollmentError as error:
+        _LOGGER.warning(
+            "MT5 order execution could not produce broker evidence: action=%s symbol=%s volume=%s reason=%s last_error=%r",
+            order.get("action"), order.get("symbol"), order.get("volume"), error, _mt5_last_error(mt5),
+        )
         session.send_order_execute_error(request_id=request_id, reason=str(error))
     except Exception:
-        _LOGGER.exception("MT5 limit-order execution failed.")
+        _LOGGER.exception(
+            "MT5 order execution failed: action=%s symbol=%s volume=%s last_error=%r",
+            order.get("action"), order.get("symbol"), order.get("volume"), _mt5_last_error(mt5),
+        )
         session.send_order_execute_error(request_id=request_id, reason="The local MT5 order execution failed.")
 
 
@@ -648,16 +661,22 @@ def _serve_execution_recovery(mt5: ReadOnlyMT5, session: AnalysisWorkerSession, 
     try:
         if operation == "worker_cleanup_reconcile":
             result = {
-                "orders": list(_records(mt5.orders_get(), "order")),
-                "positions": list(_records(mt5.positions_get(), "position")),
+                "orders": list(_records(mt5.orders_get(), "order").values()),
+                "positions": list(_records(mt5.positions_get(), "position").values()),
             }
             session.send_execution_recovery(request_id=request_id, operation=operation, accepted=True, result=result)
             return
         if operation == "execution_reconcile":
             execution_id = _request_text(request, "execution_id")
             result = {
-                "orders": [record for record in _records(mt5.orders_get(), "order") if record.get("comment") == execution_id],
-                "positions": [record for record in _records(mt5.positions_get(), "position") if record.get("comment") == execution_id],
+                "orders": [
+                    record for record in _records(mt5.orders_get(), "order").values()
+                    if record.get("comment") == execution_id
+                ],
+                "positions": [
+                    record for record in _records(mt5.positions_get(), "position").values()
+                    if record.get("comment") == execution_id
+                ],
             }
             session.send_execution_recovery(request_id=request_id, operation=operation, accepted=True, result=result)
             return
@@ -810,6 +829,16 @@ def _evidence(value: object, kind: str) -> dict[str, object]:
     if callable(as_dict):
         return dict(as_dict())
     raise WorkerEnrollmentError(f"The local MT5 terminal returned invalid {kind} evidence.")
+
+
+def _mt5_last_error(mt5: object) -> object:
+    last_error = getattr(mt5, "last_error", None)
+    if not callable(last_error):
+        return None
+    try:
+        return last_error()
+    except Exception:
+        return "unavailable"
 
 
 def _visible_symbols(mt5: object) -> list[str]:

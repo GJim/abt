@@ -10,8 +10,10 @@ from abt.worker.reconciliation import (
     LiveWorkerMarketStateAdapter,
     MT5ReconciliationAdapter,
     WorkerSafetyAdapter,
+    _mt5_last_error,
     _broker_order_request,
     _order_check_diagnostics,
+    _serve_execution_recovery,
     reconnect_worker_session,
     reconcile_authenticated_worker,
 )
@@ -47,6 +49,15 @@ class ReadOnlyMT5:
 
 
 class WorkerReconciliationTests(unittest.TestCase):
+    def test_mt5_last_error_diagnostic_is_safe_when_unavailable(self) -> None:
+        self.assertIsNone(_mt5_last_error(object()))
+
+        class BrokenMT5:
+            def last_error(self) -> object:
+                raise RuntimeError("unavailable")
+
+        self.assertEqual("unavailable", _mt5_last_error(BrokenMT5()))
+
     def test_market_order_uses_executable_tick_price(self) -> None:
         class TradingMT5:
             TRADE_ACTION_DEAL = 1
@@ -69,6 +80,55 @@ class WorkerReconciliationTests(unittest.TestCase):
 
         self.assertEqual(1.1002, buy["price"])
         self.assertEqual(1.1, sell["price"])
+
+    def test_execution_reconciliation_includes_position_open_price(self) -> None:
+        class ReconciliationMT5:
+            def orders_get(self) -> object:
+                return []
+
+            def positions_get(self) -> object:
+                return [{
+                    "ticket": 901,
+                    "volume": 0.1,
+                    "price_open": 1.1002,
+                    "comment": "abt:m:manual-trade",
+                }]
+
+        class Session:
+            response: dict[str, object] | None = None
+
+            def send_execution_recovery(self, **kwargs: object) -> None:
+                self.response = kwargs
+
+        session = Session()
+        _serve_execution_recovery(
+            ReconciliationMT5(),  # type: ignore[arg-type]
+            session,  # type: ignore[arg-type]
+            {
+                "type": "execution_reconcile_request",
+                "request_id": "request-1",
+                "execution_id": "abt:m:manual-trade",
+            },
+        )
+
+        self.assertEqual(
+            {
+                "request_id": "request-1",
+                "operation": "execution_reconcile",
+                "accepted": True,
+                "result": {
+                    "orders": [],
+                    "positions": [{
+                        "ticket": 901,
+                        "volume": 0.1,
+                        "price_open": 1.1002,
+                        "comment": "abt:m:manual-trade",
+                        "control_plane_command_id": "abt:m:manual-trade",
+                    }],
+                },
+            },
+            session.response,
+        )
 
     def test_publishes_diff_only_live_market_state_on_the_required_schedules(self) -> None:
         class LiveMT5(ReadOnlyMT5):

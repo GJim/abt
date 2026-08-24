@@ -10,3 +10,11 @@
 - The worker maps BUY requests to tick ask and SELL requests to tick bid. The
   controller tracks normalized worker order and position tickets rather than
   passing raw MT5 request structures across the WebSocket.
+- A successful market-entry acknowledgement is not necessarily a fill record.
+  Some MT5 broker integrations return `TRADE_RETCODE_DONE` with a nonzero
+  order ticket while `deal`, `price`, `bid`, and `ask` are zero and no position
+  ticket is present in the immediate `order_send` result. The controller treats
+  that as an accepted order submission, then reconciles by its execution
+  comment. It requires exactly one open position and a positive `price_open`
+  before applying protection; missing or ambiguous reconciliation freezes the
+  participating workers rather than sending the next leg.
