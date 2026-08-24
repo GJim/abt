@@ -1938,7 +1938,11 @@ class ControlLedger:
             if row[1] != "needs_human":
                 raise LedgerError("Only failed manual trades awaiting human review can be discarded.")
             active_legs = plan.get("active_legs")
-            if not isinstance(active_legs, list) or active_legs:
+            if not isinstance(active_legs, list) or any(
+                not isinstance(leg, dict)
+                or any(leg.get(field) not in (None, "") for field in ("market_order_ticket", "position_ticket", "order", "position"))
+                for leg in active_legs
+            ):
                 raise LedgerError("Manual trade has broker execution evidence and cannot be discarded.")
             pending = self._connection.execute(
                 """SELECT 1 FROM manual_trade_operations

@@ -2071,7 +2071,13 @@ class ControlPlaneServiceTests(unittest.TestCase):
                 """INSERT INTO manual_trades
                    (manual_trade_id, username, command_id, target_revision, pair_id, plan, status, created_at)
                    VALUES ('manual-failed', 'ABCDEF', 'entry-failed', 1, 'pair-1', ?, 'needs_human', ?)""",
-                [json.dumps({"legs": [], "active_legs": []}), datetime.now(UTC)],
+                [
+                    json.dumps({
+                        "legs": [],
+                        "active_legs": [{"worker_id": "worker-a"}, {"worker_id": "worker-b"}],
+                    }),
+                    datetime.now(UTC),
+                ],
             )
         login = self.client.post(
             "/api/admin/login", json={"username": "ABCDEF", "password": "A-secure-admin-password!"}
