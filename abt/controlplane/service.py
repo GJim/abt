@@ -2251,7 +2251,7 @@ def _record_execution_recovery_response(connection: _WorkerSessionConnection, re
     pending = connection.pending.pop(request_id, None)
     if pending is None:
         return
-    if pending.stage not in {"execution_reconcile", "execution_cancel", "execution_close", "worker_cleanup_reconcile",
+    if pending.stage not in {"execution_reconcile", "manual_position_reconcile", "execution_cancel", "execution_close", "worker_cleanup_reconcile",
                              "worker_cleanup_cancel", "worker_cleanup_close"} or set(request) != {
         "type", "request_id", "operation", "accepted", "result"
     } or request["operation"] != pending.stage or not isinstance(request["accepted"], bool) or not isinstance(request["result"], dict):
@@ -2265,7 +2265,7 @@ def _record_execution_recovery_error(connection: _WorkerSessionConnection, reque
     pending = connection.pending.pop(request_id, None)
     if pending is None:
         return
-    if pending.stage not in {"execution_reconcile", "execution_cancel", "execution_close", "worker_cleanup_reconcile",
+    if pending.stage not in {"execution_reconcile", "manual_position_reconcile", "execution_cancel", "execution_close", "worker_cleanup_reconcile",
                              "worker_cleanup_cancel", "worker_cleanup_close"} or set(request) != {
         "type", "request_id", "operation", "reason"
     } or request["operation"] != pending.stage:
@@ -2824,13 +2824,12 @@ async def _dispatch_manual_trade(
                 _connected_worker_session(worker_connections, worker_id, reason="Selected worker disconnected before dispatch.")
                 for worker_id in worker_ids
             ]
-            execution_id = f"abt:m:{hashlib.sha256(manual_trade_id.encode()).hexdigest()[:24]}"
-            first_order = _manual_market_order(legs[0], execution_id)
+            first_order = _manual_market_order(legs[0])
             first_response = await _request_order_execute(connections[0], first_order)
-            first_market_order_ticket = _manual_market_order_ticket(first_response, first_order)
-            first_reconciliation = await _manual_reconcile_position(connections[0], execution_id)
-            first_position_ticket = str(first_reconciliation["position_ticket"])
-            first_fill = cast(Decimal, first_reconciliation["fill_price"])
+            first_evidence = _manual_market_order_evidence(first_response, first_order)
+            first_market_order_ticket = first_evidence["market_order_ticket"]
+            first_position_ticket = first_evidence["position_ticket"]
+            first_fill = cast(Decimal, first_evidence["fill_price"])
             first_protection = _manual_protection_order(legs[0], first_position_ticket, first_fill)
             protection_response = await _request_order_execute(connections[0], first_protection)
             if protection_response.get("accepted") is not True or protection_response.get("order") != first_protection:
@@ -2844,17 +2843,16 @@ async def _dispatch_manual_trade(
                     "position_ticket": first_position_ticket,
                     "fill_price": str(first_fill),
                     "protection": first_protection,
-                    "reconciliation": first_reconciliation["reconciliation"],
+                    "reconciliation": first_evidence["reconciliation"],
                 },
             )
             await asyncio.sleep(int(plan["interval_seconds"]))
-            _ = await _manual_reconcile_position(connections[0], execution_id)
-            second_order = _manual_market_order(legs[1], execution_id)
+            second_order = _manual_market_order(legs[1])
             second_response = await _request_order_execute(connections[1], second_order)
-            second_market_order_ticket = _manual_market_order_ticket(second_response, second_order)
-            second_reconciliation = await _manual_reconcile_position(connections[1], execution_id)
-            second_position_ticket = str(second_reconciliation["position_ticket"])
-            second_fill = cast(Decimal, second_reconciliation["fill_price"])
+            second_evidence = _manual_market_order_evidence(second_response, second_order)
+            second_market_order_ticket = second_evidence["market_order_ticket"]
+            second_position_ticket = second_evidence["position_ticket"]
+            second_fill = cast(Decimal, second_evidence["fill_price"])
             second_protection = _manual_protection_order(legs[1], second_position_ticket, second_fill)
             second_protection_response = await _request_order_execute(connections[1], second_protection)
             if second_protection_response.get("accepted") is not True or second_protection_response.get("order") != second_protection:
@@ -2867,14 +2865,14 @@ async def _dispatch_manual_trade(
                         "market_order_ticket": first_market_order_ticket,
                         "position_ticket": first_position_ticket,
                         "fill_price": str(first_fill),
-                        "reconciliation": first_reconciliation["reconciliation"],
+                        "reconciliation": first_evidence["reconciliation"],
                     },
                     {
                         "worker_id": str(legs[1]["worker_id"]),
                         "market_order_ticket": second_market_order_ticket,
                         "position_ticket": second_position_ticket,
                         "fill_price": str(second_fill),
-                        "reconciliation": second_reconciliation["reconciliation"],
+                        "reconciliation": second_evidence["reconciliation"],
                     },
                 ],
             )
@@ -2887,14 +2885,14 @@ async def _dispatch_manual_trade(
                         "position_ticket": first_position_ticket,
                         "fill_price": str(first_fill),
                         "protection": first_protection,
-                        "reconciliation": first_reconciliation["reconciliation"],
+                        "reconciliation": first_evidence["reconciliation"],
                     },
                     "second_leg": {
                         "market_order_ticket": second_market_order_ticket,
                         "position_ticket": second_position_ticket,
                         "fill_price": str(second_fill),
                         "protection": second_protection,
-                        "reconciliation": second_reconciliation["reconciliation"],
+                        "reconciliation": second_evidence["reconciliation"],
                     },
                 },
             )
@@ -2902,18 +2900,17 @@ async def _dispatch_manual_trade(
         _freeze_manual_trade(ledger, manual_trade_id, worker_ids, str(error))
 
 
-def _manual_market_order(leg: dict[str, object], execution_id: str) -> dict[str, object]:
+def _manual_market_order(leg: dict[str, object]) -> dict[str, object]:
     return {
         "action": "market",
         "symbol": str(leg["symbol"]),
         "volume": str(leg["lots"]),
         "direction": "LONG" if leg["direction"] == "BUY" else "SHORT",
         "filling_mode": "FOK",
-        "control_plane_command_id": execution_id,
     }
 
 
-def _manual_market_order_ticket(response: dict[str, object], order: dict[str, object]) -> str:
+def _manual_market_order_evidence(response: dict[str, object], order: dict[str, object]) -> dict[str, object]:
     if response.get("accepted") is not True or response.get("order") != order or not isinstance(response.get("result"), dict):
         raise LedgerError("Manual-trade market order was not confirmed.")
     ticket = response["result"].get("order")
@@ -2925,31 +2922,23 @@ def _manual_market_order_ticket(response: dict[str, object], order: dict[str, ob
         raise LedgerError("Manual-trade market order did not return a broker order ticket.") from error
     if normalized_ticket <= 0:
         raise LedgerError("Manual-trade market order did not return a broker order ticket.")
-    return str(normalized_ticket)
-
-
-async def _manual_reconcile_position(
-    connection: _WorkerSessionConnection, execution_id: str
-) -> dict[str, object]:
-    observed = await _execution_recovery_request(connection, "execution_reconcile", {"execution_id": execution_id})
-    state = _cleanup_state(observed)
-    if len(state["positions"]) != 1:
-        raise LedgerError("Manual-trade reconciliation did not identify exactly one open position.")
-    position = state["positions"][0]
+    position = response["result"].get("position")
+    if not isinstance(position, dict):
+        raise LedgerError("Manual-trade market order did not return confirmed position evidence.")
     try:
         position_ticket = int(position["ticket"])
         fill_price = Decimal(str(position["price_open"]))
     except (KeyError, ValueError, ArithmeticError) as error:
-        raise LedgerError("Manual-trade reconciliation did not return a position fill price.") from error
+        raise LedgerError("Manual-trade market order did not return a position fill price.") from error
     if position_ticket <= 0:
-        raise LedgerError("Manual-trade reconciliation did not return a position ticket.")
+        raise LedgerError("Manual-trade market order did not return a position ticket.")
     if not fill_price.is_finite() or fill_price <= 0:
-        raise LedgerError("Manual-trade reconciliation did not return a positive position fill price.")
+        raise LedgerError("Manual-trade market order did not return a positive position fill price.")
     return {
+        "market_order_ticket": str(normalized_ticket),
         "position_ticket": str(position_ticket),
         "fill_price": fill_price,
         "reconciliation": {
-            "execution_id": execution_id,
             "observed_at": datetime.now(UTC).isoformat(),
             "position": position,
         },
@@ -3007,8 +2996,7 @@ async def _dispatch_manual_trade_operation(
                 _connected_worker_session(worker_connections, worker_id, reason="Participating worker disconnected.")
                 for worker_id in worker_ids
             ]
-            execution_id = f"abt:m:{hashlib.sha256(str(record['manual_trade_id']).encode()).hexdigest()[:24]}"
-            observed = await _reconcile_execution(connections, execution_id)
+            observed = await _reconcile_manual_positions(connections, [str(leg["position"]) for leg in legs])
             positions: list[tuple[_WorkerSessionConnection, dict[str, str]]] = []
             externally_closed = False
             for connection, leg, observed_leg in zip(connections, legs, observed, strict=True):
@@ -3026,7 +3014,7 @@ async def _dispatch_manual_trade_operation(
                 ))
                 if any(response.get("accepted") is not True for response in responses):
                     raise LedgerError("Manual-trade exit was not confirmed for every remaining position.")
-                final = await _reconcile_execution(connections, execution_id)
+                final = await _reconcile_manual_positions(connections, [str(leg["position"]) for leg in legs])
                 if any(leg["orders"] or leg["positions"] for leg in final):
                     raise LedgerError("Manual-trade full exit did not prove zero exposure.")
                 if externally_closed:
@@ -3181,6 +3169,22 @@ async def _reconcile_execution(
         positions = _execution_records(result.get("positions"))
         legs.append({"orders": orders, "positions": positions})
     return legs
+
+
+async def _reconcile_manual_positions(
+    connections: list[_WorkerSessionConnection], position_tickets: list[str]
+) -> list[dict[str, list[dict[str, str]]]]:
+    responses = await asyncio.gather(*(
+        _execution_recovery_request(connection, "manual_position_reconcile", {"ticket": ticket})
+        for connection, ticket in zip(connections, position_tickets, strict=True)
+    ))
+    return [
+        {
+            "orders": _execution_records(response["result"].get("orders")),
+            "positions": _execution_records(response["result"].get("positions")),
+        }
+        for response in responses
+    ]
 
 
 async def _execution_recovery_request(

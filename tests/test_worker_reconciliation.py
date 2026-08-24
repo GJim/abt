@@ -72,15 +72,17 @@ class WorkerReconciliationTests(unittest.TestCase):
 
         buy = _broker_order_request(TradingMT5(), {
             "action": "market", "symbol": "EURUSD", "volume": "0.1", "direction": "LONG",
-            "filling_mode": "FOK", "control_plane_command_id": "manual-1",
+            "filling_mode": "FOK",
         })
         sell = _broker_order_request(TradingMT5(), {
             "action": "market", "symbol": "EURUSD", "volume": "0.1", "direction": "SHORT",
-            "filling_mode": "IOC", "control_plane_command_id": "manual-2",
+            "filling_mode": "IOC",
         })
 
         self.assertEqual(1.1002, buy["price"])
         self.assertEqual(1.1, sell["price"])
+        self.assertNotIn("comment", buy)
+        self.assertNotIn("magic", buy)
 
     def test_order_execution_reports_disabled_terminal_before_sending(self) -> None:
         class DisabledTerminalMT5:

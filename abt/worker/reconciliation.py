@@ -627,6 +627,7 @@ def _serve_order_execute(mt5: ReadOnlyMT5, session: AnalysisWorkerSession, reque
         return
     try:
         _require_terminal_trading_permission(mt5)
+        positions_before = _records(mt5.positions_get(), "position")
         broker_request = _broker_order_request(mt5, order)
         sent = mt5.order_send(broker_request)
         result = _evidence(sent, "order execution")
@@ -635,6 +636,8 @@ def _serve_order_execute(mt5: ReadOnlyMT5, session: AnalysisWorkerSession, reque
             getattr(mt5, "TRADE_RETCODE_DONE", -1),
             getattr(mt5, "TRADE_RETCODE_PLACED", -2),
         }
+        if accepted and order.get("action") == "market":
+            result["position"] = _new_market_position(mt5, order, positions_before)
         if not accepted:
             _LOGGER.warning(
                 "MT5 order execution was rejected: action=%s symbol=%s volume=%s retcode=%r comment=%r last_error=%r",
@@ -681,6 +684,17 @@ def _serve_execution_recovery(mt5: ReadOnlyMT5, session: AnalysisWorkerSession, 
             }
             session.send_execution_recovery(request_id=request_id, operation=operation, accepted=True, result=result)
             return
+        if operation == "manual_position_reconcile":
+            ticket = _request_text(request, "ticket")
+            result = {
+                "orders": [],
+                "positions": [
+                    record for record in _records(mt5.positions_get(), "position").values()
+                    if str(record.get("ticket")) == ticket
+                ],
+            }
+            session.send_execution_recovery(request_id=request_id, operation=operation, accepted=True, result=result)
+            return
         ticket = int(_request_text(request, "ticket"))
         volume = float(_request_text(request, "volume"))
         if volume <= 0:
@@ -717,7 +731,7 @@ def _serve_execution_recovery(mt5: ReadOnlyMT5, session: AnalysisWorkerSession, 
 
 def _broker_order_request(mt5: object, order: dict[str, object]) -> dict[str, object]:
     if order.get("action") == "market":
-        required = ("symbol", "volume", "direction", "filling_mode", "control_plane_command_id")
+        required = ("symbol", "volume", "direction", "filling_mode")
         if set(order) != {"action", *required} or order.get("direction") not in {"LONG", "SHORT"}:
             raise WorkerEnrollmentError("The controller requested an invalid market order.")
         if order.get("filling_mode") not in {"FOK", "IOC"} or not all(isinstance(order[field], str) and order[field] for field in required):
@@ -736,7 +750,6 @@ def _broker_order_request(mt5: object, order: dict[str, object]) -> dict[str, ob
                 "type": order_type,
                 "price": price,
                 "type_filling": getattr(mt5, "ORDER_FILLING_FOK" if order["filling_mode"] == "FOK" else "ORDER_FILLING_IOC"),
-                "comment": order["control_plane_command_id"],
             }
         except (TypeError, ValueError, AttributeError) as error:
             raise WorkerEnrollmentError("The controller requested an invalid market order.") from error
@@ -768,8 +781,34 @@ def _require_terminal_trading_permission(mt5: object) -> None:
         raise WorkerEnrollmentError("The local MT5 terminal has disabled Python trading.")
 
 
+def _new_market_position(
+    mt5: object, order: dict[str, object], positions_before: dict[str, dict[str, object]]
+) -> dict[str, object]:
+    try:
+        expected_type = getattr(mt5, "POSITION_TYPE_BUY" if order["direction"] == "LONG" else "POSITION_TYPE_SELL")
+        expected_volume = float(str(order["volume"]))
+    except (KeyError, TypeError, ValueError, AttributeError) as error:
+        raise WorkerEnrollmentError("The controller requested an invalid market order.") from error
+    for _ in range(3):
+        positions_after = _records(mt5.positions_get(), "position")
+        candidates = [
+            position for ticket, position in positions_after.items()
+            if ticket not in positions_before
+            and position.get("symbol") == order["symbol"]
+            and position.get("type") == expected_type
+            and _volume(position) == expected_volume
+        ]
+        if len(candidates) == 1:
+            position = candidates[0]
+            price_open = position.get("price_open")
+            if isinstance(price_open, (int, float)) and not isinstance(price_open, bool) and price_open > 0:
+                return position
+        _sleep(0.2)
+    raise WorkerEnrollmentError("The local MT5 terminal did not provide unique new-position evidence.")
+
+
 def _broker_limit_request(mt5: object, order: dict[str, object]) -> dict[str, object]:
-    required = ("symbol", "volume", "direction", "price", "sl", "tp", "filling_mode", "expires_at", "control_plane_command_id")
+    required = ("symbol", "volume", "direction", "price", "sl", "tp", "filling_mode", "expires_at")
     if set(order) != {"action", *required} or order.get("action") != "pending_limit":
         raise WorkerEnrollmentError("The controller requested an invalid limit order.")
     direction = order.get("direction")
@@ -794,7 +833,6 @@ def _broker_limit_request(mt5: object, order: dict[str, object]) -> dict[str, ob
             "type_filling": getattr(mt5, "ORDER_FILLING_FOK" if filling_mode == "FOK" else "ORDER_FILLING_IOC"),
             "type_time": getattr(mt5, "ORDER_TIME_SPECIFIED"),
             "expiration": expiration,
-            "comment": order["control_plane_command_id"],
         }
     except (TypeError, ValueError, AttributeError) as error:
         raise WorkerEnrollmentError("The controller requested an invalid limit order.") from error

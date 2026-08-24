@@ -436,26 +436,17 @@ class WorkerIsolationTests(unittest.IsolatedAsyncioTestCase):
                     "price": 0.0,
                     "bid": 0.0,
                     "ask": 0.0,
+                    "position": (
+                        {"ticket": 901, "volume": "0.1", "price_open": "1.1002"}
+                        if connection is first_connection
+                        else {"ticket": 902, "volume": "0.2", "price_open": "1.0998"}
+                    ),
                 },
             }
-
-        async def reconcile(
-            connection: object, operation: str, payload: dict[str, str]
-        ) -> dict[str, object]:
-            self.assertEqual("execution_reconcile", operation)
-            self.assertTrue(payload["execution_id"].startswith("abt:m:"))
-            calls.append("reconcile")
-            position = (
-                {"ticket": 901, "volume": "0.1", "price_open": "1.1002"}
-                if connection is first_connection
-                else {"ticket": 902, "volume": "0.2", "price_open": "1.0998"}
-            )
-            return {"accepted": True, "operation": operation, "result": {"orders": [], "positions": [position]}}
 
         with (
             patch("abt.controlplane.service._connected_worker_session", side_effect=[first_connection, second_connection]),
             patch("abt.controlplane.service._request_order_execute", side_effect=order_execute),
-            patch("abt.controlplane.service._execution_recovery_request", side_effect=reconcile),
         ):
             await _dispatch_manual_trade(
                 Ledger(),  # type: ignore[arg-type]
@@ -465,7 +456,7 @@ class WorkerIsolationTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(
-            ["market", "reconcile", "protect", "reconcile", "market", "reconcile", "protect"],
+            ["market", "protect", "market", "protect"],
             calls,
         )
         self.assertEqual([], freezes)
@@ -477,19 +468,19 @@ class WorkerIsolationTests(unittest.IsolatedAsyncioTestCase):
             reconciliation = leg["reconciliation"]
             self.assertIsInstance(reconciliation, dict)
             self.assertTrue(str(reconciliation["observed_at"]).endswith("+00:00"))
-            self.assertEqual(str(leg["position_ticket"]), reconciliation["position"]["ticket"])
+            self.assertEqual(str(leg["position_ticket"]), str(reconciliation["position"]["ticket"]))
 
     async def test_manual_trade_freezes_before_protection_for_unresolved_reconciliation(self) -> None:
-        for positions, reason in (
-            ([], "exactly one open position"),
-            (
+        for positions in (
+            [],
+            [
                 [
                     {"ticket": 901, "volume": "0.1", "price_open": "1.1002"},
                     {"ticket": 902, "volume": "0.1", "price_open": "1.1003"},
-                ],
-                "exactly one open position",
-            ),
-            ([{"ticket": 901, "volume": "0.1", "price_open": "0"}], "positive position fill price"),
+                ][0],
+                {"ticket": 902, "volume": "0.1", "price_open": "1.1003"},
+            ],
+            [{"ticket": 901, "volume": "0.1", "price_open": "0"}],
         ):
             with self.subTest(positions=positions):
                 first_connection = object()
@@ -559,7 +550,6 @@ class WorkerIsolationTests(unittest.IsolatedAsyncioTestCase):
                 async def reconcile(
                     _connection: object, operation: str, _payload: dict[str, str]
                 ) -> dict[str, object]:
-                    self.assertEqual("execution_reconcile", operation)
                     calls.append("reconcile")
                     return {"accepted": True, "operation": operation, "result": {"orders": [], "positions": positions}}
 
@@ -575,11 +565,11 @@ class WorkerIsolationTests(unittest.IsolatedAsyncioTestCase):
                         "manual-1",
                     )
 
-                self.assertEqual(["market", "reconcile"], calls)
+                self.assertEqual(["market"], calls)
                 self.assertEqual([("manual_trade_execution_frozen", "needs_human")], [
                     (event_type, status) for event_type, status, _payload in events
                 ])
-                self.assertIn(reason, str(events[0][2]["reason"]))
+                self.assertIn("confirmed position evidence", str(events[0][2]["reason"]))
                 self.assertEqual(
                     [("manual_trade_execution_anomaly", ["worker-a", "worker-b"])],
                     [(source, worker_ids) for source, worker_ids, _audit in freezes],
@@ -621,16 +611,16 @@ class WorkerIsolationTests(unittest.IsolatedAsyncioTestCase):
             def freeze_workers(self, source: str, worker_ids: list[str], audit: dict[str, object]) -> None:
                 freezes.append((source, worker_ids, audit))
 
-        async def reconcile(
-            _connections: list[object], _execution_id: str
-        ) -> list[dict[str, list[dict[str, str]]]]:
-            if not reconciliation_results:
-                self.fail("The operation reconciled more times than expected.")
-            return reconciliation_results.pop(0)
-
         async def recovery(
             _connection: object, operation: str, payload: dict[str, str]
         ) -> dict[str, object]:
+            if operation == "manual_position_reconcile":
+                if not reconciliation_results:
+                    self.fail("The operation reconciled more times than expected.")
+                result = reconciliation_results[0].pop(0)
+                if not reconciliation_results[0]:
+                    reconciliation_results.pop(0)
+                return {"accepted": True, "operation": operation, "result": result}
             self.assertEqual("execution_close", operation)
             closed_tickets.append(payload["ticket"])
             return {"accepted": True}
@@ -647,7 +637,6 @@ class WorkerIsolationTests(unittest.IsolatedAsyncioTestCase):
         ]
         with (
             patch("abt.controlplane.service._connected_worker_session", side_effect=[first_connection, second_connection]),
-            patch("abt.controlplane.service._reconcile_execution", side_effect=reconcile),
             patch("abt.controlplane.service._execution_recovery_request", side_effect=recovery),
         ):
             await _dispatch_manual_trade_operation(

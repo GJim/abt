@@ -310,6 +310,9 @@ class AuthenticatedWorkerSession:
         if request_type == "execution_reconcile_request" and set(response) == {"type", "request_id", "execution_id"}:
             return {"type": request_type, "request_id": _required_text(response, "request_id"),
                     "execution_id": _required_text(response, "execution_id")}
+        if request_type == "manual_position_reconcile_request" and set(response) == {"type", "request_id", "ticket"}:
+            return {"type": request_type, "request_id": _required_text(response, "request_id"),
+                    "ticket": _required_text(response, "ticket")}
         if request_type in {"execution_cancel_request", "execution_close_request"} and set(response) == {
             "type", "request_id", "ticket", "volume"
         }:
@@ -397,7 +400,9 @@ class AuthenticatedWorkerSession:
 
 def _is_execution_recovery_request(response: dict[str, object]) -> bool:
     request_type = response.get("type")
-    return isinstance(request_type, str) and request_type.startswith(("execution_", "worker_cleanup_"))
+    return isinstance(request_type, str) and request_type.startswith(
+        ("execution_", "manual_position_", "worker_cleanup_")
+    )
 
 
 def collect_product_catalog_evidence(

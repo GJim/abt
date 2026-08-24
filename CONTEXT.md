@@ -56,7 +56,7 @@
 人工測試 CLI 第一版提供交易工作流資料、訂單計算與檢查、市場深度與 broker 狀態的查詢命令；不包含 MetaTrader5 的資料庫、圖表或 global variables 等低層 API。`symbol-select` 與 `symbol-hide` 是明確例外，分別加入或移除 terminal 的 Market Watch 商品，並在操作後驗證可見狀態。
 
 **測試 CLI 寫入面**:
-人工測試 CLI 以具型別命令支援 market、limit、stop、stop-limit、cancel、modify、close 與 close-by，並提供須明確標示的原生 JSON 請求進階入口；掛單涵蓋 buy/sell limit、buy/sell stop 與 buy/sell stop-limit；所有寫入均遵守相同的確認與 broker 預先檢查。填單模式只支援 FOK、IOC 與 RETURN，不支援 BOC。magic number 與 comment 預設留空，僅在使用者明確傳入時寫入；明確傳入的 comment 超出 broker 上限時拒絕，不得截斷。
+人工測試 CLI 以具型別命令支援 market、limit、stop、stop-limit、cancel、modify、close 與 close-by，並提供須明確標示的原生 JSON 請求進階入口；掛單涵蓋 buy/sell limit、buy/sell stop、buy/sell stop-limit；所有寫入均遵守相同的確認與 broker 預先檢查。填單模式只支援 FOK、IOC 與 RETURN，不支援 BOC。所有生產與人工測試訂單不得設定 magic number 或 comment；兩欄必須留空，且控制平面不得以 broker order metadata 作為 correlation 機制。
 
 **測試 CLI 持倉模型**:
 人工測試 CLI 同時支援 netting 與 hedging 帳戶；依帳戶保證金模式決定持倉操作語意，close-by 只適用於 hedging。平倉預設全數，只有明確指定 volume 時才部分平倉；hedging 以 position ticket 定位，netting 以 symbol 定位唯一持倉。
@@ -256,7 +256,7 @@ IOC 進場後，主控台以兩腿實際成交量依商品配對比例換算可�
 _Avoid_: 送單成交量、回執成交量
 
 **執行識別碼**:
-主控台在 dispatch 前持久化並寫入同一共同交易意圖兩腿 broker comment 的不可變識別碼；它將對帳中的訂單、持倉與成交關聯至該意圖。
+主控台在 dispatch 前持久化不可變的外部 execution identity；它不得寫入 broker comment 或 magic number。對帳必須由持久化的 broker ticket 與受 worker execution lock 保護的前後 broker state difference 完成；若無法唯一確認 broker evidence，必須 freeze 並要求人工處理。
 _Avoid_: ticket 配對、價格時間猜測
 
 **不確定恢復結果**:
