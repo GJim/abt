@@ -757,12 +757,12 @@ def _serve_trader_rpc(mt5: ReadOnlyMT5, session: AnalysisWorkerSession, request:
     try:
         result = _trader_read(mt5, payload) if kind == "read" else _trader_operation(mt5, payload)
         session.send_trader_rpc(request_id=request_id, kind=kind, accepted=True, result=result)
-    except (WorkerEnrollmentError, ValueError):
+    except (WorkerEnrollmentError, ValueError) as error:
         session.send_trader_rpc(
             request_id=request_id,
             kind=kind,
             accepted=False,
-            reason="The Trader request could not be completed by the local MT5 terminal.",
+            reason=str(error),
         )
     except Exception:
         _LOGGER.exception("Trader %s request failed.", kind)

@@ -14,6 +14,7 @@ from abt.worker.reconciliation import (
     _broker_order_request,
     _order_check_diagnostics,
     _serve_order_execute,
+    _serve_trader_rpc,
     _serve_execution_recovery,
     reconnect_worker_session,
     reconcile_authenticated_worker,
@@ -50,6 +51,44 @@ class ReadOnlyMT5:
 
 
 class WorkerReconciliationTests(unittest.TestCase):
+    def test_trader_rpc_reports_safe_terminal_permission_rejection(self) -> None:
+        class DisabledTerminalMT5:
+            def terminal_info(self) -> object:
+                return {"trade_allowed": False, "tradeapi_disabled": False}
+
+        class Session:
+            response: dict[str, object] | None = None
+
+            def send_trader_rpc(self, **kwargs: object) -> None:
+                self.response = kwargs
+
+        session = Session()
+        _serve_trader_rpc(
+            DisabledTerminalMT5(),
+            session,  # type: ignore[arg-type]
+            {
+                "request_id": "request-1",
+                "kind": "operation",
+                "payload": {
+                    "type": "market",
+                    "symbol": "EURUSD",
+                    "volume": "0.01",
+                    "direction": "LONG",
+                    "filling_mode": "IOC",
+                },
+            },
+        )
+
+        self.assertEqual(
+            {
+                "request_id": "request-1",
+                "kind": "operation",
+                "accepted": False,
+                "reason": "The local MT5 terminal has algorithmic trading disabled.",
+            },
+            session.response,
+        )
+
     def test_mt5_last_error_diagnostic_is_safe_when_unavailable(self) -> None:
         self.assertIsNone(_mt5_last_error(object()))
 
