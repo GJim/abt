@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from typing import Protocol, Self
 from zoneinfo import ZoneInfo
 
-from websockets.exceptions import ConnectionClosed
+from websockets.exceptions import ConnectionClosed, InvalidStatus
 
 from ..mt5.config import TimeCalibrationFamily
 from ..mt5.output import render
@@ -841,6 +841,6 @@ def open_authenticated_worker_session(
 
 
 def _raise_closed_connection(error: Exception, phase: str) -> None:
-    if isinstance(error, (ConnectionClosed, OSError, TimeoutError)):
+    if isinstance(error, (ConnectionClosed, InvalidStatus, OSError, TimeoutError)):
         raise WorkerSessionDisconnected(f"The controller closed the {phase} WebSocket.") from error
     raise error

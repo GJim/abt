@@ -9,13 +9,16 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import httpx
-from websockets.exceptions import ConnectionClosedError
+from websockets.datastructures import Headers
+from websockets.exceptions import ConnectionClosedError, InvalidStatus
 from websockets.frames import Close
+from websockets.http11 import Response
 
 from abt.controlplane.crypto import enrollment_payload
 from abt.worker.cli import HTTPEnrollmentTransport, MetaTrader5Adapter, _print_diagnostic, main
 from abt.worker.credentials import retrieve_mt5_password
 from abt.worker.enrollment import WorkerEnrollmentError, WorkerSessionDisconnected, register_worker
+from abt.worker.reconciliation import reconnect_worker_session
 from abt.worker.session import AuthenticatedWorkerSession, open_authenticated_worker_session
 
 
@@ -717,6 +720,50 @@ class WorkerCredentialTests(unittest.TestCase):
 
         with self.assertRaisesRegex(WorkerSessionDisconnected, "reconciliation"):
             session.send_reconciliation({"type": "snapshot", "cursor": 0})
+
+    def test_marks_controller_handshake_rejection_for_session_reconnect(self) -> None:
+        connection_attempts = 0
+        waits: list[float] = []
+
+        def open_session() -> AuthenticatedWorkerSession:
+            nonlocal connection_attempts
+            connection_attempts += 1
+
+            def connect(url: str) -> FakeWebSocket:
+                if connection_attempts == 1:
+                    raise InvalidStatus(Response(503, "Service Unavailable", Headers()))
+                if url.endswith("/certificate"):
+                    return FakeWebSocket(
+                        [
+                            {"purpose": "certificate_delivery", "worker_id": "worker-123", "nonce": "certificate-nonce"},
+                            {"worker_id": "worker-123", "certificate": "certificate"},
+                        ]
+                    )
+                return FakeWebSocket(
+                    [
+                        {"purpose": "worker_session", "worker_id": "worker-123", "nonce": "session-nonce"},
+                        {"type": "authenticated", "worker_id": "worker-123", "cursor": 0},
+                    ]
+                )
+
+            return open_authenticated_worker_session(
+                controller_url="https://controller.example",
+                enrollment_id="enrollment-123",
+                key_store=FakeKeyStore(),
+                connect=connect,
+            )
+
+        reconnect_worker_session(
+            open_session=open_session,
+            mt5=FakeMT5(),
+            login=123456,
+            server="Broker-Demo",
+            sleep=waits.append,
+            run_reconciliation=lambda **_: None,
+        )
+
+        self.assertEqual(2, connection_attempts)
+        self.assertEqual([5.0], waits)
 
 
 class FakeWebSocket:
