@@ -3428,6 +3428,25 @@ class ControlPlaneServiceTests(unittest.TestCase):
                 second_socket.send_json({"type": "heartbeat"})
                 self.assertEqual({"type": "heartbeat_ack"}, second_socket.receive_json())
 
+        lifecycle_events = [
+            event for event in self.app.state.ledger.events()
+            if event["event_type"] in {"worker_session_authenticated", "worker_session_superseded", "worker_session_disconnected"}
+            and event["payload"].get("worker_id") == worker_id
+        ]
+        authenticated = [event for event in lifecycle_events if event["event_type"] == "worker_session_authenticated"]
+        superseded = [event for event in lifecycle_events if event["event_type"] == "worker_session_superseded"]
+        disconnected = [
+            event for event in lifecycle_events
+            if event["event_type"] == "worker_session_disconnected"
+            and event["payload"]["disposition"] == "superseded"
+        ]
+        self.assertGreaterEqual(len(authenticated), 2)
+        self.assertEqual(1, len(superseded))
+        self.assertEqual(1, len(disconnected))
+        self.assertEqual(superseded[0]["payload"]["session_id"], disconnected[0]["payload"]["session_id"])
+        self.assertIn(superseded[0]["payload"]["session_id"], {event["payload"]["session_id"] for event in authenticated})
+        self.assertIn(superseded[0]["payload"]["replacement_session_id"], {event["payload"]["session_id"] for event in authenticated})
+
     def test_build_requires_explicit_confirmation_and_persists_unordered_active_pair_evidence(self) -> None:
         with self._live_catalog_analysis_harness() as harness:
             analysis, first_worker, second_worker = self._create_passing_analysis(

@@ -1417,7 +1417,7 @@ class ControlLedger:
             self._connection.execute("UPDATE workers SET last_seen_at = ? WHERE worker_id = ?", [_utc_now(), worker_id])
             self._event("worker_reconciliation_snapshot", {"worker_id": worker_id, "cursor": cursor})
 
-    def record_worker_session(self, worker_id: str) -> None:
+    def record_worker_session(self, worker_id: str, session_id: str | None = None) -> None:
         with self._transaction():
             active = self._connection.execute(
                 "SELECT 1 FROM workers WHERE worker_id = ? AND status = 'active'", [worker_id]
@@ -1425,7 +1425,25 @@ class ControlLedger:
             if active is None:
                 raise LedgerError("Worker is not active.")
             self._connection.execute("UPDATE workers SET last_seen_at = ? WHERE worker_id = ?", [_utc_now(), worker_id])
-            self._event("worker_session_authenticated", {"worker_id": worker_id})
+            payload: dict[str, object] = {"worker_id": worker_id}
+            if session_id is not None:
+                payload["session_id"] = session_id
+            self._event("worker_session_authenticated", payload)
+
+    def record_worker_session_lifecycle(
+        self, event_type: str, worker_id: str, session_id: str, **details: object
+    ) -> None:
+        if event_type not in {"worker_session_superseded", "worker_session_disconnected", "worker_session_failed"}:
+            raise LedgerError("Worker session lifecycle event is invalid.")
+        if not session_id:
+            raise LedgerError("Worker session ID is required.")
+        with self._transaction():
+            active = self._connection.execute(
+                "SELECT 1 FROM workers WHERE worker_id = ? AND status = 'active'", [worker_id]
+            ).fetchone()
+            if active is None:
+                raise LedgerError("Worker is not active.")
+            self._event(event_type, {"worker_id": worker_id, "session_id": session_id, **details})
 
     def record_live_state(
         self,

@@ -372,6 +372,7 @@ class _WorkerSessionConnection:
     websocket: WebSocket
     outbound: queue.Queue[_WorkerAnalysisRequest | None] = field(default_factory=queue.Queue)
     pending: dict[str, _WorkerAnalysisRequest] = field(default_factory=dict)
+    session_id: str = field(default_factory=lambda: str(uuid4()))
     superseded: bool = False
 
 
@@ -1885,11 +1886,17 @@ def create_app(
                 worker_id=worker.worker_id,
                 nonce=nonce,
             )
-            ledger.record_worker_session(worker.worker_id)
             connection = _WorkerSessionConnection(websocket)
+            ledger.record_worker_session(worker.worker_id, connection.session_id)
             previous_connections = tuple(worker_connections.get(worker.worker_id, set()))
             for previous_connection in previous_connections:
                 previous_connection.superseded = True
+                ledger.record_worker_session_lifecycle(
+                    "worker_session_superseded",
+                    worker.worker_id,
+                    previous_connection.session_id,
+                    replacement_session_id=connection.session_id,
+                )
                 _fail_pending_worker_analysis_requests(
                     previous_connection,
                     "Worker session was superseded by a newer authenticated connection.",
@@ -1994,6 +2001,14 @@ def create_app(
                     raise ValueError("Invalid protocol message.")
         except WebSocketDisconnect as error:
             _LOGGER.info("Worker session disconnected with code %s.", error.code)
+            if "worker" in locals() and "connection" in locals():
+                ledger.record_worker_session_lifecycle(
+                    "worker_session_disconnected",
+                    worker.worker_id,
+                    connection.session_id,
+                    close_code=error.code,
+                    disposition="superseded" if connection.superseded else "disconnected",
+                )
             if "worker" in locals() and not ("connection" in locals() and connection.superseded):
                 _freeze_worker_session(
                     ledger,
@@ -2004,6 +2019,14 @@ def create_app(
             await _close_policy_violation(websocket)
         except (LedgerError, ProofError, SecretStoreError, ValueError) as error:
             _LOGGER.warning("Worker session authentication or request failed: %s", error)
+            if "worker" in locals() and "connection" in locals():
+                ledger.record_worker_session_lifecycle(
+                    "worker_session_failed",
+                    worker.worker_id,
+                    connection.session_id,
+                    reason=str(error),
+                    disposition="superseded" if connection.superseded else "failed",
+                )
             if "worker" in locals() and not ("connection" in locals() and connection.superseded):
                 _freeze_worker_session(
                     ledger,
@@ -2014,6 +2037,14 @@ def create_app(
             await _close_policy_violation(websocket)
         except Exception:
             _LOGGER.exception("Worker session authentication or request failed unexpectedly.")
+            if "worker" in locals() and "connection" in locals():
+                ledger.record_worker_session_lifecycle(
+                    "worker_session_failed",
+                    worker.worker_id,
+                    connection.session_id,
+                    reason="Unexpected worker session failure.",
+                    disposition="superseded" if connection.superseded else "failed",
+                )
             if "worker" in locals() and not ("connection" in locals() and connection.superseded):
                 _freeze_worker_session(
                     ledger,
