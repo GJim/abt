@@ -161,6 +161,12 @@ class MetaTrader5Adapter:
     def symbol_info_tick(self, symbol: str) -> object:
         return self._mt5.symbol_info_tick(symbol)
 
+    def symbol_info(self, symbol: str) -> object:
+        return self._mt5.symbol_info(symbol)
+
+    def copy_ticks_range(self, symbol: str, from_time: object, to_time: object, flags: int) -> object:
+        return self._mt5.copy_ticks_range(symbol, from_time, to_time, flags)
+
     def order_check(self, request: dict[str, object]) -> object:
         return self._mt5.order_check(request)
 
@@ -171,7 +177,7 @@ class MetaTrader5Adapter:
         return self._mt5.last_error()
 
     def __getattr__(self, name: str) -> object:
-        if name.startswith(("TIMEFRAME_", "TRADE_", "ORDER_", "POSITION_")):
+        if name.startswith(("COPY_TICKS_", "TIMEFRAME_", "TRADE_", "ORDER_", "POSITION_")):
             return getattr(self._mt5, name)
         raise AttributeError(name)
 
