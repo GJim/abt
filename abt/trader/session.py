@@ -5,6 +5,8 @@ from base64 import b64encode
 from collections import deque
 from collections.abc import Callable, Iterable
 from pathlib import Path
+from queue import Empty, SimpleQueue
+from time import monotonic
 from typing import Protocol, TextIO
 from urllib.parse import urlsplit, urlunsplit
 
@@ -78,26 +80,63 @@ def run_trader_session(
     output: TextIO,
     save_cursor: Callable[[int], None],
     on_heartbeat: Callable[[], None] | None = None,
+    worker_ids: tuple[str, ...] = ("*",),
+    command_source: SimpleQueue[object] | None = None,
 ) -> None:
     """Run one foreground connection until it disconnects."""
 
+    _send(socket, {"type": "subscribe", "worker_ids": list(worker_ids)})
     pending_events: deque[dict[str, object]] = deque()
+    last_heartbeat = monotonic()
     while True:
         if on_heartbeat is not None:
             on_heartbeat()
+        if command_source is not None:
+            _send_trader_commands(socket, command_source, output)
         if pending_events:
             message = pending_events.popleft()
         else:
             try:
-                message = _message(socket, timeout=30)
+                message = _message(socket, timeout=1 if command_source is not None else 30)
             except TimeoutError:
-                _send(socket, {"type": "heartbeat"})
+                if monotonic() - last_heartbeat >= 30:
+                    _send(socket, {"type": "heartbeat"})
+                    last_heartbeat = monotonic()
                 continue
         message_type = message.get("type")
         if message_type == "heartbeat":
             _send(socket, {"type": "heartbeat"})
+            last_heartbeat = monotonic()
             continue
         if message_type == "heartbeat_ack":
+            continue
+        if message_type == "subscribed":
+            continue
+        if message_type == "market_data":
+            if (
+                not isinstance(message.get("worker_id"), str)
+                or not isinstance(message.get("observed_at"), str)
+                or not isinstance(message.get("quotes"), list)
+            ):
+                raise TraderEnrollmentError("The controller returned an invalid Trader market-data message.")
+            output.write(json.dumps(message, separators=(",", ":"), sort_keys=True) + "\n")
+            output.flush()
+            continue
+        if message_type == "market_data_unavailable":
+            if not isinstance(message.get("worker_id"), str) or not isinstance(message.get("reason"), str):
+                raise TraderEnrollmentError("The controller returned an invalid Trader market-data message.")
+            output.write(json.dumps(message, separators=(",", ":"), sort_keys=True) + "\n")
+            output.flush()
+            continue
+        if message_type == "trader_rpc_result":
+            if (
+                not isinstance(message.get("request_id"), str)
+                or message.get("status") not in {"recorded", "completed", "rejected"}
+                or (message.get("result") is not None and not isinstance(message.get("result"), dict))
+            ):
+                raise TraderEnrollmentError("The controller returned an invalid Trader RPC response.")
+            output.write(json.dumps(message, separators=(",", ":"), sort_keys=True) + "\n")
+            output.flush()
             continue
         if message_type != "event" or not isinstance(message.get("event_id"), int):
             raise TraderEnrollmentError("The controller returned an invalid Trader event.")
@@ -117,6 +156,32 @@ def run_trader_session(
                 continue
             raise TraderEnrollmentError("The controller rejected Trader event acknowledgement.")
         save_cursor(cursor)
+
+
+def _send_trader_commands(socket: TraderWebSocket, command_source: SimpleQueue[object], output: TextIO) -> None:
+    while True:
+        try:
+            command = command_source.get_nowait()
+        except Empty:
+            return
+        if not isinstance(command, dict) or set(command) != {"request_id", "worker_id", "payload"}:
+            _write_jsonl_error(output, "Trader JSONL command must contain request_id, worker_id, and payload.")
+            continue
+        if (
+            not isinstance(command["request_id"], str)
+            or not command["request_id"]
+            or not isinstance(command["worker_id"], str)
+            or not command["worker_id"]
+            or not isinstance(command["payload"], dict)
+        ):
+            _write_jsonl_error(output, "Trader JSONL command contains invalid fields.")
+            continue
+        _send(socket, {"type": "request", **command})
+
+
+def _write_jsonl_error(output: TextIO, reason: str) -> None:
+    output.write(json.dumps({"type": "local_error", "reason": reason}, separators=(",", ":"), sort_keys=True) + "\n")
+    output.flush()
 
 
 def _send_proof(

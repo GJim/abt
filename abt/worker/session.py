@@ -55,6 +55,7 @@ class AuthenticatedWorkerSession:
     _order_check_requests: deque[dict[str, object]] = field(default_factory=deque, init=False, repr=False)
     _order_execute_requests: deque[dict[str, object]] = field(default_factory=deque, init=False, repr=False)
     _execution_recovery_requests: deque[dict[str, object]] = field(default_factory=deque, init=False, repr=False)
+    _trader_rpc_requests: deque[dict[str, object]] = field(default_factory=deque, init=False, repr=False)
 
     def __enter__(self) -> Self:
         return self
@@ -128,6 +129,9 @@ class AuthenticatedWorkerSession:
             if _is_execution_recovery_request(response):
                 self._execution_recovery_requests.append(response)
                 continue
+            if response.get("type") == "trader_rpc_request":
+                self._trader_rpc_requests.append(response)
+                continue
             return self._parse_product_catalog_analysis(response)
 
     def receive_order_check(self, timeout: float | None = None) -> dict[str, object] | None:
@@ -145,6 +149,9 @@ class AuthenticatedWorkerSession:
                 return None
             if _is_execution_recovery_request(response):
                 self._execution_recovery_requests.append(response)
+                return None
+            if response.get("type") == "trader_rpc_request":
+                self._trader_rpc_requests.append(response)
                 return None
             self._analysis_requests.append(response)
             return None
@@ -164,6 +171,9 @@ class AuthenticatedWorkerSession:
                 continue
             if _is_execution_recovery_request(response):
                 self._execution_recovery_requests.append(response)
+                continue
+            if response.get("type") == "trader_rpc_request":
+                self._trader_rpc_requests.append(response)
                 continue
             return response
 
@@ -239,6 +249,8 @@ class AuthenticatedWorkerSession:
                 self._order_check_requests.append(response)
             elif _is_execution_recovery_request(response):
                 self._execution_recovery_requests.append(response)
+            elif response.get("type") == "trader_rpc_request":
+                self._trader_rpc_requests.append(response)
             else:
                 self._analysis_requests.append(response)
             return None
@@ -290,9 +302,49 @@ class AuthenticatedWorkerSession:
             self._order_check_requests.append(response)
         elif response.get("type") == "order_execute_request":
             self._order_execute_requests.append(response)
+        elif response.get("type") == "trader_rpc_request":
+            self._trader_rpc_requests.append(response)
         else:
             self._analysis_requests.append(response)
         return None
+
+    def receive_trader_rpc(self) -> dict[str, object] | None:
+        if not self._trader_rpc_requests:
+            return None
+        response = self._trader_rpc_requests.popleft()
+        if (
+            set(response) != {"type", "request_id", "kind", "payload"}
+            or response.get("type") != "trader_rpc_request"
+            or response.get("kind") not in {"read", "operation"}
+            or not isinstance(response.get("payload"), dict)
+        ):
+            raise WorkerEnrollmentError("The controller returned an invalid Trader RPC request.")
+        return {
+            "request_id": _required_text(response, "request_id"),
+            "kind": response["kind"],
+            "payload": response["payload"],
+        }
+
+    def send_trader_rpc(
+        self, *, request_id: str, kind: str, accepted: bool, result: dict[str, object] | None = None,
+        reason: str | None = None,
+    ) -> None:
+        if kind not in {"read", "operation"} or not request_id or (accepted and result is None) or (not accepted and not reason):
+            raise WorkerEnrollmentError("The worker cannot send an invalid Trader RPC response.")
+        response: dict[str, object] = {
+            "type": "trader_rpc_response",
+            "request_id": request_id,
+            "kind": kind,
+            "accepted": accepted,
+        }
+        if accepted:
+            response["result"] = result
+        else:
+            response["reason"] = reason
+        try:
+            _send(self.socket, response)
+        except Exception as error:
+            _raise_closed_connection(error, "Trader RPC response")
 
     def _parse_execution_recovery(self, response: dict[str, object]) -> dict[str, object]:
         request_type = response.get("type")

@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import base64
+from queue import SimpleQueue
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -159,6 +160,31 @@ class TraderCommandTests(unittest.TestCase):
             self.assertEqual("", output.getvalue())
             self.assertIn("pending administrator approval", errors.getvalue())
 
+    def test_connect_forwards_selected_workers_to_the_session(self) -> None:
+        with TemporaryDirectory() as directory:
+            config_path = Path(directory) / "trader.json"
+            config_path.write_text(
+                '{"version":1,"controller_url":"https://controller.example","enrollment_id":"registration-123",'
+                '"strategy_name":"mean-reversion","public_ip":"203.0.113.4","key_name":"saved-key"}\n',
+                encoding="utf-8",
+            )
+            captured: dict[str, object] = {}
+
+            def connect(_: TraderIdentity, **kwargs: object) -> None:
+                captured.update(kwargs)
+
+            with (
+                patch("abt.trader.cli.sys.platform", "win32"),
+                patch("abt.trader.cli.connect_trader", side_effect=connect),
+            ):
+                exit_code = main(
+                    ["connect", "--config", str(config_path), "--worker-id", "worker-1", "--worker-id", "worker-2"],
+                    transport_factory=FakeTransport,
+                )
+
+            self.assertEqual(0, exit_code)
+            self.assertEqual(("worker-1", "worker-2"), captured["worker_ids"])
+
     def test_connect_writes_event_before_acknowledging_and_mirrors_acknowledged_cursor(self) -> None:
         output = io.StringIO()
         acknowledged: list[int] = []
@@ -204,6 +230,7 @@ class TraderCommandTests(unittest.TestCase):
         self.assertEqual([17, 18], cursors)
         self.assertEqual(
             [
+                '{"type":"subscribe","worker_ids":["*"]}',
                 '{"cursor":17,"type":"ack"}',
                 '{"cursor":18,"type":"ack"}',
             ],
@@ -212,6 +239,87 @@ class TraderCommandTests(unittest.TestCase):
         self.assertEqual(
             '{"event_id":17,"payload":{"state":"accepted"},"type":"event"}\n'
             '{"event_id":18,"payload":{"state":"executing"},"type":"event"}\n',
+            output.getvalue(),
+        )
+
+    def test_connect_subscribes_to_market_data_and_writes_it_without_acknowledging(self) -> None:
+        class MarketDataSocket:
+            def __init__(self) -> None:
+                self.messages = iter(
+                    [
+                        '{"type":"subscribed","worker_ids":["worker-1"]}',
+                        '{"type":"market_data","worker_id":"worker-1","observed_at":"2026-08-25T00:00:00+00:00",'
+                        '"quotes":[{"symbol":"EURUSD","bid":1.1,"ask":1.2}]}',
+                    ]
+                )
+                self.sent: list[str] = []
+
+            def recv(self, timeout: float | None = None) -> str:
+                return next(self.messages)
+
+            def send(self, message: str) -> None:
+                self.sent.append(message)
+
+        socket = MarketDataSocket()
+        output = io.StringIO()
+
+        with self.assertRaises(StopIteration):
+            run_trader_session(
+                socket,  # type: ignore[arg-type]
+                output=output,
+                save_cursor=lambda _: None,
+                worker_ids=("worker-1",),
+            )
+
+        self.assertEqual(['{"type":"subscribe","worker_ids":["worker-1"]}'], socket.sent)
+        self.assertEqual(
+            '{"observed_at":"2026-08-25T00:00:00+00:00","quotes":[{"ask":1.2,"bid":1.1,"symbol":"EURUSD"}],'
+            '"type":"market_data","worker_id":"worker-1"}\n',
+            output.getvalue(),
+        )
+
+    def test_connect_sends_jsonl_request_and_writes_correlated_result(self) -> None:
+        class RpcSocket:
+            def __init__(self) -> None:
+                self.messages = iter(
+                    [
+                        '{"type":"trader_rpc_result","request_id":"read-1","status":"completed",'
+                        '"result":{"account":{"login":123456}}}',
+                    ]
+                )
+                self.sent: list[str] = []
+
+            def recv(self, timeout: float | None = None) -> str:
+                return next(self.messages)
+
+            def send(self, message: str) -> None:
+                self.sent.append(message)
+
+        commands: SimpleQueue[object] = SimpleQueue()
+        commands.put(
+            {
+                "request_id": "read-1",
+                "worker_id": "worker-1",
+                "payload": {"kind": "read", "request": {"type": "account_info"}},
+            }
+        )
+        socket = RpcSocket()
+        output = io.StringIO()
+
+        with self.assertRaises(StopIteration):
+            run_trader_session(socket, output=output, save_cursor=lambda _: None, command_source=commands)  # type: ignore[arg-type]
+
+        self.assertEqual(
+            [
+                '{"type":"subscribe","worker_ids":["*"]}',
+                '{"payload":{"kind":"read","request":{"type":"account_info"}},"request_id":"read-1",'
+                '"type":"request","worker_id":"worker-1"}',
+            ],
+            socket.sent,
+        )
+        self.assertEqual(
+            '{"request_id":"read-1","result":{"account":{"login":123456}},"status":"completed",'
+            '"type":"trader_rpc_result"}\n',
             output.getvalue(),
         )
 

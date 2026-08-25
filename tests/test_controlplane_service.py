@@ -40,6 +40,7 @@ from abt.controlplane.ledger import LedgerError
 from abt.controlplane.secrets import SecretStore, SecretStoreError
 from abt.controlplane.service import (
     _analyze_product_catalogs,
+    _broadcast_trader_market_data,
     _cancel_intent,
     _dispatch_manual_trade,
     _dispatch_manual_trade_operation,
@@ -47,6 +48,7 @@ from abt.controlplane.service import (
     _dispatch_accepted_trader_intent,
     _delete_expired_pending_secrets,
     _market_data_statistics,
+    _trader_market_snapshots,
     _preflight_management_intent,
     _preflight_trader_intent,
     _request_market_data_with_retry,
@@ -55,6 +57,8 @@ from abt.controlplane.service import (
     TraderIntentPayload,
     _validated_market_data_response,
     _validated_product_catalog_response,
+    _TraderSessionConnection,
+    _trader_market_subscription,
     create_app,
 )
 from abt.worker.reconciliation import reconcile_authenticated_worker
@@ -77,6 +81,69 @@ class MemorySecretStore:
             self.fail_next_delete = False
             raise SecretStoreError("OpenBao is unavailable.")
         del self.passwords[reference]
+
+
+class TraderMarketSubscriptionTests(unittest.TestCase):
+    def test_initial_market_data_excludes_workers_without_an_authenticated_session(self) -> None:
+        class Ledger:
+            def __init__(self) -> None:
+                self.requested_worker_ids: set[str] | None = None
+
+            def trader_market_data(self, worker_ids: set[str] | None) -> list[dict[str, object]]:
+                self.requested_worker_ids = worker_ids
+                return []
+
+        ledger = Ledger()
+
+        snapshots = _trader_market_snapshots(  # type: ignore[arg-type]
+            ledger,
+            {},
+            None,
+        )
+
+        self.assertEqual([], snapshots)
+        self.assertEqual(set(), ledger.requested_worker_ids)
+
+    def test_filters_market_data_by_subscription_without_durable_events(self) -> None:
+        class Socket:
+            def __init__(self) -> None:
+                self.messages: list[dict[str, object]] = []
+
+            async def send_json(self, message: dict[str, object]) -> None:
+                self.messages.append(message)
+
+        selected_socket = Socket()
+        all_socket = Socket()
+        ignored_socket = Socket()
+        selected = _TraderSessionConnection(selected_socket, {"worker-1"})  # type: ignore[arg-type]
+        all_workers = _TraderSessionConnection(all_socket, None)  # type: ignore[arg-type]
+        ignored = _TraderSessionConnection(ignored_socket, {"worker-2"})  # type: ignore[arg-type]
+
+        asyncio.run(
+            _broadcast_trader_market_data(
+                {"trader-1": {selected, all_workers}, "trader-2": {ignored}},
+                "worker-1",
+                "2026-08-25T00:00:00+00:00",
+                [{"symbol": "EURUSD", "bid": 1.1, "ask": 1.2}],
+            )
+        )
+
+        expected = {
+            "type": "market_data",
+            "worker_id": "worker-1",
+            "observed_at": "2026-08-25T00:00:00+00:00",
+            "quotes": [{"symbol": "EURUSD", "bid": 1.1, "ask": 1.2}],
+        }
+        self.assertEqual([expected], selected_socket.messages)
+        self.assertEqual([expected], all_socket.messages)
+        self.assertEqual([], ignored_socket.messages)
+
+    def test_accepts_wildcard_or_nonempty_worker_ids_only(self) -> None:
+        self.assertIsNone(_trader_market_subscription(["*"]))
+        self.assertEqual({"worker-1", "worker-2"}, _trader_market_subscription(["worker-1", "worker-2"]))
+        for value in ([], ["*", "worker-1"], [""]):
+            with self.assertRaises(ValueError):
+                _trader_market_subscription(value)
 
 
 class MarketDataAlignmentTests(unittest.TestCase):

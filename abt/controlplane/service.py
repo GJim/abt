@@ -371,6 +371,17 @@ class _WorkerSessionConnection:
     pending: dict[str, _WorkerAnalysisRequest] = field(default_factory=dict)
 
 
+@dataclass(eq=False)
+class _TraderSessionConnection:
+    websocket: WebSocket
+    worker_ids: set[str] | None = field(default_factory=set)
+    send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+    async def send_json(self, message: dict[str, object]) -> None:
+        async with self.send_lock:
+            await self.websocket.send_json(message)
+
+
 def create_app(
     ledger_path: Path,
     *,
@@ -424,7 +435,7 @@ def create_app(
     app.state.worker_rotation_challenges: dict[str, _WorkerRotationChallenge] = {}
     admin_notification_connections: set[WebSocket] = set()
     worker_connections: dict[str, set[_WorkerSessionConnection]] = {}
-    trader_connections: dict[str, set[WebSocket]] = {}
+    trader_connections: dict[str, set[_TraderSessionConnection]] = {}
     worker_execution_locks: dict[str, asyncio.Lock] = {}
     startup_reconciliation_started_at = datetime.now(UTC)
 
@@ -1544,7 +1555,7 @@ def create_app(
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
         connections = tuple(trader_connections.pop(trader_id, set()))
         await asyncio.gather(
-            *(connection.close(code=status.WS_1008_POLICY_VIOLATION) for connection in connections),
+            *(connection.websocket.close(code=status.WS_1008_POLICY_VIOLATION) for connection in connections),
             return_exceptions=True,
         )
         return Response(status_code=status.HTTP_204_NO_CONTENT)
@@ -1668,17 +1679,18 @@ def create_app(
                 nonce=nonce,
             )
             ledger.active_trader(trader.trader_id)
-            trader_connections.setdefault(trader.trader_id, set()).add(websocket)
+            connection = _TraderSessionConnection(websocket)
+            trader_connections.setdefault(trader.trader_id, set()).add(connection)
             session_id = ledger.open_trader_session(trader.trader_id)
             cursor = ledger.trader_event_cursor(trader.trader_id)
-            await websocket.send_json({"type": "authenticated", "trader_id": trader.trader_id, "cursor": cursor})
+            await connection.send_json({"type": "authenticated", "trader_id": trader.trader_id, "cursor": cursor})
             delivered_event_ids: set[int] = set()
             last_delivered_event_id = cursor
 
             async def deliver_events_after(event_cursor: int) -> None:
                 nonlocal last_delivered_event_id
                 for event in ledger.trader_events_after(trader.trader_id, event_cursor):
-                    await websocket.send_json({"type": "event", **jsonable_encoder(event)})
+                    await connection.send_json({"type": "event", **jsonable_encoder(event)})
                     event_id = int(event["event_id"])
                     delivered_event_ids.add(event_id)
                     last_delivered_event_id = max(last_delivered_event_id, event_id)
@@ -1690,27 +1702,57 @@ def create_app(
                 try:
                     message = await asyncio.wait_for(websocket.receive_json(), timeout=30)
                 except asyncio.TimeoutError:
-                    await websocket.send_json({"type": "heartbeat"})
+                    await connection.send_json({"type": "heartbeat"})
                     last_controller_heartbeat = monotonic()
                     continue
                 if not isinstance(message, dict) or not isinstance(message.get("type"), str):
                     raise ValueError("Invalid Trader message.")
                 if monotonic() - last_controller_heartbeat >= 30:
-                    await websocket.send_json({"type": "heartbeat"})
+                    await connection.send_json({"type": "heartbeat"})
                     last_controller_heartbeat = monotonic()
                 message_type = message["type"]
                 if message_type == "heartbeat" and set(message) == {"type"}:
                     ledger.record_trader_signal(session_id)
-                    await websocket.send_json({"type": "heartbeat_ack"})
+                    await connection.send_json({"type": "heartbeat_ack"})
                 elif message_type == "ack" and set(message) == {"type", "cursor"} and isinstance(message["cursor"], int):
                     ledger.record_trader_signal(session_id)
                     ledger.acknowledge_trader_events(
                         trader.trader_id, message["cursor"], cursor, delivered_event_ids
                     )
-                    await websocket.send_json({"type": "acknowledged", "cursor": message["cursor"]})
+                    await connection.send_json({"type": "acknowledged", "cursor": message["cursor"]})
                 elif message_type == "resume" and set(message) == {"type", "cursor"} and isinstance(message["cursor"], int):
                     ledger.record_trader_signal(session_id)
                     await deliver_events_after(message["cursor"])
+                elif message_type == "subscribe" and set(message) == {"type", "worker_ids"}:
+                    worker_ids = _trader_market_subscription(message["worker_ids"])
+                    if worker_ids is not None:
+                        ledger.trader_market_data(worker_ids)
+                    snapshots = _trader_market_snapshots(ledger, worker_connections, worker_ids)
+                    connection.worker_ids = worker_ids
+                    await connection.send_json(
+                        {"type": "subscribed", "worker_ids": ["*"] if worker_ids is None else sorted(worker_ids)}
+                    )
+                    for snapshot in snapshots:
+                        await connection.send_json({"type": "market_data", **snapshot})
+                elif (
+                    message_type == "request"
+                    and set(message) == {"type", "request_id", "worker_id", "payload"}
+                    and isinstance(message["request_id"], str)
+                    and message["request_id"]
+                    and isinstance(message["worker_id"], str)
+                    and message["worker_id"]
+                    and isinstance(message["payload"], dict)
+                ):
+                    result = await _mediate_trader_worker_request(
+                        ledger,
+                        worker_connections,
+                        worker_execution_locks,
+                        trader.trader_id,
+                        message["request_id"],
+                        message["worker_id"],
+                        cast(dict[str, Any], message["payload"]),
+                    )
+                    await connection.send_json(result)
                 elif (
                     message_type == "command"
                     and set(message) == {"type", "command_id", "payload"}
@@ -1759,7 +1801,7 @@ def create_app(
             if trader_id is not None:
                 connections = trader_connections.get(trader_id)
                 if connections is not None:
-                    connections.discard(websocket)
+                    connections.discard(connection)
                     if not connections:
                         trader_connections.pop(trader_id, None)
 
@@ -1883,10 +1925,17 @@ def create_app(
                 elif message_type == "live_state_snapshot":
                     _record_live_state_snapshot(ledger, worker.worker_id, request)
                     await websocket.send_json({"type": "live_state_accepted"})
+                    await _broadcast_trader_market_data(
+                        trader_connections, worker.worker_id, request["observed_at"], request["quotes"]
+                    )
                     await _broadcast_management_snapshot(ledger, admin_notification_connections)
                 elif message_type == "live_state_diff":
                     _record_live_state_diff(ledger, worker.worker_id, request)
                     await websocket.send_json({"type": "live_state_accepted"})
+                    if request["entity"] == "quotes":
+                        await _broadcast_trader_market_data(
+                            trader_connections, worker.worker_id, request["observed_at"], request["value"]
+                        )
                     await _broadcast_management_snapshot(ledger, admin_notification_connections)
                 elif message_type == "snapshot":
                     _record_snapshot(ledger, worker.worker_id, request)
@@ -1922,6 +1971,8 @@ def create_app(
                     _record_execution_recovery_response(connection, request)
                 elif message_type == "execution_recovery_error":
                     _record_execution_recovery_error(connection, request)
+                elif message_type == "trader_rpc_response":
+                    _record_trader_rpc_response(connection, request)
                 else:
                     raise ValueError("Invalid protocol message.")
         except WebSocketDisconnect as error:
@@ -1965,6 +2016,11 @@ def create_app(
                 connections.discard(connection)
                 if not connections:
                     worker_connections.pop(worker.worker_id, None)
+                    await _broadcast_trader_market_data_unavailable(
+                        trader_connections,
+                        worker.worker_id,
+                        "worker_session_unavailable",
+                    )
 
     if spa_directory is not None:
         def management_spa_route() -> FileResponse:
@@ -2147,6 +2203,66 @@ async def _request_worker_analysis(
         connection.pending.pop(request.request_id, None)
 
 
+async def _mediate_trader_worker_request(
+    ledger: ControlLedger,
+    worker_connections: dict[str, set[_WorkerSessionConnection]],
+    worker_execution_locks: dict[str, asyncio.Lock],
+    trader_id: str,
+    request_id: str,
+    worker_id: str,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    kind = payload.get("kind")
+    request_payload = payload.get("request")
+    if kind not in {"read", "operation"} or not isinstance(request_payload, dict):
+        raise LedgerError("Trader request payload is invalid.")
+    recorded = ledger.request_trader_worker_rpc(trader_id, request_id, worker_id, kind, request_payload)
+    if recorded["status"] != "recorded":
+        return recorded
+    try:
+        connection = _connected_worker_session(worker_connections, worker_id, reason="Selected worker is disconnected.")
+        async def dispatch() -> dict[str, object]:
+            return await _request_worker_analysis(
+                connection,
+                analysis_id="trader_rpc",
+                stage="trader_rpc",
+                timeout=30,
+                message={
+                    "type": "trader_rpc_request",
+                    "request_id": request_id,
+                    "kind": kind,
+                    "payload": request_payload,
+                },
+            )
+        response = (
+            await dispatch()
+            if kind == "read"
+            else await _with_worker_execution_lock(worker_execution_locks, worker_id, dispatch)
+        )
+        accepted = response.get("accepted")
+        if not isinstance(accepted, bool):
+            raise LedgerError("Worker returned an invalid Trader RPC response.")
+        result = response.get("result") if accepted else {"reason": _required_text(response, "reason")}
+        if not isinstance(result, dict):
+            raise LedgerError("Worker returned an invalid Trader RPC response.")
+        return ledger.complete_trader_worker_rpc(trader_id, request_id, accepted=accepted, result=result)
+    except (asyncio.TimeoutError, LedgerError) as error:
+        return ledger.complete_trader_worker_rpc(
+            trader_id,
+            request_id,
+            accepted=False,
+            result={"reason": "Worker did not complete the Trader request." if isinstance(error, asyncio.TimeoutError) else str(error)},
+        )
+
+
+async def _with_worker_execution_lock(
+    worker_execution_locks: dict[str, asyncio.Lock], worker_id: str, action: Callable[[], Any]
+) -> dict[str, object]:
+    lock = worker_execution_locks.setdefault(worker_id, asyncio.Lock())
+    async with lock:
+        return await action()
+
+
 def _record_product_catalog_analysis_response(
     connection: _WorkerSessionConnection,
     request: dict[str, object],
@@ -2244,6 +2360,20 @@ def _record_order_execute_error(connection: _WorkerSessionConnection, request: d
     if pending.stage != "order_execute" or set(request) != {"type", "request_id", "reason"}:
         raise ValueError("Invalid worker order execution error.")
     pending.future.set_exception(LedgerError(_required_text(request, "reason")))
+
+
+def _record_trader_rpc_response(connection: _WorkerSessionConnection, request: dict[str, object]) -> None:
+    request_id = _required_text(request, "request_id")
+    pending = connection.pending.pop(request_id, None)
+    if pending is None:
+        return
+    if pending.stage != "trader_rpc" or request.get("kind") not in {"read", "operation"} or not isinstance(request.get("accepted"), bool):
+        raise ValueError("Invalid worker Trader RPC response.")
+    expected_fields = {"type", "request_id", "kind", "accepted", "result" if request["accepted"] else "reason"}
+    if set(request) != expected_fields or not isinstance(request.get("result", {}), dict):
+        raise ValueError("Invalid worker Trader RPC response.")
+    if not pending.future.done():
+        pending.future.set_result(request)
 
 
 def _record_execution_recovery_response(connection: _WorkerSessionConnection, request: dict[str, object]) -> None:
@@ -3927,6 +4057,68 @@ def _record_live_state_snapshot(ledger: ControlLedger, worker_id: str, message: 
     ledger.record_live_state(
         worker_id, message["observed_at"], message["connectivity"], message["quotes"], message["orders"], message["positions"]
     )
+
+
+async def _broadcast_trader_market_data(
+    trader_connections: dict[str, set[_TraderSessionConnection]],
+    worker_id: str,
+    observed_at: str,
+    quotes: list[object],
+) -> None:
+    message = {"type": "market_data", "worker_id": worker_id, "observed_at": observed_at, "quotes": quotes}
+    connections = tuple(
+        connection
+        for trader_connections_for_identity in trader_connections.values()
+        for connection in trader_connections_for_identity
+        if connection.worker_ids is None or worker_id in connection.worker_ids
+    )
+    for connection in connections:
+        try:
+            await connection.send_json(message)
+        except (RuntimeError, WebSocketDisconnect):
+            pass
+
+
+async def _broadcast_trader_market_data_unavailable(
+    trader_connections: dict[str, set[_TraderSessionConnection]],
+    worker_id: str,
+    reason: str,
+) -> None:
+    message = {"type": "market_data_unavailable", "worker_id": worker_id, "reason": reason}
+    connections = tuple(
+        connection
+        for trader_connections_for_identity in trader_connections.values()
+        for connection in trader_connections_for_identity
+        if connection.worker_ids is None or worker_id in connection.worker_ids
+    )
+    for connection in connections:
+        try:
+            await connection.send_json(message)
+        except (RuntimeError, WebSocketDisconnect):
+            pass
+
+
+def _trader_market_snapshots(
+    ledger: ControlLedger,
+    worker_connections: dict[str, set[_WorkerSessionConnection]],
+    worker_ids: set[str] | None,
+) -> list[dict[str, Any]]:
+    """Expose retained quotes only while the Worker still has an authenticated session."""
+
+    connected_worker_ids = set(worker_connections)
+    selected_worker_ids = connected_worker_ids if worker_ids is None else worker_ids & connected_worker_ids
+    return ledger.trader_market_data(selected_worker_ids)
+
+
+def _trader_market_subscription(value: object) -> set[str] | None:
+    if not isinstance(value, list) or not value or not all(isinstance(worker_id, str) and worker_id for worker_id in value):
+        raise ValueError("Invalid Trader market-data subscription.")
+    worker_ids = set(value)
+    if "*" in worker_ids:
+        if worker_ids != {"*"}:
+            raise ValueError("Invalid Trader market-data subscription.")
+        return None
+    return worker_ids
 
 
 def _record_live_state_diff(ledger: ControlLedger, worker_id: str, message: dict[str, object]) -> None:

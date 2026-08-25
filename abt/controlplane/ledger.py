@@ -1081,6 +1081,117 @@ class ControlLedger:
             raise LedgerError("Trader command ID was reused with a different payload.")
         return json.loads(existing[1])
 
+    def request_trader_worker_rpc(
+        self, trader_id: str, request_id: str, worker_id: str, kind: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Durably admit one idempotent real-time Trader request before worker dispatch."""
+
+        if kind not in {"read", "operation"}:
+            raise LedgerError("Trader worker request kind is invalid.")
+        canonical_payload = json.dumps(
+            {"worker_id": worker_id, "kind": kind, "payload": payload},
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        payload_hash = _hash(canonical_payload)
+        with self._transaction():
+            self.active_trader(trader_id)
+            self.active_worker(worker_id)
+            existing = self._connection.execute(
+                """SELECT payload_hash, status, result FROM trader_worker_requests
+                   WHERE trader_id = ? AND request_id = ?""",
+                [trader_id, request_id],
+            ).fetchone()
+            if existing is not None:
+                if existing[0] != payload_hash:
+                    raise LedgerError("Trader request ID was reused with a different payload.")
+                return {
+                    "type": "trader_rpc_result",
+                    "request_id": request_id,
+                    "status": existing[1],
+                    "result": None if existing[2] is None else json.loads(existing[2]),
+                }
+            event_id = self._event(
+                "trader_worker_request_recorded",
+                {"trader_id": trader_id, "request_id": request_id, "worker_id": worker_id, "kind": kind, "payload": payload},
+            )
+            if kind == "operation":
+                safety = self._connection.execute(
+                    "SELECT safety_state FROM workers WHERE worker_id = ?", [worker_id]
+                ).fetchone()
+                if safety is None or safety[0] != "connected" or self.frozen_worker_ids([worker_id]):
+                    result = {"reason": "Trader operations require a connected, unfrozen worker."}
+                    completed_event_id = self._event(
+                        "trader_worker_result_recorded",
+                        {
+                            "trader_id": trader_id,
+                            "request_id": request_id,
+                            "worker_id": worker_id,
+                            "kind": kind,
+                            "accepted": False,
+                            "result": result,
+                        },
+                    )
+                    self._connection.execute(
+                        """INSERT INTO trader_worker_requests
+                           (trader_id, request_id, worker_id, kind, payload_hash, payload, status, result,
+                            requested_event_id, completed_event_id, requested_at, completed_at)
+                           VALUES (?, ?, ?, ?, ?, ?, 'rejected', ?, ?, ?, ?, ?)""",
+                        [
+                            trader_id, request_id, worker_id, kind, payload_hash, canonical_payload,
+                            json.dumps(result, separators=(",", ":"), sort_keys=True),
+                            event_id, completed_event_id, _utc_now(), _utc_now(),
+                        ],
+                    )
+                    return {"type": "trader_rpc_result", "request_id": request_id, "status": "rejected", "result": result}
+            self._connection.execute(
+                """INSERT INTO trader_worker_requests
+                   (trader_id, request_id, worker_id, kind, payload_hash, payload, status, requested_event_id, requested_at)
+                   VALUES (?, ?, ?, ?, ?, ?, 'recorded', ?, ?)""",
+                [trader_id, request_id, worker_id, kind, payload_hash, canonical_payload, event_id, _utc_now()],
+            )
+            return {"type": "trader_rpc_result", "request_id": request_id, "status": "recorded", "result": None}
+
+    def complete_trader_worker_rpc(
+        self, trader_id: str, request_id: str, *, accepted: bool, result: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Persist the worker's result before returning it to the Trader."""
+
+        with self._transaction():
+            row = self._connection.execute(
+                """SELECT worker_id, kind, status, result FROM trader_worker_requests
+                   WHERE trader_id = ? AND request_id = ?""",
+                [trader_id, request_id],
+            ).fetchone()
+            if row is None:
+                raise LedgerError("Trader worker request does not exist.")
+            if row[2] != "recorded":
+                return {
+                    "type": "trader_rpc_result",
+                    "request_id": request_id,
+                    "status": row[2],
+                    "result": None if row[3] is None else json.loads(row[3]),
+                }
+            status = "completed" if accepted else "rejected"
+            event_id = self._event(
+                "trader_worker_result_recorded",
+                {
+                    "trader_id": trader_id,
+                    "request_id": request_id,
+                    "worker_id": row[0],
+                    "kind": row[1],
+                    "accepted": accepted,
+                    "result": result,
+                },
+            )
+            self._connection.execute(
+                """UPDATE trader_worker_requests
+                   SET status = ?, result = ?, completed_event_id = ?, completed_at = ?
+                   WHERE trader_id = ? AND request_id = ?""",
+                [status, json.dumps(result, separators=(",", ":"), sort_keys=True), event_id, _utc_now(), trader_id, request_id],
+            )
+            return {"type": "trader_rpc_result", "request_id": request_id, "status": status, "result": result}
+
     def acknowledge_trader_events(
         self, trader_id: str, cursor: int, connection_cursor: int, delivered_event_ids: set[int]
     ) -> None:
@@ -1377,6 +1488,36 @@ class ControlLedger:
             )
             self._connection.execute("UPDATE workers SET last_seen_at = ? WHERE worker_id = ?", [received_at, worker_id])
             self._event("worker_live_state_diff", {"worker_id": worker_id, "entity": entity})
+
+    def trader_market_data(self, worker_ids: set[str] | None) -> list[dict[str, Any]]:
+        """Return the latest quotes for the active Workers a Trader subscribed to."""
+
+        if worker_ids is not None:
+            for worker_id in worker_ids:
+                self.active_worker(worker_id)
+        clauses = ["w.status = 'active'"]
+        parameters: list[object] = []
+        if worker_ids is not None:
+            if not worker_ids:
+                return []
+            placeholders = ", ".join("?" for _ in worker_ids)
+            clauses.append(f"w.worker_id IN ({placeholders})")
+            parameters.extend(sorted(worker_ids))
+        with self._lock:
+            rows = self._connection.execute(
+                f"""
+                SELECT w.worker_id, s.observed_at, s.quotes
+                FROM workers w
+                JOIN worker_live_state s ON s.worker_id = w.worker_id
+                WHERE {' AND '.join(clauses)}
+                ORDER BY w.approved_at
+                """,
+                parameters,
+            ).fetchall()
+        return [
+            {"worker_id": worker_id, "observed_at": observed_at, "quotes": json.loads(quotes)}
+            for worker_id, observed_at, quotes in rows
+        ]
 
     def record_worker_heartbeat(self, worker_id: str) -> None:
         with self._transaction():
@@ -4154,6 +4295,21 @@ class ControlLedger:
                     result JSON NOT NULL,
                     created_at TIMESTAMPTZ NOT NULL,
                     PRIMARY KEY (trader_id, command_id)
+                );
+                CREATE TABLE IF NOT EXISTS trader_worker_requests (
+                    trader_id VARCHAR NOT NULL,
+                    request_id VARCHAR NOT NULL,
+                    worker_id VARCHAR NOT NULL,
+                    kind VARCHAR NOT NULL,
+                    payload_hash VARCHAR NOT NULL,
+                    payload JSON NOT NULL,
+                    status VARCHAR NOT NULL,
+                    result JSON,
+                    requested_event_id BIGINT NOT NULL,
+                    completed_event_id BIGINT,
+                    requested_at TIMESTAMPTZ NOT NULL,
+                    completed_at TIMESTAMPTZ,
+                    PRIMARY KEY (trader_id, request_id)
                 );
                 CREATE TABLE IF NOT EXISTS management_intent_commands (
                     username VARCHAR NOT NULL,

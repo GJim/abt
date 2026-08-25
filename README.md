@@ -58,12 +58,33 @@ device private key, and Trader certificate are never written to disk.
 ```powershell
 abt-trader enroll
 abt-trader connect
+abt-trader connect --worker-id <worker-id>
+abt-trader connect --jsonl
 ```
 
 `connect` keeps a foreground authenticated WSS session, writes lifecycle
-events as JSON Lines to standard output, and sends diagnostics to standard
-error. Existing Trader identity configuration is protected; use
+events and subscribed market-data messages as JSON Lines to standard output,
+and sends diagnostics to standard error. It subscribes to all currently
+connected Workers by default; repeat `--worker-id` to limit it to selected
+Workers. A worker session ending emits `market_data_unavailable`, and its
+retained quotes are never replayed to a new Trader session. Existing
+Trader identity configuration is protected; use
 `abt-trader enroll --replace-config` only for deliberate replacement.
+
+With `--jsonl`, `connect` accepts one command per standard-input line and
+writes correlated results to standard output. Every command has this envelope:
+
+```json
+{"request_id":"unique-id","worker_id":"approved-worker-id","payload":{"kind":"read","request":{"type":"account_info"}}}
+```
+
+`payload.kind` is `read` or `operation`. Reads support `account_info`,
+`symbol_info`, `historical_ticks`, `current_orders`, and `current_positions`;
+historical ticks are limited to 1,000 records per request. Operations support
+`market`, `pending` (`limit`, `stop`, or `stop_limit`), `cancel`, `close`, and
+`modify_sl_tp`. Operations are refused for a disconnected, frozen, or
+`needs_human` Worker. The controller records both the request and its Worker
+result before emitting the JSONL result.
 
 If the current context has open orders or positions, an interactive switch
 requires confirmation. `--yes` bypasses that prompt.

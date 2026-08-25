@@ -25,11 +25,15 @@ class ReadOnlyMT5(Protocol):
 
     def positions_get(self) -> object: ...
 
+    def symbol_info(self, symbol: str) -> object: ...
+
     def order_check(self, request: dict[str, object]) -> object: ...
 
     def order_send(self, request: dict[str, object]) -> object: ...
 
     def symbol_info_tick(self, symbol: str) -> object: ...
+
+    def copy_ticks_range(self, symbol: str, from_time: datetime, to_time: datetime, flags: int) -> object: ...
 
 
 class AuthenticatedReconciliationSession(Protocol):
@@ -72,6 +76,13 @@ class AnalysisWorkerSession(Protocol):
         stage: str,
         reason: str,
         timeframe: str | None = None,
+    ) -> None: ...
+
+    def receive_trader_rpc(self) -> dict[str, object] | None: ...
+
+    def send_trader_rpc(
+        self, *, request_id: str, kind: str, accepted: bool, result: dict[str, object] | None = None,
+        reason: str | None = None,
     ) -> None: ...
 
     def receive_order_check(self, timeout: float | None = None) -> dict[str, object] | None: ...
@@ -491,6 +502,11 @@ def _run_reconciliation_with_analysis(
                 recovery = receive_execution_recovery(timeout=0.0)
                 if recovery is not None:
                     _serve_execution_recovery(mt5, session, recovery)
+            receive_trader_rpc = getattr(session, "receive_trader_rpc", None)
+            if callable(receive_trader_rpc):
+                trader_rpc = receive_trader_rpc()
+                if trader_rpc is not None:
+                    _serve_trader_rpc(mt5, session, trader_rpc)
             if safety is not None:
                 safety.heartbeat(now())
 
@@ -732,6 +748,179 @@ def _serve_execution_recovery(mt5: ReadOnlyMT5, session: AnalysisWorkerSession, 
         session.send_execution_recovery_error(request_id=request_id, operation=operation, reason="The local MT5 execution recovery failed.")
 
 
+def _serve_trader_rpc(mt5: ReadOnlyMT5, session: AnalysisWorkerSession, request: dict[str, object]) -> None:
+    request_id = _request_text(request, "request_id")
+    kind = _request_text(request, "kind")
+    payload = request.get("payload")
+    if kind not in {"read", "operation"} or not isinstance(payload, dict):
+        raise WorkerEnrollmentError("The controller requested an invalid Trader RPC request.")
+    try:
+        result = _trader_read(mt5, payload) if kind == "read" else _trader_operation(mt5, payload)
+        session.send_trader_rpc(request_id=request_id, kind=kind, accepted=True, result=result)
+    except (WorkerEnrollmentError, ValueError):
+        session.send_trader_rpc(
+            request_id=request_id,
+            kind=kind,
+            accepted=False,
+            reason="The Trader request could not be completed by the local MT5 terminal.",
+        )
+    except Exception:
+        _LOGGER.exception("Trader %s request failed.", kind)
+        session.send_trader_rpc(
+            request_id=request_id,
+            kind=kind,
+            accepted=False,
+            reason="The local MT5 terminal failed while handling the Trader request.",
+        )
+
+
+def _trader_read(mt5: ReadOnlyMT5, payload: dict[str, object]) -> dict[str, object]:
+    operation = _request_text(payload, "type")
+    if operation == "account_info" and set(payload) == {"type"}:
+        return {"account": _json_evidence(mt5.account_info(), "account")}
+    if operation == "symbol_info" and set(payload) == {"type", "symbol"}:
+        return {"symbol": _json_evidence(mt5.symbol_info(_request_text(payload, "symbol")), "symbol")}
+    if operation == "current_orders" and set(payload) == {"type"}:
+        return {"orders": [_json_evidence(value, "order") for value in _record_values(mt5.orders_get(), "orders")]}
+    if operation == "current_positions" and set(payload) == {"type"}:
+        return {"positions": [_json_evidence(value, "position") for value in _record_values(mt5.positions_get(), "positions")]}
+    if operation == "historical_ticks" and set(payload) == {"type", "symbol", "from_utc", "to_utc", "flags"}:
+        start = _trader_utc(_request_text(payload, "from_utc"))
+        end = _trader_utc(_request_text(payload, "to_utc"))
+        if start >= end:
+            raise ValueError
+        flags = {"all": getattr(mt5, "COPY_TICKS_ALL"), "info": getattr(mt5, "COPY_TICKS_INFO"), "trade": getattr(mt5, "COPY_TICKS_TRADE")}.get(
+            _request_text(payload, "flags")
+        )
+        if flags is None:
+            raise ValueError
+        records = _structured_records(mt5.copy_ticks_range(_request_text(payload, "symbol"), start, end, flags))
+        return {"ticks": records[:1000]}
+    raise WorkerEnrollmentError("The controller requested an invalid Trader broker read.")
+
+
+def _trader_operation(mt5: ReadOnlyMT5, payload: dict[str, object]) -> dict[str, object]:
+    operation = _request_text(payload, "type")
+    _require_terminal_trading_permission(mt5)
+    if operation in {"market", "pending"}:
+        order = _trader_order(payload)
+        result = _evidence(mt5.order_send(_broker_order_request(mt5, order)), "order execution")
+        return {"operation": operation, "result": _json_evidence(result, "order execution")}
+    if operation == "cancel" and set(payload) == {"type", "ticket"}:
+        ticket = int(_request_text(payload, "ticket"))
+        result = _evidence(
+            mt5.order_send({"action": getattr(mt5, "TRADE_ACTION_REMOVE"), "order": ticket}),
+            "order cancellation",
+        )
+        return {"operation": operation, "result": _json_evidence(result, "order cancellation")}
+    if operation == "close" and set(payload) == {"type", "ticket", "volume"}:
+        ticket = int(_request_text(payload, "ticket"))
+        volume = float(_request_text(payload, "volume"))
+        if volume <= 0:
+            raise ValueError
+        position = next(
+            (item for item in _records(mt5.positions_get(), "position").values() if str(item.get("ticket")) == str(ticket)),
+            None,
+        )
+        if position is None or not isinstance(position.get("symbol"), str) or position.get("type") is None:
+            raise WorkerEnrollmentError("The position is no longer observable.")
+        close_type = getattr(mt5, "ORDER_TYPE_SELL") if position["type"] == getattr(mt5, "POSITION_TYPE_BUY") else getattr(mt5, "ORDER_TYPE_BUY")
+        tick = _evidence(mt5.symbol_info_tick(position["symbol"]), "position close tick")
+        price_key = "bid" if close_type == getattr(mt5, "ORDER_TYPE_SELL") else "ask"
+        price = tick.get(price_key)
+        if isinstance(price, bool) or not isinstance(price, (int, float)) or price <= 0:
+            raise WorkerEnrollmentError("The position close price is unavailable.")
+        result = _evidence(
+            mt5.order_send(
+                {
+                    "action": getattr(mt5, "TRADE_ACTION_DEAL"),
+                    "position": ticket,
+                    "symbol": position["symbol"],
+                    "volume": volume,
+                    "type": close_type,
+                    "price": price,
+                    "type_filling": getattr(mt5, "ORDER_FILLING_IOC"),
+                }
+            ),
+            "position close",
+        )
+        return {"operation": operation, "result": _json_evidence(result, "position close")}
+    if operation == "modify_sl_tp" and set(payload) == {"type", "symbol", "position", "sl", "tp"}:
+        result = _evidence(
+            mt5.order_send(
+                {
+                    "action": getattr(mt5, "TRADE_ACTION_SLTP"),
+                    "symbol": _request_text(payload, "symbol"),
+                    "position": int(_request_text(payload, "position")),
+                    "sl": float(_request_text(payload, "sl")),
+                    "tp": float(_request_text(payload, "tp")),
+                }
+            ),
+            "SL/TP modification",
+        )
+        return {"operation": operation, "result": _json_evidence(result, "SL/TP modification")}
+    raise WorkerEnrollmentError("The controller requested an invalid Trader operation.")
+
+
+def _trader_order(payload: dict[str, object]) -> dict[str, object]:
+    operation = _request_text(payload, "type")
+    if operation == "market" and set(payload) == {"type", "symbol", "volume", "direction", "filling_mode"}:
+        return {"action": "market", **{field: payload[field] for field in ("symbol", "volume", "direction", "filling_mode")}}
+    if operation != "pending":
+        raise WorkerEnrollmentError("The controller requested an invalid Trader operation.")
+    required = {"type", "pending_type", "symbol", "volume", "direction", "price", "sl", "tp", "filling_mode", "expires_at"}
+    pending_type = _request_text(payload, "pending_type")
+    if pending_type == "stop_limit":
+        required.add("stop_limit_price")
+    if set(payload) != required or pending_type not in {"limit", "stop", "stop_limit"}:
+        raise WorkerEnrollmentError("The controller requested an invalid pending order.")
+    order = {
+        "action": f"pending_{pending_type}",
+        **{field: payload[field] for field in required - {"type", "pending_type"}},
+    }
+    return order
+
+
+def _trader_utc(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        raise ValueError
+    return parsed.astimezone(UTC)
+
+
+def _record_values(value: object, kind: str) -> list[object]:
+    if value is None:
+        return []
+    if not isinstance(value, (list, tuple)):
+        raise WorkerEnrollmentError(f"The local MT5 terminal returned invalid {kind} records.")
+    return list(value)
+
+
+def _structured_records(value: object) -> list[dict[str, object]]:
+    if value is None:
+        raise WorkerEnrollmentError("The local MT5 terminal returned no tick records.")
+    names = getattr(getattr(value, "dtype", None), "names", None)
+    if not isinstance(names, tuple):
+        raise WorkerEnrollmentError("The local MT5 terminal returned invalid tick records.")
+    return [
+        {name: _json_value(row[name]) for name in names}
+        for row in value
+    ]
+
+
+def _json_evidence(value: object, kind: str) -> dict[str, object]:
+    return {key: _json_value(item) for key, item in _evidence(value, kind).items()}
+
+
+def _json_value(value: object) -> object:
+    item = value.item() if callable(getattr(value, "item", None)) else value
+    if isinstance(item, datetime):
+        return item.isoformat()
+    if isinstance(item, (str, int, float, bool)) or item is None:
+        return item
+    raise WorkerEnrollmentError("The local MT5 terminal returned non-serializable evidence.")
+
+
 def _broker_order_request(mt5: object, order: dict[str, object]) -> dict[str, object]:
     if order.get("action") == "market":
         required = ("symbol", "volume", "direction", "filling_mode")
@@ -812,24 +1001,35 @@ def _new_market_position(
 
 def _broker_limit_request(mt5: object, order: dict[str, object]) -> dict[str, object]:
     required = ("symbol", "volume", "direction", "price", "sl", "tp", "filling_mode", "expires_at")
-    if set(order) != {"action", *required} or order.get("action") != "pending_limit":
-        raise WorkerEnrollmentError("The controller requested an invalid limit order.")
+    action = order.get("action")
+    if action not in {"pending_limit", "pending_stop", "pending_stop_limit"}:
+        raise WorkerEnrollmentError("The controller requested an invalid pending order.")
+    required_fields = {"action", *required}
+    if action == "pending_stop_limit":
+        required_fields.add("stop_limit_price")
+    if set(order) != required_fields:
+        raise WorkerEnrollmentError("The controller requested an invalid pending order.")
     direction = order.get("direction")
     filling_mode = order.get("filling_mode")
     if direction not in {"LONG", "SHORT"} or filling_mode not in {"FOK", "IOC"}:
-        raise WorkerEnrollmentError("The controller requested an invalid limit order.")
+        raise WorkerEnrollmentError("The controller requested an invalid pending order.")
     if not all(isinstance(order[field], str) and order[field] for field in required):
-        raise WorkerEnrollmentError("The controller requested an invalid limit order.")
+        raise WorkerEnrollmentError("The controller requested an invalid pending order.")
     try:
         expires_at = datetime.fromisoformat(str(order["expires_at"]).replace("Z", "+00:00"))
         if expires_at.tzinfo is None:
             raise ValueError
         expiration = int(expires_at.timestamp())
-        return {
+        type_name = {
+            "pending_limit": "BUY_LIMIT" if direction == "LONG" else "SELL_LIMIT",
+            "pending_stop": "BUY_STOP" if direction == "LONG" else "SELL_STOP",
+            "pending_stop_limit": "BUY_STOP_LIMIT" if direction == "LONG" else "SELL_STOP_LIMIT",
+        }[action]
+        request = {
             "action": getattr(mt5, "TRADE_ACTION_PENDING"),
             "symbol": order["symbol"],
             "volume": float(str(order["volume"])),
-            "type": getattr(mt5, "ORDER_TYPE_BUY_LIMIT" if direction == "LONG" else "ORDER_TYPE_SELL_LIMIT"),
+            "type": getattr(mt5, f"ORDER_TYPE_{type_name}"),
             "price": float(str(order["price"])),
             "sl": float(str(order["sl"])),
             "tp": float(str(order["tp"])),
@@ -837,8 +1037,11 @@ def _broker_limit_request(mt5: object, order: dict[str, object]) -> dict[str, ob
             "type_time": getattr(mt5, "ORDER_TIME_SPECIFIED"),
             "expiration": expiration,
         }
+        if action == "pending_stop_limit":
+            request["stoplimit"] = float(str(order["stop_limit_price"]))
+        return request
     except (TypeError, ValueError, AttributeError) as error:
-        raise WorkerEnrollmentError("The controller requested an invalid limit order.") from error
+        raise WorkerEnrollmentError("The controller requested an invalid pending order.") from error
 
 
 def _send_product_catalog_analysis_error(
