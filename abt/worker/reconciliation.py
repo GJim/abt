@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
 import logging
+import math
 from time import monotonic, sleep as _sleep
 from typing import ContextManager, Protocol
 
@@ -808,6 +809,7 @@ def _trader_operation(mt5: ReadOnlyMT5, payload: dict[str, object]) -> dict[str,
     if operation in {"market", "pending"}:
         order = _trader_order(payload)
         result = _broker_receipt(mt5.order_send(_broker_order_request(mt5, order)), "order execution")
+        _require_completed_trader_receipt(mt5, result, "order execution")
         return {"operation": operation, "result": result}
     if operation == "cancel" and set(payload) == {"type", "ticket"}:
         ticket = int(_request_text(payload, "ticket"))
@@ -815,6 +817,7 @@ def _trader_operation(mt5: ReadOnlyMT5, payload: dict[str, object]) -> dict[str,
             mt5.order_send({"action": getattr(mt5, "TRADE_ACTION_REMOVE"), "order": ticket}),
             "order cancellation",
         )
+        _require_completed_trader_receipt(mt5, result, "order cancellation")
         return {"operation": operation, "result": result}
     if operation == "close" and set(payload) == {"type", "ticket", "volume"}:
         ticket = int(_request_text(payload, "ticket"))
@@ -847,6 +850,7 @@ def _trader_operation(mt5: ReadOnlyMT5, payload: dict[str, object]) -> dict[str,
             ),
             "position close",
         )
+        _require_completed_trader_receipt(mt5, result, "position close")
         return {"operation": operation, "result": result}
     if operation == "modify_sl_tp" and set(payload) == {"type", "symbol", "position", "sl", "tp"}:
         result = _broker_receipt(
@@ -861,6 +865,7 @@ def _trader_operation(mt5: ReadOnlyMT5, payload: dict[str, object]) -> dict[str,
             ),
             "SL/TP modification",
         )
+        _require_completed_trader_receipt(mt5, result, "SL/TP modification")
         return {"operation": operation, "result": result}
     raise WorkerEnrollmentError("The controller requested an invalid Trader operation.")
 
@@ -926,6 +931,13 @@ def _broker_receipt(value: object, kind: str) -> dict[str, object]:
         return BrokerReceipt.model_validate(fields).model_dump(mode="json", exclude_none=True)
     except ValidationError as error:
         raise WorkerEnrollmentError(f"The local MT5 terminal returned invalid {kind} evidence.") from error
+
+
+def _require_completed_trader_receipt(mt5: object, receipt: dict[str, object], operation: str) -> None:
+    if receipt["retcode"] != getattr(mt5, "TRADE_RETCODE_DONE"):
+        raise WorkerEnrollmentError(
+            f"The MT5 {operation} was rejected: retcode={receipt['retcode']} comment={receipt.get('comment', '')!r}."
+        )
 
 
 def _json_value(value: object) -> object:
@@ -1044,7 +1056,14 @@ def _broker_limit_request(mt5: object, order: dict[str, object]) -> dict[str, ob
         expires_at = datetime.fromisoformat(str(order["expires_at"]).replace("Z", "+00:00"))
         if expires_at.tzinfo is None:
             raise ValueError
-        expiration = int(expires_at.timestamp())
+        tick = _evidence(mt5.symbol_info_tick(str(order["symbol"])), "pending order tick")
+        broker_now = tick.get("time")
+        if isinstance(broker_now, bool) or not isinstance(broker_now, (int, float)) or broker_now <= 0:
+            raise ValueError
+        minimum_expiration = int(broker_now) + math.ceil((expires_at.astimezone(UTC) - datetime.now(UTC)).total_seconds())
+        if minimum_expiration <= int(broker_now):
+            raise ValueError
+        expiration = ((minimum_expiration + 59) // 60) * 60
         type_name = {
             "pending_limit": "BUY_LIMIT" if direction == "LONG" else "SELL_LIMIT",
             "pending_stop": "BUY_STOP" if direction == "LONG" else "SELL_STOP",
