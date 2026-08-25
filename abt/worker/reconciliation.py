@@ -6,6 +6,9 @@ import logging
 from time import monotonic, sleep as _sleep
 from typing import ContextManager, Protocol
 
+from pydantic import ValidationError
+
+from ..trader_protocol import BrokerReceipt
 from .enrollment import WorkerEnrollmentError, WorkerSessionDisconnected
 from .session import collect_market_data_evidence, collect_product_catalog_evidence
 
@@ -804,15 +807,15 @@ def _trader_operation(mt5: ReadOnlyMT5, payload: dict[str, object]) -> dict[str,
     _require_terminal_trading_permission(mt5)
     if operation in {"market", "pending"}:
         order = _trader_order(payload)
-        result = _evidence(mt5.order_send(_broker_order_request(mt5, order)), "order execution")
-        return {"operation": operation, "result": _json_evidence(result, "order execution")}
+        result = _broker_receipt(mt5.order_send(_broker_order_request(mt5, order)), "order execution")
+        return {"operation": operation, "result": result}
     if operation == "cancel" and set(payload) == {"type", "ticket"}:
         ticket = int(_request_text(payload, "ticket"))
-        result = _evidence(
+        result = _broker_receipt(
             mt5.order_send({"action": getattr(mt5, "TRADE_ACTION_REMOVE"), "order": ticket}),
             "order cancellation",
         )
-        return {"operation": operation, "result": _json_evidence(result, "order cancellation")}
+        return {"operation": operation, "result": result}
     if operation == "close" and set(payload) == {"type", "ticket", "volume"}:
         ticket = int(_request_text(payload, "ticket"))
         volume = float(_request_text(payload, "volume"))
@@ -830,7 +833,7 @@ def _trader_operation(mt5: ReadOnlyMT5, payload: dict[str, object]) -> dict[str,
         price = tick.get(price_key)
         if isinstance(price, bool) or not isinstance(price, (int, float)) or price <= 0:
             raise WorkerEnrollmentError("The position close price is unavailable.")
-        result = _evidence(
+        result = _broker_receipt(
             mt5.order_send(
                 {
                     "action": getattr(mt5, "TRADE_ACTION_DEAL"),
@@ -844,9 +847,9 @@ def _trader_operation(mt5: ReadOnlyMT5, payload: dict[str, object]) -> dict[str,
             ),
             "position close",
         )
-        return {"operation": operation, "result": _json_evidence(result, "position close")}
+        return {"operation": operation, "result": result}
     if operation == "modify_sl_tp" and set(payload) == {"type", "symbol", "position", "sl", "tp"}:
-        result = _evidence(
+        result = _broker_receipt(
             mt5.order_send(
                 {
                     "action": getattr(mt5, "TRADE_ACTION_SLTP"),
@@ -858,7 +861,7 @@ def _trader_operation(mt5: ReadOnlyMT5, payload: dict[str, object]) -> dict[str,
             ),
             "SL/TP modification",
         )
-        return {"operation": operation, "result": _json_evidence(result, "SL/TP modification")}
+        return {"operation": operation, "result": result}
     raise WorkerEnrollmentError("The controller requested an invalid Trader operation.")
 
 
@@ -910,6 +913,19 @@ def _structured_records(value: object) -> list[dict[str, object]]:
 
 def _json_evidence(value: object, kind: str) -> dict[str, object]:
     return {key: _json_value(item) for key, item in _evidence(value, kind).items()}
+
+
+def _broker_receipt(value: object, kind: str) -> dict[str, object]:
+    evidence = _evidence(value, kind)
+    fields = {
+        field: _json_value(evidence[field])
+        for field in ("retcode", "deal", "order", "volume", "price", "bid", "ask", "comment", "request_id", "retcode_external")
+        if field in evidence
+    }
+    try:
+        return BrokerReceipt.model_validate(fields).model_dump(mode="json", exclude_none=True)
+    except ValidationError as error:
+        raise WorkerEnrollmentError(f"The local MT5 terminal returned invalid {kind} evidence.") from error
 
 
 def _json_value(value: object) -> object:

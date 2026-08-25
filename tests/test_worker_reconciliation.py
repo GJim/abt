@@ -12,6 +12,7 @@ from abt.worker.reconciliation import (
     WorkerSafetyAdapter,
     _mt5_last_error,
     _broker_order_request,
+    _broker_receipt,
     _json_evidence,
     _order_check_diagnostics,
     _serve_order_execute,
@@ -52,6 +53,29 @@ class ReadOnlyMT5:
 
 
 class WorkerReconciliationTests(unittest.TestCase):
+    def test_receipt_adapter_ignores_unknown_nested_mt5_request(self) -> None:
+        OrderSendResult = namedtuple(
+            "OrderSendResult",
+            ("retcode", "deal", "order", "volume", "price", "comment", "request"),
+        )
+
+        receipt = _broker_receipt(
+            OrderSendResult(10009, 123456, 123456, 0.01, 1.16587, "Done", object()),
+            "order execution",
+        )
+
+        self.assertEqual(
+            {
+                "retcode": 10009,
+                "deal": 123456,
+                "order": 123456,
+                "volume": 0.01,
+                "price": 1.16587,
+                "comment": "Done",
+            },
+            receipt,
+        )
+
     def test_serializes_nested_mt5_order_send_receipt(self) -> None:
         TradeRequest = namedtuple("TradeRequest", ("action", "symbol", "volume"))
         OrderSendResult = namedtuple("OrderSendResult", ("retcode", "deal", "price", "request"))

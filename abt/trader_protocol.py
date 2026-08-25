@@ -11,6 +11,19 @@ class _ProtocolModel(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
 
+class BrokerReceipt(_ProtocolModel):
+    retcode: int
+    deal: int | None = None
+    order: int | None = None
+    volume: float | None = None
+    price: float | None = None
+    bid: float | None = None
+    ask: float | None = None
+    comment: str | None = None
+    request_id: int | None = None
+    retcode_external: int | None = None
+
+
 class AccountInfoRead(_ProtocolModel):
     type: Literal["account_info"]
 
