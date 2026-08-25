@@ -24,6 +24,8 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
+from ..trader_protocol import trader_rpc_response_adapter
+
 from .backup import BackupManager
 from .crypto import (
     ProofError,
@@ -2436,17 +2438,18 @@ def _record_order_execute_error(connection: _WorkerSessionConnection, request: d
 
 
 def _record_trader_rpc_response(connection: _WorkerSessionConnection, request: dict[str, object]) -> None:
-    request_id = _required_text(request, "request_id")
+    try:
+        response = trader_rpc_response_adapter.validate_python(request)
+    except ValidationError as error:
+        raise ValueError("Invalid worker Trader RPC response.") from error
+    request_id = response.request_id
     pending = connection.pending.pop(request_id, None)
     if pending is None:
         return
-    if pending.stage != "trader_rpc" or request.get("kind") not in {"read", "operation"} or not isinstance(request.get("accepted"), bool):
-        raise ValueError("Invalid worker Trader RPC response.")
-    expected_fields = {"type", "request_id", "kind", "accepted", "result" if request["accepted"] else "reason"}
-    if set(request) != expected_fields or not isinstance(request.get("result", {}), dict):
+    if pending.stage != "trader_rpc":
         raise ValueError("Invalid worker Trader RPC response.")
     if not pending.future.done():
-        pending.future.set_result(request)
+        pending.future.set_result(response.model_dump(mode="json"))
 
 
 def _record_execution_recovery_response(connection: _WorkerSessionConnection, request: dict[str, object]) -> None:

@@ -12,11 +12,13 @@ from dataclasses import dataclass, field
 from typing import Protocol, Self
 from zoneinfo import ZoneInfo
 
+from pydantic import ValidationError
 from websockets.exceptions import ConnectionClosed, InvalidStatus
 
 from ..mt5.config import TimeCalibrationFamily
 from ..mt5.output import render
 from ..mt5.timecalibration import MARKET_DATA, render_calibration
+from ..trader_protocol import TraderRpcFailure, TraderRpcRequest, TraderRpcSuccess
 from .credentials import (
     WebSocketConnector,
     WorkerWebSocket,
@@ -312,18 +314,11 @@ class AuthenticatedWorkerSession:
         if not self._trader_rpc_requests:
             return None
         response = self._trader_rpc_requests.popleft()
-        if (
-            set(response) != {"type", "request_id", "kind", "payload"}
-            or response.get("type") != "trader_rpc_request"
-            or response.get("kind") not in {"read", "operation"}
-            or not isinstance(response.get("payload"), dict)
-        ):
-            raise WorkerEnrollmentError("The controller returned an invalid Trader RPC request.")
-        return {
-            "request_id": _required_text(response, "request_id"),
-            "kind": response["kind"],
-            "payload": response["payload"],
-        }
+        try:
+            request = TraderRpcRequest.model_validate(response)
+        except ValidationError as error:
+            raise WorkerEnrollmentError("The controller returned an invalid Trader RPC request.") from error
+        return request.model_dump(mode="json", exclude_none=True)
 
     def send_trader_rpc(
         self, *, request_id: str, kind: str, accepted: bool, result: dict[str, object] | None = None,
@@ -331,16 +326,11 @@ class AuthenticatedWorkerSession:
     ) -> None:
         if kind not in {"read", "operation"} or not request_id or (accepted and result is None) or (not accepted and not reason):
             raise WorkerEnrollmentError("The worker cannot send an invalid Trader RPC response.")
-        response: dict[str, object] = {
-            "type": "trader_rpc_response",
-            "request_id": request_id,
-            "kind": kind,
-            "accepted": accepted,
-        }
-        if accepted:
-            response["result"] = result
-        else:
-            response["reason"] = reason
+        response = (
+            TraderRpcSuccess(request_id=request_id, kind=kind, result=result).model_dump(mode="json")
+            if accepted
+            else TraderRpcFailure(request_id=request_id, kind=kind, reason=reason).model_dump(mode="json")
+        )
         try:
             _send(self.socket, response)
         except Exception as error:
