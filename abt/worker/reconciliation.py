@@ -918,6 +918,15 @@ def _json_value(value: object) -> object:
         return item.isoformat()
     if isinstance(item, (str, int, float, bool)) or item is None:
         return item
+    if isinstance(item, Mapping):
+        if not all(isinstance(key, str) for key in item):
+            raise WorkerEnrollmentError("The local MT5 terminal returned non-serializable evidence.")
+        return {key: _json_value(nested) for key, nested in item.items()}
+    as_dict = getattr(item, "_asdict", None)
+    if callable(as_dict):
+        return _json_value(as_dict())
+    if isinstance(item, (list, tuple)):
+        return [_json_value(nested) for nested in item]
     raise WorkerEnrollmentError("The local MT5 terminal returned non-serializable evidence.")
 
 

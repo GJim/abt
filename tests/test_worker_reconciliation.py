@@ -12,6 +12,7 @@ from abt.worker.reconciliation import (
     WorkerSafetyAdapter,
     _mt5_last_error,
     _broker_order_request,
+    _json_evidence,
     _order_check_diagnostics,
     _serve_order_execute,
     _serve_trader_rpc,
@@ -51,6 +52,25 @@ class ReadOnlyMT5:
 
 
 class WorkerReconciliationTests(unittest.TestCase):
+    def test_serializes_nested_mt5_order_send_receipt(self) -> None:
+        TradeRequest = namedtuple("TradeRequest", ("action", "symbol", "volume"))
+        OrderSendResult = namedtuple("OrderSendResult", ("retcode", "deal", "price", "request"))
+
+        evidence = _json_evidence(
+            OrderSendResult(10009, 123456, 1.16587, TradeRequest(1, "EURUSD", 0.01)),
+            "order execution",
+        )
+
+        self.assertEqual(
+            {
+                "retcode": 10009,
+                "deal": 123456,
+                "price": 1.16587,
+                "request": {"action": 1, "symbol": "EURUSD", "volume": 0.01},
+            },
+            evidence,
+        )
+
     def test_trader_rpc_reports_safe_terminal_permission_rejection(self) -> None:
         class DisabledTerminalMT5:
             def terminal_info(self) -> object:
