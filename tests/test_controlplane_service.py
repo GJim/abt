@@ -52,7 +52,6 @@ from abt.controlplane.service import (
     _preflight_management_intent,
     _preflight_trader_intent,
     _request_market_data_with_retry,
-    _request_trader_historical_ticks,
     _shared_supported_filling_modes,
     _intent_order,
     TraderIntentPayload,
@@ -199,67 +198,6 @@ class MarketDataRequestTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([30, 30, 30, 30], timeouts)
         self.assertEqual(["Worker did not respond within 30 seconds."], retries)
-
-
-class TraderHistoricalTickRequestTests(unittest.IsolatedAsyncioTestCase):
-    async def test_splits_saturated_ranges_then_deduplicates_and_orders_ticks(self) -> None:
-        calls: list[tuple[datetime, datetime]] = []
-        active_requests = 0
-        maximum_active_requests = 0
-
-        async def request_worker(*_: object, **kwargs: object) -> dict[str, object]:
-            nonlocal active_requests, maximum_active_requests
-            active_requests += 1
-            maximum_active_requests = max(maximum_active_requests, active_requests)
-            await asyncio.sleep(0)
-            payload = kwargs["message"]["payload"]  # type: ignore[index]
-            start = datetime.fromisoformat(payload["from_utc"])  # type: ignore[index]
-            end = datetime.fromisoformat(payload["to_utc"])  # type: ignore[index]
-            calls.append((start, end))
-            try:
-                if end - start > timedelta(seconds=2):
-                    return {"accepted": True, "result": {"ticks": [{"time_msc": index} for index in range(1000)]}}
-                return {
-                    "accepted": True,
-                    "result": {
-                        "ticks": [
-                            {"time_msc": int(start.timestamp() * 1000)},
-                            {"time_msc": int(end.timestamp() * 1000)},
-                        ]
-                    },
-                }
-            finally:
-                active_requests -= 1
-
-        start = datetime(2026, 8, 10, tzinfo=UTC)
-        with patch("abt.controlplane.service._request_worker_analysis", side_effect=request_worker):
-            response = await _request_trader_historical_ticks(
-                object(),  # type: ignore[arg-type]
-                {
-                    "type": "historical_ticks",
-                    "symbol": "EURUSD",
-                    "from_utc": start.isoformat(),
-                    "to_utc": (start + timedelta(seconds=4)).isoformat(),
-                    "flags": "all",
-                },
-            )
-
-        self.assertEqual(
-            [
-                (start, start + timedelta(seconds=4)),
-                (start, start + timedelta(seconds=2)),
-                (start + timedelta(seconds=2), start + timedelta(seconds=4)),
-            ],
-            calls,
-        )
-        self.assertEqual(1, maximum_active_requests)
-        self.assertEqual(
-            [
-                {"time_msc": int((start + timedelta(seconds=offset)).timestamp() * 1000)}
-                for offset in (0, 2, 4)
-            ],
-            response["result"]["ticks"],  # type: ignore[index]
-        )
 
 
 class TraderIntentPreflightTests(unittest.IsolatedAsyncioTestCase):

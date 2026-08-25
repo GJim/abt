@@ -393,6 +393,35 @@ class ControlLedgerTests(unittest.TestCase):
                 preflight,
             )
 
+    def test_trader_worker_rpc_allows_only_its_first_admission_to_dispatch(self) -> None:
+        trader_enrollment = self.ledger.create_trader_enrollment(
+            strategy_name="mean-reversion", claimed_public_ip="203.0.113.4", public_key_pem="trader-key"
+        )
+        trader_id = self.ledger.approve_trader_enrollment(
+            trader_enrollment["registration_id"], "ABCDEF", lambda trader_id, *_: f"certificate:{trader_id}"
+        )
+        challenge, _ = self.ledger.issue_enrollment_challenge()
+        worker_enrollment = self.ledger.create_enrollment(
+            login=123456,
+            server="Broker-Demo",
+            public_key_pem="worker-key",
+            account_info={"login": 123456},
+            terminal_info={"name": "MetaTrader 5"},
+            password_secret_ref="abt/data/mt5/pending/worker",
+            enrollment_challenge=challenge,
+        )
+        worker_id = self.ledger.approve_enrollment(
+            worker_enrollment.enrollment_id, "ABCDEF", lambda worker_id, *_: f"certificate:{worker_id}"
+        )
+        payload = {"type": "current_positions"}
+
+        first = self.ledger.request_trader_worker_rpc(trader_id, "request-1", worker_id, "read", payload)
+        retry = self.ledger.request_trader_worker_rpc(trader_id, "request-1", worker_id, "read", payload)
+
+        self.assertTrue(first["dispatch"])
+        self.assertFalse(retry["dispatch"])
+        self.assertEqual("recorded", retry["status"])
+
     def test_trader_cancellation_atomically_blocks_undispatched_intent_and_is_idempotent(self) -> None:
         enrollment = self.ledger.create_trader_enrollment(
             strategy_name="mean-reversion",

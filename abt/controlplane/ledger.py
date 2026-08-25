@@ -1110,6 +1110,7 @@ class ControlLedger:
                     "request_id": request_id,
                     "status": existing[1],
                     "result": None if existing[2] is None else json.loads(existing[2]),
+                    "dispatch": False,
                 }
             event_id = self._event(
                 "trader_worker_request_recorded",
@@ -1143,14 +1144,26 @@ class ControlLedger:
                             event_id, completed_event_id, _utc_now(), _utc_now(),
                         ],
                     )
-                    return {"type": "trader_rpc_result", "request_id": request_id, "status": "rejected", "result": result}
+                    return {
+                        "type": "trader_rpc_result",
+                        "request_id": request_id,
+                        "status": "rejected",
+                        "result": result,
+                        "dispatch": False,
+                    }
             self._connection.execute(
                 """INSERT INTO trader_worker_requests
                    (trader_id, request_id, worker_id, kind, payload_hash, payload, status, requested_event_id, requested_at)
                    VALUES (?, ?, ?, ?, ?, ?, 'recorded', ?, ?)""",
                 [trader_id, request_id, worker_id, kind, payload_hash, canonical_payload, event_id, _utc_now()],
             )
-            return {"type": "trader_rpc_result", "request_id": request_id, "status": "recorded", "result": None}
+            return {
+                "type": "trader_rpc_result",
+                "request_id": request_id,
+                "status": "recorded",
+                "result": None,
+                "dispatch": True,
+            }
 
     def complete_trader_worker_rpc(
         self, trader_id: str, request_id: str, *, accepted: bool, result: dict[str, Any]

@@ -80,7 +80,8 @@ writes correlated results to standard output. Every command has this envelope:
 
 `payload.kind` is `read` or `operation`. Reads support `account_info`,
 `symbol_info`, `historical_ticks`, `current_orders`, and `current_positions`;
-historical ticks are limited to 1,000 records per request. Operations support
+historical ticks are limited to 1,000 records per request; callers split and
+de-duplicate larger time ranges. Operations support
 `market`, `pending` (`limit`, `stop`, or `stop_limit`), `cancel`, `close`, and
 `modify_sl_tp`. Operations are refused for a disconnected, frozen, or
 `needs_human` Worker. The controller records both the request and its Worker
