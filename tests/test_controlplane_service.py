@@ -54,10 +54,12 @@ from abt.controlplane.service import (
     _request_market_data_with_retry,
     _shared_supported_filling_modes,
     _intent_order,
+    _is_authoritative_worker_session,
     TraderIntentPayload,
     _validated_market_data_response,
     _validated_product_catalog_response,
     _TraderSessionConnection,
+    _WorkerSessionConnection,
     _trader_market_subscription,
     create_app,
 )
@@ -3384,6 +3386,15 @@ class ControlPlaneServiceTests(unittest.TestCase):
         self.assertEqual(superseded[0]["payload"]["session_id"], disconnected[0]["payload"]["session_id"])
         self.assertIn(superseded[0]["payload"]["session_id"], {event["payload"]["session_id"] for event in authenticated})
         self.assertIn(superseded[0]["payload"]["replacement_session_id"], {event["payload"]["session_id"] for event in authenticated})
+
+    def test_superseded_worker_session_cannot_write_reconciliation_cursor(self) -> None:
+        _private_key, worker_id, _certificate = self._approved_worker(123456, "Broker-A")
+        authoritative = _WorkerSessionConnection(object())  # type: ignore[arg-type]
+        superseded = _WorkerSessionConnection(object(), superseded=True)  # type: ignore[arg-type]
+        connections = {worker_id: {authoritative}}
+
+        self.assertTrue(_is_authoritative_worker_session(connections, worker_id, authoritative))
+        self.assertFalse(_is_authoritative_worker_session(connections, worker_id, superseded))
 
     def test_build_requires_explicit_confirmation_and_persists_unordered_active_pair_evidence(self) -> None:
         with self._live_catalog_analysis_harness() as harness:

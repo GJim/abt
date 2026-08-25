@@ -1921,6 +1921,13 @@ def create_app(
                 ledger.worker_for_certificate(worker.worker_id, certificate)
                 if not isinstance(request, dict):
                     raise ValueError("Invalid protocol message.")
+                if not _is_authoritative_worker_session(worker_connections, worker.worker_id, connection):
+                    _LOGGER.info(
+                        "Ignoring message from superseded worker session %s for worker %s.",
+                        connection.session_id,
+                        worker.worker_id,
+                    )
+                    continue
                 message_type = request.get("type")
                 if message_type == "password_request" and set(request) == {"type"} and secret_store is not None:
                     await websocket.send_json(
@@ -4083,6 +4090,16 @@ def _required_text(message: dict[str, object], field: str) -> str:
     if not isinstance(value, str) or not value:
         raise ValueError("Invalid protocol message.")
     return value
+
+
+def _is_authoritative_worker_session(
+    worker_connections: dict[str, set[_WorkerSessionConnection]],
+    worker_id: str,
+    connection: _WorkerSessionConnection,
+) -> bool:
+    """Accept worker messages only from the session that owns the current cursor."""
+
+    return not connection.superseded and worker_connections.get(worker_id) == {connection}
 
 
 def _record_snapshot(ledger: ControlLedger, worker_id: str, message: dict[str, object]) -> None:
