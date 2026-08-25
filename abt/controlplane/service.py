@@ -2234,11 +2234,14 @@ async def _mediate_trader_worker_request(
                     "payload": request_payload,
                 },
             )
-        response = (
-            await dispatch()
-            if kind == "read"
-            else await _with_worker_execution_lock(worker_execution_locks, worker_id, dispatch)
-        )
+        if kind == "read" and request_payload.get("type") == "historical_ticks":
+            response = await _request_trader_historical_ticks(connection, request_payload)
+        else:
+            response = (
+                await dispatch()
+                if kind == "read"
+                else await _with_worker_execution_lock(worker_execution_locks, worker_id, dispatch)
+            )
         accepted = response.get("accepted")
         if not isinstance(accepted, bool):
             raise LedgerError("Worker returned an invalid Trader RPC response.")
@@ -2261,6 +2264,76 @@ async def _with_worker_execution_lock(
     lock = worker_execution_locks.setdefault(worker_id, asyncio.Lock())
     async with lock:
         return await action()
+
+
+async def _request_trader_historical_ticks(
+    connection: _WorkerSessionConnection, request_payload: dict[str, Any]
+) -> dict[str, object]:
+    """Recursively split saturated MT5 tick ranges and merge every unique tick."""
+
+    required = {"type", "symbol", "from_utc", "to_utc", "flags"}
+    if set(request_payload) != required or not all(
+        isinstance(request_payload[field], str) and request_payload[field]
+        for field in ("symbol", "from_utc", "to_utc", "flags")
+    ):
+        raise LedgerError("Trader historical tick request is invalid.")
+    start = _parse_trader_utc(request_payload["from_utc"])
+    end = _parse_trader_utc(request_payload["to_utc"])
+    if start >= end:
+        raise LedgerError("Trader historical tick range is invalid.")
+
+    async def request_range(range_start: datetime, range_end: datetime) -> list[dict[str, object]]:
+        response = await _request_worker_analysis(
+            connection,
+            analysis_id="trader_rpc",
+            stage="trader_rpc",
+            timeout=30,
+            message={
+                "type": "trader_rpc_request",
+                "request_id": str(uuid4()),
+                "kind": "read",
+                "payload": {
+                    **request_payload,
+                    "from_utc": range_start.isoformat(),
+                    "to_utc": range_end.isoformat(),
+                },
+            },
+        )
+        if response.get("accepted") is not True:
+            raise LedgerError(_required_text(response, "reason"))
+        result = response.get("result")
+        ticks = result.get("ticks") if isinstance(result, dict) else None
+        if not isinstance(ticks, list) or not all(isinstance(tick, dict) for tick in ticks):
+            raise LedgerError("Worker returned invalid historical ticks.")
+        if len(ticks) < 1000:
+            return cast(list[dict[str, object]], ticks)
+        midpoint = range_start + (range_end - range_start) / 2
+        if midpoint <= range_start or midpoint >= range_end:
+            raise LedgerError("Historical tick range is too dense to split without data loss.")
+        first = await request_range(range_start, midpoint)
+        second = await request_range(midpoint, range_end)
+        return first + second
+
+    ticks = await request_range(start, end)
+    unique = {json.dumps(tick, separators=(",", ":"), sort_keys=True): tick for tick in ticks}
+    ordered = sorted(
+        unique.values(),
+        key=lambda tick: (
+            tick.get("time_msc", tick.get("time", 0)),
+            json.dumps(tick, separators=(",", ":"), sort_keys=True),
+        ),
+    )
+    return {"type": "trader_rpc_response", "kind": "read", "accepted": True, "result": {"ticks": ordered}}
+
+
+def _parse_trader_utc(value: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise LedgerError("Trader historical tick timestamp is invalid.") from error
+    if parsed.tzinfo is None:
+        raise LedgerError("Trader historical tick timestamp must include a timezone.")
+    return parsed.astimezone(UTC)
 
 
 def _record_product_catalog_analysis_response(
