@@ -3414,6 +3414,20 @@ class ControlPlaneServiceTests(unittest.TestCase):
         )
         self.assertEqual(409, revoked.status_code)
 
+    def test_new_worker_session_takes_over_without_freezing_its_replacement(self) -> None:
+        private_key, worker_id, certificate = self._approved_worker(123456, "Broker-A")
+
+        with self.client.websocket_connect("/api/worker/session") as first_socket:
+            self._authenticate_worker_socket(first_socket, private_key, worker_id, certificate)
+            with self.client.websocket_connect("/api/worker/session") as second_socket:
+                self._authenticate_worker_socket(second_socket, private_key, worker_id, certificate)
+                with self.assertRaises(WebSocketDisconnect) as closed:
+                    first_socket.receive_json()
+                self.assertEqual(4001, closed.exception.code)
+
+                second_socket.send_json({"type": "heartbeat"})
+                self.assertEqual({"type": "heartbeat_ack"}, second_socket.receive_json())
+
     def test_build_requires_explicit_confirmation_and_persists_unordered_active_pair_evidence(self) -> None:
         with self._live_catalog_analysis_harness() as harness:
             analysis, first_worker, second_worker = self._create_passing_analysis(

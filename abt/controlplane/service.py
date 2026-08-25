@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from anyio import BrokenResourceError, ClosedResourceError
 from concurrent.futures import Future as ConcurrentFuture
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
@@ -371,6 +372,7 @@ class _WorkerSessionConnection:
     websocket: WebSocket
     outbound: queue.Queue[_WorkerAnalysisRequest | None] = field(default_factory=queue.Queue)
     pending: dict[str, _WorkerAnalysisRequest] = field(default_factory=dict)
+    superseded: bool = False
 
 
 @dataclass(eq=False)
@@ -1885,7 +1887,20 @@ def create_app(
             )
             ledger.record_worker_session(worker.worker_id)
             connection = _WorkerSessionConnection(websocket)
-            worker_connections.setdefault(worker.worker_id, set()).add(connection)
+            previous_connections = tuple(worker_connections.get(worker.worker_id, set()))
+            for previous_connection in previous_connections:
+                previous_connection.superseded = True
+                _fail_pending_worker_analysis_requests(
+                    previous_connection,
+                    "Worker session was superseded by a newer authenticated connection.",
+                )
+                try:
+                    await previous_connection.websocket.close(
+                        code=4001, reason="Superseded by newer worker session."
+                    )
+                except (BrokenResourceError, ClosedResourceError):
+                    pass
+            worker_connections[worker.worker_id] = {connection}
             sender_task = asyncio.create_task(_send_worker_analysis_requests(connection))
             await websocket.send_json(
                 {"type": "authenticated", "worker_id": worker.worker_id, "cursor": ledger.reconciliation_cursor(worker.worker_id)}
@@ -1979,7 +1994,7 @@ def create_app(
                     raise ValueError("Invalid protocol message.")
         except WebSocketDisconnect as error:
             _LOGGER.info("Worker session disconnected with code %s.", error.code)
-            if "worker" in locals():
+            if "worker" in locals() and not ("connection" in locals() and connection.superseded):
                 _freeze_worker_session(
                     ledger,
                     worker.worker_id,
@@ -1989,7 +2004,7 @@ def create_app(
             await _close_policy_violation(websocket)
         except (LedgerError, ProofError, SecretStoreError, ValueError) as error:
             _LOGGER.warning("Worker session authentication or request failed: %s", error)
-            if "worker" in locals():
+            if "worker" in locals() and not ("connection" in locals() and connection.superseded):
                 _freeze_worker_session(
                     ledger,
                     worker.worker_id,
@@ -1999,7 +2014,7 @@ def create_app(
             await _close_policy_violation(websocket)
         except Exception:
             _LOGGER.exception("Worker session authentication or request failed unexpectedly.")
-            if "worker" in locals():
+            if "worker" in locals() and not ("connection" in locals() and connection.superseded):
                 _freeze_worker_session(
                     ledger,
                     worker.worker_id,
@@ -2088,7 +2103,7 @@ def _connected_worker_session(
     reason: str = "Selected worker must remain connected during product catalog analysis.",
 ) -> _WorkerSessionConnection:
     connections = worker_connections.get(worker_id)
-    if not connections:
+    if not connections or len(connections) != 1:
         raise LedgerError(reason)
     return next(iter(connections))
 
