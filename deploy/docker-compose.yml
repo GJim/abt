@@ -26,8 +26,7 @@ services:
       timeout: 5s
       retries: 6
     networks:
-      ingress:
-        ipv4_address: 172.30.0.3
+      ingress: {}
       secrets: {}
 
   openbao:
@@ -85,14 +84,10 @@ services:
     depends_on:
       - controller
     networks:
-      ingress:
-        ipv4_address: 172.30.0.2
+      ingress: {}
 
 networks:
-  ingress:
-    ipam:
-      config:
-        - subnet: 172.30.0.0/24
+  ingress: {}
   secrets:
     internal: true
   hsm:

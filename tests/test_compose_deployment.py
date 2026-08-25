@@ -18,20 +18,18 @@ class ComposeDeploymentTests(unittest.TestCase):
         self.assertEqual(["controller"], services["cloudflared"]["depends_on"])
         self.assertEqual("cloudflare/cloudflared:latest", services["cloudflared"]["image"])
         self.assertEqual("tunnel --protocol http2 --no-autoupdate run", services["cloudflared"]["command"])
-        self.assertEqual({"ingress"}, set(services["cloudflared"]["networks"]))
-        self.assertEqual({"ingress", "secrets"}, set(services["controller"]["networks"]))
-        self.assertEqual("172.30.0.3", services["controller"]["networks"]["ingress"]["ipv4_address"])
+        self.assertEqual({"ingress": {}}, services["cloudflared"]["networks"])
+        self.assertEqual({"ingress": {}, "secrets": {}}, services["controller"]["networks"])
         self.assertEqual({"secrets", "hsm", "plugin-registry"}, set(services["openbao"]["networks"]))
         self.assertEqual({"hsm"}, set(services["softhsm"]["networks"]))
         self.assertEqual({"openbao"}, {name for name, service in services.items() if "plugin-registry" in service["networks"]})
-        self.assertEqual("172.30.0.2", services["cloudflared"]["networks"]["ingress"]["ipv4_address"])
         self.assertNotIn("ABT_TRUSTED_PROXY_IPS", services["controller"]["environment"])
         self.assertEqual("http://openbao:8200/v1/abt/data/health", services["controller"]["environment"]["ABT_OPENBAO_HEALTH_URL"])
         self.assertEqual(
             "${ABT_OPENBAO_HEALTH_TOKEN:?Set ABT_OPENBAO_HEALTH_TOKEN}",
             services["controller"]["environment"]["ABT_OPENBAO_HEALTH_TOKEN"],
         )
-        self.assertEqual("172.30.0.0/24", self.compose["networks"]["ingress"]["ipam"]["config"][0]["subnet"])
+        self.assertEqual({}, self.compose["networks"]["ingress"])
         self.assertEqual(
             ["CMD", "python", "-c", "from urllib.request import urlopen; urlopen('http://localhost:8000/health', timeout=2)"],
             services["controller"]["healthcheck"]["test"],
