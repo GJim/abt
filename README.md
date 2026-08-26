@@ -78,6 +78,18 @@ writes correlated results to standard output. Every command has this envelope:
 {"request_id":"unique-id","worker_id":"approved-worker-id","payload":{"kind":"read","request":{"type":"account_info"}}}
 ```
 
+Trader sessions can also query the controller's active inventory without
+supplying a Worker ID:
+
+```json
+{"request_id":"workers-1","query":"active_workers"}
+{"request_id":"pairs-1","query":"active_pairs"}
+```
+
+`active_workers` returns each enabled Worker's ID, MT5 server, connectivity,
+and safety state. `active_pairs` returns each enabled pair's ID, endpoints,
+and source Workers.
+
 `payload.kind` is `read` or `operation`. Reads support `account_info`,
 `symbol_info`, `historical_ticks`, `current_orders`, and `current_positions`;
 historical ticks are limited to 1,000 records per request; callers split and
@@ -87,8 +99,47 @@ de-duplicate larger time ranges. Operations support
 `needs_human` Worker. The controller records both the request and its Worker
 result before emitting the JSONL result.
 
+### Active-pair historical tick analysis
+
+`scripts\analyze_active_pair_ticks.py` is a read-only, Trader-mediated report
+for one active product pair over the preceding 24 hours. It starts one
+long-lived `abt-trader connect --jsonl` child process, first checks the active
+pair and its source Workers, and refuses disconnected or unsafe Workers. It
+adaptively splits capped historical-tick reads and de-duplicates shared slice
+boundaries. The JSON report includes independent bid/ask rise and fall runs
+and both bid-to-opposite-ask cross directions.
+
+```powershell
+uv run python scripts\analyze_active_pair_ticks.py --pair-id <product-pair-id>
+```
+
+When exactly one pair is active, `--pair-id` may be omitted. Use `--help` for
+UTC end-time, tolerance, quote-staleness, and Trader executable/configuration
+options. The script begins with one-hour tick slices and subdivides only
+responses that reach the 1,000-record limit. The default trend tolerances are
+1%, 0.1%, and 0.01%.
+
 If the current context has open orders or positions, an interactive switch
 requires confirmation. `--yes` bypasses that prompt.
+
+### NZDUSD cross-arbitrage simulation
+
+`scripts\simulate_nzdusd_arbitrage.py` is a read-only historical simulator for
+two exported NZDUSD tick CSV files. It permits one hedged pair at a time,
+requires a qualifying edge to clear before re-entry, applies a 2% per-trade
+loss stop and a 3% per-account daily loss stop, and stops both legs when either
+account reaches a limit. It never submits broker operations.
+
+```powershell
+uv run python scripts\simulate_nzdusd_arbitrage.py `
+  --audacity-csv results\nzdusd_ticks_<window>_audacity.csv `
+  --ftmo-csv results\nzdusd_ticks_<window>_ftmo.csv
+```
+
+The defaults simulate US$5,000 per account, a 0.2-pip entry edge, and 0.1 lot
+per leg. The script uses NZDUSD margin estimates from the current AudaCity
+(1:100) and FTMO (1:30) contract specifications; refresh those estimates if
+either broker changes its leverage or margin currency.
 
 ### Time calibration
 
