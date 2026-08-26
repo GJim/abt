@@ -31,6 +31,8 @@ class ReadOnlyMT5(Protocol):
 
     def symbol_info(self, symbol: str) -> object: ...
 
+    def order_calc_margin(self, action: int, symbol: str, volume: float, price: float) -> object: ...
+
     def order_check(self, request: dict[str, object]) -> object: ...
 
     def order_send(self, request: dict[str, object]) -> object: ...
@@ -784,6 +786,18 @@ def _trader_read(mt5: ReadOnlyMT5, payload: dict[str, object]) -> dict[str, obje
         return {"account": _json_evidence(mt5.account_info(), "account")}
     if operation == "symbol_info" and set(payload) == {"type", "symbol"}:
         return {"symbol": _json_evidence(mt5.symbol_info(_request_text(payload, "symbol")), "symbol")}
+    if operation == "calc_margin" and set(payload) == {"type", "symbol", "volume", "direction", "price"}:
+        direction = _request_text(payload, "direction")
+        action = getattr(mt5, "ORDER_TYPE_BUY") if direction == "LONG" else getattr(mt5, "ORDER_TYPE_SELL")
+        margin = mt5.order_calc_margin(
+            action,
+            _request_text(payload, "symbol"),
+            float(_request_text(payload, "volume")),
+            float(_request_text(payload, "price")),
+        )
+        if isinstance(margin, bool) or not isinstance(margin, (int, float)) or margin <= 0:
+            raise WorkerEnrollmentError("The local MT5 terminal returned an invalid calculated margin.")
+        return {"margin": margin}
     if operation == "current_orders" and set(payload) == {"type"}:
         return {"orders": [_json_evidence(value, "order") for value in _record_values(mt5.orders_get(), "orders")]}
     if operation == "current_positions" and set(payload) == {"type"}:

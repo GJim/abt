@@ -164,6 +164,9 @@ class MetaTrader5Adapter:
     def symbol_info(self, symbol: str) -> object:
         return self._mt5.symbol_info(symbol)
 
+    def order_calc_margin(self, action: int, symbol: str, volume: float, price: float) -> object:
+        return self._mt5.order_calc_margin(action, symbol, volume, price)
+
     def copy_ticks_range(self, symbol: str, from_time: object, to_time: object, flags: int) -> object:
         return self._mt5.copy_ticks_range(symbol, from_time, to_time, flags)
 

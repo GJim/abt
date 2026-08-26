@@ -599,6 +599,7 @@ class WorkerCredentialTests(unittest.TestCase):
             symbols_get=lambda: ("symbol",),
             copy_rates_range=lambda *_: ("rate",),
             symbol_info_tick=lambda _: {"time": 1},
+            order_calc_margin=lambda action, symbol, volume, price: 123.45,
             last_error=lambda: (10030, "Unsupported filling mode"),
             TIMEFRAME_M15=15,
             shutdown=lambda: None,
@@ -611,6 +612,7 @@ class WorkerCredentialTests(unittest.TestCase):
         self.assertEqual(("symbol",), adapter.symbols_get())
         self.assertEqual(("rate",), adapter.copy_rates_range("EURUSD", 15, object(), object()))
         self.assertEqual({"time": 1}, adapter.symbol_info_tick("EURUSD"))
+        self.assertEqual(123.45, adapter.order_calc_margin(0, "EURUSD", 1.0, 1.1))
         self.assertEqual((10030, "Unsupported filling mode"), adapter.last_error())
         self.assertEqual(15, adapter.TIMEFRAME_M15)
 
