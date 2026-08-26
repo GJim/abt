@@ -1740,6 +1740,27 @@ def create_app(
                     for snapshot in snapshots:
                         await connection.send_json({"type": "market_data", **snapshot})
                 elif (
+                    message_type == "query"
+                    and set(message) == {"type", "request_id", "query"}
+                    and isinstance(message["request_id"], str)
+                    and message["request_id"]
+                    and message["query"] in {"active_workers", "active_pairs"}
+                ):
+                    query = cast(str, message["query"])
+                    result = (
+                        {"workers": ledger.trader_active_workers()}
+                        if query == "active_workers"
+                        else {"pairs": ledger.trader_active_pairs()}
+                    )
+                    await connection.send_json(
+                        {
+                            "type": "trader_query_result",
+                            "request_id": message["request_id"],
+                            "query": query,
+                            "result": result,
+                        }
+                    )
+                elif (
                     message_type == "request"
                     and set(message) == {"type", "request_id", "worker_id", "payload"}
                     and isinstance(message["request_id"], str)
@@ -4232,4 +4253,7 @@ def _freeze_worker_session(ledger: ControlLedger, worker_id: str, source: str, r
 
 async def _close_policy_violation(websocket: WebSocket) -> None:
     if websocket.client_state.name != "DISCONNECTED":
-        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        try:
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        except (RuntimeError, WebSocketDisconnect):
+            pass

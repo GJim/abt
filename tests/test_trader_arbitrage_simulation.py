@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, time, timedelta
 import unittest
 
 from abt.trader.arbitrage_simulation import (
@@ -64,6 +64,35 @@ class ArbitrageSimulationTests(unittest.TestCase):
         self.assertEqual("trade_loss_stop", result.stopped_reason)
         self.assertTrue(result.audacity.stopped)
         self.assertTrue(result.ftmo.stopped)
+
+    def test_defers_reverse_exit_until_minimum_hold_then_flattens_at_cutoff(self) -> None:
+        config = SimulationConfig(
+            entry_edge=0.00002,
+            requested_volume=0.1,
+            timezone=UTC,
+            minimum_hold_seconds=2,
+            flatten_at_local=time(0, 0, 3),
+        )
+        result = simulate_single_pair(
+            [
+                quote(0, 1.0002, 1.0003),
+                quote(1, 1.0000, 1.0001),
+                quote(3, 1.0000, 1.0001),
+            ],
+            [
+                quote(0, 0.9998, 1.0000),
+                quote(1, 1.0005, 1.0007),
+                quote(3, 1.0005, 1.0007),
+            ],
+            audacity=self.audacity,
+            ftmo=self.ftmo,
+            policy=self.policy,
+            config=config,
+        )
+
+        self.assertEqual(1, len(result.trades))
+        self.assertEqual("daily_cutoff", result.trades[0].close_reason)
+        self.assertEqual(3, (result.trades[0].closed_at - result.trades[0].opened_at).total_seconds())
 
 
 if __name__ == "__main__":

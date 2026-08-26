@@ -323,6 +323,45 @@ class TraderCommandTests(unittest.TestCase):
             output.getvalue(),
         )
 
+    def test_connect_sends_jsonl_controller_query_and_writes_result(self) -> None:
+        class QuerySocket:
+            def __init__(self) -> None:
+                self.messages = iter(
+                    [
+                        '{"type":"trader_query_result","request_id":"workers-1","query":"active_workers",'
+                        '"result":{"workers":[{"worker_id":"worker-a","server":"Broker-A",'
+                        '"connectivity":"connected","safety_state":"connected"}]}}',
+                    ]
+                )
+                self.sent: list[str] = []
+
+            def recv(self, timeout: float | None = None) -> str:
+                return next(self.messages)
+
+            def send(self, message: str) -> None:
+                self.sent.append(message)
+
+        commands: SimpleQueue[object] = SimpleQueue()
+        commands.put({"request_id": "workers-1", "query": "active_workers"})
+        socket = QuerySocket()
+        output = io.StringIO()
+
+        with self.assertRaises(StopIteration):
+            run_trader_session(socket, output=output, save_cursor=lambda _: None, command_source=commands)  # type: ignore[arg-type]
+
+        self.assertEqual(
+            [
+                '{"type":"subscribe","worker_ids":["*"]}',
+                '{"query":"active_workers","request_id":"workers-1","type":"query"}',
+            ],
+            socket.sent,
+        )
+        self.assertEqual(
+            '{"query":"active_workers","request_id":"workers-1","result":{"workers":[{"connectivity":"connected",'
+            '"safety_state":"connected","server":"Broker-A","worker_id":"worker-a"}]},"type":"trader_query_result"}\n',
+            output.getvalue(),
+        )
+
 
 class FakeRotationTransport:
     def __init__(self) -> None:

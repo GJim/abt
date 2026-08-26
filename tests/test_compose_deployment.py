@@ -29,6 +29,9 @@ class ComposeDeploymentTests(unittest.TestCase):
             "${ABT_OPENBAO_HEALTH_TOKEN:?Set ABT_OPENBAO_HEALTH_TOKEN}",
             services["controller"]["environment"]["ABT_OPENBAO_HEALTH_TOKEN"],
         )
+        self.assertNotIn("ABT_BACKUP_DIRECTORY", services["controller"]["environment"])
+        self.assertNotIn("ABT_OPENBAO_RAFT_DIRECTORY", services["controller"]["environment"])
+        self.assertNotIn("ABT_SOFTHSM_TOKENS_DIRECTORY", services["controller"]["environment"])
         self.assertEqual({}, self.compose["networks"]["ingress"])
         self.assertEqual(
             ["CMD", "python", "-c", "from urllib.request import urlopen; urlopen('http://localhost:8000/health', timeout=2)"],

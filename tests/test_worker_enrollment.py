@@ -720,7 +720,7 @@ class WorkerCredentialTests(unittest.TestCase):
     def test_marks_abrupt_reconciliation_send_disconnects_for_session_reconnect(self) -> None:
         session = AuthenticatedWorkerSession(socket=AbruptlyClosingWebSocket(), reconciliation_cursor=0)
 
-        with self.assertRaisesRegex(WorkerSessionDisconnected, "reconciliation"):
+        with self.assertRaisesRegex(WorkerSessionDisconnected, "ConnectionClosedError"):
             session.send_reconciliation({"type": "snapshot", "cursor": 0})
 
     def test_marks_controller_handshake_rejection_for_session_reconnect(self) -> None:

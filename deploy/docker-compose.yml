@@ -10,9 +10,6 @@ services:
       ABT_OPENBAO_HEALTH_TOKEN: ${ABT_OPENBAO_HEALTH_TOKEN:?Set ABT_OPENBAO_HEALTH_TOKEN}
       ABT_OPENBAO_URL: http://openbao:8200
       ABT_OPENBAO_CONTROLLER_TOKEN: ${ABT_OPENBAO_CONTROLLER_TOKEN:?Set ABT_OPENBAO_CONTROLLER_TOKEN}
-      ABT_BACKUP_DIRECTORY: /var/backups/abt
-      ABT_OPENBAO_RAFT_DIRECTORY: /backup-source/openbao-raft
-      ABT_SOFTHSM_TOKENS_DIRECTORY: /backup-source/softhsm-tokens
     depends_on:
       - openbao
     volumes:

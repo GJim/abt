@@ -18,6 +18,41 @@ limit, and either unconfirmed entry leg flatten **every position** on both
 selected accounts, as requested. Start only after confirming both accounts
 contain no unrelated positions.
 
+After each confirmed market fill, the strategy uses the Worker broker
+`calc_profit` read to derive an emergency SL and TP, each for
+`--emergency-stop-loss-usd` (default: US$40) in absolute projected P/L, and
+applies them together with `modify_sl_tp`. The matching dollar amount is used
+rather than the other broker's price because the brokers can quote different
+prices, spreads, precision, and contract terms.
+
+A broker TP remains emergency protection, not the normal pair exit: the
+strategy normally closes both legs together on its reverse signal. If either
+broker protection closes a leg, the next market-data event immediately verifies
+both expected positions; its missing ticket triggers an immediate market close
+of the remaining leg and stops the strategy.
+
+Every `--integrity-check-seconds` (default: five), it reads both accounts'
+orders and positions while idle. While a pair is active, this check runs on
+every market-data event. At startup both accounts must be empty; while a pair is active,
+each account must contain exactly its expected ticket, symbol, direction, and
+volume, with no pending orders. Any mismatch is treated as an external account
+operation, logged, and followed by the configured full-account shutdown.
+
+When the controller reports selected Worker market data unavailable, the
+strategy pauses all broker reads and trading decisions for
+`--worker-disconnect-grace-seconds` (default: 300). It resumes only after each
+affected Worker reconnects and publishes market data again. If the deadline
+expires, it follows the normal safety shutdown path.
+
+Each pair must remain open for `--minimum-hold-seconds` (default: 180 seconds)
+before a normal reverse-signal exit can close it. This minimum never delays
+broker SL/TP, risk-limit, external-operation, or Ctrl+C shutdown handling.
+
+At `--flatten-at-ny` (default: `16:00`), the strategy uses
+`America/New_York` to unconditionally close both selected accounts and stop.
+This daily cutoff also overrides the minimum hold time, preventing cross-day
+positions while preserving the same wall-clock time through DST changes.
+
 ```powershell
 uv run python strategy\realtime_arbitrage.py `
   --symbol NZDUSD `

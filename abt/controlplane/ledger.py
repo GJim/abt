@@ -1550,6 +1550,33 @@ class ControlLedger:
             for worker_id, observed_at, quotes in rows
         ]
 
+    def trader_active_workers(self) -> list[dict[str, Any]]:
+        """Return the non-sensitive identities and live status of active Workers."""
+
+        return [
+            {
+                "worker_id": worker["worker_id"],
+                "server": worker["server"],
+                "connectivity": worker["connectivity"],
+                "safety_state": worker["safety_state"],
+            }
+            for worker in self.worker_reconciliation()
+            if worker["connectivity"] != "revoked"
+        ]
+
+    def trader_active_pairs(self) -> list[dict[str, Any]]:
+        """Return the endpoints and source Workers of active product pairs."""
+
+        return [
+            {
+                "product_pair_id": pair["product_pair_id"],
+                "endpoints": pair["endpoints"],
+                "source_workers": pair["source_workers"],
+            }
+            for pair in self.product_pairs()
+            if pair["status"] == "active"
+        ]
+
     def record_worker_heartbeat(self, worker_id: str) -> None:
         with self._transaction():
             self.active_worker(worker_id)

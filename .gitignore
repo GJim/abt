@@ -16,6 +16,7 @@ dist/
 results/
 test-results/
 web/test-results/
+strategy/*.json
 
 # Raw browser/source captures are reproducibility aids, not publishable research.
 .scratch/futures-prop-firm-rules/sources/

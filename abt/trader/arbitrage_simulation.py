@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, time
 import math
 from zoneinfo import ZoneInfo
 
@@ -48,7 +48,12 @@ class SimulationConfig:
     entry_edge: float
     requested_volume: float
     contract_size: float = 100_000
-    timezone: ZoneInfo = ZoneInfo("Asia/Taipei")
+    timezone: ZoneInfo = ZoneInfo("America/New_York")
+    minimum_hold_seconds: float = 0
+    emergency_protection_usd: float | None = None
+    flatten_at_local: time | None = None
+    maximum_trades: int = 100
+    maximum_margin_fraction: float = 0.5
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,9 +112,11 @@ def simulate_single_pair(
     """Simulate one cross-broker pair, stopping before either account breaches a limit.
 
     A trade opens only after both quotes exist and its directional edge reaches
-    ``entry_edge``. It closes on an opposite qualifying edge, a per-trade loss
-    stop, or a daily account loss stop. After a normal reversal close, the
-    simulator waits for both edges to disappear before accepting another entry.
+    ``entry_edge``. It closes on an opposite qualifying edge only after the
+    configured minimum hold, broker emergency protection, a per-trade loss
+    stop, a daily account loss stop, or the configured daily cutoff. After a
+    normal reversal close, the simulator waits for both edges to disappear
+    before accepting another entry.
     """
 
     _validate(audacity, ftmo, policy, config)
@@ -146,6 +153,14 @@ def simulate_single_pair(
             daily_start = equity.copy()
             daily_date = current_date
 
+        if config.flatten_at_local is not None and observed_at.astimezone(config.timezone).time() >= config.flatten_at_local:
+            if open_pair is not None:
+                trades.append(_close(open_pair, latest, observed_at, config.contract_size, "daily_cutoff"))
+                _apply_trade(balances, trades[-1])
+                open_pair = None
+            stopped_reason = "daily_cutoff"
+            break
+
         equity = _equity(balances, open_pair, latest, config.contract_size)
         if stopped_reason is None and _daily_stop(equity, daily_start, policy):
             if open_pair is not None:
@@ -157,6 +172,17 @@ def simulate_single_pair(
         if stopped_reason is not None:
             continue
 
+        if open_pair is not None and config.emergency_protection_usd is not None:
+            protection_reason = _emergency_protection_reason(
+                open_pair, latest, config.emergency_protection_usd, config.contract_size
+            )
+            if protection_reason is not None:
+                trades.append(_close(open_pair, latest, observed_at, config.contract_size, protection_reason))
+                _apply_trade(balances, trades[-1])
+                open_pair = None
+                stopped_reason = protection_reason
+                continue
+
         if open_pair is not None and _trade_stop(open_pair, latest, policy, config.contract_size):
             trades.append(_close(open_pair, latest, observed_at, config.contract_size, "trade_loss_stop"))
             _apply_trade(balances, trades[-1])
@@ -166,7 +192,8 @@ def simulate_single_pair(
 
         direction = _direction(latest, config.entry_edge)
         if open_pair is not None:
-            if direction is not None and direction != open_pair.direction:
+            held_seconds = (observed_at - open_pair.opened_at).total_seconds()
+            if direction is not None and direction != open_pair.direction and held_seconds >= config.minimum_hold_seconds:
                 trades.append(_close(open_pair, latest, observed_at, config.contract_size, "reverse_edge"))
                 _apply_trade(balances, trades[-1])
                 open_pair = None
@@ -176,8 +203,8 @@ def simulate_single_pair(
             if direction is None:
                 awaiting_clear = False
             continue
-        if direction is not None:
-            volume = _volume(config.requested_volume, audacity, ftmo, balances)
+        if direction is not None and len(trades) < config.maximum_trades:
+            volume = _volume(config.requested_volume, audacity, ftmo, balances, config.maximum_margin_fraction)
             if volume is None:
                 rejected_entries += 1
                 continue
@@ -245,13 +272,35 @@ def _trade_stop(pair: _OpenPair, quotes: dict[str, Quote], policy: RiskPolicy, c
     )
 
 
+def _emergency_protection_reason(
+    pair: _OpenPair, quotes: dict[str, Quote], protection_usd: float, contract_size: float
+) -> str | None:
+    marked = _close(pair, quotes, quotes["audacity"].observed_at, contract_size, "mark")
+    pnl = (marked.audacity_pnl, marked.ftmo_pnl)
+    if any(value <= -protection_usd for value in pnl):
+        return "emergency_stop_loss"
+    if any(value >= protection_usd for value in pnl):
+        return "emergency_take_profit"
+    return None
+
+
 def _apply_trade(balances: dict[str, float], trade: CompletedTrade) -> None:
     balances["audacity"] += trade.audacity_pnl
     balances["ftmo"] += trade.ftmo_pnl
 
 
-def _volume(requested: float, audacity: AccountSpec, ftmo: AccountSpec, balances: dict[str, float]) -> float | None:
-    upper = min(requested, balances["audacity"] / audacity.margin_per_lot, balances["ftmo"] / ftmo.margin_per_lot)
+def _volume(
+    requested: float,
+    audacity: AccountSpec,
+    ftmo: AccountSpec,
+    balances: dict[str, float],
+    maximum_margin_fraction: float,
+) -> float | None:
+    upper = min(
+        requested,
+        balances["audacity"] * maximum_margin_fraction / audacity.margin_per_lot,
+        balances["ftmo"] * maximum_margin_fraction / ftmo.margin_per_lot,
+    )
     step = max(audacity.volume_step, ftmo.volume_step)
     volume = math.floor((upper + 1e-12) / step) * step
     minimum = max(audacity.minimum_volume, ftmo.minimum_volume)
@@ -270,5 +319,13 @@ def _validate(audacity: AccountSpec, ftmo: AccountSpec, policy: RiskPolicy, conf
             raise ArbitrageSimulationError("Account specifications must contain positive funding, margin, and volume values.")
     if not 0 < policy.daily_loss_fraction < 1 or not 0 < policy.trade_loss_fraction < 1:
         raise ArbitrageSimulationError("Loss fractions must be between zero and one.")
-    if config.entry_edge <= 0 or config.requested_volume <= 0 or config.contract_size <= 0:
+    if (
+        config.entry_edge <= 0
+        or config.requested_volume <= 0
+        or config.contract_size <= 0
+        or config.minimum_hold_seconds < 0
+        or config.emergency_protection_usd is not None and config.emergency_protection_usd <= 0
+        or config.maximum_trades <= 0
+        or not 0 < config.maximum_margin_fraction <= 1
+    ):
         raise ArbitrageSimulationError("Entry edge, requested volume, and contract size must be positive.")

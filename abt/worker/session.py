@@ -832,5 +832,7 @@ def open_authenticated_worker_session(
 
 def _raise_closed_connection(error: Exception, phase: str) -> None:
     if isinstance(error, (ConnectionClosed, InvalidStatus, OSError, TimeoutError)):
-        raise WorkerSessionDisconnected(f"The controller closed the {phase} WebSocket.") from error
+        raise WorkerSessionDisconnected(
+            f"{phase} WebSocket disconnected ({type(error).__name__}: {error})."
+        ) from error
     raise error

@@ -128,6 +128,16 @@ def run_trader_session(
             output.write(json.dumps(message, separators=(",", ":"), sort_keys=True) + "\n")
             output.flush()
             continue
+        if message_type == "trader_query_result":
+            if (
+                not isinstance(message.get("request_id"), str)
+                or message.get("query") not in {"active_workers", "active_pairs"}
+                or not isinstance(message.get("result"), dict)
+            ):
+                raise TraderEnrollmentError("The controller returned an invalid Trader query response.")
+            output.write(json.dumps(message, separators=(",", ":"), sort_keys=True) + "\n")
+            output.flush()
+            continue
         if message_type == "trader_rpc_result":
             if (
                 not isinstance(message.get("request_id"), str)
@@ -164,8 +174,23 @@ def _send_trader_commands(socket: TraderWebSocket, command_source: SimpleQueue[o
             command = command_source.get_nowait()
         except Empty:
             return
-        if not isinstance(command, dict) or set(command) != {"request_id", "worker_id", "payload"}:
-            _write_jsonl_error(output, "Trader JSONL command must contain request_id, worker_id, and payload.")
+        if not isinstance(command, dict):
+            _write_jsonl_error(output, "Trader JSONL command must be an object.")
+            continue
+        if set(command) == {"request_id", "query"}:
+            if (
+                not isinstance(command["request_id"], str)
+                or not command["request_id"]
+                or command["query"] not in {"active_workers", "active_pairs"}
+            ):
+                _write_jsonl_error(output, "Trader JSONL query contains invalid fields.")
+                continue
+            _send(socket, {"type": "query", **command})
+            continue
+        if set(command) != {"request_id", "worker_id", "payload"}:
+            _write_jsonl_error(
+                output, "Trader JSONL command must contain request_id and query, or request_id, worker_id, and payload."
+            )
             continue
         if (
             not isinstance(command["request_id"], str)

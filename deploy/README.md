@@ -77,7 +77,7 @@ Persistent volumes have separate ownership and backup boundaries:
 | `controller_ledger` | controller | DuckDB control-plane ledger |
 | `openbao_raft` | OpenBao | encrypted OpenBao Raft data |
 | `softhsm_tokens` | SoftHSM/OpenBao | PKCS#11 token material |
-| `controller_backups` | controller | 24 local complete restore sets |
+| `controller_backups` | controller | retained local restore sets; automatic creation is disabled |
 
 Back up each volume as a distinct encrypted artifact. A restore must restore
 `openbao_raft` and `softhsm_tokens` as a matching pair; never copy either into
@@ -85,11 +85,11 @@ the controller or worker environment.
 
 ## Release-gate backups and restore verification
 
-The controller creates a complete restore set every hour and retains the newest
-24 sets in `controller_backups`. Each set contains a DuckDB export, OpenBao
-Raft archive, SoftHSM token archive and a SHA-256 manifest. Approval and
-revocation create an immediate `pki-change` restore set. The controller is the
-only process that snapshots the live DuckDB ledger.
+Automatic controller backups are currently disabled because the synchronous
+DuckDB export can interrupt active Worker and Trader WebSocket sessions.
+Existing restore sets remain in `controller_backups`; do not delete them.
+Before re-enabling automatic backups, replace the active-ledger snapshot path
+with an implementation that does not block the controller event loop.
 
 Once a week, an operator copies a verified complete set to encrypted offsite
 storage. Keep the offsite encryption key separately from the console host.
