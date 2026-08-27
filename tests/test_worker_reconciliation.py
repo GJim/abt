@@ -22,6 +22,7 @@ from abt.worker.reconciliation import (
     reconnect_worker_session,
     reconcile_authenticated_worker,
 )
+from abt.trader_protocol import MAX_LIVE_SYMBOLS
 from abt.worker.session import collect_market_data_evidence, collect_product_catalog_evidence
 
 
@@ -136,6 +137,142 @@ class WorkerReconciliationTests(unittest.TestCase):
             },
             session.response,
         )
+
+    def test_set_live_symbols_rejects_invalid_requests_without_changing_watched_symbols(self) -> None:
+        class LiveMT5:
+            def __init__(self) -> None:
+                self.selected: list[str] = []
+
+            def symbol_info(self, symbol: str) -> object:
+                return {"name": symbol, "trade_mode": 4, "point": 0.00001}
+
+            def symbol_select(self, symbol: str, _enable: bool) -> bool:
+                self.selected.append(symbol)
+                return True
+
+        class Session:
+            response: dict[str, object] | None = None
+
+            def send_trader_rpc(self, **kwargs: object) -> None:
+                self.response = kwargs
+
+        mt5 = LiveMT5()
+        adapter = LiveWorkerMarketStateAdapter(mt5, watched_symbols=["OLD"], emit=lambda _: None)  # type: ignore[arg-type]
+        cases = (
+            (None, {"type": "set_live_symbols", "symbols": ["EURUSD"]}),
+            (adapter, {"type": "set_live_symbols", "symbols": ["EURUSD", "EURUSD"]}),
+            (adapter, {"type": "set_live_symbols", "symbols": ["EURUSD"] * (MAX_LIVE_SYMBOLS + 1)}),
+        )
+        for live_state, payload in cases:
+            with self.subTest(payload=payload):
+                session = Session()
+                _serve_trader_rpc(
+                    mt5, session, {"request_id": "request-1", "kind": "operation", "payload": payload},
+                    live_state=live_state,
+                )
+                self.assertFalse(session.response["accepted"])  # type: ignore[index]
+                self.assertEqual(["OLD"], adapter._watched_symbols)
+        self.assertEqual([], mt5.selected)
+
+    def test_set_live_symbols_rejects_untradable_or_unselectable_symbols_without_changing_watched_symbols(self) -> None:
+        class LiveMT5:
+            def __init__(self, *, trade_mode: int = 4, select_result: bool = True) -> None:
+                self.trade_mode, self.select_result = trade_mode, select_result
+                self.selected: list[str] = []
+
+            def symbol_info(self, symbol: str) -> object:
+                return {"name": symbol, "trade_mode": self.trade_mode, "point": 0.00001}
+
+            def symbol_select(self, symbol: str, _enable: bool) -> bool:
+                self.selected.append(symbol)
+                return self.select_result
+
+        class Session:
+            response: dict[str, object] | None = None
+
+            def send_trader_rpc(self, **kwargs: object) -> None:
+                self.response = kwargs
+
+        for mt5, symbols in (
+            (LiveMT5(trade_mode=3), ["EURUSD"]),
+            (LiveMT5(select_result=False), ["EURUSD"]),
+        ):
+            with self.subTest(mt5=mt5):
+                adapter = LiveWorkerMarketStateAdapter(mt5, watched_symbols=["OLD"], emit=lambda _: None)  # type: ignore[arg-type]
+                session = Session()
+                _serve_trader_rpc(
+                    mt5,
+                    session,
+                    {"request_id": "request-1", "kind": "operation", "payload": {"type": "set_live_symbols", "symbols": symbols}},
+                    live_state=adapter,
+                )
+                self.assertFalse(session.response["accepted"])  # type: ignore[index]
+                self.assertEqual(["OLD"], adapter._watched_symbols)
+
+        mt5 = LiveMT5()
+        mt5.symbol_select = lambda symbol, _enable: symbol != "GBPUSD"  # type: ignore[method-assign]
+        adapter = LiveWorkerMarketStateAdapter(mt5, watched_symbols=["OLD"], emit=lambda _: None)  # type: ignore[arg-type]
+        session = Session()
+        _serve_trader_rpc(
+            mt5,
+            session,
+            {"request_id": "request-1", "kind": "operation", "payload": {"type": "set_live_symbols", "symbols": ["EURUSD", "GBPUSD"]}},
+            live_state=adapter,
+        )
+        self.assertFalse(session.response["accepted"])  # type: ignore[index]
+        self.assertEqual(["OLD"], adapter._watched_symbols)
+
+    def test_set_live_symbols_replaces_quotes_and_next_poll_emits_a_clean_snapshot(self) -> None:
+        class LiveMT5:
+            def __init__(self) -> None:
+                self.selected: list[str] = []
+
+            def symbol_info(self, symbol: str) -> object:
+                return {"name": symbol, "trade_mode": 4, "point": 0.00001}
+
+            def symbol_select(self, symbol: str, _enable: bool) -> bool:
+                self.selected.append(symbol)
+                return True
+
+            def symbol_info_tick(self, symbol: str) -> object:
+                return {"bid": 1.1, "ask": 1.1001, "last": 1.10005, "time": 1_787_068_740}
+
+            def orders_get(self) -> object:
+                return []
+
+            def positions_get(self) -> object:
+                return []
+
+            def terminal_info(self) -> object:
+                return {"connected": True}
+
+        class Session:
+            response: dict[str, object] | None = None
+
+            def send_trader_rpc(self, **kwargs: object) -> None:
+                self.response = kwargs
+
+        mt5 = LiveMT5()
+        emitted: list[dict[str, object]] = []
+        adapter = LiveWorkerMarketStateAdapter(mt5, watched_symbols=["OLD"], emit=emitted.append)  # type: ignore[arg-type]
+        started = datetime(2026, 8, 16, tzinfo=UTC)
+        adapter.poll(started)
+        session = Session()
+        _serve_trader_rpc(
+            mt5,
+            session,
+            {"request_id": "request-1", "kind": "operation", "payload": {"type": "set_live_symbols", "symbols": ["EURUSD", "GBPUSD"]}},
+            live_state=adapter,
+        )
+        adapter.poll(started + timedelta(milliseconds=1))
+
+        self.assertEqual({"request_id": "request-1", "kind": "operation", "accepted": True, "result": {"symbols": ["EURUSD", "GBPUSD"]}}, session.response)
+        self.assertEqual(["EURUSD", "GBPUSD"], mt5.selected)
+        self.assertEqual(
+            ["EURUSD", "GBPUSD"],
+            [quote["symbol"] for quote in emitted[-1]["quotes"]],  # type: ignore[index]
+        )
+        self.assertEqual("live_state_snapshot", emitted[-1]["type"])
 
     def test_symbols_trader_read_returns_json_evidence(self) -> None:
         mt5 = ReadOnlyMT5()

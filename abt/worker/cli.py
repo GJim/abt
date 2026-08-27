@@ -164,6 +164,9 @@ class MetaTrader5Adapter:
     def symbol_info(self, symbol: str) -> object:
         return self._mt5.symbol_info(symbol)
 
+    def symbol_select(self, symbol: str, enable: bool) -> bool:
+        return bool(self._mt5.symbol_select(symbol, enable))
+
     def order_calc_margin(self, action: int, symbol: str, volume: float, price: float) -> object:
         return self._mt5.order_calc_margin(action, symbol, volume, price)
 

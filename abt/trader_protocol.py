@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator, model_validator
+
+
+MAX_LIVE_SYMBOLS = 64
 
 
 class _ProtocolModel(BaseModel):
@@ -117,8 +120,26 @@ class ModifySlTpOperation(_ProtocolModel):
     tp: str
 
 
-TraderOperation = Annotated[
+class SetLiveSymbolsOperation(_ProtocolModel):
+    type: Literal["set_live_symbols"]
+    symbols: list[str] = Field(min_length=1, max_length=MAX_LIVE_SYMBOLS)
+
+    @field_validator("symbols")
+    @classmethod
+    def unique_nonempty_symbols(cls, symbols: list[str]) -> list[str]:
+        if not all(symbol for symbol in symbols) or len(set(symbols)) != len(symbols):
+            raise ValueError("Live symbols must be nonempty and unique.")
+        return symbols
+
+
+TraderTradeOperation = Annotated[
     MarketOperation | PendingOperation | CancelOperation | CloseOperation | ModifySlTpOperation,
+    Field(discriminator="type"),
+]
+
+
+TraderOperation = Annotated[
+    MarketOperation | PendingOperation | CancelOperation | CloseOperation | ModifySlTpOperation | SetLiveSymbolsOperation,
     Field(discriminator="type"),
 ]
 
@@ -131,7 +152,10 @@ class TraderRpcRequest(_ProtocolModel):
 
     @model_validator(mode="after")
     def matching_kind(self) -> TraderRpcRequest:
-        if self.kind == "read" and isinstance(self.payload, (MarketOperation, PendingOperation, CancelOperation, CloseOperation, ModifySlTpOperation)):
+        if self.kind == "read" and isinstance(
+            self.payload,
+            (MarketOperation, PendingOperation, CancelOperation, CloseOperation, ModifySlTpOperation, SetLiveSymbolsOperation),
+        ):
             raise ValueError("Trader read requests require a read payload.")
         if self.kind == "operation" and isinstance(
             self.payload,                         (AccountInfoRead, SymbolInfoRead, SymbolsRead, CalcMarginRead, CalcProfitRead, HistoricalTicksRead, CurrentOrdersRead, CurrentPositionsRead)

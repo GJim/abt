@@ -9,7 +9,7 @@ from typing import ContextManager, Protocol
 
 from pydantic import ValidationError
 
-from ..trader_protocol import BrokerReceipt
+from ..trader_protocol import BrokerReceipt, MAX_LIVE_SYMBOLS
 from .enrollment import WorkerEnrollmentError, WorkerSessionDisconnected
 from .session import collect_market_data_evidence, collect_product_catalog_evidence
 
@@ -32,6 +32,8 @@ class ReadOnlyMT5(Protocol):
     def symbols_get(self) -> object: ...
 
     def symbol_info(self, symbol: str) -> object: ...
+
+    def symbol_select(self, symbol: str, enable: bool) -> bool: ...
 
     def order_calc_margin(self, action: int, symbol: str, volume: float, price: float) -> object: ...
 
@@ -295,6 +297,21 @@ class LiveWorkerMarketStateAdapter:
         self._connectivity: bool | None = None
         self._sent_snapshot = False
 
+    def set_watched_symbols(self, symbols: list[str]) -> None:
+        """Replace the quote set and require the next scheduled poll to snapshot it."""
+
+        if (
+            not symbols
+            or len(symbols) > MAX_LIVE_SYMBOLS
+            or not all(isinstance(symbol, str) and symbol for symbol in symbols)
+            or len(set(symbols)) != len(symbols)
+        ):
+            raise ValueError("Watched symbols must be a unique, nonempty list within the configured limit.")
+        self._watched_symbols = list(symbols)
+        self._quotes = {}
+        self._last_quotes_at = None
+        self._sent_snapshot = False
+
     def poll(self, observed_at: datetime) -> None:
         """Poll due sources and publish only state that differs from the last observation."""
 
@@ -516,7 +533,7 @@ def _run_reconciliation_with_analysis(
             if callable(receive_trader_rpc):
                 trader_rpc = receive_trader_rpc()
                 if trader_rpc is not None:
-                    _serve_trader_rpc(mt5, session, trader_rpc)
+                    _serve_trader_rpc(mt5, session, trader_rpc, live_state=live_state)
             if safety is not None:
                 safety.heartbeat(now())
 
@@ -758,14 +775,26 @@ def _serve_execution_recovery(mt5: ReadOnlyMT5, session: AnalysisWorkerSession, 
         session.send_execution_recovery_error(request_id=request_id, operation=operation, reason="The local MT5 execution recovery failed.")
 
 
-def _serve_trader_rpc(mt5: ReadOnlyMT5, session: AnalysisWorkerSession, request: dict[str, object]) -> None:
+def _serve_trader_rpc(
+    mt5: ReadOnlyMT5,
+    session: AnalysisWorkerSession,
+    request: dict[str, object],
+    *,
+    live_state: LiveWorkerMarketStateAdapter | None = None,
+) -> None:
     request_id = _request_text(request, "request_id")
     kind = _request_text(request, "kind")
     payload = request.get("payload")
     if kind not in {"read", "operation"} or not isinstance(payload, dict):
         raise WorkerEnrollmentError("The controller requested an invalid Trader RPC request.")
     try:
-        result = _trader_read(mt5, payload) if kind == "read" else _trader_operation(mt5, payload)
+        result = (
+            _trader_read(mt5, payload)
+            if kind == "read"
+            else _set_live_symbols(mt5, live_state, payload)
+            if payload.get("type") == "set_live_symbols"
+            else _trader_operation(mt5, payload)
+        )
         session.send_trader_rpc(request_id=request_id, kind=kind, accepted=True, result=result)
     except (WorkerEnrollmentError, ValueError) as error:
         session.send_trader_rpc(
@@ -782,6 +811,41 @@ def _serve_trader_rpc(mt5: ReadOnlyMT5, session: AnalysisWorkerSession, request:
             accepted=False,
             reason="The local MT5 terminal failed while handling the Trader request.",
         )
+
+
+def _set_live_symbols(
+    mt5: ReadOnlyMT5, live_state: LiveWorkerMarketStateAdapter | None, payload: dict[str, object]
+) -> dict[str, object]:
+    if live_state is None:
+        raise WorkerEnrollmentError("Live market state is unavailable.")
+    symbols = payload.get("symbols")
+    if (
+        set(payload) != {"type", "symbols"}
+        or not isinstance(symbols, list)
+        or not symbols
+        or len(symbols) > MAX_LIVE_SYMBOLS
+        or not all(isinstance(symbol, str) and symbol for symbol in symbols)
+        or len(set(symbols)) != len(symbols)
+    ):
+        raise WorkerEnrollmentError("The controller requested invalid live symbols.")
+    for symbol in symbols:
+        evidence = _evidence(mt5.symbol_info(symbol), "symbol")
+        trade_mode, point = evidence.get("trade_mode"), evidence.get("point")
+        if (
+            isinstance(trade_mode, bool)
+            or not isinstance(trade_mode, int)
+            or trade_mode != 4
+            or isinstance(point, bool)
+            or not isinstance(point, (int, float))
+            or not math.isfinite(point)
+            or point <= 0
+        ):
+            raise WorkerEnrollmentError(f"Symbol {symbol} is not tradeable for live quotes.")
+    for symbol in symbols:
+        if not mt5.symbol_select(symbol, True):
+            raise WorkerEnrollmentError(f"Could not add {symbol} to Market Watch.")
+    live_state.set_watched_symbols(symbols)
+    return {"symbols": symbols}
 
 
 def _trader_read(mt5: ReadOnlyMT5, payload: dict[str, object]) -> dict[str, object]:

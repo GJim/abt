@@ -196,6 +196,7 @@ class RealtimeArbitrage:
         )
         self._verify_active_workers()
         self.shared_symbols = self._load_shared_symbols()
+        self._configure_live_symbols()
         self.accounts = {name: self._account(endpoint) for name, endpoint in self.endpoints.items()}
         self._assert_empty_accounts()
         self.quotes: dict[str, dict[str, tuple[datetime, float, float]]] = {"first": {}, "second": {}}
@@ -308,6 +309,21 @@ class RealtimeArbitrage:
             raise StrategyError("Selected Workers have no shared tradable symbols.")
         _LOGGER.info("shared_symbols_loaded count=%d", len(shared))
         return shared
+
+    def _configure_live_symbols(self) -> None:
+        symbols = sorted(self.shared_symbols)
+        for endpoint in self.endpoints.values():
+            try:
+                result = self.gateway.request(
+                    endpoint.worker_id,
+                    kind="operation",
+                    request={"type": "set_live_symbols", "symbols": symbols},
+                )
+            except StrategyError as error:
+                raise StrategyError(f"Worker {endpoint.worker_id} rejected live symbol configuration.") from error
+            if result.get("symbols") != symbols:
+                raise StrategyError(f"Worker {endpoint.worker_id} returned an invalid live symbol configuration.")
+            _LOGGER.info("live_symbols_configured worker=%s count=%d", endpoint.worker_id, len(symbols))
 
     def _catalog_points(self, endpoint: Endpoint) -> dict[str, float]:
         try:

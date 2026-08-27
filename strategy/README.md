@@ -12,6 +12,14 @@ invalid or unavailable, and keeps the exact-name intersection of tradable
 cached shared catalog and fresh exact-name Market Watch quotes; they never make
 per-event broker symbol-specification calls.
 
+Immediately after that intersection, the strategy configures each selected
+Worker's live quote set once with every shared symbol name in lexical order
+(up to 64 symbols). Each Worker makes those symbols visible in MT5 Market Watch
+and watches exactly that set for live quotes; it does not remove any existing
+Market Watch symbols. Startup fails if either Worker cannot acknowledge the
+exact configured names. This configuration also runs in dry-run mode: its only
+side effect is Market Watch visibility, never a position or order change.
+
 For every eligible shared symbol it considers both bid-to-opposite-ask
 directions and selects the greatest edge meeting `--entry-edge-points`.
 The threshold is a raw price difference equal to its value times the larger

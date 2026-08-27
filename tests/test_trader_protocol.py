@@ -4,7 +4,7 @@ import unittest
 
 from pydantic import ValidationError
 
-from abt.trader_protocol import trader_rpc_request_adapter, trader_rpc_response_adapter
+from abt.trader_protocol import MAX_LIVE_SYMBOLS, trader_rpc_request_adapter, trader_rpc_response_adapter
 
 
 class TraderProtocolTests(unittest.TestCase):
@@ -25,6 +25,40 @@ class TraderProtocolTests(unittest.TestCase):
         )
 
         self.assertEqual("LONG", request.payload.direction)  # type: ignore[union-attr]
+
+    def test_accepts_an_exact_set_live_symbols_operation(self) -> None:
+        request = trader_rpc_request_adapter.validate_python(
+            {
+                "type": "trader_rpc_request",
+                "request_id": "request-1",
+                "kind": "operation",
+                "payload": {"type": "set_live_symbols", "symbols": ["EURUSD", "GBPUSD"]},
+            }
+        )
+
+        self.assertEqual(
+            {"type": "set_live_symbols", "symbols": ["EURUSD", "GBPUSD"]},
+            request.payload.model_dump(),  # type: ignore[union-attr]
+        )
+
+    def test_rejects_invalid_set_live_symbols_operation(self) -> None:
+        for kind, payload in (
+            ("operation", {"type": "set_live_symbols", "symbols": ["EURUSD", "EURUSD"]}),
+            ("operation", {"type": "set_live_symbols", "symbols": ["EURUSD"], "extra": True}),
+            ("operation", {"type": "set_live_symbols", "symbols": []}),
+            ("operation", {"type": "set_live_symbols", "symbols": ["EURUSD"] * (MAX_LIVE_SYMBOLS + 1)}),
+            ("read", {"type": "set_live_symbols", "symbols": ["EURUSD"]}),
+        ):
+            with self.subTest(payload=payload):
+                with self.assertRaises(ValidationError):
+                    trader_rpc_request_adapter.validate_python(
+                        {
+                            "type": "trader_rpc_request",
+                            "request_id": "request-1",
+                            "kind": kind,
+                            "payload": payload,
+                        }
+                    )
 
     def test_rejects_buy_direction_before_the_worker_calls_mt5(self) -> None:
         with self.assertRaises(ValidationError):

@@ -27,6 +27,8 @@ class FakeGateway:
         self.symbols: dict[str, list[dict[str, object]]] = {}
         self.catalog_results: dict[str, dict[str, object]] = {}
         self.unavailable_catalog_workers: set[str] = set()
+        self.live_symbol_results: dict[str, dict[str, object]] = {}
+        self.live_symbol_rejections: set[str] = set()
 
     def request(self, worker_id: str, *, kind: str, request: dict[str, object]) -> dict[str, object]:
         self.calls.append((worker_id, kind, request))
@@ -47,6 +49,10 @@ class FakeGateway:
                     ],
                 )
             }
+        if request["type"] == "set_live_symbols":
+            if worker_id in self.live_symbol_rejections:
+                raise StrategyError("Worker rejected live symbol configuration.")
+            return self.live_symbol_results.get(worker_id, {"symbols": request["symbols"]})
         if request["type"] == "calc_margin":
             return {"margin": 1_000.0}
         if request["type"] == "current_positions":
@@ -135,11 +141,12 @@ class RealtimeArbitrageTests(unittest.TestCase):
             ("EURUSD", "first", "SHORT"): (datetime.now(UTC), 30_000),
             ("EURUSD", "second", "LONG"): (datetime.now(UTC), 1_000),
         }
+        calls_before_open = len(gateway.calls)
 
         with self.assertRaisesRegex(StrategyError, "exceeds 50%"):
             strategy._open(TradeCandidate("EURUSD", "short_first_long_second", 0.001))
 
-        self.assertFalse(any(kind == "operation" for _, kind, _ in gateway.calls))
+        self.assertFalse(any(kind == "operation" for _, kind, _ in gateway.calls[calls_before_open:]))
 
     def test_emergency_protection_sets_broker_sl_and_tp_at_equal_dollar_amounts(self) -> None:
         gateway = FakeGateway()
@@ -221,6 +228,43 @@ class RealtimeArbitrageTests(unittest.TestCase):
         self.assertEqual(("EURUSD", "short_first_long_second"), (candidate.symbol, candidate.direction))
         catalog_reads = [worker for worker, kind, request in gateway.calls if kind == "read" and request["type"] == "symbols"]
         self.assertEqual(["worker-a", "worker-b"], catalog_reads)
+
+    def test_configures_every_shared_symbol_once_on_both_workers_at_startup(self) -> None:
+        gateway = FakeGateway()
+        gateway.symbols = {
+            "worker-a": [
+                {"name": "XAUUSD", "trade_mode": 4, "point": 0.01},
+                {"name": "EURUSD", "trade_mode": 4, "point": 0.00001},
+                {"name": "GBPUSD", "trade_mode": 4, "point": 0.00001},
+            ],
+            "worker-b": [
+                {"name": "GBPUSD", "trade_mode": 4, "point": 0.00001},
+                {"name": "XAUUSD", "trade_mode": 4, "point": 0.01},
+                {"name": "EURUSD", "trade_mode": 4, "point": 0.00001},
+            ],
+        }
+
+        RealtimeArbitrage(gateway, first=Endpoint("worker-a"), second=Endpoint("worker-b"), config=configuration(execute=False))
+
+        requests = [
+            (worker, request)
+            for worker, kind, request in gateway.calls
+            if kind == "operation" and request["type"] == "set_live_symbols"
+        ]
+        self.assertEqual(
+            [
+                ("worker-a", {"type": "set_live_symbols", "symbols": ["EURUSD", "GBPUSD", "XAUUSD"]}),
+                ("worker-b", {"type": "set_live_symbols", "symbols": ["EURUSD", "GBPUSD", "XAUUSD"]}),
+            ],
+            requests,
+        )
+
+    def test_invalid_live_symbol_configuration_acknowledgment_fails_closed(self) -> None:
+        gateway = FakeGateway()
+        gateway.live_symbol_results["worker-a"] = {"symbols": ["EURUSD"]}
+
+        with self.assertRaisesRegex(StrategyError, "invalid live symbol configuration"):
+            RealtimeArbitrage(gateway, first=Endpoint("worker-a"), second=Endpoint("worker-b"), config=configuration(execute=False))
 
     def test_selects_greatest_edge_across_shared_symbols(self) -> None:
         gateway = FakeGateway()
