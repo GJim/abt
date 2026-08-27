@@ -65,6 +65,27 @@ class Account:
     day_start_equity: float
 
 
+@dataclass(frozen=True, slots=True)
+class SymbolSpecification:
+    name: str
+    trade_mode: int
+    trade_calc_mode: int | str
+    digits: int
+    point: float
+    trade_tick_size: float
+    contract_size: float
+    volume_min: float
+    volume_step: float
+    allowed_directions: frozenset[str]
+    filling_modes: frozenset[str]
+
+
+@dataclass(frozen=True, slots=True)
+class SharedSymbol:
+    point: float
+    filling_mode: str
+
+
 @dataclass(slots=True)
 class Pair:
     symbol: str
@@ -299,12 +320,27 @@ class RealtimeArbitrage:
                 raise StrategyError(f"Worker {endpoint.worker_id} is not an active, safe Worker.")
             _LOGGER.info("worker_verified worker=%s server=%s", endpoint.worker_id, worker.get("server"))
 
-    def _load_shared_symbols(self) -> dict[str, float]:
-        catalogs = {name: self._catalog_points(endpoint) for name, endpoint in self.endpoints.items()}
-        shared = {
-            symbol: max(catalogs["first"][symbol], catalogs["second"][symbol])
-            for symbol in catalogs["first"].keys() & catalogs["second"].keys()
-        }
+    def _load_shared_symbols(self) -> dict[str, SharedSymbol]:
+        catalogs = {name: self._catalog_specifications(endpoint) for name, endpoint in self.endpoints.items()}
+        shared: dict[str, SharedSymbol] = {}
+        for symbol in sorted(catalogs["first"].keys() & catalogs["second"].keys()):
+            first, second = catalogs["first"][symbol], catalogs["second"][symbol]
+            mismatches = _hard_specification_mismatches(first, second)
+            if mismatches:
+                _LOGGER.info(
+                    "shared_symbol_excluded symbol=%s reason=hard_specification_mismatch fields=%s",
+                    symbol,
+                    ",".join(mismatches),
+                )
+                continue
+            if not {"LONG", "SHORT"}.issubset(first.allowed_directions):
+                _LOGGER.info("shared_symbol_excluded symbol=%s reason=bidirectional_trading_unavailable", symbol)
+                continue
+            filling_mode = _preferred_shared_filling_mode(first.filling_modes, second.filling_modes)
+            if filling_mode is None:
+                _LOGGER.info("shared_symbol_excluded symbol=%s reason=no_shared_fok_or_ioc", symbol)
+                continue
+            shared[symbol] = SharedSymbol(point=first.point, filling_mode=filling_mode)
         if not shared:
             raise StrategyError("Selected Workers have no shared tradable symbols.")
         _LOGGER.info("shared_symbols_loaded count=%d", len(shared))
@@ -325,7 +361,7 @@ class RealtimeArbitrage:
                 raise StrategyError(f"Worker {endpoint.worker_id} returned an invalid live symbol configuration.")
             _LOGGER.info("live_symbols_configured worker=%s count=%d", endpoint.worker_id, len(symbols))
 
-    def _catalog_points(self, endpoint: Endpoint) -> dict[str, float]:
+    def _catalog_specifications(self, endpoint: Endpoint) -> dict[str, SymbolSpecification]:
         try:
             result = self.gateway.request(endpoint.worker_id, kind="read", request={"type": "symbols"})
         except StrategyError as error:
@@ -333,21 +369,20 @@ class RealtimeArbitrage:
         symbols = result.get("symbols")
         if not isinstance(symbols, list):
             raise StrategyError(f"Worker {endpoint.worker_id} returned an invalid symbol catalog.")
-        points: dict[str, float] = {}
+        specifications: dict[str, SymbolSpecification] = {}
         for symbol in symbols:
             if not isinstance(symbol, dict):
                 raise StrategyError(f"Worker {endpoint.worker_id} returned an invalid symbol catalog.")
-            symbol_name, trade_mode, point = symbol.get("name"), symbol.get("trade_mode"), symbol.get("point")
-            if not isinstance(symbol_name, str) or not symbol_name or symbol_name in points:
-                raise StrategyError(f"Worker {endpoint.worker_id} returned an invalid symbol catalog.")
+            trade_mode = symbol.get("trade_mode")
             if isinstance(trade_mode, bool) or not isinstance(trade_mode, int):
                 raise StrategyError(f"Worker {endpoint.worker_id} returned an invalid symbol catalog.")
             if trade_mode != 4:
                 continue
-            if not _positive_finite(point):
+            specification = _symbol_specification(symbol)
+            if specification.name in specifications:
                 raise StrategyError(f"Worker {endpoint.worker_id} returned an invalid symbol catalog.")
-            points[symbol_name] = float(point)
-        return points
+            specifications[specification.name] = specification
+        return specifications
 
     def _consume(self, message: dict[str, object]) -> bool:
         worker, observed_at, quotes = message.get("worker_id"), message.get("observed_at"), message.get("quotes")
@@ -414,12 +449,12 @@ class RealtimeArbitrage:
         return all(value is not None and (datetime.now(UTC) - value[0]).total_seconds() <= self.config.quote_max_age_seconds for value in values)
 
     def _candidate_for_symbol(self, symbol: str) -> TradeCandidate | None:
-        point = self.shared_symbols.get(symbol)
-        if point is None or not self._quotes_fresh(symbol):
+        specification = self.shared_symbols.get(symbol)
+        if specification is None or not self._quotes_fresh(symbol):
             return None
         _, first_bid, first_ask = self.quotes["first"][symbol]
         _, second_bid, second_ask = self.quotes["second"][symbol]
-        threshold = self.config.entry_edge_points * point
+        threshold = self.config.entry_edge_points * specification.point
         candidates = (
             TradeCandidate(symbol, "short_first_long_second", first_bid - second_ask),
             TradeCandidate(symbol, "long_first_short_second", second_bid - first_ask),
@@ -494,8 +529,21 @@ class RealtimeArbitrage:
     def _market(self, name: str, symbol: str, direction: str) -> None:
         if self.config.execute:
             endpoint = self.endpoints[name]
+            specification = self.shared_symbols.get(symbol)
+            if specification is None:
+                raise StrategyError(f"Cannot submit an order for an ineligible symbol {symbol}.")
             _LOGGER.info("market_order_submit endpoint=%s worker=%s direction=%s symbol=%s lots=%.2f", name, endpoint.worker_id, direction, symbol, self.config.lots)
-            self.gateway.request(endpoint.worker_id, kind="operation", request={"type": "market", "symbol": symbol, "volume": f"{self.config.lots:.2f}", "direction": direction, "filling_mode": "IOC"})
+            self.gateway.request(
+                endpoint.worker_id,
+                kind="operation",
+                request={
+                    "type": "market",
+                    "symbol": symbol,
+                    "volume": f"{self.config.lots:.2f}",
+                    "direction": direction,
+                    "filling_mode": specification.filling_mode,
+                },
+            )
             _LOGGER.info("market_order_completed endpoint=%s worker=%s", name, endpoint.worker_id)
         else:
             _LOGGER.info("market_order_dry_run endpoint=%s direction=%s", name, direction)
@@ -711,6 +759,107 @@ def _positive(value: object, field: str) -> float:
 
 def _positive_finite(value: object) -> bool:
     return not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(value) and value > 0
+
+
+def _symbol_specification(value: object) -> SymbolSpecification:
+    if not isinstance(value, dict):
+        raise StrategyError("Worker returned an invalid symbol catalog.")
+    name = value.get("name")
+    trade_mode = value.get("trade_mode")
+    trade_calc_mode = value.get("trade_calc_mode")
+    digits = value.get("digits")
+    if not isinstance(name, str) or not name:
+        raise StrategyError("Worker returned an invalid symbol catalog.")
+    if isinstance(trade_mode, bool) or not isinstance(trade_mode, int):
+        raise StrategyError("Worker returned an invalid symbol catalog.")
+    if isinstance(trade_calc_mode, bool) or not isinstance(trade_calc_mode, (int, str)):
+        raise StrategyError("Worker returned an invalid symbol catalog.")
+    if isinstance(trade_calc_mode, str) and not trade_calc_mode:
+        raise StrategyError("Worker returned an invalid symbol catalog.")
+    if isinstance(digits, bool) or not isinstance(digits, int):
+        raise StrategyError("Worker returned an invalid symbol catalog.")
+    return SymbolSpecification(
+        name=name,
+        trade_mode=trade_mode,
+        trade_calc_mode=trade_calc_mode,
+        digits=digits,
+        point=_required_positive_catalog_number(value, "point"),
+        trade_tick_size=_required_positive_catalog_number(value, "trade_tick_size"),
+        contract_size=_required_positive_catalog_number(value, "trade_contract_size"),
+        volume_min=_required_positive_catalog_number(value, "volume_min"),
+        volume_step=_required_positive_catalog_number(value, "volume_step"),
+        allowed_directions=_catalog_allowed_directions(value, trade_mode),
+        filling_modes=_catalog_filling_modes(value),
+    )
+
+
+def _required_positive_catalog_number(value: dict[str, object], field: str) -> float:
+    number = value.get(field)
+    if not _positive_finite(number):
+        raise StrategyError("Worker returned an invalid symbol catalog.")
+    return float(number)
+
+
+def _catalog_allowed_directions(value: dict[str, object], trade_mode: int | str) -> frozenset[str]:
+    order_mode = value.get("order_mode")
+    if order_mode is not None:
+        if isinstance(order_mode, bool) or not isinstance(order_mode, int):
+            raise StrategyError("Worker returned an invalid symbol catalog.")
+        directions = frozenset(
+            direction
+            for bit, direction in ((1, "LONG"), (2, "SHORT"))
+            if order_mode & bit
+        )
+        if directions:
+            return directions
+    if isinstance(trade_mode, int):
+        directions_by_trade_mode = {
+            1: frozenset({"LONG"}),
+            2: frozenset({"SHORT"}),
+            4: frozenset({"LONG", "SHORT"}),
+        }
+        if trade_mode in directions_by_trade_mode:
+            return directions_by_trade_mode[trade_mode]
+    raise StrategyError("Worker returned an invalid symbol catalog.")
+
+
+def _catalog_filling_modes(value: dict[str, object]) -> frozenset[str]:
+    filling_mode = value.get("filling_mode")
+    if isinstance(filling_mode, bool) or not isinstance(filling_mode, int):
+        raise StrategyError("Worker returned an invalid symbol catalog.")
+    modes = frozenset(
+        mode
+        for bit, mode in ((1, "FOK"), (2, "IOC"), (4, "BOC"))
+        if filling_mode & bit
+    )
+    if modes:
+        return modes
+    legacy_modes = {0: frozenset({"FOK"})}.get(filling_mode)
+    if legacy_modes is not None:
+        return legacy_modes
+    raise StrategyError("Worker returned an invalid symbol catalog.")
+
+
+def _hard_specification_mismatches(
+    first: SymbolSpecification,
+    second: SymbolSpecification,
+) -> list[str]:
+    fields = (
+        "trade_calc_mode",
+        "digits",
+        "point",
+        "trade_tick_size",
+        "contract_size",
+        "volume_min",
+        "volume_step",
+        "allowed_directions",
+    )
+    return [field for field in fields if getattr(first, field) != getattr(second, field)]
+
+
+def _preferred_shared_filling_mode(first: frozenset[str], second: frozenset[str]) -> str | None:
+    shared = first & second
+    return "FOK" if "FOK" in shared else "IOC" if "IOC" in shared else None
 
 
 def _ticket(position: dict[str, object]) -> int:

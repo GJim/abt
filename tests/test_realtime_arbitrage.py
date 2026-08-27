@@ -39,16 +39,15 @@ class FakeGateway:
                 raise StrategyError("Worker broker read unavailable.")
             if worker_id in self.catalog_results:
                 return self.catalog_results[worker_id]
-            return {
-                "symbols": self.symbols.get(
-                    worker_id,
-                    [
-                        {"name": "EURUSD", "trade_mode": 4, "point": 0.00001},
-                        {"name": "GBPUSD", "trade_mode": 4, "point": 0.00001},
-                        {"name": "XAUUSD", "trade_mode": 4, "point": 0.01},
-                    ],
-                )
-            }
+            catalog = self.symbols.get(
+                worker_id,
+                [
+                    {"name": "EURUSD"},
+                    {"name": "GBPUSD"},
+                    {"name": "XAUUSD", "point": 0.01, "trade_tick_size": 0.01, "digits": 2},
+                ],
+            )
+            return {"symbols": [self.symbol_specification(symbol) for symbol in catalog]}
         if request["type"] == "set_live_symbols":
             if worker_id in self.live_symbol_rejections:
                 raise StrategyError("Worker rejected live symbol configuration.")
@@ -66,6 +65,22 @@ class FakeGateway:
             profit = (close_price - open_price) * 10_000 if direction == "LONG" else (open_price - close_price) * 10_000
             return {"profit": profit}
         return {"operation": request["type"], "result": {}}
+
+    @staticmethod
+    def symbol_specification(symbol: dict[str, object]) -> dict[str, object]:
+        return {
+            "trade_mode": 4,
+            "trade_calc_mode": 0,
+            "digits": 5,
+            "point": 0.00001,
+            "trade_tick_size": 0.00001,
+            "trade_contract_size": 100_000.0,
+            "volume_min": 0.01,
+            "volume_step": 0.01,
+            "filling_mode": 3,
+            "order_mode": 3,
+            **symbol,
+        }
 
     def query(self, query: str) -> dict[str, object]:
         self.calls.append(("", "query", {"query": query}))
@@ -294,21 +309,89 @@ class RealtimeArbitrageTests(unittest.TestCase):
         self.assertIsNone(strategy._best_candidate())
         self.assertEqual([], gateway.calls[calls_before_selection:])
 
-    def test_entry_threshold_uses_the_larger_broker_point(self) -> None:
+    def test_rejects_mismatched_hard_contract_terms(self) -> None:
+        mismatches = {
+            "trade_calc_mode": 1,
+            "digits": 4,
+            "point": 0.0001,
+            "trade_tick_size": 0.0001,
+            "trade_contract_size": 10_000.0,
+            "volume_min": 0.1,
+            "volume_step": 0.1,
+            "order_mode": 1,
+        }
+        for field, second_value in mismatches.items():
+            with self.subTest(field=field):
+                gateway = FakeGateway()
+                first = FakeGateway.symbol_specification({"name": "EURUSD"})
+                second = {**first, field: second_value}
+                gateway.symbols = {"worker-a": [first], "worker-b": [second]}
+
+                with self.assertRaisesRegex(StrategyError, "no shared tradable symbols"):
+                    RealtimeArbitrage(
+                        gateway,
+                        first=Endpoint("worker-a"),
+                        second=Endpoint("worker-b"),
+                        config=configuration(execute=False),
+                    )
+
+    def test_prefers_shared_fok_and_falls_back_to_shared_ioc(self) -> None:
+        for first_filling_mode, second_filling_mode, expected in (
+            (3, 3, "FOK"),
+            (2, 2, "IOC"),
+        ):
+            with self.subTest(expected=expected):
+                gateway = FakeGateway()
+                gateway.symbols = {
+                    "worker-a": [{"name": "EURUSD", "filling_mode": first_filling_mode}],
+                    "worker-b": [{"name": "EURUSD", "filling_mode": second_filling_mode}],
+                }
+                strategy = RealtimeArbitrage(
+                    gateway,
+                    first=Endpoint("worker-a"),
+                    second=Endpoint("worker-b"),
+                    config=configuration(execute=True),
+                )
+
+                strategy._market("first", "EURUSD", "LONG")
+
+                request = next(
+                    request
+                    for worker, kind, request in reversed(gateway.calls)
+                    if worker == "worker-a" and kind == "operation" and request["type"] == "market"
+                )
+                self.assertEqual(expected, request["filling_mode"])
+
+    def test_rejects_symbols_without_a_shared_executable_filling_mode(self) -> None:
         gateway = FakeGateway()
         gateway.symbols = {
-            "worker-a": [{"name": "EURUSD", "trade_mode": 4, "point": 0.00001}],
-            "worker-b": [{"name": "EURUSD", "trade_mode": 4, "point": 0.0001}],
+            "worker-a": [{"name": "EURUSD", "filling_mode": 1}],
+            "worker-b": [{"name": "EURUSD", "filling_mode": 2}],
         }
-        config = StrategyConfig(5, 0.1, 100, 0.03, 0.02, 1, 40, 5, 180, time(16), 300, False)
-        strategy = RealtimeArbitrage(gateway, first=Endpoint("worker-a"), second=Endpoint("worker-b"), config=config)
-        now = datetime.now(UTC)
-        strategy.quotes["first"]["EURUSD"] = (now, 1.10055, 1.10065)
-        strategy.quotes["second"]["EURUSD"] = (now, 1.10000, 1.10010)
 
-        self.assertIsNone(strategy._candidate_for_symbol("EURUSD"))
-        strategy.quotes["first"]["EURUSD"] = (now, 1.10060, 1.10070)
-        self.assertEqual("short_first_long_second", strategy._candidate_for_symbol("EURUSD").direction)
+        with self.assertRaisesRegex(StrategyError, "no shared tradable symbols"):
+            RealtimeArbitrage(
+                gateway,
+                first=Endpoint("worker-a"),
+                second=Endpoint("worker-b"),
+                config=configuration(execute=False),
+            )
+
+    def test_uses_trade_mode_directions_when_order_mode_is_unavailable(self) -> None:
+        gateway = FakeGateway()
+        gateway.symbols = {
+            "worker-a": [{"name": "EURUSD", "order_mode": None}],
+            "worker-b": [{"name": "EURUSD", "order_mode": None}],
+        }
+
+        strategy = RealtimeArbitrage(
+            gateway,
+            first=Endpoint("worker-a"),
+            second=Endpoint("worker-b"),
+            config=configuration(execute=False),
+        )
+
+        self.assertEqual({"EURUSD"}, set(strategy.shared_symbols))
 
     def test_best_candidate_makes_no_broker_rpc_after_startup_catalog_load(self) -> None:
         gateway = FakeGateway()
@@ -352,7 +435,7 @@ class RealtimeArbitrageTests(unittest.TestCase):
             gateway, first=Endpoint("worker-a"), second=Endpoint("worker-b"), config=configuration()
         )
 
-        self.assertEqual({"EURUSD": 0.00001}, strategy.shared_symbols)
+        self.assertEqual({"EURUSD"}, set(strategy.shared_symbols))
 
     def test_unavailable_startup_catalog_fails_closed(self) -> None:
         gateway = FakeGateway()

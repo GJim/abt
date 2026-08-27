@@ -7,10 +7,14 @@ not use two named contexts that share one terminal.
 At startup the strategy asks the controller for `active_workers`, requires
 both specified Workers to be connected and safe, then reads each selected
 Worker's complete `symbols` catalog once. It fails startup if either catalog is
-invalid or unavailable, and keeps the exact-name intersection of tradable
-(trade mode 4, positive finite point) symbols. Live decisions use only this
-cached shared catalog and fresh exact-name Market Watch quotes; they never make
-per-event broker symbol-specification calls.
+invalid or unavailable, and keeps only exact-name symbols that are tradable
+(trade mode 4), bidirectional, and have matching hard contract terms: trade
+calculation mode, digits, point, tick size, contract size, minimum volume,
+volume step, and allowed directions. The endpoints must also share an
+executable filling mode; the strategy uses FOK when both support it, otherwise
+IOC. Live decisions use only this cached shared catalog and fresh exact-name
+Market Watch quotes; they never make per-event broker symbol-specification
+calls.
 
 Immediately after that intersection, the strategy configures each selected
 Worker's live quote set once with every shared symbol name in lexical order
