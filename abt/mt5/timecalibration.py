@@ -4,6 +4,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from numbers import Real
 from statistics import median
+from time import sleep as _sleep
 from typing import Any, Mapping
 from zoneinfo import ZoneInfo
 
@@ -14,6 +15,7 @@ MARKET_DATA = "market_data"
 TRADE_RECORDS = "trade_records"
 _MAX_SAMPLES = 20
 _FULL_MARKET_SAMPLE_COUNT = 3
+_MARKET_SAMPLE_INTERVAL_SECONDS = 1
 
 
 def prepare_market_data(
@@ -148,8 +150,18 @@ def time_status(context: Context, user_timezone: ZoneInfo) -> dict[str, Any]:
 
 
 def _market_samples(api: object, symbol: str) -> tuple[CalibrationSample, ...]:
-    samples = tuple(sample for _ in range(_FULL_MARKET_SAMPLE_COUNT) if (sample := _market_sample(api, symbol)) is not None)
-    return samples
+    samples: list[CalibrationSample] = []
+    previous_epoch: int | None = None
+    for index in range(_FULL_MARKET_SAMPLE_COUNT):
+        sample = _market_sample(api, symbol)
+        if sample is not None:
+            epoch = int(round(_parse_utc(sample.calibrated_at_utc).timestamp())) + sample.offset_seconds
+            if previous_epoch is None or epoch > previous_epoch:
+                samples.append(sample)
+                previous_epoch = epoch
+        if index < _FULL_MARKET_SAMPLE_COUNT - 1:
+            _sleep(_MARKET_SAMPLE_INTERVAL_SECONDS)
+    return tuple(samples) if len(samples) == _FULL_MARKET_SAMPLE_COUNT else ()
 
 
 def _market_sample(api: object, symbol: str) -> CalibrationSample | None:
@@ -159,7 +171,13 @@ def _market_sample(api: object, symbol: str) -> CalibrationSample | None:
         return None
     tick = getter(symbol)
     after = _utc_now()
-    epoch = _field(tick, "time")
+    epoch_milliseconds = _field(tick, "time_msc")
+    if _valid_epoch(epoch_milliseconds):
+        epoch = float(epoch_milliseconds) / 1000
+        source = "symbol_info_tick.time_msc"
+    else:
+        epoch = _field(tick, "time")
+        source = "symbol_info_tick.time"
     if not _valid_epoch(epoch):
         return None
     midpoint = before + (after - before) / 2
@@ -167,7 +185,7 @@ def _market_sample(api: object, symbol: str) -> CalibrationSample | None:
     offset = int(round(difference))
     error = abs(difference - offset) + (after - before).total_seconds() / 2
     return CalibrationSample(
-        source="symbol_info_tick.time",
+        source=source,
         calibrated_at_utc=_utc_iso(after),
         offset_seconds=offset,
         error_seconds=round(error, 6),

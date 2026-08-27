@@ -33,6 +33,10 @@ class SymbolInfoRead(_ProtocolModel):
     symbol: str
 
 
+class SymbolsRead(_ProtocolModel):
+    type: Literal["symbols"]
+
+
 class CalcMarginRead(_ProtocolModel):
     type: Literal["calc_margin"]
     symbol: str
@@ -67,7 +71,7 @@ class CurrentPositionsRead(_ProtocolModel):
 
 
 TraderRead = Annotated[
-    AccountInfoRead | SymbolInfoRead | CalcMarginRead | CalcProfitRead | HistoricalTicksRead | CurrentOrdersRead | CurrentPositionsRead,
+    AccountInfoRead | SymbolInfoRead | SymbolsRead | CalcMarginRead | CalcProfitRead | HistoricalTicksRead | CurrentOrdersRead | CurrentPositionsRead,
     Field(discriminator="type"),
 ]
 
@@ -130,7 +134,7 @@ class TraderRpcRequest(_ProtocolModel):
         if self.kind == "read" and isinstance(self.payload, (MarketOperation, PendingOperation, CancelOperation, CloseOperation, ModifySlTpOperation)):
             raise ValueError("Trader read requests require a read payload.")
         if self.kind == "operation" and isinstance(
-            self.payload,                         (AccountInfoRead, SymbolInfoRead, CalcMarginRead, CalcProfitRead, HistoricalTicksRead, CurrentOrdersRead, CurrentPositionsRead)
+            self.payload,                         (AccountInfoRead, SymbolInfoRead, SymbolsRead, CalcMarginRead, CalcProfitRead, HistoricalTicksRead, CurrentOrdersRead, CurrentPositionsRead)
         ):
             raise ValueError("Trader operation requests require an operation payload.")
         return self

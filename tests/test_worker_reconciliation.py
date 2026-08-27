@@ -15,6 +15,7 @@ from abt.worker.reconciliation import (
     _broker_receipt,
     _json_evidence,
     _order_check_diagnostics,
+    _trader_read,
     _serve_order_execute,
     _serve_trader_rpc,
     _serve_execution_recovery,
@@ -46,6 +47,10 @@ class ReadOnlyMT5:
     def positions_get(self) -> object:
         self.calls.append("positions_get")
         return self.positions
+
+    def symbols_get(self) -> object:
+        self.calls.append("symbols_get")
+        return [{"name": "EURUSD", "trade_mode": 4, "point": 0.00001}]
 
     def order_send(self, *_: object, **__: object) -> object:
         self.broker_write_calls += 1
@@ -122,7 +127,6 @@ class WorkerReconciliationTests(unittest.TestCase):
                 },
             },
         )
-
         self.assertEqual(
             {
                 "request_id": "request-1",
@@ -132,6 +136,24 @@ class WorkerReconciliationTests(unittest.TestCase):
             },
             session.response,
         )
+
+    def test_symbols_trader_read_returns_json_evidence(self) -> None:
+        mt5 = ReadOnlyMT5()
+
+        result = _trader_read(mt5, {"type": "symbols"})
+
+        self.assertEqual(
+            {"symbols": [{"name": "EURUSD", "trade_mode": 4, "point": 0.00001}]},
+            result,
+        )
+        self.assertEqual(["symbols_get"], mt5.calls)
+
+    def test_symbols_trader_read_rejects_unavailable_catalog(self) -> None:
+        mt5 = ReadOnlyMT5()
+        mt5.symbols_get = lambda: None  # type: ignore[method-assign]
+
+        with self.assertRaisesRegex(WorkerEnrollmentError, "invalid symbol catalog"):
+            _trader_read(mt5, {"type": "symbols"})
 
     def test_mt5_last_error_diagnostic_is_safe_when_unavailable(self) -> None:
         self.assertIsNone(_mt5_last_error(object()))

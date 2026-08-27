@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
+import math
 import signal
 import subprocess
 import sys
@@ -42,7 +44,7 @@ class Endpoint:
 
 @dataclass(frozen=True, slots=True)
 class StrategyConfig:
-    entry_edge_pips: float
+    entry_edge_points: float
     lots: float
     maximum_trades: int
     daily_loss_fraction: float
@@ -65,6 +67,7 @@ class Account:
 
 @dataclass(slots=True)
 class Pair:
+    symbol: str
     direction: str
     first_entry: float
     second_entry: float
@@ -75,6 +78,13 @@ class Pair:
     first_direction: str
     second_direction: str
     opened_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class TradeCandidate:
+    symbol: str
+    direction: str
+    edge: float
 
 
 class TraderGateway:
@@ -176,27 +186,26 @@ class TraderGateway:
 class RealtimeArbitrage:
     """Own one pair lifecycle; the caller only supplies endpoints and configuration."""
 
-    def __init__(
-        self, gateway: TraderGateway, *, first: Endpoint, second: Endpoint, symbol: str, config: StrategyConfig
-    ) -> None:
+    def __init__(self, gateway: TraderGateway, *, first: Endpoint, second: Endpoint, config: StrategyConfig) -> None:
         if first.worker_id == second.worker_id:
             raise StrategyError("Arbitrage endpoints must use different Workers.")
-        self.gateway, self.endpoints, self.symbol, self.config = gateway, {"first": first, "second": second}, symbol, config
+        self.gateway, self.endpoints, self.config = gateway, {"first": first, "second": second}, config
         _LOGGER.info(
-            "strategy_initializing symbol=%s first_worker=%s second_worker=%s lots=%.2f edge_pips=%.2f max_trades=%d execute=%s",
-            symbol, first.worker_id, second.worker_id, config.lots, config.entry_edge_pips, config.maximum_trades, config.execute,
+            "strategy_initializing first_worker=%s second_worker=%s lots=%.2f edge_points=%.2f max_trades=%d execute=%s",
+            first.worker_id, second.worker_id, config.lots, config.entry_edge_points, config.maximum_trades, config.execute,
         )
-        self._verify_active_workers_and_symbol()
+        self._verify_active_workers()
+        self.shared_symbols = self._load_shared_symbols()
         self.accounts = {name: self._account(endpoint) for name, endpoint in self.endpoints.items()}
         self._assert_empty_accounts()
-        self.quotes: dict[str, tuple[datetime, float, float]] = {}
-        self.margin_per_lot: dict[tuple[str, str], float] = {}
-        self.margin_refresh_at: datetime | None = None
+        self.quotes: dict[str, dict[str, tuple[datetime, float, float]]] = {"first": {}, "second": {}}
+        self.margin_per_lot: dict[tuple[str, str, str], tuple[datetime, float]] = {}
         self.integrity_check_at: datetime | None = None
         self.pair: Pair | None = None
         self.unavailable_endpoints: set[str] = set()
         self.worker_disconnect_deadline: datetime | None = None
-        self.awaiting_clear = self.stopped = False
+        self.awaiting_clear_symbol: str | None = None
+        self.stopped = False
         self.completed_trades = 0
         self._ny_date: object | None = None
         _LOGGER.info("strategy_initialized")
@@ -220,38 +229,40 @@ class RealtimeArbitrage:
                 self._recover_worker_market_data(message)
             if self.unavailable_endpoints:
                 continue
-            self._check_active_pair_integrity()
-            if not self._quotes_fresh():
-                continue
-            self._refresh_margin_if_due()
-            self._check_integrity_if_due()
-            if self.pair is not None and self._risk_breached():
+            if self.pair is not None and self.config.execute:
+                self._check_active_pair_integrity()
+            else:
+                self._check_integrity_if_due()
+            if self.pair is not None and self._quotes_fresh(self.pair.symbol) and self._risk_breached():
                 _LOGGER.warning("risk_limit_triggered completed_trades=%d", self.completed_trades)
                 self._halt("risk limit reached")
-            direction = self._direction()
             if self.pair is not None:
-                if direction is not None and direction != self.pair.direction:
+                candidate = self._candidate_for_symbol(self.pair.symbol)
+                if candidate is not None and candidate.direction != self.pair.direction:
                     if not self._minimum_hold_elapsed():
                         remaining = self.config.minimum_hold_seconds - (datetime.now(UTC) - self.pair.opened_at).total_seconds()
                         _LOGGER.info(
                             "reverse_signal_deferred_minimum_hold old_direction=%s new_direction=%s remaining_seconds=%.1f",
                             self.pair.direction,
-                            direction,
+                            candidate.direction,
                             max(0, remaining),
                         )
                         continue
-                    _LOGGER.info("reverse_signal_close old_direction=%s new_direction=%s", self.pair.direction, direction)
+                    _LOGGER.info("reverse_signal_close symbol=%s old_direction=%s new_direction=%s", self.pair.symbol, self.pair.direction, candidate.direction)
                     self._flatten_all()
                     self.completed_trades += 1
-                    self.pair, self.awaiting_clear = None, True
+                    self.awaiting_clear_symbol, self.pair = self.pair.symbol, None
                 continue
-            if self.awaiting_clear:
-                self.awaiting_clear = direction is not None
-                if not self.awaiting_clear:
+            candidate = self._best_candidate()
+            if self.awaiting_clear_symbol is not None:
+                if self._candidate_for_symbol(self.awaiting_clear_symbol) is None:
                     _LOGGER.info("reentry_rearmed")
-            elif direction is not None and self.completed_trades < self.config.maximum_trades:
-                self._open(direction)
-            elif direction is not None:
+                    self.awaiting_clear_symbol = None
+                elif candidate is None or candidate.symbol == self.awaiting_clear_symbol:
+                    continue
+            if candidate is not None and self.completed_trades < self.config.maximum_trades:
+                self._open(candidate)
+            elif candidate is not None:
                 _LOGGER.info("entry_skipped_trade_limit completed_trades=%d maximum_trades=%d", self.completed_trades, self.config.maximum_trades)
 
     def shutdown(self) -> None:
@@ -270,7 +281,7 @@ class RealtimeArbitrage:
         _LOGGER.info("account_loaded worker=%s balance=%.2f equity=%.2f", endpoint.worker_id, balance, equity)
         return Account(balance, equity, equity)
 
-    def _verify_active_workers_and_symbol(self) -> None:
+    def _verify_active_workers(self) -> None:
         result = self.gateway.query("active_workers")
         workers = result.get("workers")
         if not isinstance(workers, list):
@@ -286,29 +297,71 @@ class RealtimeArbitrage:
             if not isinstance(worker, dict) or worker.get("connectivity") != "connected" or worker.get("safety_state") != "connected":
                 raise StrategyError(f"Worker {endpoint.worker_id} is not an active, safe Worker.")
             _LOGGER.info("worker_verified worker=%s server=%s", endpoint.worker_id, worker.get("server"))
-            result = self.gateway.request(endpoint.worker_id, kind="read", request={"type": "symbol_info", "symbol": self.symbol})
-            symbol = result.get("symbol")
-            if not isinstance(symbol, dict) or symbol.get("name") != self.symbol or symbol.get("trade_mode") != 4:
-                raise StrategyError(f"Worker {endpoint.worker_id} cannot trade {self.symbol}.")
-            _LOGGER.info("symbol_verified worker=%s symbol=%s", endpoint.worker_id, self.symbol)
+
+    def _load_shared_symbols(self) -> dict[str, float]:
+        catalogs = {name: self._catalog_points(endpoint) for name, endpoint in self.endpoints.items()}
+        shared = {
+            symbol: max(catalogs["first"][symbol], catalogs["second"][symbol])
+            for symbol in catalogs["first"].keys() & catalogs["second"].keys()
+        }
+        if not shared:
+            raise StrategyError("Selected Workers have no shared tradable symbols.")
+        _LOGGER.info("shared_symbols_loaded count=%d", len(shared))
+        return shared
+
+    def _catalog_points(self, endpoint: Endpoint) -> dict[str, float]:
+        try:
+            result = self.gateway.request(endpoint.worker_id, kind="read", request={"type": "symbols"})
+        except StrategyError as error:
+            raise StrategyError(f"Worker {endpoint.worker_id} returned no symbol catalog.") from error
+        symbols = result.get("symbols")
+        if not isinstance(symbols, list):
+            raise StrategyError(f"Worker {endpoint.worker_id} returned an invalid symbol catalog.")
+        points: dict[str, float] = {}
+        for symbol in symbols:
+            if not isinstance(symbol, dict):
+                raise StrategyError(f"Worker {endpoint.worker_id} returned an invalid symbol catalog.")
+            symbol_name, trade_mode, point = symbol.get("name"), symbol.get("trade_mode"), symbol.get("point")
+            if not isinstance(symbol_name, str) or not symbol_name or symbol_name in points:
+                raise StrategyError(f"Worker {endpoint.worker_id} returned an invalid symbol catalog.")
+            if isinstance(trade_mode, bool) or not isinstance(trade_mode, int):
+                raise StrategyError(f"Worker {endpoint.worker_id} returned an invalid symbol catalog.")
+            if trade_mode != 4:
+                continue
+            if not _positive_finite(point):
+                raise StrategyError(f"Worker {endpoint.worker_id} returned an invalid symbol catalog.")
+            points[symbol_name] = float(point)
+        return points
 
     def _consume(self, message: dict[str, object]) -> bool:
         worker, observed_at, quotes = message.get("worker_id"), message.get("observed_at"), message.get("quotes")
         name = next((key for key, endpoint in self.endpoints.items() if endpoint.worker_id == worker), None)
         if name is None or not isinstance(observed_at, str) or not isinstance(quotes, list):
             return False
-        quote = next((item for item in quotes if isinstance(item, dict) and item.get("symbol") == self.symbol), None)
-        if not isinstance(quote, dict):
+        try:
+            timestamp = _utc(observed_at)
+        except (StrategyError, ValueError):
+            _LOGGER.warning("quote_ignored endpoint=%s reason=invalid_observed_at", name)
             return False
-        self.quotes[name] = (_utc(observed_at), _positive(quote.get("bid"), "bid"), _positive(quote.get("ask"), "ask"))
-        _LOGGER.debug("quote_updated endpoint=%s bid=%s ask=%s observed_at=%s", name, quote["bid"], quote["ask"], observed_at)
-        return True
+        consumed = False
+        for quote in quotes:
+            if not isinstance(quote, dict) or not isinstance(quote.get("symbol"), str) or not quote["symbol"]:
+                continue
+            try:
+                bid, ask = _positive(quote.get("bid"), "bid"), _positive(quote.get("ask"), "ask")
+            except StrategyError:
+                _LOGGER.warning("quote_ignored endpoint=%s symbol=%s reason=invalid_price", name, quote["symbol"])
+                continue
+            self.quotes[name][quote["symbol"]] = (timestamp, bid, ask)
+            _LOGGER.debug("quote_updated endpoint=%s symbol=%s bid=%s ask=%s observed_at=%s", name, quote["symbol"], bid, ask, observed_at)
+            consumed = True
+        return consumed
 
     def _suspend_for_worker_disconnect(self, error: WorkerMarketDataUnavailable) -> None:
         name = next((key for key, endpoint in self.endpoints.items() if endpoint.worker_id == error.worker_id), None)
         if name is None:
             raise StrategyError(f"Controller reported market-data loss for unselected Worker {error.worker_id}.")
-        self.quotes.pop(name, None)
+        self.quotes[name].clear()
         self.unavailable_endpoints.add(name)
         deadline = datetime.now(UTC) + timedelta(seconds=self.config.worker_disconnect_grace_seconds)
         if self.worker_disconnect_deadline is None:
@@ -340,60 +393,75 @@ class RealtimeArbitrage:
             _LOGGER.info("worker_market_data_recovered endpoint=%s worker=%s", name, worker_id)
             self.worker_disconnect_deadline = None
 
-    def _quotes_fresh(self) -> bool:
-        return set(self.quotes) == {"first", "second"} and all((datetime.now(UTC) - value[0]).total_seconds() <= self.config.quote_max_age_seconds for value in self.quotes.values())
+    def _quotes_fresh(self, symbol: str) -> bool:
+        values = [self.quotes[name].get(symbol) for name in ("first", "second")]
+        return all(value is not None and (datetime.now(UTC) - value[0]).total_seconds() <= self.config.quote_max_age_seconds for value in values)
 
-    def _refresh_margin_if_due(self) -> None:
-        if self.margin_refresh_at is not None and datetime.now(UTC) < self.margin_refresh_at:
-            return
-        for name, endpoint in self.endpoints.items():
-            _, bid, ask = self.quotes[name]
-            for direction, price in (("LONG", ask), ("SHORT", bid)):
-                result = self.gateway.request(endpoint.worker_id, kind="read", request={"type": "calc_margin", "symbol": self.symbol, "volume": "1.00", "direction": direction, "price": f"{price:.10f}"})
-                self.margin_per_lot[name, direction] = _positive(result.get("margin"), "calculated margin")
-                _LOGGER.info("margin_refreshed endpoint=%s direction=%s per_lot=%.2f", name, direction, self.margin_per_lot[name, direction])
-        self.margin_refresh_at = datetime.now(UTC) + timedelta(hours=1)
-        _LOGGER.info("margin_refresh_complete next_at=%s", self.margin_refresh_at.isoformat())
+    def _candidate_for_symbol(self, symbol: str) -> TradeCandidate | None:
+        point = self.shared_symbols.get(symbol)
+        if point is None or not self._quotes_fresh(symbol):
+            return None
+        _, first_bid, first_ask = self.quotes["first"][symbol]
+        _, second_bid, second_ask = self.quotes["second"][symbol]
+        threshold = self.config.entry_edge_points * point
+        candidates = (
+            TradeCandidate(symbol, "short_first_long_second", first_bid - second_ask),
+            TradeCandidate(symbol, "long_first_short_second", second_bid - first_ask),
+        )
+        eligible = [candidate for candidate in candidates if candidate.edge + 1e-12 >= threshold]
+        return min(eligible, key=lambda candidate: (-candidate.edge, candidate.direction)) if eligible else None
 
-    def _direction(self) -> str | None:
-        _, first_bid, first_ask = self.quotes["first"]
-        _, second_bid, second_ask = self.quotes["second"]
-        edge = self.config.entry_edge_pips * 0.0001
-        if first_bid - second_ask + 1e-12 >= edge:
-            return "short_first_long_second"
-        if second_bid - first_ask + 1e-12 >= edge:
-            return "long_first_short_second"
-        return None
+    def _best_candidate(self) -> TradeCandidate | None:
+        symbols = sorted(self.shared_symbols.keys() & self.quotes["first"].keys() & self.quotes["second"].keys())
+        candidates = [candidate for symbol in symbols if (candidate := self._candidate_for_symbol(symbol)) is not None]
+        return min(candidates, key=lambda candidate: (-candidate.edge, candidate.symbol, candidate.direction)) if candidates else None
 
-    def _open(self, direction: str) -> None:
+    def _refresh_margin(self, symbol: str, name: str, direction: str) -> float:
+        key = symbol, name, direction
+        cached = self.margin_per_lot.get(key)
+        now = datetime.now(UTC)
+        if cached is not None and now - cached[0] < timedelta(hours=1):
+            return cached[1]
+        _, bid, ask = self.quotes[name][symbol]
+        endpoint = self.endpoints[name]
+        price = ask if direction == "LONG" else bid
+        result = self.gateway.request(endpoint.worker_id, kind="read", request={"type": "calc_margin", "symbol": symbol, "volume": "1.00", "direction": direction, "price": f"{price:.10f}"})
+        margin = _positive(result.get("margin"), "calculated margin")
+        self.margin_per_lot[key] = now, margin
+        _LOGGER.info("margin_refreshed endpoint=%s symbol=%s direction=%s per_lot=%.2f", name, symbol, direction, margin)
+        return margin
+
+    def _open(self, candidate: TradeCandidate) -> None:
+        symbol, direction = candidate.symbol, candidate.direction
         first_direction, second_direction = ("SHORT", "LONG") if direction == "short_first_long_second" else ("LONG", "SHORT")
-        _LOGGER.info("entry_signal direction=%s first_side=%s second_side=%s", direction, first_direction, second_direction)
+        _LOGGER.info("entry_signal symbol=%s direction=%s edge=%s first_side=%s second_side=%s", symbol, direction, candidate.edge, first_direction, second_direction)
         for name, side in (("first", first_direction), ("second", second_direction)):
-            required = self.config.lots * self.margin_per_lot[name, side]
+            required = self.config.lots * self._refresh_margin(symbol, name, side)
             limit = self.accounts[name].equity * 0.5
             if required > limit:
                 _LOGGER.warning("margin_limit_triggered endpoint=%s required=%.2f limit=%.2f", name, required, limit)
                 self._halt(f"warning: {name} margin exceeds 50% of equity")
         try:
-            self._market("first", first_direction)
-            self._market("second", second_direction)
+            self._market("first", symbol, first_direction)
+            self._market("second", symbol, second_direction)
             if not self.config.execute:
-                _, first_bid, first_ask = self.quotes["first"]
-                _, second_bid, second_ask = self.quotes["second"]
+                _, first_bid, first_ask = self.quotes["first"][symbol]
+                _, second_bid, second_ask = self.quotes["second"][symbol]
                 self.pair = Pair(
-                    direction, first_bid if first_direction == "SHORT" else first_ask,
+                    symbol, direction, first_bid if first_direction == "SHORT" else first_ask,
                     second_ask if second_direction == "LONG" else second_bid,
                     self.accounts["first"].equity, self.accounts["second"].equity, 0, 0, first_direction, second_direction,
                     datetime.now(UTC),
                 )
                 return
-            first_position = self._expected_position("first", first_direction)
-            second_position = self._expected_position("second", second_direction)
-            self._set_emergency_protection("first", first_position, first_direction)
-            self._set_emergency_protection("second", second_position, second_direction)
+            first_position = self._expected_position("first", symbol, first_direction)
+            second_position = self._expected_position("second", symbol, second_direction)
+            self._set_emergency_protection("first", symbol, first_position, first_direction)
+            self._set_emergency_protection("second", symbol, second_position, second_direction)
         except Exception as error:
             self._halt(f"unhedged entry: {error}")
         self.pair = Pair(
+            symbol,
             direction,
             _positive(first_position.get("price_open"), "first position price_open"),
             _positive(second_position.get("price_open"), "second position price_open"),
@@ -405,18 +473,18 @@ class RealtimeArbitrage:
             second_direction,
             datetime.now(UTC),
         )
-        _LOGGER.info("pair_opened direction=%s first_entry=%.5f second_entry=%.5f", direction, self.pair.first_entry, self.pair.second_entry)
+        _LOGGER.info("pair_opened symbol=%s direction=%s first_entry=%.5f second_entry=%.5f", symbol, direction, self.pair.first_entry, self.pair.second_entry)
 
-    def _market(self, name: str, direction: str) -> None:
+    def _market(self, name: str, symbol: str, direction: str) -> None:
         if self.config.execute:
             endpoint = self.endpoints[name]
-            _LOGGER.info("market_order_submit endpoint=%s worker=%s direction=%s symbol=%s lots=%.2f", name, endpoint.worker_id, direction, self.symbol, self.config.lots)
-            self.gateway.request(endpoint.worker_id, kind="operation", request={"type": "market", "symbol": self.symbol, "volume": f"{self.config.lots:.2f}", "direction": direction, "filling_mode": "IOC"})
+            _LOGGER.info("market_order_submit endpoint=%s worker=%s direction=%s symbol=%s lots=%.2f", name, endpoint.worker_id, direction, symbol, self.config.lots)
+            self.gateway.request(endpoint.worker_id, kind="operation", request={"type": "market", "symbol": symbol, "volume": f"{self.config.lots:.2f}", "direction": direction, "filling_mode": "IOC"})
             _LOGGER.info("market_order_completed endpoint=%s worker=%s", name, endpoint.worker_id)
         else:
             _LOGGER.info("market_order_dry_run endpoint=%s direction=%s", name, direction)
 
-    def _expected_position(self, name: str, direction: str) -> dict[str, object]:
+    def _expected_position(self, name: str, symbol: str, direction: str) -> dict[str, object]:
         endpoint = self.endpoints[name]
         result = self.gateway.request(endpoint.worker_id, kind="read", request={"type": "current_positions"})
         positions = result.get("positions")
@@ -424,7 +492,7 @@ class RealtimeArbitrage:
         matching = [
             position
             for position in positions if isinstance(position, dict)
-            and position.get("symbol") == self.symbol
+            and position.get("symbol") == symbol
             and position.get("type") == expected_type
             and position.get("volume") == self.config.lots
         ] if isinstance(positions, list) else []
@@ -432,19 +500,19 @@ class RealtimeArbitrage:
             raise StrategyError(f"Worker {endpoint.worker_id} did not confirm one expected position.")
         return matching[0]
 
-    def _set_emergency_protection(self, name: str, position: dict[str, object], direction: str) -> None:
+    def _set_emergency_protection(self, name: str, symbol: str, position: dict[str, object], direction: str) -> None:
         if not self.config.execute:
             return
         endpoint = self.endpoints[name]
         entry = _positive(position.get("price_open"), "position price_open")
-        sl = self._profit_target_price(endpoint, direction, entry, -self.config.emergency_stop_loss_usd)
-        tp = self._profit_target_price(endpoint, direction, entry, self.config.emergency_stop_loss_usd)
+        sl = self._profit_target_price(endpoint, symbol, direction, entry, -self.config.emergency_stop_loss_usd)
+        tp = self._profit_target_price(endpoint, symbol, direction, entry, self.config.emergency_stop_loss_usd)
         self.gateway.request(
             endpoint.worker_id,
             kind="operation",
             request={
                 "type": "modify_sl_tp",
-                "symbol": self.symbol,
+                "symbol": symbol,
                 "position": str(_ticket(position)),
                 "sl": f"{sl:.10f}",
                 "tp": f"{tp:.10f}",
@@ -459,7 +527,7 @@ class RealtimeArbitrage:
             self.config.emergency_stop_loss_usd,
         )
 
-    def _profit_target_price(self, endpoint: Endpoint, direction: str, entry: float, target_profit: float) -> float:
+    def _profit_target_price(self, endpoint: Endpoint, symbol: str, direction: str, entry: float, target_profit: float) -> float:
         lower, upper = entry * 0.5, entry * 1.5
         for _ in range(32):
             candidate = (lower + upper) / 2
@@ -467,7 +535,7 @@ class RealtimeArbitrage:
                 endpoint.worker_id,
                 kind="read",
                 request={
-                    "type": "calc_profit", "symbol": self.symbol, "volume": f"{self.config.lots:.2f}",
+                    "type": "calc_profit", "symbol": symbol, "volume": f"{self.config.lots:.2f}",
                     "direction": direction, "open_price": f"{entry:.10f}", "close_price": f"{candidate:.10f}",
                 },
             )
@@ -529,7 +597,7 @@ class RealtimeArbitrage:
             expected_position = (
                 len(positions) == 1
                 and _ticket(positions[0]) == expected_ticket
-                and positions[0].get("symbol") == self.symbol
+                and positions[0].get("symbol") == self.pair.symbol
                 and positions[0].get("type") == expected_type
                 and positions[0].get("volume") == self.config.lots
             )
@@ -550,12 +618,42 @@ class RealtimeArbitrage:
 
     def _pnl(self) -> dict[str, float]:
         assert self.pair is not None
-        _, first_bid, first_ask = self.quotes["first"]
-        _, second_bid, second_ask = self.quotes["second"]
-        units = self.config.lots * 100_000
-        if self.pair.direction == "short_first_long_second":
-            return {"first": (self.pair.first_entry - first_ask) * units, "second": (second_bid - self.pair.second_entry) * units}
-        return {"first": (first_bid - self.pair.first_entry) * units, "second": (self.pair.second_entry - second_ask) * units}
+        _, first_bid, first_ask = self.quotes["first"][self.pair.symbol]
+        _, second_bid, second_ask = self.quotes["second"][self.pair.symbol]
+        return {
+            "first": self._calculated_profit(
+                "first",
+                self.pair.first_direction,
+                self.pair.first_entry,
+                first_ask if self.pair.first_direction == "SHORT" else first_bid,
+            ),
+            "second": self._calculated_profit(
+                "second",
+                self.pair.second_direction,
+                self.pair.second_entry,
+                second_ask if self.pair.second_direction == "SHORT" else second_bid,
+            ),
+        }
+
+    def _calculated_profit(self, name: str, direction: str, open_price: float, close_price: float) -> float:
+        assert self.pair is not None
+        endpoint = self.endpoints[name]
+        result = self.gateway.request(
+            endpoint.worker_id,
+            kind="read",
+            request={
+                "type": "calc_profit",
+                "symbol": self.pair.symbol,
+                "volume": f"{self.config.lots:.2f}",
+                "direction": direction,
+                "open_price": f"{open_price:.10f}",
+                "close_price": f"{close_price:.10f}",
+            },
+        )
+        profit = result.get("profit")
+        if isinstance(profit, bool) or not isinstance(profit, (int, float)) or not math.isfinite(profit):
+            raise StrategyError("Worker returned invalid calculated profit.")
+        return float(profit)
 
     def _flatten_all(self) -> None:
         for name, endpoint in self.endpoints.items():
@@ -595,6 +693,10 @@ def _positive(value: object, field: str) -> float:
     return float(value)
 
 
+def _positive_finite(value: object) -> bool:
+    return not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(value) and value > 0
+
+
 def _ticket(position: dict[str, object]) -> int:
     ticket = position.get("ticket")
     if isinstance(ticket, bool) or not isinstance(ticket, int):
@@ -613,8 +715,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--first-worker")
     parser.add_argument("--second-worker")
-    parser.add_argument("--symbol", default="NZDUSD")
-    parser.add_argument("--entry-edge-pips", type=float, default=0.4)
+    parser.add_argument("--entry-edge-points", type=float, default=4)
     parser.add_argument("--lots", type=float, default=0.1)
     parser.add_argument("--max-trades", type=int, default=100)
     parser.add_argument("--daily-loss-percent", type=float, default=3)
@@ -635,10 +736,10 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--first-worker and --second-worker must be specified together.")
     if args.first_worker == args.second_worker and args.first_worker is not None:
         parser.error("Workers must differ.")
-    if min(args.entry_edge_pips, args.lots, args.max_trades, args.quote_max_age_seconds, args.daily_loss_percent, args.trade_loss_percent, args.emergency_stop_loss_usd, args.integrity_check_seconds, args.minimum_hold_seconds, args.worker_disconnect_grace_seconds) <= 0:
+    if min(args.entry_edge_points, args.lots, args.max_trades, args.quote_max_age_seconds, args.daily_loss_percent, args.trade_loss_percent, args.emergency_stop_loss_usd, args.integrity_check_seconds, args.minimum_hold_seconds, args.worker_disconnect_grace_seconds) <= 0:
         parser.error("All limits must be positive.")
     config = StrategyConfig(
-        args.entry_edge_pips, args.lots, args.max_trades, args.daily_loss_percent / 100, args.trade_loss_percent / 100,
+        args.entry_edge_points, args.lots, args.max_trades, args.daily_loss_percent / 100, args.trade_loss_percent / 100,
         args.quote_max_age_seconds, args.emergency_stop_loss_usd, args.integrity_check_seconds, args.minimum_hold_seconds,
         args.flatten_at_ny, args.worker_disconnect_grace_seconds, args.execute,
     )
@@ -654,9 +755,7 @@ def main(argv: list[str] | None = None) -> int:
             if args.first_worker is not None
             else _select_workers(gateway)
         )
-        strategy = RealtimeArbitrage(
-            gateway, first=Endpoint(first_worker), second=Endpoint(second_worker), symbol=args.symbol, config=config
-        )
+        strategy = RealtimeArbitrage(gateway, first=Endpoint(first_worker), second=Endpoint(second_worker), config=config)
         strategy.run(stop)
         return 0
     except StrategyError as error:

@@ -362,6 +362,23 @@ class TraderCommandTests(unittest.TestCase):
             output.getvalue(),
         )
 
+    def test_connect_rejects_product_pair_inventory_query(self) -> None:
+        class QuerySocket:
+            def recv(self, timeout: float | None = None) -> str:
+                raise StopIteration
+
+            def send(self, message: str) -> None:
+                pass
+
+        commands: SimpleQueue[object] = SimpleQueue()
+        commands.put({"request_id": "pairs-1", "query": "active_pairs"})
+        output = io.StringIO()
+
+        with self.assertRaises(StopIteration):
+            run_trader_session(QuerySocket(), output=output, save_cursor=lambda _: None, command_source=commands)  # type: ignore[arg-type]
+
+        self.assertIn("Trader JSONL query contains invalid fields.", output.getvalue())
+
 
 class FakeRotationTransport:
     def __init__(self) -> None:

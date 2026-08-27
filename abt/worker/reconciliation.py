@@ -29,6 +29,8 @@ class ReadOnlyMT5(Protocol):
 
     def positions_get(self) -> object: ...
 
+    def symbols_get(self) -> object: ...
+
     def symbol_info(self, symbol: str) -> object: ...
 
     def order_calc_margin(self, action: int, symbol: str, volume: float, price: float) -> object: ...
@@ -788,6 +790,11 @@ def _trader_read(mt5: ReadOnlyMT5, payload: dict[str, object]) -> dict[str, obje
         return {"account": _json_evidence(mt5.account_info(), "account")}
     if operation == "symbol_info" and set(payload) == {"type", "symbol"}:
         return {"symbol": _json_evidence(mt5.symbol_info(_request_text(payload, "symbol")), "symbol")}
+    if operation == "symbols" and set(payload) == {"type"}:
+        symbols = mt5.symbols_get()
+        if not isinstance(symbols, (list, tuple)):
+            raise WorkerEnrollmentError("The local MT5 terminal returned an invalid symbol catalog.")
+        return {"symbols": [_json_evidence(value, "symbol") for value in symbols]}
     if operation == "calc_margin" and set(payload) == {"type", "symbol", "volume", "direction", "price"}:
         direction = _request_text(payload, "direction")
         action = getattr(mt5, "ORDER_TYPE_BUY") if direction == "LONG" else getattr(mt5, "ORDER_TYPE_SELL")

@@ -131,7 +131,7 @@ def run_trader_session(
         if message_type == "trader_query_result":
             if (
                 not isinstance(message.get("request_id"), str)
-                or message.get("query") not in {"active_workers", "active_pairs"}
+                or message.get("query") != "active_workers"
                 or not isinstance(message.get("result"), dict)
             ):
                 raise TraderEnrollmentError("The controller returned an invalid Trader query response.")
@@ -181,7 +181,7 @@ def _send_trader_commands(socket: TraderWebSocket, command_source: SimpleQueue[o
             if (
                 not isinstance(command["request_id"], str)
                 or not command["request_id"]
-                or command["query"] not in {"active_workers", "active_pairs"}
+                or command["query"] != "active_workers"
             ):
                 _write_jsonl_error(output, "Trader JSONL query contains invalid fields.")
                 continue

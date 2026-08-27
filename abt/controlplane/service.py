@@ -1744,14 +1744,10 @@ def create_app(
                     and set(message) == {"type", "request_id", "query"}
                     and isinstance(message["request_id"], str)
                     and message["request_id"]
-                    and message["query"] in {"active_workers", "active_pairs"}
+                    and message["query"] == "active_workers"
                 ):
                     query = cast(str, message["query"])
-                    result = (
-                        {"workers": ledger.trader_active_workers()}
-                        if query == "active_workers"
-                        else {"pairs": ledger.trader_active_pairs()}
-                    )
+                    result = {"workers": ledger.trader_active_workers()}
                     await connection.send_json(
                         {
                             "type": "trader_query_result",

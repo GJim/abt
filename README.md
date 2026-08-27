@@ -83,12 +83,12 @@ supplying a Worker ID:
 
 ```json
 {"request_id":"workers-1","query":"active_workers"}
-{"request_id":"pairs-1","query":"active_pairs"}
 ```
 
 `active_workers` returns each enabled Worker's ID, MT5 server, connectivity,
-and safety state. `active_pairs` returns each enabled pair's ID, endpoints,
-and source Workers.
+and safety state. Product-pair management remains available through its
+management interfaces; it does not constrain direct Trader Worker RPC or
+Trader inventory queries.
 
 `payload.kind` is `read` or `operation`. Reads support `account_info`,
 `symbol_info`, `historical_ticks`, `current_orders`, and `current_positions`;

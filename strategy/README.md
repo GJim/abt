@@ -4,12 +4,19 @@
 connected account Workers. Each Worker must own a different MT5 terminal; do
 not use two named contexts that share one terminal.
 
-The strategy accepts one symbol (default NZDUSD) for both endpoints. At startup
-it asks the controller for `active_workers`, requires both specified Workers to
-be connected and safe, then queries `symbol_info` on each Worker. It exits
-before any broker operation if either Worker cannot trade the selected symbol.
+At startup the strategy asks the controller for `active_workers`, requires
+both specified Workers to be connected and safe, then reads each selected
+Worker's complete `symbols` catalog once. It fails startup if either catalog is
+invalid or unavailable, and keeps the exact-name intersection of tradable
+(trade mode 4, positive finite point) symbols. Live decisions use only this
+cached shared catalog and fresh exact-name Market Watch quotes; they never make
+per-event broker symbol-specification calls.
 
-The remaining defaults are a 0.4-pip entry edge, 0.1 lot per leg, at
+For every eligible shared symbol it considers both bid-to-opposite-ask
+directions and selects the greatest edge meeting `--entry-edge-points`.
+The threshold is a raw price difference equal to its value times the larger
+of the two broker points. Ties select lexical symbol then direction. The
+remaining defaults are a 4-point entry edge, 0.1 lot per leg, at
 most 100 completed trades, 3% daily account loss, and 2% per-trade account
 loss. Daily loss resets at midnight in `America/New_York`.
 
@@ -55,7 +62,7 @@ positions while preserving the same wall-clock time through DST changes.
 
 ```powershell
 uv run python strategy\realtime_arbitrage.py `
-  --symbol NZDUSD `
+  --entry-edge-points 4 `
   --execute
 ```
 
@@ -64,8 +71,12 @@ the controller and prompts for two distinct selections. `trader.json` defaults
 to the file beside the script: `strategy\trader.json`. To automate selection,
 pass `--first-worker` and `--second-worker` together.
 
-Pass `--execute` only after the dry-run output, worker connectivity, symbol
-availability have been verified. Every hour it asks each Worker to calculate
-the broker's live margin for one lot in both directions. If the requested
-lots would consume over 50% of either account's equity, it warns, flattens
-both accounts, and exits.
+Pass `--execute` only after the dry-run output and worker connectivity have
+been verified. Before opening the selected candidate, and at most once per
+hour per symbol, endpoint, and direction, it asks each Worker to calculate
+the broker's live margin for one lot. If the requested lots would consume over
+50% of either account's equity, it warns, flattens both accounts, and exits.
+While a pair is open it evaluates only that pair's symbol for reversal and
+exit; it cannot open another trade. After closing, the closed symbol must
+clear its qualifying signal before re-entry on that symbol, but a different
+valid shared-symbol candidate may be selected.

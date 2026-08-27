@@ -27,6 +27,9 @@ class TimeCalibrationTests(unittest.TestCase):
         self.now = datetime(2026, 8, 14, 12, tzinfo=UTC)
         self.context = Context("demo", Path(r"C:\MT5\terminal64.exe"), 123456, "Broker-Demo", self.timezone.key)
         self.config = Config(Path("unused.toml"), "demo", {"demo": self.context})
+        self.sleep = patch("abt.mt5.timecalibration._sleep")
+        self.sleep.start()
+        self.addCleanup(self.sleep.stop)
 
     def test_missing_or_new_day_market_calibration_collects_full_samples(self) -> None:
         api = CalibrationApi(int(self.now.timestamp()) + 10_800)
@@ -37,13 +40,58 @@ class TimeCalibrationTests(unittest.TestCase):
             updated, family = prepare_market_data(api, self.config, self.context, "EURUSD", self.timezone)
 
         self.assertEqual(api.tick_calls, 3)
-        self.assertEqual(family.offset_seconds, 10_800)
+        self.assertEqual(family.offset_seconds, 10_801)
         self.assertEqual(family.status, "calibrated")
         self.assertEqual(family.calibrated_local_date, "2026-08-14")
         self.assertEqual(family.calibration_symbol, "EURUSD")
         self.assertEqual(len(family.samples), 3)
         self.assertEqual(updated.time_calibration.market_data, family)
         save_context.assert_called_once()
+
+    def test_stale_cached_tick_cannot_create_market_calibration(self) -> None:
+        class StaleTickApi:
+            def __init__(self, epoch: int) -> None:
+                self.epoch = epoch
+
+            def symbol_info_tick(self, symbol: str) -> SimpleNamespace:
+                return SimpleNamespace(time=self.epoch)
+
+        with patch("abt.mt5.timecalibration._save_context") as save_context:
+            updated, family = prepare_market_data(
+                StaleTickApi(int(self.now.timestamp()) - 35_413),
+                self.config,
+                self.context,
+                "EURUSD",
+                self.timezone,
+            )
+
+        self.assertEqual(updated, self.context)
+        self.assertIsNone(family.offset_seconds)
+        save_context.assert_not_called()
+
+    def test_market_calibration_prefers_millisecond_tick_epoch(self) -> None:
+        epoch = int(self.now.timestamp()) + 10_800
+
+        class MillisecondTickApi:
+            def __init__(self) -> None:
+                self.tick_calls = 0
+
+            def symbol_info_tick(self, symbol: str) -> SimpleNamespace:
+                self.tick_calls += 1
+                tick_epoch = epoch + self.tick_calls - 1
+                return SimpleNamespace(
+                    time=tick_epoch,
+                    time_msc=tick_epoch * 1000 + 750,
+                )
+
+        with (
+            patch("abt.mt5.timecalibration._utc_now", return_value=self.now),
+            patch("abt.mt5.timecalibration._save_context"),
+        ):
+            _, family = prepare_market_data(MillisecondTickApi(), self.config, self.context, "EURUSD", self.timezone)
+
+        self.assertEqual(family.offset_seconds, 10_802)
+        self.assertEqual(family.samples[-1].source, "symbol_info_tick.time_msc")
 
     def test_same_day_probe_only_recalibrates_when_drift_changes(self) -> None:
         family = TimeCalibrationFamily(
@@ -79,7 +127,7 @@ class TimeCalibrationTests(unittest.TestCase):
         self.assertEqual(len(unchanged.samples), 1)
         self.assertEqual(unchanged_api.tick_calls, 1)
         self.assertEqual(unchanged_api.symbols, ["EURUSD"])
-        self.assertEqual(changed.offset_seconds, 14_400)
+        self.assertEqual(changed.offset_seconds, 14_402)
         self.assertEqual(len(changed.samples), 3)
         self.assertEqual(changed_api.tick_calls, 4)
         self.assertEqual(changed_api.symbols, ["EURUSD"] * 4)
@@ -370,7 +418,7 @@ class CalibrationApi:
     def symbol_info_tick(self, symbol: str) -> SimpleNamespace | None:
         self.tick_calls += 1
         self.symbols.append(symbol)
-        return None if self.epoch is None else SimpleNamespace(time=self.epoch)
+        return None if self.epoch is None else SimpleNamespace(time=self.epoch + self.tick_calls - 1)
 
 
 class TradeRecordApi:

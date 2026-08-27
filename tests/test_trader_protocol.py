@@ -76,6 +76,18 @@ class TraderProtocolTests(unittest.TestCase):
 
         self.assertEqual("calc_margin", request.payload.type)  # type: ignore[union-attr]
 
+    def test_accepts_a_typed_symbols_read(self) -> None:
+        request = trader_rpc_request_adapter.validate_python(
+            {
+                "type": "trader_rpc_request",
+                "request_id": "request-1",
+                "kind": "read",
+                "payload": {"type": "symbols"},
+            }
+        )
+
+        self.assertEqual("symbols", request.payload.type)  # type: ignore[union-attr]
+
     def test_requires_exact_response_shape(self) -> None:
         with self.assertRaises(ValidationError):
             trader_rpc_response_adapter.validate_python(
