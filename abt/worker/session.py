@@ -10,6 +10,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from dataclasses import dataclass, field
 from typing import Protocol, Self
+from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from pydantic import ValidationError
@@ -29,6 +30,7 @@ from .credentials import (
     _worker_endpoint,
 )
 from .enrollment import WorkerEnrollmentError, WorkerSessionDisconnected
+from .scheduler import DeadlineAwareTraderRpcScheduler, ScheduledTraderRpc, TraderRpcOutcome
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -53,11 +55,12 @@ class AuthenticatedWorkerSession:
     reconciliation_cursor: int
     worker_id: str = ""
     certificate: str = ""
+    recovery_epoch: str = field(default_factory=lambda: str(uuid4()))
     _analysis_requests: deque[dict[str, object]] = field(default_factory=deque, init=False, repr=False)
-    _order_check_requests: deque[dict[str, object]] = field(default_factory=deque, init=False, repr=False)
-    _order_execute_requests: deque[dict[str, object]] = field(default_factory=deque, init=False, repr=False)
     _execution_recovery_requests: deque[dict[str, object]] = field(default_factory=deque, init=False, repr=False)
-    _trader_rpc_requests: deque[dict[str, object]] = field(default_factory=deque, init=False, repr=False)
+    _trader_rpc_scheduler: DeadlineAwareTraderRpcScheduler = field(
+        default_factory=DeadlineAwareTraderRpcScheduler, init=False, repr=False
+    )
 
     def __enter__(self) -> Self:
         return self
@@ -103,14 +106,22 @@ class AuthenticatedWorkerSession:
         except Exception as error:
             _raise_closed_connection(error, "heartbeat")
 
-    def send_safety_state(self, state: str, reason: str) -> None:
+    def send_recovery_state(self, state: str, reason: str) -> None:
         try:
-            _send(self.socket, {"type": "safety_state", "state": state, "reason": reason})
+            _send(self.socket, {"type": "recovery_state", "state": state, "reason": reason})
             response = self._response()
             if response != {"type": "accepted", "state": state}:
-                raise WorkerEnrollmentError("The controller rejected the worker safety state.")
+                raise WorkerEnrollmentError("The controller rejected the worker recovery state.")
         except Exception as error:
-            _raise_closed_connection(error, "safety-state update")
+            _raise_closed_connection(error, "recovery-state update")
+
+    def send_recovery_sync(self, journal: list[dict[str, object]]) -> None:
+        try:
+            _send(self.socket, {"type": "recovery_sync", "epoch": self.recovery_epoch, "journal": journal})
+            if self._response() != {"type": "recovery_sync_accepted", "epoch": self.recovery_epoch}:
+                raise WorkerEnrollmentError("The controller rejected Worker recovery sync.")
+        except Exception as error:
+            _raise_closed_connection(error, "recovery sync")
 
     def receive_product_catalog_analysis(self, timeout: float | None = None) -> dict[str, object] | None:
         if self._analysis_requests:
@@ -123,22 +134,20 @@ class AuthenticatedWorkerSession:
             except Exception as error:
                 _raise_closed_connection(error, "analysis request")
             if response.get("type") == "order_check_request":
-                self._order_check_requests.append(response)
+                self._queue_hedge_request(response)
                 continue
             if response.get("type") == "order_execute_request":
-                self._order_execute_requests.append(response)
+                self._queue_hedge_request(response)
                 continue
             if _is_execution_recovery_request(response):
                 self._execution_recovery_requests.append(response)
                 continue
             if response.get("type") == "trader_rpc_request":
-                self._trader_rpc_requests.append(response)
+                self._queue_trader_rpc(response)
                 continue
             return self._parse_product_catalog_analysis(response)
 
     def receive_order_check(self, timeout: float | None = None) -> dict[str, object] | None:
-        if self._order_check_requests:
-            return self._parse_order_check(self._order_check_requests.popleft())
         try:
             response = _message(self.socket, timeout=timeout)
         except TimeoutError:
@@ -147,17 +156,18 @@ class AuthenticatedWorkerSession:
             _raise_closed_connection(error, "order-check request")
         if response.get("type") != "order_check_request":
             if response.get("type") == "order_execute_request":
-                self._order_execute_requests.append(response)
+                self._queue_hedge_request(response)
                 return None
             if _is_execution_recovery_request(response):
                 self._execution_recovery_requests.append(response)
                 return None
             if response.get("type") == "trader_rpc_request":
-                self._trader_rpc_requests.append(response)
+                self._queue_trader_rpc(response)
                 return None
             self._analysis_requests.append(response)
             return None
-        return self._parse_order_check(response)
+        self._queue_hedge_request(response)
+        return None
 
     def _response(self) -> dict[str, object]:
         while True:
@@ -166,16 +176,16 @@ class AuthenticatedWorkerSession:
                 self._analysis_requests.append(response)
                 continue
             if response.get("type") == "order_check_request":
-                self._order_check_requests.append(response)
+                self._queue_hedge_request(response)
                 continue
             if response.get("type") == "order_execute_request":
-                self._order_execute_requests.append(response)
+                self._queue_hedge_request(response)
                 continue
             if _is_execution_recovery_request(response):
                 self._execution_recovery_requests.append(response)
                 continue
             if response.get("type") == "trader_rpc_request":
-                self._trader_rpc_requests.append(response)
+                self._queue_trader_rpc(response)
                 continue
             return response
 
@@ -204,27 +214,104 @@ class AuthenticatedWorkerSession:
         return result
 
     def _parse_order_check(self, response: dict[str, object]) -> dict[str, object]:
-        if set(response) != {"type", "analysis_id", "request_id", "order"} or response.get("type") != "order_check_request":
+        expected_fields = {"type", "analysis_id", "request_id", "order"}
+        if "expires_at" in response:
+            expected_fields.add("expires_at")
+        if set(response) != expected_fields or response.get("type") != "order_check_request":
             raise WorkerEnrollmentError("The controller returned an invalid order-check request.")
         if response.get("analysis_id") != "order_check":
             raise WorkerEnrollmentError("The controller returned an invalid order-check request.")
-        return {"request_id": _required_text(response, "request_id"), "order": response["order"]}
+        request = {"request_id": _required_text(response, "request_id"), "order": response["order"]}
+        if "expires_at" in response:
+            request["expires_at"] = _required_utc_timestamp(response, "expires_at")
+        return request
+
+    def _queue_hedge_request(self, response: dict[str, object]) -> None:
+        request_type = response.get("type")
+        if request_type == "order_check_request":
+            request = self._parse_order_check(response)
+        elif request_type == "order_execute_request":
+            request = self._parse_order_execute(response)
+        else:
+            raise WorkerEnrollmentError("The controller returned an invalid hedged-entry request.")
+        request_id = str(request["request_id"])
+        scheduled = {
+            "request_id": request_id,
+            "command_id": f"{request_type}:{request_id}",
+            "kind": "operation",
+            "priority": "execution",
+            "payload": {"type": request_type, "order": request["order"]},
+            "worker_request_type": request_type,
+            "worker_request": request,
+        }
+        if "expires_at" in request:
+            scheduled["expires_at"] = request["expires_at"]
+        outcome = self._trader_rpc_scheduler.admit(scheduled)
+        if outcome is None or not outcome.terminal:
+            return
+        self._send_hedge_scheduler_outcome(request_type, request, outcome)
+
+    def _send_hedge_scheduler_outcome(
+        self,
+        request_type: str,
+        request: dict[str, object],
+        outcome: TraderRpcOutcome,
+    ) -> None:
+        request_id = _required_text(request, "request_id")
+        reason = f"{outcome.category}: {outcome.reason}"
+        order = request.get("order")
+        if not isinstance(order, dict):
+            raise WorkerEnrollmentError("The controller returned an invalid hedged-entry request.")
+        if request_type == "order_check_request":
+            if outcome.category == "expired_not_started":
+                self.send_order_check(
+                    request_id=request_id,
+                    order=order,
+                    accepted=False,
+                    execution_state="not_started",
+                    outcome="expired_not_started",
+                )
+            else:
+                self.send_order_check_error(request_id=request_id, reason=reason)
+            return
+        if outcome.category == "expired_not_started":
+            self.send_order_execute(
+                request_id=request_id,
+                order=order,
+                accepted=False,
+                result={},
+                execution_state="not_started",
+                outcome="expired_not_started",
+            )
+        else:
+            self.send_order_execute_error(request_id=request_id, reason=reason)
 
     def send_order_check(
-        self, *, request_id: str, order: dict[str, object], accepted: bool, diagnostics: dict[str, object]
+        self,
+        *,
+        request_id: str,
+        order: dict[str, object],
+        accepted: bool,
+        diagnostics: dict[str, object] | None = None,
+        execution_state: str | None = None,
+        outcome: str | None = None,
     ) -> None:
+        if (execution_state, outcome) not in {(None, None), ("not_started", "expired_not_started")}:
+            raise WorkerEnrollmentError("The worker cannot send an invalid order-check outcome.")
+        response: dict[str, object] = {
+            "type": "order_check_response",
+            "analysis_id": "order_check",
+            "request_id": request_id,
+            "accepted": accepted,
+            "order": order,
+        }
+        if diagnostics is not None:
+            response["diagnostics"] = diagnostics
+        if execution_state is not None:
+            response["execution_state"] = execution_state
+            response["outcome"] = outcome
         try:
-            _send(
-                self.socket,
-                {
-                    "type": "order_check_response",
-                    "analysis_id": "order_check",
-                    "request_id": request_id,
-                    "accepted": accepted,
-                    "order": order,
-                    "diagnostics": diagnostics,
-                },
-            )
+            _send(self.socket, response)
         except Exception as error:
             _raise_closed_connection(error, "order-check response")
 
@@ -238,8 +325,6 @@ class AuthenticatedWorkerSession:
             _raise_closed_connection(error, "order-check error response")
 
     def receive_order_execute(self, timeout: float | None = None) -> dict[str, object] | None:
-        if self._order_execute_requests:
-            return self._parse_order_execute(self._order_execute_requests.popleft())
         try:
             response = _message(self.socket, timeout=timeout)
         except TimeoutError:
@@ -248,38 +333,63 @@ class AuthenticatedWorkerSession:
             _raise_closed_connection(error, "order execution request")
         if response.get("type") != "order_execute_request":
             if response.get("type") == "order_check_request":
-                self._order_check_requests.append(response)
+                self._queue_hedge_request(response)
             elif _is_execution_recovery_request(response):
                 self._execution_recovery_requests.append(response)
             elif response.get("type") == "trader_rpc_request":
-                self._trader_rpc_requests.append(response)
+                self._queue_trader_rpc(response)
             else:
                 self._analysis_requests.append(response)
             return None
-        return self._parse_order_execute(response)
+        self._queue_hedge_request(response)
+        return None
 
     def _parse_order_execute(self, response: dict[str, object]) -> dict[str, object]:
-        if set(response) != {"type", "request_id", "order"} or response.get("type") != "order_execute_request":
+        expected_fields = {"type", "request_id", "order"}
+        if "expires_at" in response:
+            expected_fields.add("expires_at")
+        if "effect_id" in response:
+            expected_fields.add("effect_id")
+        if set(response) != expected_fields or response.get("type") != "order_execute_request":
             raise WorkerEnrollmentError("The controller returned an invalid order execution request.")
         order = response.get("order")
         if not isinstance(order, dict):
             raise WorkerEnrollmentError("The controller returned an invalid order execution request.")
-        return {"request_id": _required_text(response, "request_id"), "order": order}
+        request = {"request_id": _required_text(response, "request_id"), "order": order}
+        if "expires_at" in response:
+            request["expires_at"] = _required_utc_timestamp(response, "expires_at")
+        if "effect_id" in response:
+            request["effect_id"] = _required_text(response, "effect_id")
+        return request
 
     def send_order_execute(
-        self, *, request_id: str, order: dict[str, object], accepted: bool, result: dict[str, object]
+        self,
+        *,
+        request_id: str,
+        order: dict[str, object],
+        accepted: bool,
+        result: dict[str, object],
+        execution_state: str | None = None,
+        outcome: str | None = None,
     ) -> None:
+        if (execution_state, outcome) not in {
+            (None, None),
+            ("not_started", "expired_not_started"),
+            ("sent", "unknown_after_send"),
+        }:
+            raise WorkerEnrollmentError("The worker cannot send an invalid order execution outcome.")
+        response: dict[str, object] = {
+            "type": "order_execute_response",
+            "request_id": request_id,
+            "accepted": accepted,
+            "order": order,
+            "result": result,
+        }
+        if execution_state is not None:
+            response["execution_state"] = execution_state
+            response["outcome"] = outcome
         try:
-            _send(
-                self.socket,
-                {
-                    "type": "order_execute_response",
-                    "request_id": request_id,
-                    "accepted": accepted,
-                    "order": order,
-                    "result": result,
-                },
-            )
+            _send(self.socket, response)
         except Exception as error:
             _raise_closed_connection(error, "order execution response")
 
@@ -301,24 +411,56 @@ class AuthenticatedWorkerSession:
         if _is_execution_recovery_request(response):
             return self._parse_execution_recovery(response)
         if response.get("type") == "order_check_request":
-            self._order_check_requests.append(response)
+            self._queue_hedge_request(response)
         elif response.get("type") == "order_execute_request":
-            self._order_execute_requests.append(response)
+            self._queue_hedge_request(response)
         elif response.get("type") == "trader_rpc_request":
-            self._trader_rpc_requests.append(response)
+            self._queue_trader_rpc(response)
         else:
             self._analysis_requests.append(response)
         return None
 
-    def receive_trader_rpc(self) -> dict[str, object] | None:
-        if not self._trader_rpc_requests:
+    def receive_trader_rpc(self) -> ScheduledTraderRpc | None:
+        scheduled = self._trader_rpc_scheduler.next()
+        if isinstance(scheduled, TraderRpcOutcome):
+            if scheduled.worker_request_type is not None and scheduled.worker_request is not None:
+                self._send_hedge_scheduler_outcome(
+                    scheduled.worker_request_type,
+                    scheduled.worker_request,
+                    scheduled,
+                )
+                return None
+            self.send_trader_rpc(
+                request_id=scheduled.request_id,
+                kind=scheduled.kind,
+                accepted=False,
+                reason=f"{scheduled.category}: {scheduled.reason}",
+            )
             return None
-        response = self._trader_rpc_requests.popleft()
+        return scheduled
+
+    def _queue_trader_rpc(self, response: dict[str, object]) -> None:
+        envelope_fields = {"type", "request_id", "kind", "payload", "command_id", "payload_hash", "priority", "expires_at", "correlation"}
+        if not set(response).issubset(envelope_fields):
+            raise WorkerEnrollmentError("The controller returned an invalid Trader RPC request.")
         try:
-            request = TraderRpcRequest.model_validate(response)
+            request = TraderRpcRequest.model_validate(
+                {field: response[field] for field in ("type", "request_id", "kind", "payload")}
+            )
         except ValidationError as error:
             raise WorkerEnrollmentError("The controller returned an invalid Trader RPC request.") from error
-        return request.model_dump(mode="json", exclude_none=True)
+        scheduled = {
+            **request.model_dump(mode="json", exclude_none=True),
+            **{field: response[field] for field in ("command_id", "payload_hash", "priority", "expires_at", "correlation") if field in response},
+        }
+        outcome = self._trader_rpc_scheduler.admit(scheduled)
+        if outcome is not None and outcome.terminal:
+            self.send_trader_rpc(
+                request_id=request.request_id,
+                kind=request.kind,
+                accepted=False,
+                reason=f"{outcome.category}: {outcome.reason}",
+            )
 
     def send_trader_rpc(
         self, *, request_id: str, kind: str, accepted: bool, result: dict[str, object] | None = None,
@@ -338,9 +480,9 @@ class AuthenticatedWorkerSession:
 
     def _parse_execution_recovery(self, response: dict[str, object]) -> dict[str, object]:
         request_type = response.get("type")
-        if request_type == "worker_cleanup_reconcile_request" and set(response) == {"type", "request_id"}:
+        if request_type == "account_recovery_reconcile_request" and set(response) == {"type", "request_id"}:
             return {"type": request_type, "request_id": _required_text(response, "request_id")}
-        if request_type in {"worker_cleanup_cancel_request", "worker_cleanup_close_request"} and set(response) == {
+        if request_type in {"account_recovery_cancel_request", "account_recovery_close_request"} and set(response) == {
             "type", "request_id", "ticket", "volume"
         }:
             return {
@@ -352,9 +494,6 @@ class AuthenticatedWorkerSession:
         if request_type == "execution_reconcile_request" and set(response) == {"type", "request_id", "execution_id"}:
             return {"type": request_type, "request_id": _required_text(response, "request_id"),
                     "execution_id": _required_text(response, "execution_id")}
-        if request_type == "manual_position_reconcile_request" and set(response) == {"type", "request_id", "ticket"}:
-            return {"type": request_type, "request_id": _required_text(response, "request_id"),
-                    "ticket": _required_text(response, "ticket")}
         if request_type in {"execution_cancel_request", "execution_close_request"} and set(response) == {
             "type", "request_id", "ticket", "volume"
         }:
@@ -443,7 +582,7 @@ class AuthenticatedWorkerSession:
 def _is_execution_recovery_request(response: dict[str, object]) -> bool:
     request_type = response.get("type")
     return isinstance(request_type, str) and request_type.startswith(
-        ("execution_", "manual_position_", "worker_cleanup_")
+        ("execution_", "account_recovery_")
     )
 
 
@@ -828,6 +967,17 @@ def open_authenticated_worker_session(
             _raise_closed_connection(error, "authenticated worker session")
         raise
     return AuthenticatedWorkerSession(socket, reconciliation_cursor=cursor, worker_id=worker_id, certificate=certificate)
+
+
+def _required_utc_timestamp(response: dict[str, object], field: str) -> str:
+    value = _required_text(response, field)
+    try:
+        timestamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise WorkerEnrollmentError("The controller returned an invalid request expiry.") from error
+    if timestamp.tzinfo is None:
+        raise WorkerEnrollmentError("The controller returned an invalid request expiry.")
+    return timestamp.astimezone(UTC).isoformat()
 
 
 def _raise_closed_connection(error: Exception, phase: str) -> None:

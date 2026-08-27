@@ -330,7 +330,7 @@ class TraderCommandTests(unittest.TestCase):
                     [
                         '{"type":"trader_query_result","request_id":"workers-1","query":"active_workers",'
                         '"result":{"workers":[{"worker_id":"worker-a","server":"Broker-A",'
-                        '"connectivity":"connected","safety_state":"connected"}]}}',
+                        '"connectivity":"connected"}]}}',
                     ]
                 )
                 self.sent: list[str] = []
@@ -358,7 +358,74 @@ class TraderCommandTests(unittest.TestCase):
         )
         self.assertEqual(
             '{"query":"active_workers","request_id":"workers-1","result":{"workers":[{"connectivity":"connected",'
-            '"safety_state":"connected","server":"Broker-A","worker_id":"worker-a"}]},"type":"trader_query_result"}\n',
+            '"server":"Broker-A","worker_id":"worker-a"}]},"type":"trader_query_result"}\n',
+            output.getvalue(),
+        )
+
+    def test_connect_forwards_a_hedged_entry_command_and_correlates_its_result(self) -> None:
+        class CommandSocket:
+            def __init__(self) -> None:
+                self.messages = iter(
+                    [
+                        '{"type":"trader_command_result","request_id":"entry-1",'
+                        '"result":{"command_id":"entry-1","status":"accepted","legs":[]}}',
+                    ]
+                )
+                self.sent: list[str] = []
+
+            def recv(self, timeout: float | None = None) -> str:
+                return next(self.messages)
+
+            def send(self, message: str) -> None:
+                self.sent.append(message)
+
+        commands: SimpleQueue[object] = SimpleQueue()
+        commands.put(
+            {
+                "request_id": "entry-1",
+                "command_id": "entry-1",
+                "payload": {
+                    "type": "hedged_entry",
+                    "expires_at": "2026-08-27T10:00:05+00:00",
+                    "first": {
+                        "worker_id": "worker-a",
+                        "symbol": "EURUSD",
+                        "volume": "0.10",
+                        "direction": "LONG",
+                        "filling_mode": "FOK",
+                        "margin_limit": "400",
+                    },
+                    "second": {
+                        "worker_id": "worker-b",
+                        "symbol": "EURUSD",
+                        "volume": "0.10",
+                        "direction": "SHORT",
+                        "filling_mode": "FOK",
+                        "margin_limit": "400",
+                    },
+                },
+            }
+        )
+        socket = CommandSocket()
+        output = io.StringIO()
+
+        with self.assertRaises(StopIteration):
+            run_trader_session(socket, output=output, save_cursor=lambda _: None, command_source=commands)  # type: ignore[arg-type]
+
+        self.assertEqual(
+            [
+                '{"type":"subscribe","worker_ids":["*"]}',
+                '{"command_id":"entry-1","payload":{"expires_at":"2026-08-27T10:00:05+00:00","first":{"direction":"LONG","filling_mode":"FOK",'
+                '"margin_limit":"400","symbol":"EURUSD","volume":"0.10","worker_id":"worker-a"},'
+                '"second":{"direction":"SHORT","filling_mode":"FOK","margin_limit":"400",'
+                '"symbol":"EURUSD","volume":"0.10","worker_id":"worker-b"},"type":"hedged_entry"},'
+                '"type":"command"}',
+            ],
+            socket.sent,
+        )
+        self.assertEqual(
+            '{"request_id":"entry-1","result":{"command_id":"entry-1","legs":[],"status":"accepted"},'
+            '"type":"trader_command_result"}\n',
             output.getvalue(),
         )
 

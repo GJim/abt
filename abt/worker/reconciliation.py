@@ -9,8 +9,10 @@ from typing import ContextManager, Protocol
 
 from pydantic import ValidationError
 
-from ..trader_protocol import BrokerReceipt, MAX_LIVE_SYMBOLS
+from ..trader_protocol import BrokerReceipt, CalcMarginBatchRead, MAX_LIVE_SYMBOLS
 from .enrollment import WorkerEnrollmentError, WorkerSessionDisconnected
+from .effect_journal import EffectJournalError, WorkerEffectJournal
+from .scheduler import BrokerActionNotStarted, ScheduledTraderRpc
 from .session import collect_market_data_evidence, collect_product_catalog_evidence
 
 
@@ -61,7 +63,7 @@ class AuthenticatedReconciliationSession(Protocol):
 class WorkerSafetySession(Protocol):
     def heartbeat(self) -> bool: ...
 
-    def send_safety_state(self, state: str, reason: str) -> None: ...
+    def send_recovery_state(self, state: str, reason: str) -> None: ...
 
 
 class AnalysisWorkerSession(Protocol):
@@ -90,7 +92,7 @@ class AnalysisWorkerSession(Protocol):
         timeframe: str | None = None,
     ) -> None: ...
 
-    def receive_trader_rpc(self) -> dict[str, object] | None: ...
+    def receive_trader_rpc(self) -> ScheduledTraderRpc | dict[str, object] | None: ...
 
     def send_trader_rpc(
         self, *, request_id: str, kind: str, accepted: bool, result: dict[str, object] | None = None,
@@ -100,7 +102,14 @@ class AnalysisWorkerSession(Protocol):
     def receive_order_check(self, timeout: float | None = None) -> dict[str, object] | None: ...
 
     def send_order_check(
-        self, *, request_id: str, order: dict[str, object], accepted: bool, diagnostics: dict[str, object]
+        self,
+        *,
+        request_id: str,
+        order: dict[str, object],
+        accepted: bool,
+        diagnostics: dict[str, object] | None = None,
+        execution_state: str | None = None,
+        outcome: str | None = None,
     ) -> None: ...
 
     def send_order_check_error(self, *, request_id: str, reason: str) -> None: ...
@@ -108,7 +117,14 @@ class AnalysisWorkerSession(Protocol):
     def receive_order_execute(self, timeout: float | None = None) -> dict[str, object] | None: ...
 
     def send_order_execute(
-        self, *, request_id: str, order: dict[str, object], accepted: bool, result: dict[str, object]
+        self,
+        *,
+        request_id: str,
+        order: dict[str, object],
+        accepted: bool,
+        result: dict[str, object],
+        execution_state: str | None = None,
+        outcome: str | None = None,
     ) -> None: ...
 
     def send_order_execute_error(self, *, request_id: str, reason: str) -> None: ...
@@ -146,11 +162,11 @@ class WorkerSafetyAdapter:
             self._last_controller_signal = observed_at
             if self.state != "connected":
                 self.state = "connected"
-                self._session.send_safety_state("connected", "controller_signal_recovered")
+                self._session.send_recovery_state("connected", "controller_signal_recovered")
             return True
         if observed_at - self._last_controller_signal >= self._lost_link_after and self.state != "lost_link_safety":
             self.state = "lost_link_safety"
-            self._session.send_safety_state("lost_link_safety", "five_minute_missed_heartbeat")
+            self._session.send_recovery_state("lost_link_safety", "five_minute_missed_heartbeat")
         return False
 
     def run_with_retries(
@@ -175,11 +191,15 @@ class WorkerSafetyAdapter:
 
     def _needs_human(self, reason: str) -> None:
         self.state = "needs_human"
-        self._session.send_safety_state("needs_human", reason)
+        self._session.send_recovery_state("needs_human", reason)
 
 
 class AccountMismatchError(WorkerEnrollmentError):
     """The terminal is logged into an account other than the worker's binding."""
+
+
+class BrokerReceiptRejected(WorkerEnrollmentError):
+    """MT5 returned an authoritative non-success receipt after a broker send."""
 
 
 class MT5ReconciliationAdapter:
@@ -368,9 +388,13 @@ def reconcile_authenticated_worker(
     now: Callable[[], datetime] = lambda: datetime.now(UTC),
     sleep: Callable[[float], None] = _sleep,
     maintenance: Callable[[], None] | None = None,
+    effect_journal: WorkerEffectJournal | None = None,
 ) -> None:
     """Use an authenticated session's memory-only password for read-only MT5 reconciliation."""
 
+    send_recovery_sync = getattr(session, "send_recovery_sync", None)
+    if callable(send_recovery_sync):
+        send_recovery_sync([] if effect_journal is None else effect_journal.unresolved())
     password = session.request_password()
     initialized = False
     try:
@@ -385,7 +409,7 @@ def reconcile_authenticated_worker(
         if account.get("login") != login or account.get("server") != server:
             raise AccountMismatchError("The local MT5 account does not match the approved worker binding.")
         safety: WorkerSafetyAdapter | None = None
-        if callable(getattr(session, "heartbeat", None)) and callable(getattr(session, "send_safety_state", None)):
+        if callable(getattr(session, "heartbeat", None)) and callable(getattr(session, "send_recovery_state", None)):
             safety = WorkerSafetyAdapter(session)  # type: ignore[arg-type]
         reconciliation = MT5ReconciliationAdapter(
             mt5, emit=session.send_reconciliation, initial_cursor=getattr(session, "reconciliation_cursor", 0)
@@ -407,6 +431,7 @@ def reconcile_authenticated_worker(
                 safety=safety,
                 maintenance=maintenance,
                 live_state=live_state,
+                effect_journal=effect_journal,
             )
         else:
             reconciliation.run_forever(
@@ -433,12 +458,14 @@ def reconcile_with_safety(
     now: Callable[[], datetime] = lambda: datetime.now(UTC),
     sleep: Callable[[float], None] = _sleep,
     maintenance: Callable[[], None] | None = None,
+    effect_journal: WorkerEffectJournal | None = None,
 ) -> None:
     """Run reconciliation with bounded terminal/API recovery and human escalation."""
 
     WorkerSafetyAdapter(session).run_with_retries(
         lambda: reconcile_authenticated_worker(
-            mt5=mt5, session=session, login=login, server=server, now=now, sleep=sleep, maintenance=maintenance
+            mt5=mt5, session=session, login=login, server=server, now=now, sleep=sleep, maintenance=maintenance,
+            effect_journal=effect_journal,
         ),
         sleep=sleep,
     )
@@ -453,6 +480,7 @@ def reconnect_worker_session(
     sleep: Callable[[float], None] = _sleep,
     run_reconciliation: Callable[..., None] = reconcile_with_safety,
     maintenance: Callable[[AuthenticatedReconciliationSession], None] | None = None,
+    effect_journal: WorkerEffectJournal | None = None,
     monotonic_clock: Callable[[], float] = monotonic,
 ) -> None:
     """Reconnect an interrupted proved WSS session with a bounded exponential backoff."""
@@ -470,6 +498,7 @@ def reconnect_worker_session(
                     server=server,
                     sleep=sleep,
                     maintenance=None if maintenance is None else lambda: maintenance(session),
+                    effect_journal=effect_journal,
                 )
             return
         except WorkerSessionDisconnected as error:
@@ -497,6 +526,7 @@ def _run_reconciliation_with_analysis(
     safety: WorkerSafetyAdapter | None,
     maintenance: Callable[[], None] | None,
     live_state: LiveWorkerMarketStateAdapter | None,
+    effect_journal: WorkerEffectJournal | None,
 ) -> None:
     next_maintenance = now()
     next_reconciliation = next_maintenance
@@ -508,6 +538,7 @@ def _run_reconciliation_with_analysis(
         if observed_at >= next_reconciliation:
             reconciliation.poll(observed_at)
             next_reconciliation = observed_at + timedelta(minutes=1)
+        _serve_pending_trader_rpc(mt5, session, live_state, effect_journal)
         if live_state is not None:
             live_state.poll(observed_at)
         for _ in range(2):
@@ -523,19 +554,38 @@ def _run_reconciliation_with_analysis(
             if callable(receive_order_execute):
                 order_execute = receive_order_execute(timeout=0.0)
                 if order_execute is not None:
-                    _serve_order_execute(mt5, session, order_execute)
+                    _serve_order_execute(mt5, session, order_execute, effect_journal=effect_journal)
             receive_execution_recovery = getattr(session, "receive_execution_recovery", None)
             if callable(receive_execution_recovery):
                 recovery = receive_execution_recovery(timeout=0.0)
                 if recovery is not None:
                     _serve_execution_recovery(mt5, session, recovery)
-            receive_trader_rpc = getattr(session, "receive_trader_rpc", None)
-            if callable(receive_trader_rpc):
-                trader_rpc = receive_trader_rpc()
-                if trader_rpc is not None:
-                    _serve_trader_rpc(mt5, session, trader_rpc, live_state=live_state)
+            _serve_pending_trader_rpc(mt5, session, live_state, effect_journal)
             if safety is not None:
                 safety.heartbeat(now())
+
+
+def _serve_pending_trader_rpc(
+    mt5: ReadOnlyMT5,
+    session: AnalysisWorkerSession,
+    live_state: LiveWorkerMarketStateAdapter | None,
+    effect_journal: WorkerEffectJournal | None,
+) -> None:
+    receive_trader_rpc = getattr(session, "receive_trader_rpc", None)
+    if not callable(receive_trader_rpc):
+        return
+    trader_rpc = receive_trader_rpc()
+    if trader_rpc is None:
+        return
+    if isinstance(trader_rpc, ScheduledTraderRpc):
+        request_type = trader_rpc.request.get("worker_request_type")
+        worker_request = trader_rpc.request.get("worker_request")
+        if request_type in {"order_check_request", "order_execute_request"} and isinstance(worker_request, dict):
+            _serve_scheduled_hedge_request(mt5, session, trader_rpc, request_type, worker_request, effect_journal)
+            return
+        _serve_scheduled_trader_rpc(mt5, session, trader_rpc, live_state=live_state, effect_journal=effect_journal)
+        return
+    _serve_trader_rpc(mt5, session, trader_rpc, live_state=live_state)
 
 
 def _serve_product_catalog_analysis(
@@ -618,14 +668,50 @@ def _serve_product_catalog_analysis(
     )
 
 
-def _serve_order_check(mt5: ReadOnlyMT5, session: AnalysisWorkerSession, request: dict[str, object]) -> None:
+def _serve_scheduled_hedge_request(
+    mt5: ReadOnlyMT5,
+    session: AnalysisWorkerSession,
+    scheduled: ScheduledTraderRpc,
+    request_type: str,
+    request: dict[str, object],
+    effect_journal: WorkerEffectJournal | None,
+) -> None:
+    category = (
+        _serve_order_check(mt5, session, request, before_broker_action=scheduled.before_broker_send)
+        if request_type == "order_check_request"
+        else _serve_order_execute(
+            mt5, session, request, before_broker_send=scheduled.before_broker_send, effect_journal=effect_journal
+        )
+    )
+    scheduled.complete(category, f"The scheduled {request_type} reached a terminal Worker outcome.")
+
+
+def _serve_order_check(
+    mt5: ReadOnlyMT5,
+    session: AnalysisWorkerSession,
+    request: dict[str, object],
+    *,
+    before_broker_action: Callable[[], None] | None = None,
+) -> str:
     request_id = _request_text(request, "request_id")
     order = request.get("order")
     if not isinstance(order, dict):
         session.send_order_check_error(request_id=request_id, reason="The controller requested an invalid order check.")
-        return
+        return "rejected_preflight"
+    if _request_expired(request):
+        session.send_order_check(
+            request_id=request_id,
+            order=order,
+            accepted=False,
+            execution_state="not_started",
+            outcome="expired_not_started",
+        )
+        return "expired_not_started"
     try:
-        result = mt5.order_check(_broker_limit_request(mt5, order))
+        _require_terminal_trading_permission(mt5)
+        if before_broker_action is not None:
+            before_broker_action()
+        result = mt5.order_check(_broker_order_request(mt5, order))
         diagnostics = _order_check_diagnostics(mt5, str(order["symbol"]), result)
         accepted = diagnostics["retcode"] == 0
         _LOGGER.debug(
@@ -633,10 +719,25 @@ def _serve_order_check(mt5: ReadOnlyMT5, session: AnalysisWorkerSession, request
             request_id, order["symbol"], diagnostics["retcode"], "accepted" if accepted else "rejected",
         )
         session.send_order_check(request_id=request_id, order=order, accepted=accepted, diagnostics=diagnostics)
+        return "completed"
+    except BrokerActionNotStarted as error:
+        if error.outcome.category == "expired_not_started":
+            session.send_order_check(
+                request_id=request_id,
+                order=order,
+                accepted=False,
+                execution_state="not_started",
+                outcome="expired_not_started",
+            )
+        else:
+            session.send_order_check_error(request_id=request_id, reason=f"{error.outcome.category}: {error.outcome.reason}")
+        return error.outcome.category
     except WorkerEnrollmentError as error:
         session.send_order_check_error(request_id=request_id, reason=str(error))
+        return "rejected_preflight"
     except Exception:
         session.send_order_check_error(request_id=request_id, reason="The local MT5 order check failed.")
+        return "rejected_preflight"
 
 
 def _order_check_diagnostics(mt5: ReadOnlyMT5, symbol: str, result: object) -> dict[str, object]:
@@ -648,6 +749,10 @@ def _order_check_diagnostics(mt5: ReadOnlyMT5, symbol: str, result: object) -> d
     comment = evidence.get("comment")
     if isinstance(comment, str) and comment:
         diagnostics["comment"] = comment
+    for field in ("margin", "margin_free", "margin_level"):
+        value = evidence.get(field)
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+            diagnostics[field] = float(value)
     try:
         tick = _evidence(mt5.symbol_info_tick(symbol), "symbol tick")
     except WorkerEnrollmentError:
@@ -662,18 +767,42 @@ def _order_check_diagnostics(mt5: ReadOnlyMT5, symbol: str, result: object) -> d
     return diagnostics
 
 
-def _serve_order_execute(mt5: ReadOnlyMT5, session: AnalysisWorkerSession, request: dict[str, object]) -> None:
+def _serve_order_execute(
+    mt5: ReadOnlyMT5,
+    session: AnalysisWorkerSession,
+    request: dict[str, object],
+    *,
+    before_broker_send: Callable[[], None] | None = None,
+    effect_journal: WorkerEffectJournal | None = None,
+) -> str:
     request_id = _request_text(request, "request_id")
     order = request.get("order")
     if not isinstance(order, dict):
         session.send_order_execute_error(request_id=request_id, reason="The controller requested an invalid order execution.")
-        return
+        return "rejected_preflight"
+    if _request_expired(request):
+        _send_expired_order_execute(session, request_id, order)
+        return "expired_not_started"
+    order_send_started = False
+    broker_response_received = False
     try:
         _require_terminal_trading_permission(mt5)
         positions_before = _records(mt5.positions_get(), "position")
         broker_request = _broker_order_request(mt5, order)
-        sent = mt5.order_send(broker_request)
+        if _request_expired(request):
+            _send_expired_order_execute(session, request_id, order)
+            return "expired_not_started"
+        effect_id = request.get("effect_id", f"hedged-entry:{request_id}")
+        if not isinstance(effect_id, str) or not effect_id:
+            raise WorkerEnrollmentError("The controller requested an invalid broker effect ID.")
+        order_send_started = True
+        sent = _journaled_order_send(
+            mt5, broker_request, effect_journal=effect_journal, effect_id=effect_id, before_broker_send=before_broker_send
+        )
         result = _evidence(sent, "order execution")
+        broker_response_received = True
+        if effect_journal is not None:
+            effect_journal.record_receipt(effect_id, result)
         retcode = result.get("retcode")
         accepted = isinstance(retcode, int) and retcode in {
             getattr(mt5, "TRADE_RETCODE_DONE", -1),
@@ -688,25 +817,86 @@ def _serve_order_execute(mt5: ReadOnlyMT5, session: AnalysisWorkerSession, reque
                 _mt5_last_error(mt5),
             )
         session.send_order_execute(request_id=request_id, order=order, accepted=accepted, result=result)
+        return "completed"
+    except BrokerActionNotStarted as error:
+        if error.outcome.category == "expired_not_started":
+            _send_expired_order_execute(session, request_id, order)
+        else:
+            session.send_order_execute_error(
+                request_id=request_id,
+                reason=f"{error.outcome.category}: {error.outcome.reason}",
+            )
+        return error.outcome.category
+    except EffectJournalError as error:
+        _LOGGER.warning("MT5 order execution was blocked by the local effect journal: %s", error)
+        session.send_order_execute_error(request_id=request_id, reason=str(error))
+        return "rejected_preflight"
     except WorkerEnrollmentError as error:
+        if order_send_started and not broker_response_received:
+            _send_unknown_order_execute(session, request_id, order)
+            return "unknown_after_send"
         _LOGGER.warning(
             "MT5 order execution could not produce broker evidence: action=%s symbol=%s volume=%s reason=%s last_error=%r",
             order.get("action"), order.get("symbol"), order.get("volume"), error, _mt5_last_error(mt5),
         )
         session.send_order_execute_error(request_id=request_id, reason=str(error))
+        return "rejected_preflight"
     except Exception:
+        if order_send_started and not broker_response_received:
+            _LOGGER.warning(
+                "MT5 order execution outcome is unknown after broker send: action=%s symbol=%s volume=%s last_error=%r",
+                order.get("action"), order.get("symbol"), order.get("volume"), _mt5_last_error(mt5),
+            )
+            _send_unknown_order_execute(session, request_id, order)
+            return "unknown_after_send"
         _LOGGER.exception(
             "MT5 order execution failed: action=%s symbol=%s volume=%s last_error=%r",
             order.get("action"), order.get("symbol"), order.get("volume"), _mt5_last_error(mt5),
         )
         session.send_order_execute_error(request_id=request_id, reason="The local MT5 order execution failed.")
+        return "rejected_preflight"
+
+
+def _request_expired(request: dict[str, object], *, now: Callable[[], datetime] = lambda: datetime.now(UTC)) -> bool:
+    expires_at = request.get("expires_at")
+    if expires_at is None:
+        return False
+    if not isinstance(expires_at, str):
+        raise WorkerEnrollmentError("The controller requested an invalid request expiry.")
+    try:
+        expiry = _trader_utc(expires_at)
+    except ValueError as error:
+        raise WorkerEnrollmentError("The controller requested an invalid request expiry.") from error
+    return now() >= expiry
+
+
+def _send_expired_order_execute(session: AnalysisWorkerSession, request_id: str, order: dict[str, object]) -> None:
+    session.send_order_execute(
+        request_id=request_id,
+        order=order,
+        accepted=False,
+        result={},
+        execution_state="not_started",
+        outcome="expired_not_started",
+    )
+
+
+def _send_unknown_order_execute(session: AnalysisWorkerSession, request_id: str, order: dict[str, object]) -> None:
+    session.send_order_execute(
+        request_id=request_id,
+        order=order,
+        accepted=False,
+        result={},
+        execution_state="sent",
+        outcome="unknown_after_send",
+    )
 
 
 def _serve_execution_recovery(mt5: ReadOnlyMT5, session: AnalysisWorkerSession, request: dict[str, object]) -> None:
     request_id = _request_text(request, "request_id")
     operation = _request_text(request, "type").removesuffix("_request")
     try:
-        if operation == "worker_cleanup_reconcile":
+        if operation == "account_recovery_reconcile":
             result = {
                 "orders": list(_records(mt5.orders_get(), "order").values()),
                 "positions": list(_records(mt5.positions_get(), "position").values()),
@@ -727,24 +917,13 @@ def _serve_execution_recovery(mt5: ReadOnlyMT5, session: AnalysisWorkerSession, 
             }
             session.send_execution_recovery(request_id=request_id, operation=operation, accepted=True, result=result)
             return
-        if operation == "manual_position_reconcile":
-            ticket = _request_text(request, "ticket")
-            result = {
-                "orders": [],
-                "positions": [
-                    record for record in _records(mt5.positions_get(), "position").values()
-                    if str(record.get("ticket")) == ticket
-                ],
-            }
-            session.send_execution_recovery(request_id=request_id, operation=operation, accepted=True, result=result)
-            return
         ticket = int(_request_text(request, "ticket"))
         volume = float(_request_text(request, "volume"))
         if volume <= 0:
             raise ValueError
-        if operation in {"execution_cancel", "worker_cleanup_cancel"}:
+        if operation in {"execution_cancel", "account_recovery_cancel"}:
             result = _evidence(mt5.order_send({"action": getattr(mt5, "TRADE_ACTION_REMOVE"), "order": ticket}), "order cancellation")
-        elif operation in {"execution_close", "worker_cleanup_close"}:
+        elif operation in {"execution_close", "account_recovery_close"}:
             position = next(
                 (item for item in _records(mt5.positions_get(), "position").values() if str(item.get("ticket")) == str(ticket)),
                 None,
@@ -813,6 +992,84 @@ def _serve_trader_rpc(
         )
 
 
+def _serve_scheduled_trader_rpc(
+    mt5: ReadOnlyMT5,
+    session: AnalysisWorkerSession,
+    scheduled: ScheduledTraderRpc,
+    *,
+    live_state: LiveWorkerMarketStateAdapter | None = None,
+    effect_journal: WorkerEffectJournal | None = None,
+) -> None:
+    """Execute one selected RPC once, broadcasting a coalesced read result."""
+
+    request = scheduled.request
+    request_id = _request_text(request, "request_id")
+    kind = _request_text(request, "kind")
+    payload = request.get("payload")
+    if kind not in {"read", "operation"} or not isinstance(payload, dict):
+        outcome = scheduled.complete(
+            "rejected_preflight",
+            "The controller requested an invalid Trader RPC request.",
+        )
+        _send_scheduled_trader_rpc_failure(session, scheduled, outcome.category, outcome.reason)
+        return
+    try:
+        result = (
+            _trader_read(mt5, payload)
+            if kind == "read"
+            else _set_live_symbols(mt5, live_state, payload)
+            if payload.get("type") == "set_live_symbols"
+            else _trader_operation(
+                mt5,
+                payload,
+                before_broker_send=scheduled.before_broker_send,
+                effect_journal=effect_journal,
+                effect_id=scheduled.command_id,
+            )
+        )
+        scheduled.complete("completed", "The MT5 operation completed with an authoritative result.")
+        for response_request in scheduled.requests:
+            session.send_trader_rpc(
+                request_id=_request_text(response_request, "request_id"),
+                kind=kind,
+                accepted=True,
+                result=result,
+            )
+    except BrokerActionNotStarted as error:
+        _send_scheduled_trader_rpc_failure(session, scheduled, error.outcome.category, error.outcome.reason)
+    except BrokerReceiptRejected as error:
+        scheduled.complete("completed", str(error))
+        _send_scheduled_trader_rpc_failure(session, scheduled, "completed", str(error))
+    except (WorkerEnrollmentError, ValueError) as error:
+        category = "unknown_after_send" if "mt5_action_started_at" in scheduled.telemetry else "rejected_preflight"
+        scheduled.complete(category, str(error))
+        _send_scheduled_trader_rpc_failure(session, scheduled, category, str(error))
+    except Exception:
+        category = "unknown_after_send" if "mt5_action_started_at" in scheduled.telemetry else "rejected_preflight"
+        reason = "The local MT5 terminal failed while handling the Trader request."
+        if category == "unknown_after_send":
+            _LOGGER.warning("Scheduled Trader %s request has an unknown outcome after MT5 send.", kind)
+        else:
+            _LOGGER.exception("Scheduled Trader %s request failed before MT5 send.", kind)
+        scheduled.complete(category, reason)
+        _send_scheduled_trader_rpc_failure(session, scheduled, category, reason)
+
+
+def _send_scheduled_trader_rpc_failure(
+    session: AnalysisWorkerSession,
+    scheduled: ScheduledTraderRpc,
+    category: str,
+    reason: str,
+) -> None:
+    for request in scheduled.requests:
+        session.send_trader_rpc(
+            request_id=_request_text(request, "request_id"),
+            kind=_request_text(request, "kind"),
+            accepted=False,
+            reason=f"{category}: {reason}",
+        )
+
+
 def _set_live_symbols(
     mt5: ReadOnlyMT5, live_state: LiveWorkerMarketStateAdapter | None, payload: dict[str, object]
 ) -> dict[str, object]:
@@ -860,17 +1117,19 @@ def _trader_read(mt5: ReadOnlyMT5, payload: dict[str, object]) -> dict[str, obje
             raise WorkerEnrollmentError("The local MT5 terminal returned an invalid symbol catalog.")
         return {"symbols": [_json_evidence(value, "symbol") for value in symbols]}
     if operation == "calc_margin" and set(payload) == {"type", "symbol", "volume", "direction", "price"}:
-        direction = _request_text(payload, "direction")
-        action = getattr(mt5, "ORDER_TYPE_BUY") if direction == "LONG" else getattr(mt5, "ORDER_TYPE_SELL")
-        margin = mt5.order_calc_margin(
-            action,
-            _request_text(payload, "symbol"),
-            float(_request_text(payload, "volume")),
-            float(_request_text(payload, "price")),
-        )
-        if isinstance(margin, bool) or not isinstance(margin, (int, float)) or margin <= 0:
-            raise WorkerEnrollmentError("The local MT5 terminal returned an invalid calculated margin.")
-        return {"margin": margin}
+        return {"margin": _trader_margin(mt5, payload)}
+    if operation == "calc_margin_batch":
+        try:
+            batch = CalcMarginBatchRead.model_validate(payload)
+        except ValidationError as error:
+            raise WorkerEnrollmentError("The controller requested an invalid Trader broker read.") from error
+        calculations = [calculation.model_dump(mode="json") for calculation in batch.calculations]
+        return {
+            "margins": [
+                {**calculation, "margin": _trader_margin(mt5, calculation)}
+                for calculation in calculations
+            ]
+        }
     if operation == "calc_profit" and set(payload) == {"type", "symbol", "volume", "direction", "open_price", "close_price"}:
         direction = _request_text(payload, "direction")
         action = getattr(mt5, "ORDER_TYPE_BUY") if direction == "LONG" else getattr(mt5, "ORDER_TYPE_SELL")
@@ -903,20 +1162,60 @@ def _trader_read(mt5: ReadOnlyMT5, payload: dict[str, object]) -> dict[str, obje
     raise WorkerEnrollmentError("The controller requested an invalid Trader broker read.")
 
 
-def _trader_operation(mt5: ReadOnlyMT5, payload: dict[str, object]) -> dict[str, object]:
+def _trader_margin(mt5: ReadOnlyMT5, calculation: dict[str, object]) -> float:
+    direction = _request_text(calculation, "direction")
+    action = getattr(mt5, "ORDER_TYPE_BUY") if direction == "LONG" else getattr(mt5, "ORDER_TYPE_SELL")
+    margin = mt5.order_calc_margin(
+        action,
+        _request_text(calculation, "symbol"),
+        float(_request_text(calculation, "volume")),
+        float(_request_text(calculation, "price")),
+    )
+    if (
+        isinstance(margin, bool)
+        or not isinstance(margin, (int, float))
+        or not math.isfinite(margin)
+        or margin <= 0
+    ):
+        raise WorkerEnrollmentError("The local MT5 terminal returned an invalid calculated margin.")
+    return float(margin)
+
+
+def _trader_operation(
+    mt5: ReadOnlyMT5,
+    payload: dict[str, object],
+    *,
+    before_broker_send: Callable[[], None] | None = None,
+    effect_journal: WorkerEffectJournal | None = None,
+    effect_id: str | None = None,
+) -> dict[str, object]:
     operation = _request_text(payload, "type")
     _require_terminal_trading_permission(mt5)
     if operation in {"market", "pending"}:
         order = _trader_order(payload)
-        result = _broker_receipt(mt5.order_send(_broker_order_request(mt5, order)), "order execution")
+        broker_request = _broker_order_request(mt5, order)
+        result = _broker_receipt(
+            _journaled_order_send(
+                mt5, broker_request, effect_journal=effect_journal, effect_id=effect_id, before_broker_send=before_broker_send
+            ),
+            "order execution",
+        )
+        _record_journal_receipt(effect_journal, effect_id, result)
         _require_completed_trader_receipt(mt5, result, "order execution")
         return {"operation": operation, "result": result}
     if operation == "cancel" and set(payload) == {"type", "ticket"}:
         ticket = int(_request_text(payload, "ticket"))
         result = _broker_receipt(
-            mt5.order_send({"action": getattr(mt5, "TRADE_ACTION_REMOVE"), "order": ticket}),
+            _journaled_order_send(
+                mt5,
+                {"action": getattr(mt5, "TRADE_ACTION_REMOVE"), "order": ticket},
+                effect_journal=effect_journal,
+                effect_id=effect_id,
+                before_broker_send=before_broker_send,
+            ),
             "order cancellation",
         )
+        _record_journal_receipt(effect_journal, effect_id, result)
         _require_completed_trader_receipt(mt5, result, "order cancellation")
         return {"operation": operation, "result": result}
     if operation == "close" and set(payload) == {"type", "ticket", "volume"}:
@@ -937,7 +1236,8 @@ def _trader_operation(mt5: ReadOnlyMT5, payload: dict[str, object]) -> dict[str,
         if isinstance(price, bool) or not isinstance(price, (int, float)) or price <= 0:
             raise WorkerEnrollmentError("The position close price is unavailable.")
         result = _broker_receipt(
-            mt5.order_send(
+            _journaled_order_send(
+                mt5,
                 {
                     "action": getattr(mt5, "TRADE_ACTION_DEAL"),
                     "position": ticket,
@@ -946,28 +1246,67 @@ def _trader_operation(mt5: ReadOnlyMT5, payload: dict[str, object]) -> dict[str,
                     "type": close_type,
                     "price": price,
                     "type_filling": getattr(mt5, "ORDER_FILLING_IOC"),
-                }
+                },
+                effect_journal=effect_journal,
+                effect_id=effect_id,
+                before_broker_send=before_broker_send,
             ),
             "position close",
         )
+        _record_journal_receipt(effect_journal, effect_id, result)
         _require_completed_trader_receipt(mt5, result, "position close")
         return {"operation": operation, "result": result}
     if operation == "modify_sl_tp" and set(payload) == {"type", "symbol", "position", "sl", "tp"}:
         result = _broker_receipt(
-            mt5.order_send(
+            _journaled_order_send(
+                mt5,
                 {
                     "action": getattr(mt5, "TRADE_ACTION_SLTP"),
                     "symbol": _request_text(payload, "symbol"),
                     "position": int(_request_text(payload, "position")),
                     "sl": float(_request_text(payload, "sl")),
                     "tp": float(_request_text(payload, "tp")),
-                }
+                },
+                effect_journal=effect_journal,
+                effect_id=effect_id,
+                before_broker_send=before_broker_send,
             ),
             "SL/TP modification",
         )
+        _record_journal_receipt(effect_journal, effect_id, result)
         _require_completed_trader_receipt(mt5, result, "SL/TP modification")
         return {"operation": operation, "result": result}
     raise WorkerEnrollmentError("The controller requested an invalid Trader operation.")
+
+
+def _journaled_order_send(
+    mt5: ReadOnlyMT5,
+    request: dict[str, object],
+    *,
+    effect_journal: WorkerEffectJournal | None,
+    effect_id: str | None,
+    before_broker_send: Callable[[], None] | None,
+) -> object:
+    if effect_journal is not None:
+        if not effect_id:
+            raise EffectJournalError("A broker effect ID is required for a journaled MT5 write.")
+        state = effect_journal.prepare(effect_id, request)
+        if state != "prepared":
+            raise EffectJournalError("A durable broker effect must be observed before any retry.")
+    if before_broker_send is not None:
+        before_broker_send()
+    if effect_journal is not None:
+        effect_journal.mark_send_started(effect_id)
+    return mt5.order_send(request)
+
+
+def _record_journal_receipt(
+    effect_journal: WorkerEffectJournal | None, effect_id: str | None, receipt: dict[str, object]
+) -> None:
+    if effect_journal is not None:
+        if not effect_id:
+            raise EffectJournalError("A broker effect ID is required for a journaled MT5 write.")
+        effect_journal.record_receipt(effect_id, receipt)
 
 
 def _trader_order(payload: dict[str, object]) -> dict[str, object]:
@@ -1035,7 +1374,7 @@ def _broker_receipt(value: object, kind: str) -> dict[str, object]:
 
 def _require_completed_trader_receipt(mt5: object, receipt: dict[str, object], operation: str) -> None:
     if receipt["retcode"] != getattr(mt5, "TRADE_RETCODE_DONE"):
-        raise WorkerEnrollmentError(
+        raise BrokerReceiptRejected(
             f"The MT5 {operation} was rejected: retcode={receipt['retcode']} comment={receipt.get('comment', '')!r}."
         )
 

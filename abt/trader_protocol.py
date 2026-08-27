@@ -8,6 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator,
 
 
 MAX_LIVE_SYMBOLS = 64
+MAX_MARGIN_CALCULATIONS = MAX_LIVE_SYMBOLS * 2
 
 
 class _ProtocolModel(BaseModel):
@@ -48,6 +49,18 @@ class CalcMarginRead(_ProtocolModel):
     price: str
 
 
+class MarginCalculation(_ProtocolModel):
+    symbol: str
+    volume: str
+    direction: Literal["LONG", "SHORT"]
+    price: str
+
+
+class CalcMarginBatchRead(_ProtocolModel):
+    type: Literal["calc_margin_batch"]
+    calculations: list[MarginCalculation] = Field(min_length=1, max_length=MAX_MARGIN_CALCULATIONS)
+
+
 class CalcProfitRead(_ProtocolModel):
     type: Literal["calc_profit"]
     symbol: str
@@ -74,7 +87,7 @@ class CurrentPositionsRead(_ProtocolModel):
 
 
 TraderRead = Annotated[
-    AccountInfoRead | SymbolInfoRead | SymbolsRead | CalcMarginRead | CalcProfitRead | HistoricalTicksRead | CurrentOrdersRead | CurrentPositionsRead,
+    AccountInfoRead | SymbolInfoRead | SymbolsRead | CalcMarginRead | CalcMarginBatchRead | CalcProfitRead | HistoricalTicksRead | CurrentOrdersRead | CurrentPositionsRead,
     Field(discriminator="type"),
 ]
 
@@ -158,7 +171,7 @@ class TraderRpcRequest(_ProtocolModel):
         ):
             raise ValueError("Trader read requests require a read payload.")
         if self.kind == "operation" and isinstance(
-            self.payload,                         (AccountInfoRead, SymbolInfoRead, SymbolsRead, CalcMarginRead, CalcProfitRead, HistoricalTicksRead, CurrentOrdersRead, CurrentPositionsRead)
+            self.payload,                                     (AccountInfoRead, SymbolInfoRead, SymbolsRead, CalcMarginRead, CalcMarginBatchRead, CalcProfitRead, HistoricalTicksRead, CurrentOrdersRead, CurrentPositionsRead)
         ):
             raise ValueError("Trader operation requests require an operation payload.")
         return self

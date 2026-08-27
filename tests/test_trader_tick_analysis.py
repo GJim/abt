@@ -92,8 +92,8 @@ class TraderTickAnalysisTests(unittest.TestCase):
             },
         }
         workers = [
-            {"worker_id": "worker-a", "server": "Broker-A", "connectivity": "connected", "safety_state": "connected"},
-            {"worker_id": "worker-b", "server": "Broker-B", "connectivity": "connected", "safety_state": "connected"},
+            {"worker_id": "worker-a", "server": "Broker-A", "connectivity": "connected"},
+            {"worker_id": "worker-b", "server": "Broker-B", "connectivity": "connected"},
         ]
 
         self.assertEqual([("worker-a", "EURUSD"), ("worker-b", "EURUSD.a")], select_safe_pair_workers(pair, workers))
@@ -111,9 +111,9 @@ class TraderTickAnalysisTests(unittest.TestCase):
             },
         }
         workers = [
-            {"worker_id": "worker-a", "server": "Broker-A", "connectivity": "stale", "safety_state": "connected"},
-            {"worker_id": "worker-a-replacement", "server": "Broker-A", "connectivity": "connected", "safety_state": "connected"},
-            {"worker_id": "worker-b", "server": "Broker-B", "connectivity": "connected", "safety_state": "connected"},
+            {"worker_id": "worker-a", "server": "Broker-A", "connectivity": "stale"},
+            {"worker_id": "worker-a-replacement", "server": "Broker-A", "connectivity": "connected"},
+            {"worker_id": "worker-b", "server": "Broker-B", "connectivity": "connected"},
         ]
 
         self.assertEqual(

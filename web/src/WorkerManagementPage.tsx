@@ -135,10 +135,10 @@ export function WorkerManagementPage({
       {revokeCandidate ? (
         <section aria-labelledby="revoke-certificate-heading" className="worker-revoke-confirmation">
           <h2 id="revoke-certificate-heading">Revoke certificate for {revokeCandidate.login} on {revokeCandidate.server}?</h2>
-          <p>This is an emergency containment action. The worker will receive <code>REVOKE_AND_FLATTEN</code>; its related pairs remain frozen until manually resolved.</p>
+          <p>This is an emergency containment action. The control plane automatically converges related accounts to their safe lifecycle state.</p>
           <div className="action-row">
             <button className="reject-button" disabled={isRevoking} onClick={() => void confirmRevoke()} type="button">
-              {isRevoking ? 'Revoking…' : 'Confirm revoke and flatten'}
+              {isRevoking ? 'Revoking…' : 'Confirm emergency revocation'}
             </button>
             <button disabled={isRevoking} onClick={() => setRevokeCandidate(null)} type="button">Cancel</button>
           </div>
@@ -279,13 +279,13 @@ function WorkerRoster({
                     </ul>
                   )}
                 </section>
-                {worker.freeze ? (
-                  <section aria-label={`Freeze record for ${accountName}`}>
-                    <h3>Freeze record</h3>
-                    <p>{worker.safety_state === 'frozen' ? 'Frozen' : 'Previously frozen'} by {worker.freeze.source.replaceAll('_', ' ')}.</p>
-                    <p>Affected workers: {worker.freeze.affected_worker_ids.join(', ')}.</p>
-                    <p>{worker.freeze.audit.reason}</p>
-                    <time dateTime={worker.freeze.frozen_at}>{formatDateTime(worker.freeze.frozen_at)}</time>
+                {worker.recovery ? (
+                  <section aria-label={`Recovery lifecycle for ${accountName}`}>
+                    <h3>Recovery lifecycle</h3>
+                    <p>{humanizeRecoveryState(worker.recovery.lifecycle_state)} toward {humanizeRecoveryState(worker.recovery.desired_state)}.</p>
+                    <p>{worker.recovery.directive.reason}</p>
+                    <p>Current directive: {humanizeRecoveryState(worker.recovery.directive.kind)}.</p>
+                    <time dateTime={worker.recovery.updated_at}>{formatDateTime(worker.recovery.updated_at)}</time>
                   </section>
                 ) : null}
                 {worker.connectivity !== 'revoked' ? (
@@ -316,13 +316,13 @@ function formatAccountSummary(account: Record<string, unknown>) {
 }
 
 function describeWorkerHealth(worker: AccountWorker) {
-  if (worker.safety_state === 'frozen') {
-    return { description: 'Account is isolated until an administrator completes recovery.', label: 'Frozen', tone: 'human-action' }
+  if (worker.recovery && worker.recovery.lifecycle_state !== 'READY') {
+    return { description: `Automatic recovery is ${humanizeRecoveryState(worker.recovery.lifecycle_state).toLowerCase()}.`, label: 'Recovering', tone: 'recovering' }
   }
   if (worker.connectivity === 'revoked') {
     return { description: 'Certificate revoked; connection is blocked.', label: 'Revoked', tone: 'human-action' }
   }
-  if (worker.safety_state !== 'connected' || worker.connectivity === 'disconnected') {
+  if (worker.connectivity === 'disconnected') {
     return { description: 'Requires operator investigation before further use.', label: 'Action needed', tone: 'human-action' }
   }
   if (worker.connectivity === 'stale' || !worker.latest_snapshot || isSnapshotStale(worker.latest_snapshot.observed_at)) {
@@ -338,5 +338,9 @@ function describeWorkerHealth(worker: AccountWorker) {
 
 function workerPriority(worker: AccountWorker) {
   const health = describeWorkerHealth(worker)
-  return health.tone === 'human-action' ? 0 : health.tone === 'stale' ? 1 : 2
+  return health.tone === 'human-action' ? 0 : health.tone === 'recovering' || health.tone === 'stale' ? 1 : 2
+}
+
+function humanizeRecoveryState(value: string) {
+  return value.toLocaleLowerCase().replaceAll('_', ' ').replace(/\b\w/g, (character) => character.toLocaleUpperCase())
 }

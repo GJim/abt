@@ -43,8 +43,9 @@ timelines, CSRF headers, and server-error display.
    reconciliation evidence.
 5. From the management workspace, preview and confirm emergency flatten for a
    filled intent. Retain the cancellation/close responses and reconciliation
-   result. If any recovery operation fails, verify the pair is frozen for
-   human recovery.
+   result. If any recovery operation fails, verify that the affected accounts
+   enter `CONVERGING_EMPTY` and remain blocked from new entries until broker
+   observations prove the desired state.
 6. Submit one request with a failed or timed-out `order_check` and one whose
    checks succeed but broker execution fails. The former must have
    `rejected_preflight` with both endpoint outcomes and no intent; the latter
@@ -52,4 +53,5 @@ timelines, CSRF headers, and server-error display.
    immutable timelines with the release evidence.
 
 Do not enable the slice if any command succeeds without the corresponding
-immutable ledger event, or if a failed recovery leaves the pair unfrozen.
+immutable ledger event, or if a failed recovery admits a pair before the
+required broker observation.

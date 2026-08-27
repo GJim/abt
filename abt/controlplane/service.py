@@ -23,7 +23,7 @@ from fastapi import Cookie, FastAPI, Header, HTTPException, Query, Response, Web
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from ..trader_protocol import trader_rpc_response_adapter
 
@@ -196,44 +196,47 @@ class TraderIntentCancellationPayload(BaseModel):
     intent_id: str = Field(min_length=1)
 
 
+class HedgedEntryLegPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    worker_id: str = Field(min_length=1)
+    symbol: str = Field(min_length=1)
+    volume: Decimal = Field(gt=0)
+    direction: Literal["LONG", "SHORT"]
+    filling_mode: Literal["FOK", "IOC"]
+    margin_limit: Decimal = Field(gt=0)
+
+
+class HedgedEntryPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["hedged_entry"]
+    expires_at: datetime
+    first: HedgedEntryLegPayload
+    second: HedgedEntryLegPayload
+
+    @field_validator("expires_at")
+    @classmethod
+    def require_absolute_expiry(cls, value: datetime) -> datetime:
+        if value.tzinfo is None:
+            raise ValueError("expires_at must include a timezone.")
+        return value.astimezone(UTC)
+
+    @model_validator(mode="after")
+    def paired_market_legs(self) -> HedgedEntryPayload:
+        if (
+            self.first.worker_id == self.second.worker_id
+            or self.first.symbol != self.second.symbol
+            or self.first.volume != self.second.volume
+            or self.first.direction == self.second.direction
+            or self.first.filling_mode != self.second.filling_mode
+        ):
+            raise ValueError("Hedged entry requires two opposing equal-volume legs on distinct workers.")
+        return self
+
+
 class ManagementIntentCommandRequest(BaseModel):
     command_id: str = Field(min_length=1, max_length=128)
-
-
-class WorkerRecoveryCommandRequest(BaseModel):
-    command_id: str = Field(min_length=1, max_length=128)
-
-
-class ManualTradingTargetRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    pair_id: str = Field(min_length=1)
-    buy_worker_id: str = Field(min_length=1)
-    sell_worker_id: str = Field(min_length=1)
-    leg_order: Literal["buy_to_sell", "sell_to_buy"]
-    interval_seconds: int = Field(ge=0)
-    expected_revision: int = Field(ge=0)
-
-
-class ManualTradeEntryRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    command_id: str = Field(min_length=1, max_length=128)
-    target_revision: int = Field(ge=1)
-    base_lots: Decimal = Field(gt=0)
-    stop_loss_pips: Decimal = Field(gt=0)
-    take_profit_pips: Decimal = Field(gt=0)
-
-
-class ManualTradeExitRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    command_id: str = Field(min_length=1, max_length=128)
-
-
-class ManualTradeProtectionRequest(ManualTradeExitRequest):
-    stop_loss_pips: Decimal = Field(gt=0)
-    take_profit_pips: Decimal = Field(gt=0)
 
 
 class ManagementIntentCreateRequest(TraderIntentPayload):
@@ -348,8 +351,12 @@ def _operations_dashboard(
 
 
 def _worker_dashboard_classification(worker: dict[str, Any]) -> dict[str, str]:
-    if worker["safety_state"] in {"frozen", "lost_link_safety", "needs_human"}:
-        return {"category": "intervention_required", "classification_reason": worker["safety_state"]}
+    recovery = worker.get("recovery")
+    if isinstance(recovery, dict) and recovery.get("lifecycle_state") != "READY":
+        return {
+            "category": "intervention_required",
+            "classification_reason": f"account_recovery_{recovery['lifecycle_state']}",
+        }
     if worker["connectivity"] == "stale":
         return {"category": "intervention_required", "classification_reason": "worker_stale"}
     if worker["connectivity"] == "revoked":
@@ -900,193 +907,6 @@ def create_app(
         _require_admin(ledger, abt_admin_session)
         return ledger.worker_reconciliation()
 
-    @app.get("/api/admin/manual-trading-target")
-    def get_manual_trading_target(
-        abt_admin_session: Annotated[str | None, Cookie()] = None,
-    ) -> dict[str, object] | None:
-        _require_admin(ledger, abt_admin_session)
-        return ledger.manual_trading_target()
-
-    @app.put("/api/admin/manual-trading-target")
-    def configure_manual_trading_target(
-        body: ManualTradingTargetRequest,
-        abt_admin_session: Annotated[str | None, Cookie()] = None,
-        x_csrf_token: Annotated[str | None, Header()] = None,
-    ) -> dict[str, object]:
-        username = _require_admin(ledger, abt_admin_session, x_csrf_token, require_csrf=True)
-        try:
-            return ledger.configure_manual_trading_target(username, **body.model_dump())
-        except LedgerError as error:
-            raise HTTPException(status_code=_ledger_error_status(error), detail=str(error)) from error
-
-    @app.post("/api/admin/manual-trades/preview")
-    def preview_manual_trade(
-        body: ManualTradeEntryRequest,
-        abt_admin_session: Annotated[str | None, Cookie()] = None,
-        x_csrf_token: Annotated[str | None, Header()] = None,
-    ) -> dict[str, object]:
-        _require_admin(ledger, abt_admin_session, x_csrf_token, require_csrf=True)
-        try:
-            return ledger.preview_manual_trade(body.model_dump(mode="json", exclude={"command_id"}))
-        except LedgerError as error:
-            raise HTTPException(status_code=_ledger_error_status(error), detail=str(error)) from error
-
-    @app.post("/api/admin/manual-trades", status_code=status.HTTP_201_CREATED)
-    async def create_manual_trade(
-        body: ManualTradeEntryRequest,
-        abt_admin_session: Annotated[str | None, Cookie()] = None,
-        x_csrf_token: Annotated[str | None, Header()] = None,
-    ) -> dict[str, object]:
-        username = _require_admin(ledger, abt_admin_session, x_csrf_token, require_csrf=True)
-        try:
-            result = ledger.request_manual_trade(
-                username, body.command_id, body.model_dump(mode="json", exclude={"command_id"})
-            )
-            if result["status"] == "scheduled":
-                asyncio.create_task(
-                    _dispatch_manual_trade(
-                        ledger, worker_connections, worker_execution_locks, str(result["manual_trade_id"])
-                    )
-                )
-            return result
-        except LedgerError as error:
-            raise HTTPException(status_code=_ledger_error_status(error), detail=str(error)) from error
-
-    @app.get("/api/admin/manual-trades")
-    def list_active_manual_trades(
-        abt_admin_session: Annotated[str | None, Cookie()] = None,
-    ) -> list[dict[str, object]]:
-        _require_admin(ledger, abt_admin_session)
-        return ledger.active_manual_trades()
-
-    @app.delete("/api/admin/manual-trades/{manual_trade_id}")
-    def discard_unconfirmed_manual_trade(
-        manual_trade_id: str,
-        abt_admin_session: Annotated[str | None, Cookie()] = None,
-        x_csrf_token: Annotated[str | None, Header()] = None,
-    ) -> dict[str, object]:
-        username = _require_admin(ledger, abt_admin_session, x_csrf_token, require_csrf=True)
-        try:
-            return ledger.discard_unconfirmed_manual_trade(username, manual_trade_id)
-        except LedgerError as error:
-            raise HTTPException(status_code=_ledger_error_status(error), detail=str(error)) from error
-
-    @app.post("/api/admin/manual-trades/{manual_trade_id}/exit/preview")
-    def preview_active_manual_trade_exit(
-        manual_trade_id: str,
-        body: ManualTradeExitRequest,
-        abt_admin_session: Annotated[str | None, Cookie()] = None,
-        x_csrf_token: Annotated[str | None, Header()] = None,
-    ) -> dict[str, object]:
-        _require_admin(ledger, abt_admin_session, x_csrf_token, require_csrf=True)
-        try:
-            return ledger.preview_active_manual_trade_operation(
-                manual_trade_id, "exit", body.model_dump(exclude={"command_id"})
-            )
-        except LedgerError as error:
-            raise HTTPException(status_code=_ledger_error_status(error), detail=str(error)) from error
-
-    @app.post("/api/admin/manual-trades/{manual_trade_id}/exit", status_code=status.HTTP_201_CREATED)
-    async def exit_active_manual_trade(
-        manual_trade_id: str,
-        body: ManualTradeExitRequest,
-        abt_admin_session: Annotated[str | None, Cookie()] = None,
-        x_csrf_token: Annotated[str | None, Header()] = None,
-    ) -> dict[str, object]:
-        username = _require_admin(ledger, abt_admin_session, x_csrf_token, require_csrf=True)
-        try:
-            result = ledger.request_active_manual_trade_operation(
-                username, body.command_id, manual_trade_id, "exit", body.model_dump(exclude={"command_id"})
-            )
-            if result["status"] == "scheduled":
-                asyncio.create_task(
-                    _dispatch_manual_trade_operation(
-                        ledger, worker_connections, worker_execution_locks, str(result["operation_id"])
-                    )
-                )
-            return result
-        except LedgerError as error:
-            raise HTTPException(status_code=_ledger_error_status(error), detail=str(error)) from error
-
-    @app.post("/api/admin/manual-trades/{manual_trade_id}/protection/preview")
-    def preview_active_manual_trade_protection(
-        manual_trade_id: str,
-        body: ManualTradeProtectionRequest,
-        abt_admin_session: Annotated[str | None, Cookie()] = None,
-        x_csrf_token: Annotated[str | None, Header()] = None,
-    ) -> dict[str, object]:
-        _require_admin(ledger, abt_admin_session, x_csrf_token, require_csrf=True)
-        try:
-            return ledger.preview_active_manual_trade_operation(
-                manual_trade_id, "protection", body.model_dump(mode="json", exclude={"command_id"})
-            )
-        except LedgerError as error:
-            raise HTTPException(status_code=_ledger_error_status(error), detail=str(error)) from error
-
-    @app.post("/api/admin/manual-trades/{manual_trade_id}/protection", status_code=status.HTTP_201_CREATED)
-    async def update_active_manual_trade_protection(
-        manual_trade_id: str,
-        body: ManualTradeProtectionRequest,
-        abt_admin_session: Annotated[str | None, Cookie()] = None,
-        x_csrf_token: Annotated[str | None, Header()] = None,
-    ) -> dict[str, object]:
-        username = _require_admin(ledger, abt_admin_session, x_csrf_token, require_csrf=True)
-        try:
-            result = ledger.request_active_manual_trade_operation(
-                username, body.command_id, manual_trade_id, "protection", body.model_dump(mode="json", exclude={"command_id"})
-            )
-            if result["status"] == "scheduled":
-                asyncio.create_task(
-                    _dispatch_manual_trade_operation(
-                        ledger, worker_connections, worker_execution_locks, str(result["operation_id"])
-                    )
-                )
-            return result
-        except LedgerError as error:
-            raise HTTPException(status_code=_ledger_error_status(error), detail=str(error)) from error
-
-    @app.post("/api/admin/workers/{worker_id}/cleanup")
-    async def cleanup_worker(
-        worker_id: str,
-        body: WorkerRecoveryCommandRequest,
-        abt_admin_session: Annotated[str | None, Cookie()] = None,
-        x_csrf_token: Annotated[str | None, Header()] = None,
-    ) -> dict[str, object]:
-        username = _require_admin(ledger, abt_admin_session, x_csrf_token, require_csrf=True)
-        try:
-            result, scheduled = ledger.request_worker_recovery(username, body.command_id, worker_id, "cleanup")
-            if scheduled:
-                asyncio.create_task(
-                    _cleanup_frozen_worker(
-                        ledger, worker_connections, worker_execution_locks, worker_id, result, username,
-                        admin_notification_connections,
-                    )
-                )
-            return result
-        except LedgerError as error:
-            raise HTTPException(status_code=_ledger_error_status(error), detail=str(error)) from error
-
-    @app.post("/api/admin/workers/{worker_id}/release")
-    async def release_worker(
-        worker_id: str,
-        body: WorkerRecoveryCommandRequest,
-        abt_admin_session: Annotated[str | None, Cookie()] = None,
-        x_csrf_token: Annotated[str | None, Header()] = None,
-    ) -> dict[str, object]:
-        username = _require_admin(ledger, abt_admin_session, x_csrf_token, require_csrf=True)
-        try:
-            result, scheduled = ledger.request_worker_recovery(username, body.command_id, worker_id, "release")
-            if scheduled:
-                asyncio.create_task(
-                    _release_frozen_worker(
-                        ledger, worker_connections, worker_execution_locks, worker_id, result, username,
-                        admin_notification_connections,
-                    )
-                )
-            return result
-        except LedgerError as error:
-            raise HTTPException(status_code=_ledger_error_status(error), detail=str(error)) from error
-
     @app.get("/api/admin/alerts")
     def list_alerts(
         abt_admin_session: Annotated[str | None, Cookie()] = None,
@@ -1539,6 +1359,9 @@ def create_app(
             _create_pki_backup(backup_manager)
         except LedgerError as error:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
+        await _automatically_converge_accounts(
+            ledger, worker_connections, worker_execution_locks, [worker_id]
+        )
         connections = tuple(worker_connections.pop(worker_id, set()))
         await asyncio.gather(
             *(connection.websocket.close(code=status.WS_1008_POLICY_VIOLATION) for connection in connections),
@@ -1805,9 +1628,39 @@ def create_app(
                                     cancellation.intent_id, preflight,
                                 )
                             )
+                    elif payload.get("type") == "hedged_entry":
+                        result = await _execute_hedged_entry(
+                            ledger,
+                            worker_connections,
+                            worker_execution_locks,
+                            trader.trader_id,
+                            message["command_id"],
+                            payload,
+                        )
+                        await connection.send_json(
+                            {
+                                "type": "trader_command_result",
+                                "request_id": message["command_id"],
+                                "result": result,
+                            }
+                        )
+                    elif payload.get("type") == "protected_pair":
+                        if set(payload) != {"type", "pair_id", "legs"} or not isinstance(payload.get("pair_id"), str) or not isinstance(payload.get("legs"), list):
+                            raise ValueError("Invalid protected recovery pair command.")
+                        result = ledger.register_protected_pair(
+                            trader.trader_id, payload["pair_id"], cast(list[dict[str, object]], payload["legs"])
+                        )
+                        await connection.send_json(
+                            {
+                                "type": "trader_command_result",
+                                "request_id": message["command_id"],
+                                "result": result,
+                            }
+                        )
                     else:
                         raise ValueError("Invalid Trader command.")
-                    await websocket.send_json(result)
+                    if payload.get("type") not in {"hedged_entry", "protected_pair"}:
+                        await websocket.send_json(result)
                     await deliver_events_after(last_delivered_event_id)
                 else:
                     raise ValueError("Invalid Trader message.")
@@ -1950,24 +1803,27 @@ def create_app(
                     await websocket.send_json(
                         {"type": "password", "password": secret_store.read_password(worker.password_secret_ref)}
                     )
+                elif (
+                    message_type == "recovery_sync"
+                    and set(request) == {"type", "epoch", "journal"}
+                    and isinstance(request.get("epoch"), str)
+                    and request["epoch"]
+                    and isinstance(request.get("journal"), list)
+                    and all(isinstance(item, dict) for item in request["journal"])
+                ):
+                    ledger.record_worker_recovery_sync(worker.worker_id, request["epoch"], request["journal"])
+                    await websocket.send_json({"type": "recovery_sync_accepted", "epoch": request["epoch"]})
                 elif message_type == "heartbeat" and set(request) == {"type"}:
                     ledger.record_worker_heartbeat(worker.worker_id)
                     await websocket.send_json({"type": "heartbeat_ack"})
                 elif (
-                    message_type == "safety_state"
+                    message_type == "recovery_state"
                     and set(request) == {"type", "state", "reason"}
                     and isinstance(request.get("state"), str)
                     and isinstance(request.get("reason"), str)
                     and request["reason"]
                 ):
-                    if request["state"] == "frozen":
-                        ledger.freeze_worker_and_active_counterparts(
-                            worker.worker_id,
-                            "worker_reported_safety_state",
-                            {"reason": request["reason"]},
-                        )
-                    else:
-                        ledger.record_worker_safety_state(worker.worker_id, request["state"], request["reason"])
+                    ledger.report_worker_recovery_state(worker.worker_id, request["state"], request["reason"])
                     await websocket.send_json({"type": "accepted", "state": request["state"]})
                     await _broadcast_management_snapshot(ledger, admin_notification_connections)
                 elif message_type == "live_state_snapshot":
@@ -1988,14 +1844,17 @@ def create_app(
                 elif message_type == "snapshot":
                     _record_snapshot(ledger, worker.worker_id, request)
                     await websocket.send_json({"type": "accepted", "cursor": request["cursor"]})
-                    await _broadcast_management_snapshot(ledger, admin_notification_connections)
                     asyncio.create_task(
-                        _fail_undispatched_accepted_intents_after_startup_reconciliation(
-                            ledger, startup_reconciliation_started_at, worker_connections, worker_execution_locks
+                        _automatically_converge_accounts(
+                            ledger,
+                            worker_connections,
+                            worker_execution_locks,
+                            ledger.recovery_incident_workers(worker.worker_id),
                         )
                     )
+                    await _broadcast_management_snapshot(ledger, admin_notification_connections)
                     asyncio.create_task(
-                        _recover_manual_trades_after_startup_reconciliation(
+                        _resolve_interrupted_intents_after_startup_reconciliation(
                             ledger, startup_reconciliation_started_at, worker_connections, worker_execution_locks
                         )
                     )
@@ -2034,7 +1893,7 @@ def create_app(
                     disposition="superseded" if connection.superseded else "disconnected",
                 )
             if "worker" in locals() and not ("connection" in locals() and connection.superseded):
-                _freeze_worker_session(
+                _handle_worker_disconnect(
                     ledger,
                     worker.worker_id,
                     "worker_session_disconnected",
@@ -2052,7 +1911,7 @@ def create_app(
                     disposition="superseded" if connection.superseded else "failed",
                 )
             if "worker" in locals() and not ("connection" in locals() and connection.superseded):
-                _freeze_worker_session(
+                _handle_worker_disconnect(
                     ledger,
                     worker.worker_id,
                     "worker_session_failure",
@@ -2070,7 +1929,7 @@ def create_app(
                     disposition="superseded" if connection.superseded else "failed",
                 )
             if "worker" in locals() and not ("connection" in locals() and connection.superseded):
-                _freeze_worker_session(
+                _handle_worker_disconnect(
                     ledger,
                     worker.worker_id,
                     "worker_session_failure",
@@ -2099,8 +1958,8 @@ def create_app(
             return FileResponse(spa_directory / "index.html")
 
         for spa_route in (
-            "/analysis", "/analysis/{analysis_path:path}", "/audit", "/workers", "/worker-recovery", "/traders", "/intents",
-            "/manual-trading", "/pairs/{pair_status:path}",
+            "/analysis", "/analysis/{analysis_path:path}", "/audit", "/workers", "/traders", "/intents",
+            "/pairs/{pair_status:path}",
         ):
             app.add_api_route(spa_route, management_spa_route, methods=["GET"], include_in_schema=False)
 
@@ -2294,7 +2153,9 @@ async def _mediate_trader_worker_request(
         return recorded
     try:
         connection = _connected_worker_session(worker_connections, worker_id, reason="Selected worker is disconnected.")
+
         async def dispatch() -> dict[str, object]:
+            expires_at = datetime.now(UTC) + timedelta(seconds=30)
             return await _request_worker_analysis(
                 connection,
                 analysis_id="trader_rpc",
@@ -2303,8 +2164,15 @@ async def _mediate_trader_worker_request(
                 message={
                     "type": "trader_rpc_request",
                     "request_id": request_id,
+                    "command_id": request_id,
                     "kind": kind,
                     "payload": request_payload,
+                    "payload_hash": hashlib.sha256(
+                        json.dumps(request_payload, separators=(",", ":"), sort_keys=True, ensure_ascii=False).encode()
+                    ).hexdigest(),
+                    "priority": _trader_rpc_priority(kind, request_payload),
+                    "expires_at": expires_at.isoformat(),
+                    "correlation": {"trader_id": trader_id, "request_id": request_id},
                 },
             )
         response = (
@@ -2318,14 +2186,48 @@ async def _mediate_trader_worker_request(
         result = response.get("result") if accepted else {"reason": _required_text(response, "reason")}
         if not isinstance(result, dict):
             raise LedgerError("Worker returned an invalid Trader RPC response.")
+        if kind == "operation" and not accepted and str(result.get("reason", "")).startswith("unknown_after_send:"):
+            ledger.begin_empty_convergence(
+                [worker_id],
+                "trader_worker_operation_unknown",
+                {"trader_id": trader_id, "request_id": request_id, "reason": result["reason"]},
+            )
+            result["contained"] = True
         return ledger.complete_trader_worker_rpc(trader_id, request_id, accepted=accepted, result=result)
-    except (asyncio.TimeoutError, LedgerError) as error:
+    except asyncio.TimeoutError:
+        result: dict[str, object] = {
+            "reason": "Worker did not complete the Trader request.",
+            "retryable": kind == "read",
+        }
+        if kind == "operation":
+            ledger.begin_empty_convergence(
+                [worker_id],
+                "trader_worker_operation_unknown",
+                {"trader_id": trader_id, "request_id": request_id, "reason": result["reason"]},
+            )
+            result["contained"] = True
+        return ledger.complete_trader_worker_rpc(trader_id, request_id, accepted=False, result=result)
+    except LedgerError as error:
         return ledger.complete_trader_worker_rpc(
             trader_id,
             request_id,
             accepted=False,
-            result={"reason": "Worker did not complete the Trader request." if isinstance(error, asyncio.TimeoutError) else str(error)},
+            result={
+                "reason": str(error),
+                "retryable": True,
+            },
         )
+
+
+def _trader_rpc_priority(kind: str, payload: dict[str, object]) -> str:
+    if kind == "operation":
+        if payload.get("type") in {"market", "pending"}:
+            return "execution"
+        if payload.get("type") in {"cancel", "close", "modify_sl_tp"}:
+            return "protection"
+    if payload.get("type") in {"calc_margin", "calc_margin_batch", "symbols", "historical_ticks"}:
+        return "background"
+    return "normal"
 
 
 async def _with_worker_execution_lock(
@@ -2422,7 +2324,9 @@ def _record_order_execute_response(connection: _WorkerSessionConnection, request
     pending = connection.pending.pop(request_id, None)
     if pending is None:
         return
-    if pending.stage != "order_execute" or set(request) != {"type", "request_id", "accepted", "order", "result"}:
+    required = {"type", "request_id", "accepted", "order", "result"}
+    allowed = required | {"execution_state", "outcome"}
+    if pending.stage != "order_execute" or not required.issubset(request) or not set(request).issubset(allowed):
         raise ValueError("Invalid worker order execution response.")
     if not pending.future.done():
         pending.future.set_result(request)
@@ -2458,8 +2362,14 @@ def _record_execution_recovery_response(connection: _WorkerSessionConnection, re
     pending = connection.pending.pop(request_id, None)
     if pending is None:
         return
-    if pending.stage not in {"execution_reconcile", "manual_position_reconcile", "execution_cancel", "execution_close", "worker_cleanup_reconcile",
-                             "worker_cleanup_cancel", "worker_cleanup_close"} or set(request) != {
+    if pending.stage not in {
+        "execution_reconcile",
+        "execution_cancel",
+        "execution_close",
+        "account_recovery_reconcile",
+        "account_recovery_cancel",
+        "account_recovery_close",
+    } or set(request) != {
         "type", "request_id", "operation", "accepted", "result"
     } or request["operation"] != pending.stage or not isinstance(request["accepted"], bool) or not isinstance(request["result"], dict):
         raise ValueError("Invalid worker execution recovery response.")
@@ -2472,8 +2382,14 @@ def _record_execution_recovery_error(connection: _WorkerSessionConnection, reque
     pending = connection.pending.pop(request_id, None)
     if pending is None:
         return
-    if pending.stage not in {"execution_reconcile", "manual_position_reconcile", "execution_cancel", "execution_close", "worker_cleanup_reconcile",
-                             "worker_cleanup_cancel", "worker_cleanup_close"} or set(request) != {
+    if pending.stage not in {
+        "execution_reconcile",
+        "execution_cancel",
+        "execution_close",
+        "account_recovery_reconcile",
+        "account_recovery_cancel",
+        "account_recovery_close",
+    } or set(request) != {
         "type", "request_id", "operation", "reason"
     } or request["operation"] != pending.stage:
         raise ValueError("Invalid worker execution recovery error.")
@@ -2775,6 +2691,387 @@ async def _pair_worker_execution(
         ordered[0][1].release()
 
 
+async def _execute_hedged_entry(
+    ledger: ControlLedger,
+    worker_connections: dict[str, set[_WorkerSessionConnection]],
+    worker_execution_locks: dict[str, asyncio.Lock],
+    trader_id: str,
+    command_id: str,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Synchronously preflight and dispatch a market hedge as one isolated pair operation."""
+
+    locks = getattr(ledger, "_hedged_entry_command_locks", None)
+    if locks is None:
+        locks = {}
+        setattr(ledger, "_hedged_entry_command_locks", locks)
+    lock = locks.setdefault(f"{trader_id}:{command_id}", asyncio.Lock())
+    async with lock:
+        return await _execute_hedged_entry_locked(
+            ledger, worker_connections, worker_execution_locks, trader_id, command_id, payload
+        )
+
+
+async def _execute_hedged_entry_locked(
+    ledger: ControlLedger,
+    worker_connections: dict[str, set[_WorkerSessionConnection]],
+    worker_execution_locks: dict[str, asyncio.Lock],
+    trader_id: str,
+    command_id: str,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Keep complete pair execution and idempotency checks behind the HedgedEntry module."""
+
+    started_at = datetime.now(UTC)
+    started_monotonic = monotonic()
+    worker_ids: list[str] = []
+    outcomes: list[dict[str, object]] = []
+    dispatch_started = False
+    try:
+        command = HedgedEntryPayload.model_validate(payload)
+        legs = [command.first, command.second]
+        worker_ids = [leg.worker_id for leg in legs]
+        existing, started = ledger.begin_hedged_entry_command(trader_id, command_id, payload)
+        if not started:
+            if existing is None:
+                raise LedgerError("Hedged entry command recovery returned no durable state.")
+            if existing.get("status") != "in_progress":
+                return existing
+            reason = "Hedged entry was already in progress when controller recovery resumed."
+            _start_hedged_entry_recovery(ledger, worker_ids, trader_id, command_id, reason, outcomes)
+            return _record_hedged_entry_result(
+                ledger,
+                trader_id,
+                command_id,
+                payload,
+                _hedged_entry_result(command_id, "contained", reason, outcomes, started_at, started_monotonic),
+            )
+        remaining_seconds = (command.expires_at - datetime.now(UTC)).total_seconds()
+        if remaining_seconds <= 0:
+            raise LedgerError("Hedged entry expiry has passed.")
+        deadline = monotonic() + remaining_seconds
+        orders = [_hedged_market_order(leg) for leg in legs]
+        async with _pair_worker_execution(worker_execution_locks, *worker_ids):
+            try:
+                existing = ledger.trader_command_result(trader_id, command_id, payload)
+            except LedgerError as error:
+                return {
+                    "type": "command_result",
+                    "command_id": command_id,
+                    "status": "rejected_preflight",
+                    "reason": str(error),
+                    "legs": [],
+                }
+            if existing is not None and existing.get("status") != "in_progress":
+                return existing
+            ledger.active_trader(trader_id)
+            recovering_worker_ids = ledger.recovery_admission_blocked(worker_ids)
+            if recovering_worker_ids:
+                raise LedgerError(
+                    f"Worker recovery is incomplete: {', '.join(sorted(recovering_worker_ids))}."
+                )
+            connections = [
+                _connected_worker_session(
+                    worker_connections, worker_id, reason="Selected worker disconnected before market preflight."
+                )
+                for worker_id in worker_ids
+            ]
+            outcomes = [
+                {"worker_id": worker_id, "order": order, "preflight": {"status": "not_started"}, "dispatch": {"status": "not_started"}}
+                for worker_id, order in zip(worker_ids, orders, strict=True)
+            ]
+            preflight_started = monotonic()
+            preflight_timeout = _hedged_remaining_timeout(deadline)
+            preflight_responses = await asyncio.gather(
+                *(
+                    _timed_hedged_request(
+                        _request_order_check,
+                        connection,
+                        order,
+                        timeout=preflight_timeout,
+                        expires_at=command.expires_at,
+                    )
+                    for connection, order in zip(connections, orders, strict=True)
+                )
+            )
+            for index, (outcome, response) in enumerate(zip(outcomes, preflight_responses, strict=True)):
+                outcome["preflight"] = _hedged_preflight_outcome(
+                    response[0],
+                    cast(dict[str, object], outcome["order"]),
+                    legs[index].margin_limit,
+                    response[1],
+                )
+            preflight_elapsed_ms = _elapsed_ms(preflight_started)
+            if any(cast(dict[str, object], outcome["preflight"])["status"] != "accepted" for outcome in outcomes):
+                return _record_hedged_entry_result(
+                    ledger,
+                    trader_id,
+                    command_id,
+                    payload,
+                    _hedged_entry_result(
+                        command_id,
+                        "rejected_preflight",
+                        "Both fresh broker order checks must accept margin within the supplied hard limit.",
+                        outcomes,
+                        started_at,
+                        started_monotonic,
+                        preflight_elapsed_ms=preflight_elapsed_ms,
+                    ),
+                )
+            dispatch_timeout = _hedged_remaining_timeout(deadline)
+            dispatch_started = True
+            dispatch_started_at = monotonic()
+            dispatch_responses = await asyncio.gather(
+                *(
+                    _timed_hedged_request(
+                        _request_order_execute,
+                        connection,
+                        order,
+                        timeout=dispatch_timeout,
+                        expires_at=command.expires_at,
+                        effect_id=f"{command_id}:{worker_id}:market",
+                    )
+                    for connection, order, worker_id in zip(connections, orders, worker_ids, strict=True)
+                )
+            )
+            for outcome, response in zip(outcomes, dispatch_responses, strict=True):
+                outcome["dispatch"] = _hedged_dispatch_outcome(
+                    response[0], cast(dict[str, object], outcome["order"]), response[1]
+                )
+            dispatch_elapsed_ms = _elapsed_ms(dispatch_started_at)
+            if any(cast(dict[str, object], outcome["dispatch"])["status"] != "accepted" for outcome in outcomes):
+                reason = "A market-leg outcome was failed or unknown after paired dispatch."
+                _start_hedged_entry_recovery(ledger, worker_ids, trader_id, command_id, reason, outcomes)
+                asyncio.create_task(
+                    _automatically_converge_accounts(ledger, worker_connections, worker_execution_locks, worker_ids)
+                )
+                return _record_hedged_entry_result(
+                    ledger,
+                    trader_id,
+                    command_id,
+                    payload,
+                    _hedged_entry_result(
+                        command_id,
+                        "contained",
+                        reason,
+                        outcomes,
+                        started_at,
+                        started_monotonic,
+                        preflight_elapsed_ms=preflight_elapsed_ms,
+                        dispatch_elapsed_ms=dispatch_elapsed_ms,
+                    ),
+                )
+            return _record_hedged_entry_result(
+                ledger,
+                trader_id,
+                command_id,
+                payload,
+                _hedged_entry_result(
+                    command_id,
+                    "accepted",
+                    None,
+                    outcomes,
+                    started_at,
+                    started_monotonic,
+                    preflight_elapsed_ms=preflight_elapsed_ms,
+                    dispatch_elapsed_ms=dispatch_elapsed_ms,
+                ),
+            )
+    except (LedgerError, ValidationError, ValueError, asyncio.TimeoutError) as error:
+        reason = str(error) or "The controller rejected the hedged entry."
+        if dispatch_started and worker_ids:
+            _start_hedged_entry_recovery(ledger, worker_ids, trader_id, command_id, reason, outcomes)
+            asyncio.create_task(
+                _automatically_converge_accounts(ledger, worker_connections, worker_execution_locks, worker_ids)
+            )
+        result = _hedged_entry_result(
+            command_id,
+            "contained" if dispatch_started and worker_ids else "rejected_preflight",
+            reason,
+            outcomes,
+            started_at,
+            started_monotonic,
+        )
+        try:
+            return _record_hedged_entry_result(ledger, trader_id, command_id, payload, result)
+        except LedgerError as record_error:
+            return _hedged_entry_result(
+                command_id,
+                "rejected_preflight",
+                str(record_error),
+                outcomes,
+                started_at,
+                started_monotonic,
+            )
+
+
+async def _timed_hedged_request(
+    request: Callable[..., Any], connection: _WorkerSessionConnection, order: dict[str, object], **kwargs: object
+) -> tuple[dict[str, object] | Exception, int]:
+    started = monotonic()
+    try:
+        return await request(connection, order, **kwargs), _elapsed_ms(started)
+    except Exception as error:
+        return error, _elapsed_ms(started)
+
+
+def _hedged_remaining_timeout(deadline: float) -> float:
+    remaining_seconds = deadline - monotonic()
+    if remaining_seconds <= 0:
+        raise LedgerError("Hedged entry expiry has passed before broker dispatch.")
+    return min(30.0, remaining_seconds)
+
+
+def _hedged_market_order(leg: HedgedEntryLegPayload) -> dict[str, object]:
+    return {
+        "action": "market",
+        "symbol": leg.symbol,
+        "volume": str(leg.volume),
+        "direction": leg.direction,
+        "filling_mode": leg.filling_mode,
+    }
+
+
+def _hedged_preflight_outcome(
+    response: dict[str, object] | Exception,
+    order: dict[str, object],
+    margin_limit: Decimal,
+    elapsed_ms: int,
+) -> dict[str, object]:
+    if isinstance(response, Exception):
+        return {
+            "status": "rejected",
+            "reason": str(response) or "Worker preflight did not produce a conclusive result.",
+            "elapsed_ms": elapsed_ms,
+        }
+    if not _valid_order_check_response(response, order):
+        return {"status": "malformed", "response": response, "elapsed_ms": elapsed_ms}
+    if response.get("outcome") == "expired_not_started" and response.get("execution_state") == "not_started":
+        return {
+            "status": "expired_not_started",
+            "reason": "Worker deadline elapsed before broker order check.",
+            "response": response,
+            "elapsed_ms": elapsed_ms,
+        }
+    diagnostics = response.get("diagnostics")
+    margin = diagnostics.get("margin") if isinstance(diagnostics, dict) else None
+    if (
+        isinstance(margin, bool)
+        or not isinstance(margin, (int, float))
+        or not math.isfinite(margin)
+        or margin < 0
+    ):
+        return {
+            "status": "rejected",
+            "reason": "Broker order check did not return a usable margin.",
+            "response": response,
+            "elapsed_ms": elapsed_ms,
+        }
+    if Decimal(str(margin)) > margin_limit:
+        return {
+            "status": "rejected",
+            "reason": f"Broker order-check margin {margin} exceeds the hard limit {margin_limit}.",
+            "response": response,
+            "elapsed_ms": elapsed_ms,
+        }
+    if response["accepted"] is not True:
+        return {"status": "rejected", "response": response, "elapsed_ms": elapsed_ms}
+    return {"status": "accepted", "response": response, "margin": margin, "elapsed_ms": elapsed_ms}
+
+
+def _hedged_dispatch_outcome(
+    response: dict[str, object] | Exception, order: dict[str, object], elapsed_ms: int
+) -> dict[str, object]:
+    if isinstance(response, Exception):
+        return {
+            "status": "unknown",
+            "reason": str(response) or "Worker market-send outcome is unknown.",
+            "elapsed_ms": elapsed_ms,
+        }
+    if response.get("type") != "order_execute_response" or response.get("order") != order or not isinstance(response.get("result"), dict):
+        return {"status": "rejected", "response": response, "elapsed_ms": elapsed_ms}
+    if response.get("accepted") is not True:
+        if response.get("outcome") == "expired_not_started" and response.get("execution_state") == "not_started":
+            return {
+                "status": "expired_not_started",
+                "reason": "Worker deadline elapsed before broker market send.",
+                "response": response,
+                "elapsed_ms": elapsed_ms,
+            }
+        if response.get("outcome") == "unknown_after_send" and response.get("execution_state") == "sent":
+            return {
+                "status": "unknown",
+                "reason": "Worker lost the broker market-send response.",
+                "response": response,
+                "elapsed_ms": elapsed_ms,
+            }
+        return {"status": "rejected", "response": response, "elapsed_ms": elapsed_ms}
+    return {"status": "accepted", "response": response, "elapsed_ms": elapsed_ms}
+
+
+def _hedged_entry_result(
+    command_id: str,
+    status_value: str,
+    reason: str | None,
+    outcomes: list[dict[str, object]],
+    started_at: datetime,
+    started_monotonic: float,
+    *,
+    preflight_elapsed_ms: int | None = None,
+    dispatch_elapsed_ms: int | None = None,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "type": "command_result",
+        "command_id": command_id,
+        "status": status_value,
+        "legs": outcomes,
+        "timings": {
+            "started_at": started_at.isoformat(),
+            "completed_at": datetime.now(UTC).isoformat(),
+            "elapsed_ms": _elapsed_ms(started_monotonic),
+        },
+        "preflight_notice": "Broker order checks do not reserve liquidity or guarantee later execution.",
+    }
+    if preflight_elapsed_ms is not None:
+        result["timings"]["preflight_elapsed_ms"] = preflight_elapsed_ms
+    if dispatch_elapsed_ms is not None:
+        result["timings"]["dispatch_elapsed_ms"] = dispatch_elapsed_ms
+    if reason is not None:
+        result["reason"] = reason
+    return result
+
+
+def _elapsed_ms(started_at: float) -> int:
+    return max(0, round((monotonic() - started_at) * 1000))
+
+
+def _start_hedged_entry_recovery(
+    ledger: ControlLedger,
+    worker_ids: list[str],
+    trader_id: str,
+    command_id: str,
+    reason: str,
+    outcomes: list[dict[str, object]],
+) -> None:
+    audit = {
+        "trader_id": trader_id,
+        "command_id": command_id,
+        "reason": reason,
+        "legs": outcomes,
+    }
+    ledger.begin_empty_convergence(worker_ids, "hedged_entry_execution_anomaly", audit)
+
+
+def _record_hedged_entry_result(
+    ledger: ControlLedger,
+    trader_id: str,
+    command_id: str,
+    payload: dict[str, Any],
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    return ledger.record_hedged_entry_command(trader_id, command_id, payload, result)
+
+
 async def _preflight_trader_intent(
     ledger: ControlLedger,
     worker_connections: dict[str, set[_WorkerSessionConnection]],
@@ -2835,10 +3132,10 @@ async def _preflight_intent(
             raise LedgerError("Intent filling mode is not supported by both endpoints.")
         sources = cast(dict[str, dict[str, Any]], pair["source_workers"])
         workers = [sources["first_worker"], sources["second_worker"]]
-        frozen_worker_ids = ledger.frozen_worker_ids([str(worker["worker_id"]) for worker in workers])
-        if frozen_worker_ids:
+        recovering_worker_ids = ledger.recovery_admission_blocked([str(worker["worker_id"]) for worker in workers])
+        if recovering_worker_ids:
             raise LedgerError(
-                f"Frozen worker cannot be selected for a new trade: {', '.join(sorted(frozen_worker_ids))}."
+                f"Worker recovery is incomplete: {', '.join(sorted(recovering_worker_ids))}."
             )
         endpoint_by_server = {str(item["server"]): item for item in specifications}
         if set(endpoint_by_server) != {str(worker["server"]) for worker in workers}:
@@ -2957,10 +3254,10 @@ async def _dispatch_accepted_trader_intent(
             for worker_id in worker_ids
         ]
         async with _pair_worker_execution(worker_execution_locks, *worker_ids):
-            frozen_worker_ids = ledger.frozen_worker_ids(worker_ids)
-            if frozen_worker_ids:
+            recovering_worker_ids = ledger.recovery_admission_blocked(worker_ids)
+            if recovering_worker_ids:
                 raise LedgerError(
-                    f"Frozen worker cannot receive a new trade: {', '.join(sorted(frozen_worker_ids))}."
+                    f"Worker recovery is incomplete: {', '.join(sorted(recovering_worker_ids))}."
                 )
             responses = await asyncio.gather(
                 *(
@@ -2970,7 +3267,7 @@ async def _dispatch_accepted_trader_intent(
                 return_exceptions=True,
             )
     except LedgerError as error:
-        _freeze_intent_execution(ledger, intent_id, str(error), worker_ids)
+        _start_intent_account_recovery(ledger, intent_id, str(error), worker_ids)
         return
 
     accepted = True
@@ -2991,7 +3288,7 @@ async def _dispatch_accepted_trader_intent(
 
     if not accepted:
         ledger.record_intent_execution(intent_id, "incomplete_entry_detected", {}, status="working")
-        _freeze_intent_execution(
+        _start_intent_account_recovery(
             ledger,
             intent_id,
             f"Incomplete {filling_mode} entry requires worker isolation.",
@@ -3006,270 +3303,6 @@ async def _dispatch_accepted_trader_intent(
             {"notice": "Matched volume is established only by reconciliation; placement acknowledgements are not fills."},
             status="working",
         )
-
-
-async def _dispatch_manual_trade(
-    ledger: ControlLedger,
-    worker_connections: dict[str, set[_WorkerSessionConnection]],
-    worker_execution_locks: dict[str, asyncio.Lock],
-    manual_trade_id: str,
-) -> None:
-    """Dispatch a manual market pair sequentially, protecting every fill before waiting."""
-
-    if not ledger.claim_manual_trade_dispatch(manual_trade_id):
-        return
-    plan = ledger.manual_trade_plan(manual_trade_id)
-    legs = cast(list[dict[str, object]], plan["legs"])
-    worker_ids = [str(leg["worker_id"]) for leg in legs]
-    try:
-        if len(legs) != 2 or len(set(worker_ids)) != 2:
-            raise LedgerError("Manual trade has invalid leg evidence.")
-        async with _pair_worker_execution(worker_execution_locks, *worker_ids):
-            if ledger.frozen_worker_ids(worker_ids):
-                raise LedgerError("A selected worker is frozen before manual-trade dispatch.")
-            connections = [
-                _connected_worker_session(worker_connections, worker_id, reason="Selected worker disconnected before dispatch.")
-                for worker_id in worker_ids
-            ]
-            first_order = _manual_market_order(legs[0])
-            first_response = await _request_order_execute(connections[0], first_order)
-            first_evidence = _manual_market_order_evidence(first_response, first_order)
-            first_market_order_ticket = first_evidence["market_order_ticket"]
-            first_position_ticket = first_evidence["position_ticket"]
-            first_fill = cast(Decimal, first_evidence["fill_price"])
-            first_protection = _manual_protection_order(legs[0], first_position_ticket, first_fill)
-            protection_response = await _request_order_execute(connections[0], first_protection)
-            if protection_response.get("accepted") is not True or protection_response.get("order") != first_protection:
-                raise LedgerError("First manual-trade leg protection was not confirmed.")
-            ledger.record_manual_trade_event(
-                manual_trade_id,
-                "manual_trade_first_leg_protected",
-                {
-                    "leg": legs[0],
-                    "market_order_ticket": first_market_order_ticket,
-                    "position_ticket": first_position_ticket,
-                    "fill_price": str(first_fill),
-                    "protection": first_protection,
-                    "reconciliation": first_evidence["reconciliation"],
-                },
-            )
-            await asyncio.sleep(int(plan["interval_seconds"]))
-            second_order = _manual_market_order(legs[1])
-            second_response = await _request_order_execute(connections[1], second_order)
-            second_evidence = _manual_market_order_evidence(second_response, second_order)
-            second_market_order_ticket = second_evidence["market_order_ticket"]
-            second_position_ticket = second_evidence["position_ticket"]
-            second_fill = cast(Decimal, second_evidence["fill_price"])
-            second_protection = _manual_protection_order(legs[1], second_position_ticket, second_fill)
-            second_protection_response = await _request_order_execute(connections[1], second_protection)
-            if second_protection_response.get("accepted") is not True or second_protection_response.get("order") != second_protection:
-                raise LedgerError("Second manual-trade leg protection was not confirmed.")
-            ledger.activate_manual_trade(
-                manual_trade_id,
-                [
-                    {
-                        "worker_id": str(legs[0]["worker_id"]),
-                        "market_order_ticket": first_market_order_ticket,
-                        "position_ticket": first_position_ticket,
-                        "fill_price": str(first_fill),
-                        "reconciliation": first_evidence["reconciliation"],
-                    },
-                    {
-                        "worker_id": str(legs[1]["worker_id"]),
-                        "market_order_ticket": second_market_order_ticket,
-                        "position_ticket": second_position_ticket,
-                        "fill_price": str(second_fill),
-                        "reconciliation": second_evidence["reconciliation"],
-                    },
-                ],
-            )
-            ledger.record_manual_trade_event(
-                manual_trade_id,
-                "manual_trade_active",
-                {
-                    "first_leg": {
-                        "market_order_ticket": first_market_order_ticket,
-                        "position_ticket": first_position_ticket,
-                        "fill_price": str(first_fill),
-                        "protection": first_protection,
-                        "reconciliation": first_evidence["reconciliation"],
-                    },
-                    "second_leg": {
-                        "market_order_ticket": second_market_order_ticket,
-                        "position_ticket": second_position_ticket,
-                        "fill_price": str(second_fill),
-                        "protection": second_protection,
-                        "reconciliation": second_evidence["reconciliation"],
-                    },
-                },
-            )
-    except (KeyError, LedgerError, ValueError, asyncio.TimeoutError) as error:
-        _freeze_manual_trade(ledger, manual_trade_id, worker_ids, str(error))
-
-
-def _manual_market_order(leg: dict[str, object]) -> dict[str, object]:
-    return {
-        "action": "market",
-        "symbol": str(leg["symbol"]),
-        "volume": str(leg["lots"]),
-        "direction": "LONG" if leg["direction"] == "BUY" else "SHORT",
-        "filling_mode": "FOK",
-    }
-
-
-def _manual_market_order_evidence(response: dict[str, object], order: dict[str, object]) -> dict[str, object]:
-    if response.get("accepted") is not True or response.get("order") != order or not isinstance(response.get("result"), dict):
-        raise LedgerError("Manual-trade market order was not confirmed.")
-    ticket = response["result"].get("order")
-    if isinstance(ticket, bool) or not isinstance(ticket, (str, int)):
-        raise LedgerError("Manual-trade market order did not return a broker order ticket.")
-    try:
-        normalized_ticket = int(ticket)
-    except ValueError as error:
-        raise LedgerError("Manual-trade market order did not return a broker order ticket.") from error
-    if normalized_ticket <= 0:
-        raise LedgerError("Manual-trade market order did not return a broker order ticket.")
-    position = response["result"].get("position")
-    if not isinstance(position, dict):
-        raise LedgerError("Manual-trade market order did not return confirmed position evidence.")
-    try:
-        position_ticket = int(position["ticket"])
-        fill_price = Decimal(str(position["price_open"]))
-    except (KeyError, ValueError, ArithmeticError) as error:
-        raise LedgerError("Manual-trade market order did not return a position fill price.") from error
-    if position_ticket <= 0:
-        raise LedgerError("Manual-trade market order did not return a position ticket.")
-    if not fill_price.is_finite() or fill_price <= 0:
-        raise LedgerError("Manual-trade market order did not return a positive position fill price.")
-    return {
-        "market_order_ticket": str(normalized_ticket),
-        "position_ticket": str(position_ticket),
-        "fill_price": fill_price,
-        "reconciliation": {
-            "observed_at": datetime.now(UTC).isoformat(),
-            "position": position,
-        },
-    }
-
-
-def _manual_protection_order(
-    leg: dict[str, object], position_ticket: str, fill_price: Decimal
-) -> dict[str, object]:
-    pip_size = Decimal(str(leg["pip_size"]))
-    stop_loss_pips = Decimal(str(cast(dict[str, object], leg).get("stop_loss_pips", "0")))
-    take_profit_pips = Decimal(str(cast(dict[str, object], leg).get("take_profit_pips", "0")))
-    if stop_loss_pips <= 0 or take_profit_pips <= 0:
-        raise LedgerError("Manual-trade protection distances are invalid.")
-    buy = leg["direction"] == "BUY"
-    return {
-        "action": "protect",
-        "symbol": str(leg["symbol"]),
-        "position": position_ticket,
-        "sl": str(fill_price - stop_loss_pips * pip_size if buy else fill_price + stop_loss_pips * pip_size),
-        "tp": str(fill_price + take_profit_pips * pip_size if buy else fill_price - take_profit_pips * pip_size),
-    }
-
-
-def _freeze_manual_trade(ledger: ControlLedger, manual_trade_id: str, worker_ids: list[str], reason: str) -> None:
-    _LOGGER.warning("Manual trade %s froze its participating workers: %s", manual_trade_id, reason)
-    ledger.record_manual_trade_event(
-        manual_trade_id, "manual_trade_execution_frozen", {"reason": reason}, status="needs_human"
-    )
-    if worker_ids:
-        ledger.freeze_workers(
-            "manual_trade_execution_anomaly", worker_ids, {"manual_trade_id": manual_trade_id, "reason": reason}
-        )
-
-
-async def _dispatch_manual_trade_operation(
-    ledger: ControlLedger,
-    worker_connections: dict[str, set[_WorkerSessionConnection]],
-    worker_execution_locks: dict[str, asyncio.Lock],
-    operation_id: str,
-) -> None:
-    if not ledger.claim_manual_trade_operation_dispatch(operation_id):
-        return
-    record = ledger.manual_trade_operation(operation_id)
-    plan = cast(dict[str, object], record["plan"])
-    legs = cast(list[dict[str, object]], plan["legs"])
-    worker_ids = [str(leg["worker_id"]) for leg in legs]
-    try:
-        if len(legs) != 2 or len(set(worker_ids)) != 2:
-            raise LedgerError("Manual-trade operation has invalid leg evidence.")
-        async with _pair_worker_execution(worker_execution_locks, *worker_ids):
-            if ledger.frozen_worker_ids(worker_ids):
-                raise LedgerError("A participating worker is frozen.")
-            connections = [
-                _connected_worker_session(worker_connections, worker_id, reason="Participating worker disconnected.")
-                for worker_id in worker_ids
-            ]
-            observed = await _reconcile_manual_positions(connections, [str(leg["position"]) for leg in legs])
-            positions: list[tuple[_WorkerSessionConnection, dict[str, str]]] = []
-            externally_closed = False
-            for connection, leg, observed_leg in zip(connections, legs, observed, strict=True):
-                position = next((item for item in observed_leg["positions"] if item["ticket"] == leg["position"]), None)
-                if position is None:
-                    externally_closed = True
-                    continue
-                positions.append((connection, position))
-            if record["operation"] == "exit":
-                responses = await asyncio.gather(*(
-                    _execution_recovery_request(
-                        connection, "execution_close", {"ticket": position["ticket"], "volume": position["volume"]}
-                    )
-                    for connection, position in positions
-                ))
-                if any(response.get("accepted") is not True for response in responses):
-                    raise LedgerError("Manual-trade exit was not confirmed for every remaining position.")
-                final = await _reconcile_manual_positions(connections, [str(leg["position"]) for leg in legs])
-                if any(leg["orders"] or leg["positions"] for leg in final):
-                    raise LedgerError("Manual-trade full exit did not prove zero exposure.")
-                if externally_closed:
-                    _freeze_manual_trade_operation(
-                        ledger,
-                        operation_id,
-                        record,
-                        worker_ids,
-                        "A manual-trade leg was already closed externally; the verified remaining positions were closed.",
-                    )
-                    return
-            else:
-                if externally_closed:
-                    raise LedgerError("Active manual-trade position could not be reconciled.")
-                orders = [
-                    {
-                        "action": "protect", "symbol": str(leg["symbol"]), "position": str(leg["position"]),
-                        "sl": str(leg["stop_loss"]), "tp": str(leg["take_profit"]),
-                    }
-                    for leg in legs
-                ]
-                responses = await asyncio.gather(*(
-                    _request_order_execute(connection, order) for connection, order in zip(connections, orders, strict=True)
-                ))
-                if any(response.get("accepted") is not True or response.get("order") != order
-                       for response, order in zip(responses, orders, strict=True)):
-                    raise LedgerError("Manual-trade protection update was not confirmed for both legs.")
-            ledger.record_manual_trade_operation(
-                operation_id, "manual_trade_operation_completed", {"plan": plan}, status="completed"
-            )
-    except (KeyError, LedgerError, ValueError, asyncio.TimeoutError) as error:
-        _freeze_manual_trade_operation(ledger, operation_id, record, worker_ids, str(error))
-
-
-def _freeze_manual_trade_operation(
-    ledger: ControlLedger,
-    operation_id: str,
-    record: dict[str, object],
-    worker_ids: list[str],
-    reason: str,
-) -> None:
-    ledger.record_manual_trade_operation(
-        operation_id, "manual_trade_operation_frozen", {"reason": reason}, status="needs_human"
-    )
-    ledger.freeze_workers(
-        "manual_trade_operation_anomaly", worker_ids,
-        {"manual_trade_id": record["manual_trade_id"], "operation_id": operation_id, "reason": reason},
-    )
 
 
 async def _cancel_intent(
@@ -3316,7 +3349,7 @@ async def _operate_on_intent_exposure(
                 ledger.record_intent_execution(
                     intent_id, "rejected_due_to_fill", {"execution_id": execution_id, "legs": observed}, status="working"
                 )
-                _freeze_intent_execution(
+                _start_intent_account_recovery(
                     ledger,
                     intent_id,
                     "Cancellation observed broker exposure.",
@@ -3338,25 +3371,18 @@ async def _operate_on_intent_exposure(
                 status="cancelled",
             )
     except (KeyError, LedgerError, ValueError, asyncio.TimeoutError) as error:
-        _freeze_intent_execution(ledger, intent_id, f"{operation} could not be proven safe: {error}", worker_ids)
+        _start_intent_account_recovery(ledger, intent_id, f"{operation} could not be proven safe: {error}", worker_ids)
         return
-def _freeze_intent_execution(
+
+
+def _start_intent_account_recovery(
     ledger: ControlLedger, intent_id: str, reason: str, worker_ids: list[str] | None = None
 ) -> None:
-    ledger.record_intent_execution(intent_id, "intent_execution_frozen", {"reason": reason}, status="needs_human")
-    if worker_ids:
-        freeze_workers = getattr(ledger, "freeze_workers", None)
-        if callable(freeze_workers):
-            freeze_workers(
-                "intent_execution_anomaly",
-                worker_ids,
-                {"intent_id": intent_id, "reason": reason},
-            )
-        return
-    freeze_intent_workers = getattr(ledger, "freeze_intent_workers", None)
-    if callable(freeze_intent_workers):
-        freeze_intent_workers(
-            intent_id,
+    ledger.record_intent_execution(intent_id, "intent_account_recovery_started", {"reason": reason}, status="needs_human")
+    affected_worker_ids = worker_ids or ledger.intent_worker_ids(intent_id)
+    if affected_worker_ids:
+        ledger.begin_empty_convergence(
+            affected_worker_ids,
             "intent_execution_anomaly",
             {"intent_id": intent_id, "reason": reason},
         )
@@ -3378,22 +3404,6 @@ async def _reconcile_execution(
     return legs
 
 
-async def _reconcile_manual_positions(
-    connections: list[_WorkerSessionConnection], position_tickets: list[str]
-) -> list[dict[str, list[dict[str, str]]]]:
-    responses = await asyncio.gather(*(
-        _execution_recovery_request(connection, "manual_position_reconcile", {"ticket": ticket})
-        for connection, ticket in zip(connections, position_tickets, strict=True)
-    ))
-    return [
-        {
-            "orders": _execution_records(response["result"].get("orders")),
-            "positions": _execution_records(response["result"].get("positions")),
-        }
-        for response in responses
-    ]
-
-
 async def _execution_recovery_request(
     connection: _WorkerSessionConnection, operation: str, payload: dict[str, str]
 ) -> dict[str, object]:
@@ -3407,88 +3417,63 @@ async def _execution_recovery_request(
     return response
 
 
-async def _worker_cleanup_request(
-    connection: _WorkerSessionConnection, operation: str, payload: dict[str, str] | None = None
-) -> dict[str, object]:
-    request_id = str(uuid4())
-    response = await _request_worker_analysis(
-        connection,
-        analysis_id=operation,
-        stage=operation,
-        timeout=30,
-        message={"type": f"{operation}_request", "request_id": request_id, **(payload or {})},
-    )
-    if response.get("accepted") is not True or response.get("operation") != operation:
-        raise LedgerError(f"Worker did not confirm {operation}.")
-    return response
+async def _automatically_converge_accounts(
+    ledger: ControlLedger,
+    worker_connections: dict[str, set[_WorkerSessionConnection]],
+    worker_execution_locks: dict[str, asyncio.Lock],
+    worker_ids: list[str],
+) -> None:
+    """Converge recovery incidents with fresh observations, never a blind retry."""
+
+    await asyncio.gather(*(
+        _automatically_converge_account(ledger, worker_connections, worker_execution_locks, worker_id)
+        for worker_id in dict.fromkeys(worker_ids)
+    ))
 
 
-def _cleanup_state(response: dict[str, object]) -> dict[str, list[dict[str, str]]]:
+async def _automatically_converge_account(
+    ledger: ControlLedger,
+    worker_connections: dict[str, set[_WorkerSessionConnection]],
+    worker_execution_locks: dict[str, asyncio.Lock],
+    worker_id: str,
+) -> None:
+    directive = ledger.recovery_directive(worker_id)
+    if directive is None or directive["desired_state"] != "EMPTY":
+        return
+    try:
+        async with _pair_worker_execution(worker_execution_locks, worker_id, worker_id):
+            connection = _connected_worker_session(
+                worker_connections, worker_id, reason="Recovery will resume when the Worker reconnects."
+            )
+            state = _account_recovery_state(
+                await _execution_recovery_request(connection, "account_recovery_reconcile", {})
+            )
+            current = ledger.record_recovery_observation(worker_id, state["orders"], state["positions"])
+            if current is None or current["directive"]["kind"] == "NONE":
+                return
+            if current["directive"]["kind"] == "CANCEL_ORDERS":
+                for order in state["orders"]:
+                    await _execution_recovery_request(connection, "account_recovery_cancel", order)
+                state = _account_recovery_state(
+                    await _execution_recovery_request(connection, "account_recovery_reconcile", {})
+                )
+                current = ledger.record_recovery_observation(worker_id, state["orders"], state["positions"])
+            if current is not None and current["directive"]["kind"] == "CLOSE_POSITIONS":
+                for position in state["positions"]:
+                    await _execution_recovery_request(connection, "account_recovery_close", position)
+                state = _account_recovery_state(
+                    await _execution_recovery_request(connection, "account_recovery_reconcile", {})
+                )
+                ledger.record_recovery_observation(worker_id, state["orders"], state["positions"])
+    except (KeyError, LedgerError, ValueError, asyncio.TimeoutError) as error:
+        _LOGGER.warning("Automatic account recovery is pending for %s: %s", worker_id, error)
+
+
+def _account_recovery_state(response: dict[str, object]) -> dict[str, list[dict[str, str]]]:
     result = response.get("result")
     if not isinstance(result, dict):
-        raise LedgerError("Worker cleanup reconciliation returned an unknown broker state.")
+        raise LedgerError("Account recovery reconciliation returned an unknown broker state.")
     return {"orders": _execution_records(result.get("orders")), "positions": _execution_records(result.get("positions"))}
-
-
-async def _cleanup_frozen_worker(
-    ledger: ControlLedger,
-    worker_connections: dict[str, set[_WorkerSessionConnection]],
-    worker_execution_locks: dict[str, asyncio.Lock],
-    worker_id: str,
-    command: dict[str, object],
-    username: str,
-    admin_notification_connections: set[WebSocket] | None = None,
-) -> None:
-    operation_id = str(command["operation_id"])
-    state: dict[str, object] = {"orders": [], "positions": []}
-    try:
-        async with _pair_worker_execution(worker_execution_locks, worker_id, worker_id):
-            connection = _connected_worker_session(
-                worker_connections, worker_id, reason="Frozen worker must be connected for account cleanup."
-            )
-            state = _cleanup_state(await _worker_cleanup_request(connection, "worker_cleanup_reconcile"))
-            for order in state["orders"]:
-                await _worker_cleanup_request(connection, "worker_cleanup_cancel", order)
-            state = _cleanup_state(await _worker_cleanup_request(connection, "worker_cleanup_reconcile"))
-            if state["orders"]:
-                raise LedgerError("Broker did not confirm cancellation of every pending order.")
-            for position in state["positions"]:
-                await _worker_cleanup_request(connection, "worker_cleanup_close", position)
-            state = _cleanup_state(await _worker_cleanup_request(connection, "worker_cleanup_reconcile"))
-            if state["orders"] or state["positions"]:
-                raise LedgerError("Broker cleanup final reconciliation did not prove an empty account.")
-    except (KeyError, LedgerError, ValueError, asyncio.TimeoutError) as error:
-        _LOGGER.warning("Worker cleanup %s failed for %s: %s", operation_id, worker_id, error)
-        ledger.record_worker_cleanup(worker_id, operation_id, username, state, False)
-    else:
-        ledger.record_worker_cleanup(worker_id, operation_id, username, state, True)
-    if admin_notification_connections is not None:
-        await _broadcast_management_snapshot(ledger, admin_notification_connections)
-
-
-async def _release_frozen_worker(
-    ledger: ControlLedger,
-    worker_connections: dict[str, set[_WorkerSessionConnection]],
-    worker_execution_locks: dict[str, asyncio.Lock],
-    worker_id: str,
-    command: dict[str, object],
-    username: str,
-    admin_notification_connections: set[WebSocket] | None = None,
-) -> None:
-    operation_id = str(command["operation_id"])
-    try:
-        async with _pair_worker_execution(worker_execution_locks, worker_id, worker_id):
-            connection = _connected_worker_session(
-                worker_connections, worker_id, reason="Frozen worker must be connected for independent release."
-            )
-            state = _cleanup_state(await _worker_cleanup_request(connection, "worker_cleanup_reconcile"))
-            ledger.record_empty_account_reconciliation(worker_id, operation_id, username, state)
-            ledger.release_frozen_worker(worker_id, operation_id, username, state)
-    except (KeyError, LedgerError, ValueError, asyncio.TimeoutError) as error:
-        _LOGGER.warning("Worker release %s failed for %s: %s", operation_id, worker_id, error)
-        ledger.record_worker_release_failure(worker_id, operation_id, username, str(error))
-    if admin_notification_connections is not None:
-        await _broadcast_management_snapshot(ledger, admin_notification_connections)
 
 
 def _execution_records(records: object) -> list[dict[str, str]]:
@@ -3518,7 +3503,7 @@ def _execution_records(records: object) -> list[dict[str, str]]:
     return normalized
 
 
-async def _fail_undispatched_accepted_intents_after_startup_reconciliation(
+async def _resolve_interrupted_intents_after_startup_reconciliation(
     ledger: ControlLedger,
     startup_reconciliation_started_at: datetime,
     worker_connections: dict[str, set[_WorkerSessionConnection]],
@@ -3529,7 +3514,7 @@ async def _fail_undispatched_accepted_intents_after_startup_reconciliation(
     for record in ledger.accepted_intents_for_dispatch():
         outcomes = cast(list[dict[str, object]], record["preflight"])
         if len(outcomes) != 2 or not all(isinstance(item.get("worker_id"), str) and isinstance(item.get("order"), dict) for item in outcomes):
-            _freeze_intent_execution(ledger, str(record["intent_id"]), "Interrupted dispatch has malformed preflight evidence.")
+            _start_intent_account_recovery(ledger, str(record["intent_id"]), "Interrupted dispatch has malformed preflight evidence.")
             continue
         worker_ids = [str(item["worker_id"]) for item in outcomes]
         if not ledger.workers_reconciled_since(worker_ids, startup_reconciliation_started_at):
@@ -3540,7 +3525,7 @@ async def _fail_undispatched_accepted_intents_after_startup_reconciliation(
             )
             continue
         if record["status"] == "dispatching":
-            _freeze_intent_execution(
+            _start_intent_account_recovery(
                 ledger,
                 str(record["intent_id"]),
                 "Controller restarted during broker dispatch; broker state is uncertain.",
@@ -3552,61 +3537,6 @@ async def _fail_undispatched_accepted_intents_after_startup_reconciliation(
                 "intent_dispatch_abandoned",
                 {"reason": "Controller restarted before dispatch; preflight does not reserve broker liquidity."},
                 status="failed_before_dispatch",
-            )
-
-
-async def _recover_manual_trades_after_startup_reconciliation(
-    ledger: ControlLedger,
-    startup_reconciliation_started_at: datetime,
-    worker_connections: dict[str, set[_WorkerSessionConnection]],
-    worker_execution_locks: dict[str, asyncio.Lock],
-) -> None:
-    """Resume definitely undispatched manual work and isolate interrupted broker dispatches."""
-
-    for record in ledger.manual_trades_for_recovery():
-        plan = cast(dict[str, object], record["plan"])
-        legs = cast(list[dict[str, object]], plan.get("legs", []))
-        worker_ids = [str(leg["worker_id"]) for leg in legs if isinstance(leg.get("worker_id"), str)]
-        if len(worker_ids) != 2 or len(set(worker_ids)) != 2:
-            _freeze_manual_trade(
-                ledger, str(record["manual_trade_id"]), worker_ids, "Interrupted manual trade has malformed leg evidence."
-            )
-            continue
-        if not ledger.workers_reconciled_since(worker_ids, startup_reconciliation_started_at):
-            continue
-        if record["status"] == "scheduled":
-            await _dispatch_manual_trade(
-                ledger, worker_connections, worker_execution_locks, str(record["manual_trade_id"])
-            )
-        else:
-            _freeze_manual_trade(
-                ledger, str(record["manual_trade_id"]), worker_ids,
-                "Controller restarted during manual broker dispatch; broker state is uncertain.",
-            )
-    for record in ledger.manual_trade_operations_for_recovery():
-        plan = cast(dict[str, object], record["plan"])
-        legs = cast(list[dict[str, object]], plan.get("legs", []))
-        worker_ids = [str(leg["worker_id"]) for leg in legs if isinstance(leg.get("worker_id"), str)]
-        if len(worker_ids) != 2 or len(set(worker_ids)) != 2:
-            ledger.record_manual_trade_operation(
-                str(record["operation_id"]), "manual_trade_operation_frozen",
-                {"reason": "Interrupted operation has malformed leg evidence."}, status="needs_human",
-            )
-            continue
-        if not ledger.workers_reconciled_since(worker_ids, startup_reconciliation_started_at):
-            continue
-        if record["status"] == "scheduled":
-            await _dispatch_manual_trade_operation(
-                ledger, worker_connections, worker_execution_locks, str(record["operation_id"])
-            )
-        else:
-            reason = "Controller restarted during manual-trade operation; broker state is uncertain."
-            ledger.record_manual_trade_operation(
-                str(record["operation_id"]), "manual_trade_operation_frozen", {"reason": reason}, status="needs_human"
-            )
-            ledger.freeze_workers(
-                "manual_trade_operation_anomaly", worker_ids,
-                {"manual_trade_id": record["manual_trade_id"], "operation_id": record["operation_id"], "reason": reason},
             )
 
 
@@ -3657,35 +3587,54 @@ def _intent_pip_size(specification: dict[str, Any]) -> Decimal:
 
 
 async def _request_order_check(
-    connection: _WorkerSessionConnection, order: dict[str, object], *, timeout: float
+    connection: _WorkerSessionConnection, order: dict[str, object], *, timeout: float, expires_at: datetime | None = None
 ) -> dict[str, object]:
     request_id = str(uuid4())
+    message: dict[str, object] = {
+        "type": "order_check_request",
+        "analysis_id": "order_check",
+        "request_id": request_id,
+        "order": order,
+    }
+    if expires_at is not None:
+        message["expires_at"] = expires_at.isoformat()
     return await _request_worker_analysis(
         connection,
         analysis_id="order_check",
         stage="order_check",
         timeout=timeout,
-        message={"type": "order_check_request", "analysis_id": "order_check", "request_id": request_id, "order": order},
+        message=message,
     )
 
 
 async def _request_order_execute(
-    connection: _WorkerSessionConnection, order: dict[str, object], *, timeout: float = 30
+    connection: _WorkerSessionConnection,
+    order: dict[str, object],
+    *,
+    timeout: float = 30,
+    expires_at: datetime | None = None,
+    effect_id: str | None = None,
 ) -> dict[str, object]:
     request_id = str(uuid4())
+    message: dict[str, object] = {"type": "order_execute_request", "request_id": request_id, "order": order}
+    if expires_at is not None:
+        message["expires_at"] = expires_at.isoformat()
+    if effect_id is not None:
+        message["effect_id"] = effect_id
     return await _request_worker_analysis(
         connection,
         analysis_id="order_execute",
         stage="order_execute",
         timeout=timeout,
-        message={"type": "order_execute_request", "request_id": request_id, "order": order},
+        message=message,
     )
 
 
 def _valid_order_check_response(response: dict[str, object], order: dict[str, object]) -> bool:
     required = {"type", "analysis_id", "request_id", "accepted", "order"}
     response_fields = set(response)
-    if response_fields != required and response_fields != required | {"diagnostics"}:
+    allowed = required | {"diagnostics", "execution_state", "outcome"}
+    if not required.issubset(response_fields) or not response_fields.issubset(allowed):
         return False
     if (
         response["type"] != "order_check_response"
@@ -3706,11 +3655,21 @@ def _valid_order_check_response(response: dict[str, object], order: dict[str, ob
 
 
 def _valid_order_check_diagnostics(value: object) -> bool:
-    if not isinstance(value, dict) or not {"retcode"} <= set(value) <= {"retcode", "comment", "quote"}:
+    if not isinstance(value, dict) or not {"retcode"} <= set(value) <= {
+        "retcode", "comment", "quote", "margin", "margin_free", "margin_level"
+    }:
         return False
     if isinstance(value["retcode"], bool) or not isinstance(value["retcode"], int):
         return False
     if "comment" in value and (not isinstance(value["comment"], str) or not value["comment"]):
+        return False
+    if any(
+        isinstance(value[field], bool)
+        or not isinstance(value[field], (int, float))
+        or not math.isfinite(value[field])
+        for field in ("margin", "margin_free", "margin_level")
+        if field in value
+    ):
         return False
     if "quote" not in value:
         return True
@@ -4240,11 +4199,11 @@ def _record_delta(ledger: ControlLedger, worker_id: str, message: dict[str, obje
     )
 
 
-def _freeze_worker_session(ledger: ControlLedger, worker_id: str, source: str, reason: str) -> None:
+def _handle_worker_disconnect(ledger: ControlLedger, worker_id: str, source: str, reason: str) -> None:
     try:
-        ledger.freeze_worker_and_active_counterparts(worker_id, source, {"reason": reason})
+        ledger.recover_worker_disconnect(worker_id, source, {"reason": reason})
     except LedgerError as error:
-        _LOGGER.warning("Could not isolate worker %s after %s: %s", worker_id, source, error)
+        _LOGGER.warning("Could not start recovery for worker %s after %s: %s", worker_id, source, error)
 
 
 async def _close_policy_violation(websocket: WebSocket) -> None:

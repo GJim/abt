@@ -89,8 +89,11 @@ _Avoid_: 反向訂單
 **帳戶工作者**:
 專屬於一個交易帳戶的獨立 MT5 terminal 與執行程序，負責該帳戶的下單、輪詢和對帳；工作者獨佔 terminal 的啟動、附著與健康監控，該 terminal 不得用於人工交易。terminal/API 異常時，工作者以受限退避嘗試自動重啟或重新附著，並每次以 `account_info` 驗證預期 login/server；連續 3 次失敗或帳戶不一致時停止重試並標示需人工處理。主控台不得在工作者間切換終端登入。第一版允許工作者跨多台主機部署。
 
-**工作者凍結**:
-交易異常時對該次交易參與的帳戶工作者施加的帳戶級隔離狀態；凍結工作者不得被選作任何新交易配對。worker 失聯時，其與所有活動交易 counterpart 一併凍結。每個工作者只有在取消全部掛單、平掉全部持倉並由 broker 驗證零掛單、零持倉後，經管理員明確確認才能獨立解凍。
+**帳戶復原生命週期**:
+以 broker observation 作事實、主控台 ledger desired state 作目標的帳戶安全狀態機。`ENTRY_UNCONFIRMED`、`CATCHING_UP`、`CONVERGING_EMPTY`、`ACTIVE_VERIFIED`、`READY`、`NEEDS_HUMAN` 與 `REVOKED` 都會持久化；只有 `READY` 可接受新進場。routine uncertain effect 以觀測後的新補償 effect 收斂，不以重送或永久 freeze 處理。
+
+**Worker effect journal**:
+帳戶工作者本機 SQLite/WAL 的 broker write 證據簿。每個 effect 在 MT5 write 前寫入 `prepared`，緊接 send 前寫入 `send_started`，receipt 或 broker observation 後保存證據。`send_started` effect 永遠不得以相同 effect ID 重送。
 
 **工作者信任邊界**:
 帳戶工作者僅在原生 Windows 的 CNG keystore 保存不可匯出的裝置私鑰；沒有受支援 CNG keystore 的主機不得成為工作者。MT5 憑證由 OpenBao 集中管理。工作者只接受已釘選主控台公開驗證金鑰所簽署、帶有交易者指令 ID 與期限的指令；工作者以裝置憑證及 challenge-response 向主控台證明身分，並必須持久去重該指令。
@@ -117,7 +120,7 @@ _Avoid_: 反向訂單
 主控台的單調時鐘是配對期限與逾時的唯一裁決者；所有主控台與帳戶工作者必須同步受信任 UTC 時間來源，工作者與 broker 時間僅作事件證據。
 
 **失聯安全平倉**:
-一個帳戶工作者與主控台失聯超過其帳戶操作規範定義的心跳寬限時間後，必須在遵守帳戶操作規範下平掉自己所負責方向的當前持倉。預設每 30 秒雙向心跳，連續 5 分鐘未收到有效主控台訊號即進入此處置；重新連線後，主控台凍結該 worker 及其所有活動交易 counterpart，待各 worker 完成帳戶清空與人工解凍後才可恢復。
+一個帳戶工作者與主控台失聯超過其帳戶操作規範定義的心跳寬限時間後，必須停止新進場並進入帳戶復原生命週期。預設每 30 秒雙向心跳，連續 5 分鐘未收到有效主控台訊號即要求重新觀測；未確認或不受有效 broker SL/TP 保護的曝險收斂至空帳戶。已驗證的受保護配對在重連比較前不因單端失聯而直接平倉。
 
 **撤銷安全平倉**:
 撤銷工作者裝置憑證是緊急安全事件；主控台必須送出簽署的 `REVOKE_AND_FLATTEN`，工作者立即平掉其方向持倉。未回執或已失聯的工作者依失聯安全平倉處置，並凍結該 worker 及其所有活動交易 counterpart，等待帳戶清空與人工解凍。
@@ -135,7 +138,7 @@ _Avoid_: 反向訂單
 可經主控台 API 建立共同交易意圖，或在兩腿皆未成交時撤回意圖的獨立服務身分；它必須完成公開金鑰註冊與人工批准，並經已驗證 WSS 工作階段收發自己意圖的即時生命週期事件、訂閱任一已啟用工作者的 bid/ask 市場資料、對明確指定的單一工作者發起即時 broker read 或 worker operation，以及在中斷後重連，不得使用管理站、查詢全域或其他交易者資料、管理工作者或取得任何 MT5 憑證。每個部署實例使用獨立的憑證；策略名稱僅作為可稽核註記，不構成授權身分。
 
 **Trader worker operation**:
-交易者經主控台對單一明確指定工作者發起的 broker 寫入；包含市價單、limit／stop／stop-limit 定價單、取消掛單、平倉與停損／停利修改。主控台必須先持久記錄請求，再將其轉交工作者；工作者回覆後，主控台必須持久記錄執行回執，才可回傳交易者。每個 operation 以交易者身分、operation ID 與 payload hash 去重。frozen 或 needs_human worker 一律拒絕此類寫入。
+交易者經主控台對單一明確指定工作者發起的 broker 寫入；包含市價單、limit／stop／stop-limit 定價單、取消掛單、平倉與停損／停利修改。主控台必須先持久記錄請求，再將其轉交工作者；工作者回覆後，主控台必須持久記錄執行回執，才可回傳交易者。每個 operation 以交易者身分、operation ID 與 payload hash 去重；Worker effect journal 防止 send-started operation 重送。`NEEDS_HUMAN`、`REVOKED` 或 lifecycle 未到 `READY` 的 worker 一律拒絕新進場。
 
 **Trader broker read**:
 交易者經主控台向單一明確指定工作者發起的即時唯讀查詢；包含 account info、symbol info、historical ticks、目前掛單與目前持倉。回應只來自已連線工作者的當前 MT5 session，主控台不得以自己的持久資料替代。historical ticks 每批最多 1,000 筆，交易者自行拆解及串接大型查詢。

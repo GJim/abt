@@ -9,7 +9,6 @@ import threading
 from base64 import urlsafe_b64decode, urlsafe_b64encode
 from binascii import Error as Base64Error
 from dataclasses import dataclass, replace
-from decimal import Decimal, InvalidOperation
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable
@@ -18,6 +17,18 @@ from uuid import uuid4
 import duckdb
 from argon2 import PasswordHasher
 from argon2.exceptions import InvalidHashError, VerifyMismatchError
+
+from ..account_recovery import (
+    AccountRecovery,
+    ProtectedLeg,
+    RecoveryDecision,
+    RecoveryDirective,
+    RecoveryPair,
+    converge_empty,
+    catching_up,
+    observe,
+    observe_pair,
+)
 
 
 class LedgerError(RuntimeError):
@@ -1081,6 +1092,83 @@ class ControlLedger:
             raise LedgerError("Trader command ID was reused with a different payload.")
         return json.loads(existing[1])
 
+    def begin_hedged_entry_command(
+        self, trader_id: str, command_id: str, payload: dict[str, Any]
+    ) -> tuple[dict[str, Any] | None, bool]:
+        """Durably mark a valid hedged command in progress before Worker dispatch."""
+
+        canonical_payload = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+        payload_hash = _hash(canonical_payload)
+        if payload.get("type") != "hedged_entry":
+            raise LedgerError("Hedged-entry command type is invalid.")
+        with self._transaction():
+            self.active_trader(trader_id)
+            existing = self._connection.execute(
+                "SELECT payload_hash, result FROM trader_commands WHERE trader_id = ? AND command_id = ?",
+                [trader_id, command_id],
+            ).fetchone()
+            if existing is not None:
+                if existing[0] != payload_hash:
+                    raise LedgerError("Trader command ID was reused with a different payload.")
+                return json.loads(existing[1]), False
+            result = {"type": "command_result", "command_id": command_id, "status": "in_progress", "legs": []}
+            event_id = self._event(
+                "hedged_entry_started",
+                {"trader_id": trader_id, "command_id": command_id, "command": payload},
+            )
+            self._connection.execute("INSERT INTO trader_events (trader_id, event_id) VALUES (?, ?)", [trader_id, event_id])
+            persisted = {**result, "event_id": event_id}
+            self._connection.execute(
+                "INSERT INTO trader_commands (trader_id, command_id, payload_hash, result, created_at) VALUES (?, ?, ?, ?, ?)",
+                [trader_id, command_id, payload_hash, json.dumps(persisted, sort_keys=True), _utc_now()],
+            )
+            return persisted, True
+
+    def record_hedged_entry_command(
+        self, trader_id: str, command_id: str, payload: dict[str, Any], result: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Durably retain the complete synchronous outcome of a broker market-pair command."""
+
+        canonical_payload = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+        payload_hash = _hash(canonical_payload)
+        if payload.get("type") != "hedged_entry":
+            raise LedgerError("Hedged-entry command type is invalid.")
+        with self._transaction():
+            self.active_trader(trader_id)
+            existing = self._connection.execute(
+                "SELECT payload_hash, result FROM trader_commands WHERE trader_id = ? AND command_id = ?",
+                [trader_id, command_id],
+            ).fetchone()
+            if existing is not None:
+                if existing[0] != payload_hash:
+                    raise LedgerError("Trader command ID was reused with a different payload.")
+                existing_result = json.loads(existing[1])
+                if existing_result.get("status") != "in_progress":
+                    return existing_result
+            event_id = self._event(
+                "hedged_entry_completed",
+                {
+                    "trader_id": trader_id,
+                    "command_id": command_id,
+                    "command": payload,
+                    "outcome": result,
+                },
+            )
+            self._connection.execute("INSERT INTO trader_events (trader_id, event_id) VALUES (?, ?)", [trader_id, event_id])
+            persisted = {**result, "event_id": event_id}
+            if existing is None:
+                self._connection.execute(
+                    "INSERT INTO trader_commands (trader_id, command_id, payload_hash, result, created_at) VALUES (?, ?, ?, ?, ?)",
+                    [trader_id, command_id, payload_hash, json.dumps(persisted, sort_keys=True), _utc_now()],
+                )
+            else:
+                self._connection.execute(
+                    """UPDATE trader_commands SET result = ?
+                       WHERE trader_id = ? AND command_id = ?""",
+                    [json.dumps(persisted, sort_keys=True), trader_id, command_id],
+                )
+            return persisted
+
     def request_trader_worker_rpc(
         self, trader_id: str, request_id: str, worker_id: str, kind: str, payload: dict[str, Any]
     ) -> dict[str, Any]:
@@ -1117,11 +1205,8 @@ class ControlLedger:
                 {"trader_id": trader_id, "request_id": request_id, "worker_id": worker_id, "kind": kind, "payload": payload},
             )
             if kind == "operation":
-                safety = self._connection.execute(
-                    "SELECT safety_state FROM workers WHERE worker_id = ?", [worker_id]
-                ).fetchone()
-                if safety is None or safety[0] != "connected" or self.frozen_worker_ids([worker_id]):
-                    result = {"reason": "Trader operations require a connected, unfrozen worker."}
+                if self.recovery_admission_blocked([worker_id]):
+                    result = {"reason": "Trader operations require an account with completed recovery."}
                     completed_event_id = self._event(
                         "trader_worker_result_recorded",
                         {
@@ -1429,6 +1514,474 @@ class ControlLedger:
             )
             self._connection.execute("UPDATE workers SET last_seen_at = ? WHERE worker_id = ?", [_utc_now(), worker_id])
             self._event("worker_reconciliation_snapshot", {"worker_id": worker_id, "cursor": cursor})
+            recovery = self._account_recovery(worker_id)
+            if recovery is not None:
+                if recovery.expected_leg is None:
+                    decision = observe(
+                        recovery,
+                        orders=[item for item in orders if isinstance(item, dict)],
+                        positions=[item for item in positions if isinstance(item, dict)],
+                    )
+                    self._store_recovery_decision(decision)
+            self._record_pair_snapshot(
+                worker_id,
+                snapshot_id,
+                [item for item in orders if isinstance(item, dict)],
+                [item for item in positions if isinstance(item, dict)],
+            )
+
+    def begin_empty_convergence(
+        self, worker_ids: list[str], source: str, audit: dict[str, object]
+    ) -> list[dict[str, Any]]:
+        """Persist automatic account-empty recovery without routine worker freezing."""
+
+        if not worker_ids or not source or not isinstance(audit.get("reason"), str) or not audit["reason"]:
+            raise LedgerError("Account recovery source, workers, and reason are required.")
+        incident_id = str(uuid4())
+        with self._transaction():
+            records: list[dict[str, Any]] = []
+            for worker_id in dict.fromkeys(worker_ids):
+                worker = self._connection.execute(
+                    "SELECT status FROM workers WHERE worker_id = ?", [worker_id]
+                ).fetchone()
+                if worker is None:
+                    raise LedgerError("Worker is not active.")
+                current = self._account_recovery(worker_id)
+                if worker[0] == "revoked":
+                    if current is None or current.state != "REVOKED":
+                        raise LedgerError("Worker is not active.")
+                    directive_row = self._connection.execute(
+                        "SELECT last_directive FROM account_recoveries WHERE worker_id = ?", [worker_id]
+                    ).fetchone()
+                    assert directive_row is not None
+                    directive = json.loads(directive_row[0])
+                    records.append(
+                        self._recovery_record(
+                            current,
+                            RecoveryDirective(
+                                directive["kind"],
+                                directive["reason"],
+                                directive["revision"],
+                                tuple(directive.get("tickets", [])),
+                            ),
+                        )
+                    )
+                    continue
+                if worker[0] != "active":
+                    raise LedgerError("Worker is not active.")
+                current = current or AccountRecovery(worker_id=worker_id)
+                decision = converge_empty(current, incident_id, str(audit["reason"]))
+                self._store_recovery_decision(decision, source=source, audit=audit)
+                records.append(self._recovery_record(decision.account, decision.directive))
+            return records
+
+    def recovery_admission_blocked(self, worker_ids: list[str]) -> set[str]:
+        """Return accounts with recovery work that cannot receive a new entry."""
+
+        if not worker_ids:
+            return set()
+        placeholders = ", ".join("?" for _ in worker_ids)
+        with self._lock:
+            rows = self._connection.execute(
+                f"""SELECT worker_id FROM account_recoveries
+                    WHERE worker_id IN ({placeholders}) AND lifecycle_state <> 'READY'""",
+                worker_ids,
+            ).fetchall()
+        return {str(row[0]) for row in rows}
+
+    def recovery_incident_workers(self, worker_id: str) -> list[str]:
+        """Return every account that must converge with this recovery incident."""
+
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT incident_id FROM account_recoveries WHERE worker_id = ?", [worker_id]
+            ).fetchone()
+            if row is None or row[0] is None:
+                return [worker_id]
+            rows = self._connection.execute(
+                """SELECT worker_id FROM account_recoveries
+                   WHERE incident_id = ? AND desired_state = 'EMPTY' ORDER BY worker_id""",
+                [row[0]],
+            ).fetchall()
+        return [str(item[0]) for item in rows] or [worker_id]
+
+    def recover_worker_disconnect(self, worker_id: str, source: str, audit: dict[str, object]) -> bool:
+        """Suspend a verified protected pair pending fresh snapshots after a lost link."""
+
+        with self._transaction():
+            if self._connection.execute(
+                "SELECT 1 FROM workers WHERE worker_id = ? AND status = 'active'", [worker_id]
+            ).fetchone() is None:
+                raise LedgerError("Worker is not active.")
+            pairs = self._connection.execute(
+                """SELECT pair_id, worker_ids, lifecycle_state, revision FROM recovery_pairs
+                   WHERE lifecycle_state IN ('CATCHING_UP', 'ACTIVE_VERIFIED')"""
+            ).fetchall()
+            protected_pairs = [
+                (str(pair_id), tuple(json.loads(worker_ids)), str(state), int(revision))
+                for pair_id, worker_ids, state, revision in pairs
+                if worker_id in json.loads(worker_ids)
+            ]
+            if not protected_pairs:
+                recovery = self._account_recovery(worker_id)
+                if recovery is not None and recovery.state != "READY":
+                    self._event(
+                        "account_recovery_waiting_for_worker",
+                        {"worker_id": worker_id, "source": source, "audit": audit},
+                    )
+                    return True
+                return False
+            for pair_id, worker_ids, state, revision in protected_pairs:
+                self._connection.execute("DELETE FROM recovery_pair_observations WHERE pair_id = ?", [pair_id])
+                self._connection.execute(
+                    """UPDATE recovery_pairs
+                       SET lifecycle_state = 'CATCHING_UP', revision = ?, updated_at = ?
+                       WHERE pair_id = ?""",
+                    [revision + (state == "ACTIVE_VERIFIED"), _utc_now(), pair_id],
+                )
+                for affected_worker_id in worker_ids:
+                    recovery = self._account_recovery(affected_worker_id)
+                    if recovery is not None and recovery.desired_state == "PROTECTED_LEG":
+                        self._store_recovery_decision(
+                            catching_up(recovery, "A protected-pair Worker disconnected; fresh snapshots are required."),
+                            source=source,
+                            audit=audit,
+                        )
+                self._event(
+                    "recovery_pair_catching_up",
+                    {"pair_id": pair_id, "worker_ids": list(worker_ids), "source": source, "audit": audit},
+                )
+            return True
+
+    def register_protected_pair(
+        self, trader_id: str, pair_id: str, legs: list[dict[str, object]]
+    ) -> dict[str, Any]:
+        """Require fresh full snapshots from both Workers before admitting a hedge."""
+
+        if not pair_id or len(legs) != 2:
+            raise LedgerError("A protected recovery pair requires exactly two legs.")
+        required_leg_fields = {"worker_id", "ticket", "symbol", "side", "volume", "stop_loss", "take_profit"}
+        if any(set(leg) != required_leg_fields for leg in legs):
+            raise LedgerError("A protected recovery pair leg is invalid.")
+        try:
+            expected = tuple(
+                ProtectedLeg(
+                    ticket=str(leg["ticket"]),
+                    symbol=str(leg["symbol"]),
+                    side=str(leg["side"]),
+                    volume=str(leg["volume"]),
+                    stop_loss=str(leg["stop_loss"]),
+                    take_profit=str(leg["take_profit"]),
+                )
+                for leg in legs
+            )
+            worker_ids = tuple(str(leg["worker_id"]) for leg in legs)
+        except KeyError as error:
+            raise LedgerError("A protected recovery pair leg is invalid.") from error
+        if len(set(worker_ids)) != 2 or any(not value for value in worker_ids):
+            raise LedgerError("A protected recovery pair requires two distinct Workers.")
+        if any(
+            not all(getattr(leg, field) for field in ("ticket", "symbol", "side", "volume", "stop_loss", "take_profit"))
+            for leg in expected
+        ):
+            raise LedgerError("A protected recovery pair leg is invalid.")
+        with self._transaction():
+            self.active_trader(trader_id)
+            existing = self._connection.execute(
+                "SELECT trader_id, worker_ids, expected_legs, lifecycle_state, revision FROM recovery_pairs WHERE pair_id = ?",
+                [pair_id],
+            ).fetchone()
+            expected_json = json.dumps([leg.__dict__ for leg in expected], sort_keys=True)
+            if existing is not None:
+                if existing[0] != trader_id or existing[1] != json.dumps(worker_ids) or existing[2] != expected_json:
+                    raise LedgerError("Protected recovery pair ID was reused with a different payload.")
+                return {
+                    "pair_id": pair_id,
+                    "worker_ids": json.loads(existing[1]),
+                    "lifecycle_state": existing[3],
+                    "revision": existing[4],
+                }
+            for worker_id in worker_ids:
+                if self._connection.execute(
+                    "SELECT 1 FROM workers WHERE worker_id = ? AND status = 'active'", [worker_id]
+                ).fetchone() is None:
+                    raise LedgerError("Protected recovery pair Worker is not active.")
+            pair = RecoveryPair(pair_id, worker_ids, expected)
+            self._connection.execute(
+                """INSERT INTO recovery_pairs (pair_id, trader_id, worker_ids, expected_legs, lifecycle_state, revision, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                [pair_id, trader_id, json.dumps(worker_ids), expected_json, pair.state, pair.revision, _utc_now()],
+            )
+            for worker_id, expected_leg in zip(worker_ids, expected, strict=True):
+                account = AccountRecovery(
+                    worker_id=worker_id,
+                    state="CATCHING_UP",
+                    desired_state="PROTECTED_LEG",
+                    revision=1,
+                    incident_id=pair_id,
+                    expected_leg=expected_leg,
+                )
+                self._store_recovery_decision(
+                    RecoveryDecision(account, RecoveryDirective("REQUEST_SNAPSHOT", "Protected pair awaits fresh snapshots.", 1)),
+                    source="protected_pair_registered",
+                )
+            self._event("recovery_pair_registered", {"pair_id": pair_id, "trader_id": trader_id, "worker_ids": worker_ids})
+            return {"pair_id": pair_id, "worker_ids": list(worker_ids), "lifecycle_state": pair.state, "revision": pair.revision}
+
+    def record_worker_recovery_sync(
+        self, worker_id: str, epoch: str, journal: list[dict[str, object]]
+    ) -> None:
+        """Start a new recovery epoch; only subsequent snapshots may verify a pair."""
+
+        if not epoch or not all(isinstance(item, dict) for item in journal):
+            raise LedgerError("Worker recovery sync is invalid.")
+        with self._transaction():
+            if self._connection.execute(
+                "SELECT 1 FROM workers WHERE worker_id = ? AND status = 'active'", [worker_id]
+            ).fetchone() is None:
+                raise LedgerError("Worker is not active.")
+            self._connection.execute(
+                """INSERT INTO worker_recovery_syncs (worker_id, epoch, journal, received_at)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(worker_id) DO UPDATE SET epoch = excluded.epoch, journal = excluded.journal,
+                     received_at = excluded.received_at""",
+                [worker_id, epoch, json.dumps(journal, sort_keys=True), _utc_now()],
+            )
+            self._connection.execute("DELETE FROM recovery_pair_observations WHERE worker_id = ?", [worker_id])
+            pairs = self._connection.execute(
+                """SELECT pair_id FROM recovery_pairs
+                   WHERE CAST(worker_ids AS VARCHAR) LIKE ?
+                     AND lifecycle_state IN ('CATCHING_UP', 'ACTIVE_VERIFIED')""",
+                [f"%{worker_id}%"],
+            ).fetchall()
+            for (pair_id,) in pairs:
+                self._connection.execute("DELETE FROM recovery_pair_observations WHERE pair_id = ?", [pair_id])
+                self._connection.execute(
+                    "UPDATE recovery_pairs SET lifecycle_state = 'CATCHING_UP', updated_at = ? WHERE pair_id = ?",
+                    [_utc_now(), pair_id],
+                )
+            recovery = self._account_recovery(worker_id)
+            if recovery is not None and recovery.desired_state == "PROTECTED_LEG":
+                self._store_recovery_decision(
+                    catching_up(recovery, "Worker recovery epoch changed; a full snapshot is required."),
+                    source="worker_recovery_sync",
+                )
+            self._event(
+                "worker_recovery_sync_received",
+                {"worker_id": worker_id, "epoch": epoch, "unresolved_effects": len(journal)},
+            )
+
+    def account_recoveries(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._connection.execute(
+                """SELECT worker_id, lifecycle_state, desired_state, revision, incident_id, expected_leg,
+                          last_directive, updated_at
+                   FROM account_recoveries ORDER BY updated_at DESC"""
+            ).fetchall()
+        return [
+            {
+                "worker_id": row[0],
+                "lifecycle_state": row[1],
+                "desired_state": row[2],
+                "revision": row[3],
+                "incident_id": row[4],
+                "expected_leg": None if row[5] is None else json.loads(row[5]),
+                "directive": json.loads(row[6]),
+                "updated_at": row[7],
+            }
+            for row in rows
+        ]
+
+    def recovery_directive(self, worker_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            recovery = self._account_recovery(worker_id)
+            if recovery is None:
+                return None
+            row = self._connection.execute(
+                "SELECT last_directive FROM account_recoveries WHERE worker_id = ?", [worker_id]
+            ).fetchone()
+            assert row is not None
+            raw = json.loads(row[0])
+        return self._recovery_record(
+            recovery,
+            RecoveryDirective(raw["kind"], raw["reason"], raw["revision"], tuple(raw.get("tickets", []))),
+        )
+
+    def record_recovery_observation(
+        self, worker_id: str, orders: list[dict[str, object]], positions: list[dict[str, object]]
+    ) -> dict[str, Any] | None:
+        """Advance an existing recovery incident from a fresh direct broker observation."""
+
+        with self._transaction():
+            recovery = self._account_recovery(worker_id)
+            if recovery is None:
+                return None
+            decision = (
+                RecoveryDecision(
+                    recovery,
+                    RecoveryDirective(
+                        "NONE",
+                        "The Worker is revoked." if recovery.state == "REVOKED" else "Recovery requires human intervention.",
+                        recovery.revision,
+                    ),
+                )
+                if recovery.state in {"NEEDS_HUMAN", "REVOKED"}
+                else observe(recovery, orders=orders, positions=positions)
+            )
+            self._store_recovery_decision(decision)
+            return self._recovery_record(decision.account, decision.directive)
+
+    def _account_recovery(self, worker_id: str) -> AccountRecovery | None:
+        row = self._connection.execute(
+            """SELECT lifecycle_state, desired_state, revision, incident_id, expected_leg
+               FROM account_recoveries WHERE worker_id = ?""",
+            [worker_id],
+        ).fetchone()
+        if row is None:
+            return None
+        return AccountRecovery(
+            worker_id=worker_id,
+            state=row[0],
+            desired_state=row[1],
+            revision=int(row[2]),
+            incident_id=row[3],
+            expected_leg=None if row[4] is None else ProtectedLeg(**json.loads(row[4])),
+        )
+
+    def _store_recovery_decision(
+        self,
+        decision: RecoveryDecision,
+        *,
+        source: str = "broker_observation",
+        audit: dict[str, object] | None = None,
+    ) -> None:
+        account, directive = decision.account, decision.directive
+        directive_json = {
+            "kind": directive.kind,
+            "reason": directive.reason,
+            "revision": directive.revision,
+            "tickets": list(directive.tickets),
+        }
+        self._connection.execute(
+            """INSERT INTO account_recoveries
+               (worker_id, lifecycle_state, desired_state, revision, incident_id, expected_leg, last_directive, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(worker_id) DO UPDATE SET
+                 lifecycle_state = excluded.lifecycle_state, desired_state = excluded.desired_state,
+                 revision = excluded.revision, incident_id = excluded.incident_id,
+                 expected_leg = excluded.expected_leg, last_directive = excluded.last_directive,
+                 updated_at = excluded.updated_at""",
+            [
+                account.worker_id, account.state, account.desired_state, account.revision, account.incident_id,
+                None if account.expected_leg is None else json.dumps(account.expected_leg.__dict__, sort_keys=True),
+                json.dumps(directive_json, sort_keys=True), _utc_now(),
+            ],
+        )
+        self._event(
+            "account_recovery_transition",
+            {
+                "worker_id": account.worker_id,
+                "state": account.state,
+                "desired_state": account.desired_state,
+                "revision": account.revision,
+                "incident_id": account.incident_id,
+                "source": source,
+                "audit": audit or {},
+                "directive": directive_json,
+            },
+        )
+
+    def _record_pair_snapshot(
+        self, worker_id: str, snapshot_id: str, orders: list[dict[str, object]], positions: list[dict[str, object]]
+    ) -> None:
+        sync = self._connection.execute(
+            "SELECT epoch FROM worker_recovery_syncs WHERE worker_id = ?", [worker_id]
+        ).fetchone()
+        if sync is None:
+            return
+        recovery_epoch = str(sync[0])
+        rows = self._connection.execute(
+            """SELECT pair_id, worker_ids, expected_legs, lifecycle_state, revision
+               FROM recovery_pairs WHERE CAST(worker_ids AS VARCHAR) LIKE ?
+                 AND lifecycle_state IN ('CATCHING_UP', 'ACTIVE_VERIFIED')""",
+            [f"%{worker_id}%"],
+        ).fetchall()
+        for pair_id, worker_ids_json, legs_json, state, revision in rows:
+            worker_ids = tuple(json.loads(worker_ids_json))
+            if worker_id not in worker_ids:
+                continue
+            self._connection.execute(
+                """INSERT INTO recovery_pair_observations
+                       (pair_id, worker_id, recovery_epoch, snapshot_id, orders, positions, observed_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(pair_id, worker_id) DO UPDATE SET recovery_epoch = excluded.recovery_epoch,
+                     snapshot_id = excluded.snapshot_id, orders = excluded.orders, positions = excluded.positions,
+                     observed_at = excluded.observed_at""",
+                [pair_id, worker_id, recovery_epoch, snapshot_id, json.dumps(orders), json.dumps(positions), _utc_now()],
+            )
+            observation_rows = self._connection.execute(
+                """SELECT observation.worker_id, observation.orders, observation.positions
+                   FROM recovery_pair_observations AS observation
+                   JOIN worker_recovery_syncs AS sync ON sync.worker_id = observation.worker_id
+                   WHERE observation.pair_id = ? AND observation.recovery_epoch = sync.epoch""",
+                [pair_id],
+            ).fetchall()
+            observations = {
+                row[0]: (json.loads(row[1]), json.loads(row[2]))
+                for row in observation_rows
+            }
+            expected = tuple(ProtectedLeg(**leg) for leg in json.loads(legs_json))
+            decision = observe_pair(RecoveryPair(pair_id, worker_ids, expected, state=state, revision=int(revision)), observations)
+            self._connection.execute(
+                "UPDATE recovery_pairs SET lifecycle_state = ?, revision = ?, updated_at = ? WHERE pair_id = ?",
+                [decision.pair.state, decision.pair.revision, _utc_now(), pair_id],
+            )
+            if decision.converge_worker_ids:
+                for affected_worker_id in decision.converge_worker_ids:
+                    current = self._account_recovery(affected_worker_id)
+                    assert current is not None
+                    self._store_recovery_decision(
+                        converge_empty(current, str(pair_id), "Paired protected snapshots diverged."),
+                        source="paired_snapshot_mismatch",
+                    )
+            elif decision.pair.state == "ACTIVE_VERIFIED":
+                for affected_worker_id in worker_ids:
+                    current = self._account_recovery(affected_worker_id)
+                    assert current is not None and current.expected_leg is not None
+                    self._store_recovery_decision(
+                        RecoveryDecision(
+                            AccountRecovery(
+                                worker_id=affected_worker_id,
+                                state="ACTIVE_VERIFIED",
+                                desired_state="PROTECTED_LEG",
+                                revision=current.revision,
+                                incident_id=current.incident_id,
+                                expected_leg=current.expected_leg,
+                            ),
+                            RecoveryDirective("NONE", "Both protected broker legs match.", current.revision),
+                        ),
+                        source="paired_snapshot_match",
+                    )
+            self._event(
+                "recovery_pair_snapshot_compared",
+                {"pair_id": pair_id, "state": decision.pair.state, "worker_ids": list(worker_ids)},
+            )
+
+    @staticmethod
+    def _recovery_record(account: AccountRecovery, directive: RecoveryDirective) -> dict[str, Any]:
+        return {
+            "worker_id": account.worker_id,
+            "lifecycle_state": account.state,
+            "desired_state": account.desired_state,
+            "revision": account.revision,
+            "incident_id": account.incident_id,
+            "directive": {
+                "kind": directive.kind,
+                "reason": directive.reason,
+                "revision": directive.revision,
+                "tickets": list(directive.tickets),
+            },
+        }
 
     def record_worker_session(self, worker_id: str, session_id: str | None = None) -> None:
         with self._transaction():
@@ -1452,10 +2005,10 @@ class ControlLedger:
             raise LedgerError("Worker session ID is required.")
         with self._transaction():
             active = self._connection.execute(
-                "SELECT 1 FROM workers WHERE worker_id = ? AND status = 'active'", [worker_id]
+                "SELECT 1 FROM workers WHERE worker_id = ? AND status IN ('active', 'revoked')", [worker_id]
             ).fetchone()
             if active is None:
-                raise LedgerError("Worker is not active.")
+                raise LedgerError("Worker does not exist.")
             self._event(event_type, {"worker_id": worker_id, "session_id": session_id, **details})
 
     def record_live_state(
@@ -1558,7 +2111,7 @@ class ControlLedger:
                 "worker_id": worker["worker_id"],
                 "server": worker["server"],
                 "connectivity": worker["connectivity"],
-                "safety_state": worker["safety_state"],
+                "recovery": worker["recovery"],
             }
             for worker in self.worker_reconciliation()
             if worker["connectivity"] != "revoked"
@@ -1583,128 +2136,41 @@ class ControlLedger:
             self._connection.execute("UPDATE workers SET last_seen_at = ? WHERE worker_id = ?", [_utc_now(), worker_id])
             self._event("worker_heartbeat_received", {"worker_id": worker_id})
 
-    def record_worker_safety_state(self, worker_id: str, state: str, reason: str) -> None:
+    def report_worker_recovery_state(self, worker_id: str, state: str, reason: str) -> None:
         if state not in {"connected", "lost_link_safety", "needs_human"}:
-            raise LedgerError("Worker safety state is invalid.")
-        if state in {"lost_link_safety", "needs_human"}:
-            self.freeze_worker_and_active_counterparts(
+            raise LedgerError("Worker recovery state is invalid.")
+        if state == "lost_link_safety":
+            self.recover_worker_disconnect(
                 worker_id,
-                "worker_safety_state",
+                "worker_reported_recovery_state",
                 {"reason": reason, "reported_state": state},
             )
             return
         with self._transaction():
             self.active_worker(worker_id)
-            current = self._connection.execute(
-                "SELECT safety_state FROM workers WHERE worker_id = ?", [worker_id]
-            ).fetchone()
-            if current is not None and current[0] == "frozen":
+            if state == "connected":
                 self._event(
-                    "worker_safety_state_ignored",
+                    "worker_recovery_state_reported",
                     {"worker_id": worker_id, "state": state, "reason": reason},
                 )
                 return
-            self._connection.execute(
-                "UPDATE workers SET safety_state = ?, last_seen_at = ? WHERE worker_id = ?",
-                [state, _utc_now(), worker_id],
+            current = self._account_recovery(worker_id) or AccountRecovery(worker_id=worker_id)
+            decision = RecoveryDecision(
+                AccountRecovery(
+                    worker_id=worker_id,
+                    state="NEEDS_HUMAN",
+                    desired_state=current.desired_state,
+                    revision=current.revision + 1,
+                    incident_id=current.incident_id,
+                    expected_leg=current.expected_leg,
+                ),
+                RecoveryDirective("NONE", reason, current.revision + 1),
             )
-            self._event("worker_safety_state_changed", {"worker_id": worker_id, "state": state, "reason": reason})
-
-    def freeze_workers(
-        self,
-        source: str,
-        affected_worker_ids: list[str],
-        audit: dict[str, object],
-    ) -> list[dict[str, Any]]:
-        """Durably isolate active worker accounts without replacing their original freeze evidence."""
-
-        with self._transaction():
-            return self._freeze_workers(source, affected_worker_ids, audit)
-
-    def _freeze_workers(
-        self,
-        source: str,
-        affected_worker_ids: list[str],
-        audit: dict[str, object],
-    ) -> list[dict[str, Any]]:
-        if not source or not affected_worker_ids:
-            raise LedgerError("Worker freeze source and affected workers are required.")
-        if any(not worker_id for worker_id in affected_worker_ids):
-            raise LedgerError("Affected worker IDs are invalid.")
-        if not isinstance(audit.get("reason"), str) or not audit["reason"]:
-            raise LedgerError("Worker freeze audit reason is required.")
-        worker_ids = list(dict.fromkeys(affected_worker_ids))
-        frozen: list[dict[str, Any]] = []
-        for worker_id in worker_ids:
-            existing = self._connection.execute(
-                """SELECT source, affected_worker_ids, audit, frozen_at, event_id
-                   FROM worker_freezes WHERE worker_id = ? ORDER BY frozen_at DESC LIMIT 1""",
-                [worker_id],
-            ).fetchone()
-            if existing is not None:
-                frozen.append(
-                    {
-                        "worker_id": worker_id,
-                        "source": existing[0],
-                        "affected_worker_ids": json.loads(existing[1]),
-                        "audit": json.loads(existing[2]),
-                        "frozen_at": existing[3],
-                        "event_id": existing[4],
-                    }
-                )
-                continue
-            status = self._connection.execute(
-                "SELECT status FROM workers WHERE worker_id = ?", [worker_id]
-            ).fetchone()
-            if status is None:
-                raise LedgerError("Worker is not active.")
-            if status[0] != "active":
-                continue
-            frozen_at = _utc_now()
-            payload = {
-                "worker_id": worker_id,
-                "source": source,
-                "affected_worker_ids": worker_ids,
-                "audit": audit,
-            }
-            event_id = self._event("worker_frozen", payload)
-            self._connection.execute(
-                """INSERT INTO worker_freezes
-                   (freeze_id, worker_id, source, affected_worker_ids, audit, frozen_at, event_id)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                [
-                    str(uuid4()), worker_id, source, json.dumps(worker_ids, sort_keys=True),
-                    json.dumps(audit, sort_keys=True), frozen_at, event_id,
-                ],
+            self._store_recovery_decision(
+                decision,
+                source="worker_reported_recovery_state",
+                audit={"reported_state": state, "reason": reason},
             )
-            self._connection.execute(
-                "UPDATE workers SET safety_state = 'frozen', last_seen_at = ? WHERE worker_id = ?",
-                [frozen_at, worker_id],
-            )
-            self._alert(worker_id, "high", "worker_frozen", source)
-            frozen.append(
-                {
-                    "worker_id": worker_id,
-                    "source": source,
-                    "affected_worker_ids": worker_ids,
-                    "audit": audit,
-                    "frozen_at": frozen_at,
-                    "event_id": event_id,
-                }
-            )
-        return frozen
-
-    def freeze_worker_and_active_counterparts(
-        self, worker_id: str, source: str, audit: dict[str, object]
-    ) -> list[dict[str, Any]]:
-        """Freeze a worker and every account sharing an active execution with it."""
-
-        with self._transaction():
-            if self._connection.execute(
-                "SELECT 1 FROM workers WHERE worker_id = ? AND status = 'active'", [worker_id]
-            ).fetchone() is None:
-                raise LedgerError("Worker is not active.")
-            return self._freeze_workers(source, self._active_counterpart_worker_ids(worker_id), audit)
 
     def _active_counterpart_worker_ids(self, worker_id: str) -> list[str]:
         counterparts = {worker_id}
@@ -1723,142 +2189,14 @@ class ControlLedger:
                 counterparts.update(worker_ids)
         return sorted(counterparts)
 
-    def freeze_intent_workers(
-        self, intent_id: str, source: str, audit: dict[str, object]
-    ) -> list[dict[str, Any]]:
-        """Freeze every valid participant retained in an intent's preflight evidence."""
-
-        with self._transaction():
-            worker_ids = list(dict.fromkeys(
-                item["worker_id"]
-                for item in self._intent_preflight(intent_id)
-                if isinstance(item, dict) and isinstance(item.get("worker_id"), str) and item["worker_id"]
-            ))
-            if not worker_ids:
-                raise LedgerError("Intent has no worker isolation evidence.")
-            return self._freeze_workers(source, worker_ids, audit)
-
-    def frozen_worker_ids(self, worker_ids: list[str]) -> set[str]:
-        if not worker_ids:
-            return set()
-        placeholders = ", ".join("?" for _ in worker_ids)
+    def intent_worker_ids(self, intent_id: str) -> list[str]:
         with self._lock:
-            rows = self._connection.execute(
-                f"SELECT worker_id FROM workers WHERE worker_id IN ({placeholders}) AND safety_state = 'frozen'",
-                worker_ids,
-            ).fetchall()
-        return {str(row[0]) for row in rows}
-
-    def request_worker_recovery(
-        self, username: str, command_id: str, worker_id: str, operation: str
-    ) -> tuple[dict[str, Any], bool]:
-        if operation not in {"cleanup", "release"}:
-            raise LedgerError("Worker recovery operation is invalid.")
-        payload = {"worker_id": worker_id, "operation": operation}
-        payload_hash = _hash(json.dumps(payload, sort_keys=True))
-        with self._transaction():
-            existing = self._connection.execute(
-                """SELECT payload_hash, result FROM worker_recovery_commands
-                   WHERE username = ? AND command_id = ?""",
-                [username, command_id],
-            ).fetchone()
-            if existing is not None:
-                if existing[0] != payload_hash:
-                    raise LedgerError("Worker recovery command ID was already used with a different payload.")
-                return json.loads(existing[1]), False
-            state = self._connection.execute(
-                "SELECT safety_state FROM workers WHERE worker_id = ? AND status = 'active'", [worker_id]
-            ).fetchone()
-            if state is None:
-                raise LedgerError("Worker is not active.")
-            if state[0] != "frozen":
-                raise LedgerError("Worker recovery is available only for frozen workers.")
-            result = {
-                "worker_id": worker_id,
-                "operation": operation,
-                "operation_id": str(uuid4()),
-                "status": f"{operation}_scheduled",
-            }
-            self._connection.execute(
-                """INSERT INTO worker_recovery_commands
-                   (username, command_id, payload_hash, worker_id, operation, result, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                [username, command_id, payload_hash, worker_id, operation, json.dumps(result, sort_keys=True), _utc_now()],
-            )
-            self._event(
-                f"worker_{operation}_requested",
-                {"worker_id": worker_id, "operation_id": result["operation_id"], "requested_by": username},
-            )
-            return result, True
-
-    def record_worker_cleanup(
-        self, worker_id: str, operation_id: str, requested_by: str, state: dict[str, object], succeeded: bool
-    ) -> None:
-        with self._transaction():
-            self._event(
-                "worker_cleanup_completed" if succeeded else "worker_cleanup_failed",
-                {
-                    "worker_id": worker_id,
-                    "operation_id": operation_id,
-                    "requested_by": requested_by,
-                    "state": state,
-                },
-            )
-
-    def release_frozen_worker(
-        self, worker_id: str, operation_id: str, released_by: str, state: dict[str, object]
-    ) -> None:
-        if state.get("orders") or state.get("positions"):
-            raise LedgerError("Worker release requires an empty broker-account reconciliation.")
-        with self._transaction():
-            changed = self._connection.execute(
-                """UPDATE workers SET safety_state = 'connected', last_seen_at = ?
-                   WHERE worker_id = ? AND status = 'active' AND safety_state = 'frozen'
-                   RETURNING worker_id""",
-                [_utc_now(), worker_id],
-            ).fetchone()
-            if changed is None:
-                raise LedgerError("Worker recovery is available only for frozen workers.")
-            self._event(
-                "worker_released",
-                {
-                    "worker_id": worker_id,
-                    "operation_id": operation_id,
-                    "released_by": released_by,
-                    "reconciled_at": _utc_now().isoformat(),
-                },
-            )
-
-    def record_empty_account_reconciliation(
-        self, worker_id: str, operation_id: str, requested_by: str, state: dict[str, object]
-    ) -> None:
-        if state.get("orders") or state.get("positions"):
-            raise LedgerError("Empty-account reconciliation contains broker exposure.")
-        with self._transaction():
-            self._event(
-                "worker_empty_account_reconciled",
-                {
-                    "worker_id": worker_id,
-                    "operation_id": operation_id,
-                    "requested_by": requested_by,
-                    "orders": [],
-                    "positions": [],
-                    "reconciled_at": _utc_now().isoformat(),
-                },
-            )
-
-    def record_worker_release_failure(
-        self, worker_id: str, operation_id: str, requested_by: str, reason: str
-    ) -> None:
-        with self._transaction():
-            self._event(
-                "worker_release_failed",
-                {
-                    "worker_id": worker_id,
-                    "operation_id": operation_id,
-                    "requested_by": requested_by,
-                    "reason": reason,
-                },
+            return list(
+                dict.fromkeys(
+                    item["worker_id"]
+                    for item in self._intent_preflight(intent_id)
+                    if isinstance(item, dict) and isinstance(item.get("worker_id"), str) and item["worker_id"]
+                )
             )
 
     def revoke_worker(self, worker_id: str, revoked_by: str) -> None:
@@ -1870,10 +2208,26 @@ class ControlLedger:
                 raise LedgerError("Worker is not active.")
             self._connection.execute(
                 """
-                UPDATE workers SET status = 'revoked', safety_state = 'revoked', revoked_at = ?
+                UPDATE workers SET status = 'revoked', revoked_at = ?
                 WHERE worker_id = ? AND status = 'active'
                 """,
                 [_utc_now(), worker_id],
+            )
+            current = self._account_recovery(worker_id) or AccountRecovery(worker_id=worker_id)
+            self._store_recovery_decision(
+                RecoveryDecision(
+                    AccountRecovery(
+                        worker_id=worker_id,
+                        state="REVOKED",
+                        desired_state="EMPTY",
+                        revision=current.revision + 1,
+                        incident_id=current.incident_id,
+                        expected_leg=None,
+                    ),
+                    RecoveryDirective("REQUEST_SNAPSHOT", "The revoked Worker account must converge to empty.", current.revision + 1),
+                ),
+                source="administrator_revocation",
+                audit={"revoked_by": revoked_by},
             )
             self._event("worker_certificate_revoked", {"worker_id": worker_id, "revoked_by": revoked_by})
             self._alert(worker_id, "high", "certificate_revoked", "administrator_revocation")
@@ -1940,17 +2294,17 @@ class ControlLedger:
                         "entity": entity,
                         "ticket": ticket,
                         "change": change,
-                        "reason": "Unattributed external broker change requires human recovery.",
+                        "reason": "Unattributed external broker change requires account recovery.",
                     }
                     execution_event_id = self._event(
-                        "intent_execution_frozen",
+                        "intent_account_recovery_started",
                         {"intent_id": intent_id, **payload},
                     )
                     self._connection.execute(
                         """INSERT INTO trader_intent_execution_records
                            (intent_id, event_id, event_type, payload, recorded_at)
                            VALUES (?, ?, ?, ?, ?)""",
-                        [intent_id, execution_event_id, "intent_execution_frozen",
+                        [intent_id, execution_event_id, "intent_account_recovery_started",
                          json.dumps(payload, separators=(",", ":"), sort_keys=True), _utc_now()],
                     )
                     self._connection.execute(
@@ -1961,25 +2315,29 @@ class ControlLedger:
                         "UPDATE trader_intents SET status = 'needs_human' WHERE intent_id = ?",
                         [intent_id],
                     )
-                self._freeze_workers(
-                    "external_broker_change",
-                    self._active_counterpart_worker_ids(worker_id),
-                    {
-                        "reason": "Unattributed external broker change requires account isolation.",
-                        "cursor": cursor,
-                        "entity": entity,
-                        "ticket": ticket,
-                    },
-                )
+                audit = {
+                    "reason": "Unattributed external broker change requires account recovery.",
+                    "cursor": cursor,
+                    "entity": entity,
+                    "ticket": ticket,
+                }
+                incident_id = str(uuid4())
+                for affected_worker_id in self._active_counterpart_worker_ids(worker_id):
+                    current = self._account_recovery(affected_worker_id) or AccountRecovery(worker_id=affected_worker_id)
+                    self._store_recovery_decision(
+                        converge_empty(current, incident_id, str(audit["reason"])),
+                        source="external_broker_change",
+                        audit=audit,
+                    )
 
     def worker_reconciliation(self) -> list[dict[str, Any]]:
         now = _utc_now()
         with self._lock:
             workers = self._connection.execute(
-                "SELECT worker_id, login, server, status, safety_state, last_seen_at FROM workers ORDER BY approved_at"
+                "SELECT worker_id, login, server, status, last_seen_at FROM workers ORDER BY approved_at"
             ).fetchall()
             result = []
-            for worker_id, login, server, status, safety_state, last_seen_at in workers:
+            for worker_id, login, server, status, last_seen_at in workers:
                 live_state = self._connection.execute(
                     """SELECT observed_at, connectivity, quotes, orders, positions, received_at
                        FROM worker_live_state WHERE worker_id = ?""",
@@ -1999,6 +2357,11 @@ class ControlLedger:
                     """,
                     [worker_id],
                 ).fetchall()
+                recovery = self._connection.execute(
+                    """SELECT lifecycle_state, desired_state, revision, incident_id, last_directive, updated_at
+                       FROM account_recoveries WHERE worker_id = ?""",
+                    [worker_id],
+                ).fetchone()
                 result.append(
                     {
                         "worker_id": worker_id,
@@ -2008,8 +2371,14 @@ class ControlLedger:
                             "revoked" if status == "revoked"
                             else "connected" if last_seen_at and now - last_seen_at <= timedelta(minutes=5) else "stale"
                         ),
-                        "safety_state": safety_state,
-                        "freeze": self._worker_freeze(worker_id),
+                        "recovery": None if recovery is None else {
+                            "lifecycle_state": recovery[0],
+                            "desired_state": recovery[1],
+                            "revision": recovery[2],
+                            "incident_id": recovery[3],
+                            "directive": json.loads(recovery[4]),
+                            "updated_at": recovery[5],
+                        },
                         "live_state": None if live_state is None else {
                             "observed_at": live_state[0],
                             "connectivity": bool(live_state[1]),
@@ -2031,606 +2400,6 @@ class ControlLedger:
                     }
                 )
         return result
-
-    def manual_trading_target(self) -> dict[str, Any] | None:
-        with self._lock:
-            row = self._connection.execute(
-                """SELECT pair_id, first_worker_id, second_worker_id, leg_order, interval_seconds,
-                          revision, active_manual_trade_id, configured_by, configured_at
-                   FROM manual_trading_target WHERE singleton = TRUE"""
-            ).fetchone()
-            if row is None:
-                return None
-            pair = self._product_pair_by_id(row[0])
-            workers_by_id = {worker["worker_id"]: worker for worker in self.worker_reconciliation()}
-            worker_ids = [row[1], row[2]]
-            return {
-                "pair": pair,
-                "workers": self._manual_target_workers(pair, worker_ids, workers_by_id),
-                "buy_worker_id": row[1],
-                "sell_worker_id": row[2],
-                "leg_order": row[3],
-                "interval_seconds": row[4],
-                "revision": row[5],
-                "active_manual_trade_id": row[6],
-                "configured_by": row[7],
-                "configured_at": row[8],
-            }
-
-    def _manual_target_workers(
-        self, pair: dict[str, Any], worker_ids: list[str], workers_by_id: dict[str, dict[str, Any]]
-    ) -> list[dict[str, Any]]:
-        selected: list[dict[str, Any]] = []
-        used_endpoints: set[tuple[str, str]] = set()
-        for worker_id in worker_ids:
-            worker = workers_by_id.get(worker_id)
-            if worker is None:
-                raise LedgerError("Manual-trading target references a worker that no longer exists.")
-            matches = [endpoint for endpoint in pair["endpoints"] if endpoint["server"] == worker["server"]]
-            if len(matches) != 1:
-                raise LedgerError("Manual-trading target worker must match exactly one product-pair endpoint.")
-            endpoint = matches[0]
-            endpoint_key = (str(endpoint["server"]), str(endpoint["symbol"]))
-            if endpoint_key in used_endpoints:
-                raise LedgerError("Manual-trading target requires workers for different product-pair endpoints.")
-            used_endpoints.add(endpoint_key)
-            selected.append({**worker, "endpoint": endpoint})
-        return selected
-
-    def active_manual_trades(self) -> list[dict[str, Any]]:
-        with self._lock:
-            workers_by_id = {worker["worker_id"]: worker for worker in self.worker_reconciliation()}
-            rows = self._connection.execute(
-                """SELECT manual_trade_id, pair_id, plan, status, created_at
-                   FROM manual_trades
-                   WHERE status IN ('scheduled', 'dispatching', 'active', 'needs_human')
-                   ORDER BY created_at DESC"""
-            ).fetchall()
-            trades: list[dict[str, Any]] = []
-            for manual_trade_id, pair_id, serialized_plan, status, created_at in rows:
-                plan = json.loads(serialized_plan)
-                active_by_worker = {
-                    str(leg["worker_id"]): leg for leg in plan.get("active_legs", []) if isinstance(leg, dict)
-                }
-                legs = []
-                for leg in plan.get("legs", []):
-                    worker_id = str(leg["worker_id"])
-                    active = active_by_worker.get(worker_id)
-                    market_order_ticket = None if active is None else active.get(
-                        "market_order_ticket", active.get("order")
-                    )
-                    position_ticket = None if active is None else active.get(
-                        "position_ticket", active.get("position")
-                    )
-                    position = None if position_ticket is None else str(position_ticket)
-                    worker = workers_by_id.get(worker_id)
-                    live_positions = [] if worker is None or worker["live_state"] is None else worker["live_state"]["positions"]
-                    position_open = bool(position) and any(str(item.get("ticket")) == position for item in live_positions)
-                    legs.append({
-                        "worker_id": worker_id,
-                        "login": None if worker is None else worker["login"],
-                        "server": None if worker is None else worker["server"],
-                        "symbol": leg["symbol"],
-                        "direction": leg["direction"],
-                        "lots": leg["lots"],
-                        "market_order_ticket": None if market_order_ticket is None else str(market_order_ticket),
-                        "position_ticket": position,
-                        "position_status": "open" if position_open else "closed" if position else "pending",
-                    })
-                trades.append({
-                    "manual_trade_id": manual_trade_id,
-                    "pair_id": pair_id,
-                    "status": status,
-                    "created_at": created_at,
-                    "legs": legs,
-                })
-            return trades
-
-    def discard_unconfirmed_manual_trade(self, username: str, manual_trade_id: str) -> dict[str, Any]:
-        with self._transaction():
-            row = self._connection.execute(
-                "SELECT plan, status FROM manual_trades WHERE manual_trade_id = ?", [manual_trade_id]
-            ).fetchone()
-            if row is None:
-                raise LedgerError("Manual trade does not exist.")
-            plan = json.loads(row[0])
-            if row[1] != "needs_human":
-                raise LedgerError("Only failed manual trades awaiting human review can be discarded.")
-            active_legs = plan.get("active_legs")
-            if not isinstance(active_legs, list) or any(
-                not isinstance(leg, dict)
-                or any(leg.get(field) not in (None, "") for field in ("market_order_ticket", "position_ticket", "order", "position"))
-                for leg in active_legs
-            ):
-                raise LedgerError("Manual trade has broker execution evidence and cannot be discarded.")
-            pending = self._connection.execute(
-                """SELECT 1 FROM manual_trade_operations
-                   WHERE manual_trade_id = ? AND status IN ('scheduled', 'dispatching')""",
-                [manual_trade_id],
-            ).fetchone()
-            if pending is not None:
-                raise LedgerError("Manual trade has an operation still in progress.")
-            self._connection.execute(
-                "UPDATE manual_trades SET status = 'discarded' WHERE manual_trade_id = ?", [manual_trade_id]
-            )
-            self._event(
-                "manual_trade_discarded",
-                {"manual_trade_id": manual_trade_id, "username": username, "reason": "unconfirmed_broker_execution"},
-            )
-            return {"manual_trade_id": manual_trade_id, "status": "discarded"}
-
-    def configure_manual_trading_target(
-        self,
-        username: str,
-        *,
-        pair_id: str,
-        buy_worker_id: str,
-        sell_worker_id: str,
-        leg_order: str,
-        interval_seconds: int,
-        expected_revision: int,
-    ) -> dict[str, Any]:
-        if leg_order not in {"buy_to_sell", "sell_to_buy"}:
-            raise LedgerError("Manual-trading leg order is invalid.")
-        if isinstance(interval_seconds, bool) or interval_seconds < 0:
-            raise LedgerError("Manual-trading interval must be a non-negative integer.")
-        with self._transaction():
-            current = self._connection.execute(
-                """SELECT revision, active_manual_trade_id FROM manual_trading_target WHERE singleton = TRUE"""
-            ).fetchone()
-            actual_revision = 0 if current is None else current[0]
-            if expected_revision != actual_revision:
-                raise LedgerError("Manual-trading target revision does not match the current target.")
-            if buy_worker_id == sell_worker_id:
-                raise LedgerError("Manual-trading target requires two different workers.")
-            pair = self._product_pair_by_id(pair_id)
-            if pair["status"] != "active":
-                raise LedgerError("Manual-trading target requires an active product pair.")
-            applicability = {
-                worker["worker_id"]: worker
-                for worker in self._product_pair_with_worker_applicability(pair)["worker_applicability"]
-            }
-            workers_by_id = {worker["worker_id"]: worker for worker in self.worker_reconciliation()}
-            for worker_id in (buy_worker_id, sell_worker_id):
-                worker = workers_by_id.get(worker_id)
-                eligible = applicability.get(worker_id)
-                if worker is None or eligible is None or eligible["applicability_status"] != "applicable":
-                    raise LedgerError("Manual-trading target worker is not applicable to the selected product pair.")
-                if worker["connectivity"] != "connected" or worker["live_state"] is None or not worker["live_state"]["connectivity"]:
-                    raise LedgerError("Manual-trading target workers must be connected.")
-                if worker["safety_state"] != "connected":
-                    raise LedgerError("Frozen workers cannot be selected for manual trading.")
-            self._manual_target_workers(pair, [buy_worker_id, sell_worker_id], workers_by_id)
-            revision = actual_revision + 1
-            now = _utc_now()
-            self._connection.execute(
-                """INSERT INTO manual_trading_target
-                       (singleton, pair_id, first_worker_id, second_worker_id, leg_order, interval_seconds,
-                        revision, active_manual_trade_id, configured_by, configured_at)
-                   VALUES (TRUE, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
-                   ON CONFLICT (singleton) DO UPDATE SET
-                       pair_id = excluded.pair_id, first_worker_id = excluded.first_worker_id,
-                       second_worker_id = excluded.second_worker_id, leg_order = excluded.leg_order,
-                       interval_seconds = excluded.interval_seconds, revision = excluded.revision,
-                       active_manual_trade_id = NULL,
-                       configured_by = excluded.configured_by, configured_at = excluded.configured_at""",
-                [pair_id, buy_worker_id, sell_worker_id, leg_order, interval_seconds, revision, username, now],
-            )
-            self._event(
-                "manual_trading_target_configured",
-                {
-                    "pair_id": pair_id,
-                    "buy_worker_id": buy_worker_id,
-                    "sell_worker_id": sell_worker_id,
-                    "leg_order": leg_order,
-                    "interval_seconds": interval_seconds,
-                    "revision": revision,
-                    "configured_by": username,
-                },
-            )
-        target = self.manual_trading_target()
-        assert target is not None
-        return target
-
-    def preview_manual_trade(self, payload: dict[str, Any]) -> dict[str, Any]:
-        with self._lock:
-            return self._manual_trade_plan(payload)
-
-    def request_manual_trade(self, username: str, command_id: str, payload: dict[str, Any]) -> dict[str, Any]:
-        canonical_payload = json.dumps(payload, separators=(",", ":"), sort_keys=True)
-        payload_hash = _hash(canonical_payload)
-        with self._transaction():
-            existing = self._connection.execute(
-                """SELECT payload_hash, result FROM manual_trade_commands
-                   WHERE username = ? AND command_id = ?""",
-                [username, command_id],
-            ).fetchone()
-            if existing is not None:
-                if existing[0] != payload_hash:
-                    raise LedgerError("Manual-trade command ID was reused with a different payload.")
-                return json.loads(existing[1])
-            plan = self._manual_trade_plan(payload)
-            manual_trade_id = str(uuid4())
-            now = _utc_now()
-            self._connection.execute(
-                """INSERT INTO manual_trades
-                   (manual_trade_id, username, command_id, target_revision, pair_id, plan, status, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, 'scheduled', ?)""",
-                [
-                    manual_trade_id, username, command_id, plan["target_revision"], plan["pair_id"],
-                    json.dumps(plan, separators=(",", ":"), sort_keys=True), now,
-                ],
-            )
-            event_id = self._event(
-                "manual_trade_scheduled",
-                {"manual_trade_id": manual_trade_id, "username": username, "command_id": command_id, "plan": plan},
-            )
-            result = {
-                "command_id": command_id,
-                "manual_trade_id": manual_trade_id,
-                "status": "scheduled",
-                "event_id": event_id,
-                "plan": plan,
-            }
-            self._connection.execute(
-                """INSERT INTO manual_trade_commands (username, command_id, payload_hash, result, created_at)
-                   VALUES (?, ?, ?, ?, ?)""",
-                [username, command_id, payload_hash, json.dumps(result, separators=(",", ":"), sort_keys=True), now],
-            )
-            return result
-
-    def claim_manual_trade_dispatch(self, manual_trade_id: str) -> bool:
-        with self._transaction():
-            return self._connection.execute(
-                """UPDATE manual_trades SET status = 'dispatching'
-                   WHERE manual_trade_id = ? AND status = 'scheduled'
-                   RETURNING manual_trade_id""",
-                [manual_trade_id],
-            ).fetchone() is not None
-
-    def manual_trade_plan(self, manual_trade_id: str) -> dict[str, Any]:
-        with self._lock:
-            row = self._connection.execute(
-                "SELECT plan FROM manual_trades WHERE manual_trade_id = ?", [manual_trade_id]
-            ).fetchone()
-            if row is None:
-                raise LedgerError("Manual trade does not exist.")
-            return json.loads(row[0])
-
-    def record_manual_trade_event(
-        self, manual_trade_id: str, event_type: str, payload: dict[str, Any], *, status: str | None = None
-    ) -> None:
-        with self._transaction():
-            if self._connection.execute(
-                "SELECT 1 FROM manual_trades WHERE manual_trade_id = ?", [manual_trade_id]
-            ).fetchone() is None:
-                raise LedgerError("Manual trade does not exist.")
-            self._event(event_type, {"manual_trade_id": manual_trade_id, **payload})
-            if status is not None:
-                self._connection.execute(
-                    "UPDATE manual_trades SET status = ? WHERE manual_trade_id = ?", [status, manual_trade_id]
-                )
-
-    def activate_manual_trade(self, manual_trade_id: str, active_legs: list[dict[str, Any]]) -> None:
-        with self._transaction():
-            row = self._connection.execute(
-                "SELECT plan FROM manual_trades WHERE manual_trade_id = ?", [manual_trade_id]
-            ).fetchone()
-            if row is None:
-                raise LedgerError("Manual trade does not exist.")
-            plan = json.loads(row[0])
-            plan["active_legs"] = active_legs
-            self._connection.execute(
-                "UPDATE manual_trades SET plan = ?, status = 'active' WHERE manual_trade_id = ?",
-                [json.dumps(plan, separators=(",", ":"), sort_keys=True), manual_trade_id],
-            )
-
-    def _manual_trade_plan(self, payload: dict[str, Any]) -> dict[str, Any]:
-        required = {"target_revision", "base_lots", "stop_loss_pips", "take_profit_pips"}
-        if set(payload) != required:
-            raise LedgerError("Manual-trade entry payload is invalid.")
-        target = self.manual_trading_target()
-        if target is None:
-            raise LedgerError("Manual-trading target is not configured.")
-        if payload["target_revision"] != target["revision"]:
-            raise LedgerError("Manual-trading target revision does not match the current target.")
-        try:
-            base_lots = Decimal(str(payload["base_lots"]))
-            stop_loss_pips = Decimal(str(payload["stop_loss_pips"]))
-            take_profit_pips = Decimal(str(payload["take_profit_pips"]))
-        except (InvalidOperation, ValueError) as error:
-            raise LedgerError("Manual-trade lots and protection distances must be decimal values.") from error
-        if min(base_lots, stop_loss_pips, take_profit_pips) <= 0:
-            raise LedgerError("Manual-trade lots and protection distances must be positive.")
-        buy_worker_id, sell_worker_id = (str(worker["worker_id"]) for worker in target["workers"])
-        pair = target["pair"]
-        specifications = {
-            (str(item["server"]), str(item["symbol"])): item["specification"]
-            for item in pair["reference_specifications"]
-            if isinstance(item, dict) and isinstance(item.get("specification"), dict)
-        }
-        ratio = pair["lot_relationship"]
-        try:
-            first_ratio = Decimal(str(ratio["first_lots"]))
-            second_ratio = Decimal(str(ratio["second_lots"]))
-        except (KeyError, InvalidOperation, ValueError) as error:
-            raise LedgerError("Product pair has an invalid fixed lot relationship.") from error
-        if first_ratio <= 0 or second_ratio <= 0:
-            raise LedgerError("Product pair has an invalid fixed lot relationship.")
-        legs: list[dict[str, Any]] = []
-        first_endpoint = pair["endpoints"][0]
-        for worker in target["workers"]:
-            worker_id = str(worker["worker_id"])
-            endpoint = worker["endpoint"]
-            specification = specifications.get((str(endpoint["server"]), str(endpoint["symbol"])))
-            if specification is None:
-                raise LedgerError("Product pair is missing endpoint trading specifications.")
-            lots = base_lots if endpoint == first_endpoint else base_lots * second_ratio / first_ratio
-            if not _exact_volume(lots, specification):
-                raise LedgerError("Derived manual-trade lots are not exactly valid for both endpoints.")
-            direction = "BUY" if worker_id == buy_worker_id else "SELL"
-            quote = next(
-                (item for item in (worker["live_state"] or {}).get("quotes", []) if item.get("symbol") == endpoint["symbol"]),
-                None,
-            )
-            if not isinstance(quote, dict):
-                raise LedgerError("Manual-trade quote is unavailable for a selected endpoint.")
-            try:
-                estimate = Decimal(str(quote["ask"] if direction == "BUY" else quote["bid"]))
-                pip_size = _pip_size(specification)
-            except (KeyError, InvalidOperation, ValueError) as error:
-                raise LedgerError("Manual-trade quote or endpoint specification is invalid.") from error
-            if estimate <= 0:
-                raise LedgerError("Manual-trade quote is unavailable for a selected endpoint.")
-            legs.append(
-                {
-                    "worker_id": worker_id,
-                    "symbol": endpoint["symbol"],
-                    "direction": direction,
-                    "lots": str(lots),
-                    "estimated_entry_price": str(estimate),
-                    "estimated_stop_loss": str(estimate - stop_loss_pips * pip_size if direction == "BUY" else estimate + stop_loss_pips * pip_size),
-                    "estimated_take_profit": str(estimate + take_profit_pips * pip_size if direction == "BUY" else estimate - take_profit_pips * pip_size),
-                    "pip_size": str(pip_size),
-                    "stop_loss_pips": str(stop_loss_pips),
-                    "take_profit_pips": str(take_profit_pips),
-                }
-            )
-            if Decimal(legs[-1]["estimated_stop_loss"]) <= 0 or Decimal(legs[-1]["estimated_take_profit"]) <= 0:
-                raise LedgerError("Manual-trade protection prices must remain positive.")
-        first_direction = "BUY" if target["leg_order"] == "buy_to_sell" else "SELL"
-        ordered = sorted(legs, key=lambda leg: 0 if leg["direction"] == first_direction else 1)
-        return {
-            "pair_id": pair["product_pair_id"],
-            "target_revision": target["revision"],
-            "leg_order": target["leg_order"],
-            "interval_seconds": target["interval_seconds"],
-            "stop_loss_pips": str(stop_loss_pips),
-            "take_profit_pips": str(take_profit_pips),
-            "legs": ordered,
-        }
-
-    def manual_trades_for_recovery(self) -> list[dict[str, Any]]:
-        with self._lock:
-            rows = self._connection.execute(
-                """SELECT manual_trade_id, status, plan FROM manual_trades
-                   WHERE status IN ('scheduled', 'dispatching')"""
-            ).fetchall()
-            return [
-                {"manual_trade_id": row[0], "status": row[1], "plan": json.loads(row[2])}
-                for row in rows
-            ]
-
-    def preview_active_manual_trade_operation(
-        self, manual_trade_id: str, operation: str, payload: dict[str, Any]
-    ) -> dict[str, Any]:
-        with self._lock:
-            return self._active_manual_trade_operation_plan(manual_trade_id, operation, payload)
-
-    def request_active_manual_trade_operation(
-        self, username: str, command_id: str, manual_trade_id: str, operation: str, payload: dict[str, Any]
-    ) -> dict[str, Any]:
-        canonical_payload = json.dumps({"operation": operation, **payload}, separators=(",", ":"), sort_keys=True)
-        payload_hash = _hash(canonical_payload)
-        with self._transaction():
-            existing = self._connection.execute(
-                """SELECT payload_hash, result FROM manual_trade_operation_commands
-                   WHERE username = ? AND command_id = ?""",
-                [username, command_id],
-            ).fetchone()
-            if existing is not None:
-                if existing[0] != payload_hash:
-                    raise LedgerError("Manual-trade command ID was reused with a different payload.")
-                return json.loads(existing[1])
-            plan = self._active_manual_trade_operation_plan(manual_trade_id, operation, payload)
-            in_flight = self._connection.execute(
-                """SELECT 1 FROM manual_trade_operations
-                   WHERE manual_trade_id = ? AND status IN ('scheduled', 'dispatching')""",
-                [plan["manual_trade_id"]],
-            ).fetchone()
-            if in_flight is not None:
-                raise LedgerError("An active manual-trade operation is already in progress.")
-            operation_id = str(uuid4())
-            now = _utc_now()
-            result = {
-                "command_id": command_id,
-                "operation_id": operation_id,
-                "manual_trade_id": plan["manual_trade_id"],
-                "operation": operation,
-                "status": "scheduled",
-                "plan": plan,
-            }
-            self._connection.execute(
-                """INSERT INTO manual_trade_operations
-                   (operation_id, manual_trade_id, username, command_id, operation, plan, status, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, 'scheduled', ?)""",
-                [operation_id, plan["manual_trade_id"], username, command_id, operation,
-                 json.dumps(plan, separators=(",", ":"), sort_keys=True), now],
-            )
-            self._connection.execute(
-                """INSERT INTO manual_trade_operation_commands (username, command_id, payload_hash, result, created_at)
-                   VALUES (?, ?, ?, ?, ?)""",
-                [username, command_id, payload_hash, json.dumps(result, separators=(",", ":"), sort_keys=True), now],
-            )
-            self._event("manual_trade_operation_scheduled", result)
-            return result
-
-    def claim_manual_trade_operation_dispatch(self, operation_id: str) -> bool:
-        with self._transaction():
-            return self._connection.execute(
-                """UPDATE manual_trade_operations SET status = 'dispatching'
-                   WHERE operation_id = ? AND status = 'scheduled' RETURNING operation_id""",
-                [operation_id],
-            ).fetchone() is not None
-
-    def manual_trade_operation(self, operation_id: str) -> dict[str, Any]:
-        with self._lock:
-            row = self._connection.execute(
-                """SELECT manual_trade_id, operation, plan FROM manual_trade_operations WHERE operation_id = ?""",
-                [operation_id],
-            ).fetchone()
-            if row is None:
-                raise LedgerError("Manual-trade operation does not exist.")
-            return {"manual_trade_id": row[0], "operation": row[1], "plan": json.loads(row[2])}
-
-    def record_manual_trade_operation(
-        self, operation_id: str, event_type: str, payload: dict[str, Any], *, status: str | None = None
-    ) -> None:
-        with self._transaction():
-            row = self._connection.execute(
-                "SELECT manual_trade_id, operation, plan FROM manual_trade_operations WHERE operation_id = ?",
-                [operation_id],
-            ).fetchone()
-            if row is None:
-                raise LedgerError("Manual-trade operation does not exist.")
-            self._event(event_type, {"operation_id": operation_id, "manual_trade_id": row[0], **payload})
-            if status == "completed":
-                if row[1] == "protection":
-                    operation_plan = json.loads(row[2])
-                    trade = self._connection.execute(
-                        "SELECT plan FROM manual_trades WHERE manual_trade_id = ?", [row[0]]
-                    ).fetchone()
-                    if trade is None:
-                        raise LedgerError("Manual trade does not exist.")
-                    trade_plan = json.loads(trade[0])
-                    for leg, update in zip(trade_plan["legs"], operation_plan["legs"], strict=True):
-                        leg["stop_loss_pips"] = operation_plan["stop_loss_pips"]
-                        leg["take_profit_pips"] = operation_plan["take_profit_pips"]
-                        leg["estimated_stop_loss"] = update["stop_loss"]
-                        leg["estimated_take_profit"] = update["take_profit"]
-                    self._connection.execute(
-                        "UPDATE manual_trades SET plan = ? WHERE manual_trade_id = ?",
-                        [json.dumps(trade_plan, separators=(",", ":"), sort_keys=True), row[0]],
-                    )
-                elif row[1] == "exit":
-                    self._connection.execute(
-                        "UPDATE manual_trades SET status = 'closed' WHERE manual_trade_id = ?", [row[0]]
-                    )
-                    self._connection.execute(
-                        """UPDATE manual_trading_target SET active_manual_trade_id = NULL
-                           WHERE singleton = TRUE AND active_manual_trade_id = ?""",
-                        [row[0]],
-                    )
-            elif status == "needs_human":
-                self._connection.execute(
-                    """UPDATE manual_trades SET status = 'needs_human'
-                       WHERE manual_trade_id = ? AND status != 'closed'""",
-                    [row[0]],
-                )
-            if status is not None:
-                self._connection.execute(
-                    "UPDATE manual_trade_operations SET status = ? WHERE operation_id = ?", [status, operation_id]
-                )
-
-    def _active_manual_trade_operation_plan(
-        self, manual_trade_id: str, operation: str, payload: dict[str, Any]
-    ) -> dict[str, Any]:
-        if operation == "exit":
-            if payload:
-                raise LedgerError("Manual-trade full-exit payload is invalid.")
-        elif operation == "protection":
-            if set(payload) != {"stop_loss_pips", "take_profit_pips"}:
-                raise LedgerError("Manual-trade protection payload is invalid.")
-            try:
-                stop_loss_pips = Decimal(str(payload["stop_loss_pips"]))
-                take_profit_pips = Decimal(str(payload["take_profit_pips"]))
-            except (InvalidOperation, ValueError) as error:
-                raise LedgerError("Manual-trade protection distances must be decimal values.") from error
-            if min(stop_loss_pips, take_profit_pips) <= 0:
-                raise LedgerError("Manual-trade protection distances must be positive.")
-        else:
-            raise LedgerError("Manual-trade operation is invalid.")
-        row = self._connection.execute(
-            "SELECT plan, status FROM manual_trades WHERE manual_trade_id = ?", [manual_trade_id]
-        ).fetchone()
-        if row is None or row[1] not in {"active", "needs_human"}:
-            raise LedgerError("Manual trade has no operable active positions.")
-        if operation == "protection" and row[1] != "active":
-            raise LedgerError("Manual trade needs human review before protections can be updated.")
-        trade_plan = json.loads(row[0])
-        active_by_worker = {
-            item["worker_id"]: item
-            for item in trade_plan.get("active_legs", [])
-            if isinstance(item, dict) and isinstance(item.get("worker_id"), str)
-        }
-        legs: list[dict[str, Any]] = []
-        for leg in trade_plan.get("legs", []):
-            active = active_by_worker.get(leg.get("worker_id"))
-            position_ticket = None if not isinstance(active, dict) else active.get(
-                "position_ticket", active.get("position")
-            )
-            if not isinstance(position_ticket, str) or not position_ticket:
-                raise LedgerError("Active manual trade is missing confirmed position evidence.")
-            item = {
-                "worker_id": leg["worker_id"], "symbol": leg["symbol"], "direction": leg["direction"],
-                "lots": leg["lots"], "position": position_ticket, "fill_price": active["fill_price"],
-            }
-            if operation == "protection":
-                pip_size = Decimal(str(leg["pip_size"]))
-                fill_price = Decimal(str(active["fill_price"]))
-                buy = leg["direction"] == "BUY"
-                item["stop_loss"] = str(fill_price - stop_loss_pips * pip_size if buy else fill_price + stop_loss_pips * pip_size)
-                item["take_profit"] = str(fill_price + take_profit_pips * pip_size if buy else fill_price - take_profit_pips * pip_size)
-            legs.append(item)
-        if len(legs) != 2 or len({leg["worker_id"] for leg in legs}) != 2:
-            raise LedgerError("Active manual trade has invalid leg evidence.")
-        result: dict[str, Any] = {
-            "manual_trade_id": manual_trade_id, "operation": operation, "legs": legs,
-        }
-        if operation == "protection":
-            result["stop_loss_pips"] = str(stop_loss_pips)
-            result["take_profit_pips"] = str(take_profit_pips)
-        return result
-
-    def manual_trade_operations_for_recovery(self) -> list[dict[str, Any]]:
-        with self._lock:
-            rows = self._connection.execute(
-                """SELECT operation_id, manual_trade_id, operation, plan, status FROM manual_trade_operations
-                   WHERE status IN ('scheduled', 'dispatching')"""
-            ).fetchall()
-            return [
-                {
-                    "operation_id": row[0], "manual_trade_id": row[1], "operation": row[2],
-                    "plan": json.loads(row[3]), "status": row[4],
-                }
-                for row in rows
-            ]
-
-    def _worker_freeze(self, worker_id: str) -> dict[str, Any] | None:
-        row = self._connection.execute(
-            """SELECT source, affected_worker_ids, audit, frozen_at, event_id
-               FROM worker_freezes WHERE worker_id = ? ORDER BY frozen_at DESC LIMIT 1""",
-            [worker_id],
-        ).fetchone()
-        if row is None:
-            return None
-        return {
-            "source": row[0],
-            "affected_worker_ids": json.loads(row[1]),
-            "audit": json.loads(row[2]),
-            "frozen_at": row[3],
-            "event_id": row[4],
-        }
 
     def worker_snapshot_page(
         self, *, limit: int, cursor: str | None, page: int | None, query: str | None
@@ -2784,7 +2553,7 @@ class ControlLedger:
     def _analysis_worker(self, worker_id: str, now: datetime) -> dict[str, Any]:
         row = self._connection.execute(
             """
-            SELECT worker_id, login, server, status, safety_state, last_seen_at
+            SELECT worker_id, login, server, status, last_seen_at
             FROM workers
             WHERE worker_id = ?
             """,
@@ -2792,9 +2561,9 @@ class ControlLedger:
         ).fetchone()
         if row is None or row[3] != "active":
             raise LedgerError("Selected worker must be approved, healthy, and connected.")
-        if row[4] != "connected":
+        if row[4] is None or now - row[4] > timedelta(minutes=5):
             raise LedgerError("Selected worker must be approved, healthy, and connected.")
-        if row[5] is None or now - row[5] > timedelta(minutes=5):
+        if self.recovery_admission_blocked([worker_id]):
             raise LedgerError("Selected worker must be approved, healthy, and connected.")
         return {"worker_id": row[0], "login": row[1], "server": row[2]}
 
@@ -3124,7 +2893,6 @@ class ControlLedger:
                 "UPDATE product_pair_build_confirmations SET used_at = ? WHERE confirmation_id = ?",
                 [_utc_now(), confirmation_id],
             )
-            self._clear_manual_trading_target_for_retired_pair(product_pair_id)
             self._event(
                 "product_pair_built",
                 {
@@ -3223,7 +2991,6 @@ class ControlLedger:
                 """,
                 [_utc_now(), retired_by, product_pair_id],
             )
-            self._clear_manual_trading_target_for_retired_pair(product_pair_id)
             self._event(
                 "product_pair_retired",
                 {
@@ -3233,22 +3000,6 @@ class ControlLedger:
                 },
             )
             return self._product_pair_by_id(product_pair_id)
-
-    def _clear_manual_trading_target_for_retired_pair(self, product_pair_id: str) -> None:
-        target = self._connection.execute(
-            """SELECT active_manual_trade_id FROM manual_trading_target
-               WHERE singleton = TRUE AND pair_id = ?""",
-            [product_pair_id],
-        ).fetchone()
-        if target is None:
-            return
-        if target[0] is not None:
-            raise LedgerError("An active manual-trading target cannot be retired.")
-        self._connection.execute(
-            "DELETE FROM manual_trading_target WHERE singleton = TRUE AND pair_id = ?",
-            [product_pair_id],
-        )
-        self._event("manual_trading_target_cleared", {"pair_id": product_pair_id, "reason": "product_pair_retired"})
 
     def product_pairs(self) -> list[dict[str, Any]]:
         with self._lock:
@@ -4440,17 +4191,7 @@ class ControlLedger:
                     status VARCHAR NOT NULL,
                     approved_at TIMESTAMPTZ NOT NULL,
                     last_seen_at TIMESTAMPTZ,
-                    safety_state VARCHAR NOT NULL DEFAULT 'connected',
                     revoked_at TIMESTAMPTZ
-                );
-                CREATE TABLE IF NOT EXISTS worker_freezes (
-                    freeze_id VARCHAR PRIMARY KEY,
-                    worker_id VARCHAR NOT NULL,
-                    source VARCHAR NOT NULL,
-                    affected_worker_ids JSON NOT NULL,
-                    audit JSON NOT NULL,
-                    frozen_at TIMESTAMPTZ NOT NULL,
-                    event_id BIGINT NOT NULL UNIQUE
                 );
                 CREATE TABLE IF NOT EXISTS certificate_overlaps (
                     role VARCHAR NOT NULL,
@@ -4483,6 +4224,41 @@ class ControlLedger:
                     received_at TIMESTAMPTZ NOT NULL,
                     PRIMARY KEY (worker_id, cursor)
                 );
+                CREATE TABLE IF NOT EXISTS account_recoveries (
+                    worker_id VARCHAR PRIMARY KEY,
+                    lifecycle_state VARCHAR NOT NULL,
+                    desired_state VARCHAR NOT NULL,
+                    revision BIGINT NOT NULL,
+                    incident_id VARCHAR,
+                    expected_leg JSON,
+                    last_directive JSON NOT NULL,
+                    updated_at TIMESTAMPTZ NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS recovery_pairs (
+                    pair_id VARCHAR PRIMARY KEY,
+                    trader_id VARCHAR NOT NULL,
+                    worker_ids JSON NOT NULL,
+                    expected_legs JSON NOT NULL,
+                    lifecycle_state VARCHAR NOT NULL,
+                    revision BIGINT NOT NULL,
+                    updated_at TIMESTAMPTZ NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS recovery_pair_observations (
+                    pair_id VARCHAR NOT NULL,
+                    worker_id VARCHAR NOT NULL,
+                    recovery_epoch VARCHAR,
+                    snapshot_id VARCHAR NOT NULL,
+                    orders JSON NOT NULL,
+                    positions JSON NOT NULL,
+                    observed_at TIMESTAMPTZ NOT NULL,
+                    PRIMARY KEY (pair_id, worker_id)
+                );
+                CREATE TABLE IF NOT EXISTS worker_recovery_syncs (
+                    worker_id VARCHAR PRIMARY KEY,
+                    epoch VARCHAR NOT NULL,
+                    journal JSON NOT NULL,
+                    received_at TIMESTAMPTZ NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS worker_live_state (
                     worker_id VARCHAR PRIMARY KEY,
                     observed_at VARCHAR NOT NULL,
@@ -4491,64 +4267,6 @@ class ControlLedger:
                     orders JSON NOT NULL,
                     positions JSON NOT NULL,
                     received_at TIMESTAMPTZ NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS manual_trading_target (
-                    singleton BOOLEAN PRIMARY KEY CHECK (singleton = TRUE),
-                    pair_id VARCHAR NOT NULL,
-                    first_worker_id VARCHAR NOT NULL,
-                    second_worker_id VARCHAR NOT NULL,
-                    leg_order VARCHAR NOT NULL,
-                    interval_seconds BIGINT NOT NULL CHECK (interval_seconds >= 0),
-                    revision BIGINT NOT NULL,
-                    active_manual_trade_id VARCHAR,
-                    configured_by VARCHAR NOT NULL,
-                    configured_at TIMESTAMPTZ NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS manual_trades (
-                    manual_trade_id VARCHAR PRIMARY KEY,
-                    username VARCHAR NOT NULL,
-                    command_id VARCHAR NOT NULL,
-                    target_revision BIGINT NOT NULL,
-                    pair_id VARCHAR NOT NULL,
-                    plan JSON NOT NULL,
-                    status VARCHAR NOT NULL,
-                    created_at TIMESTAMPTZ NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS manual_trade_commands (
-                    username VARCHAR NOT NULL,
-                    command_id VARCHAR NOT NULL,
-                    payload_hash VARCHAR NOT NULL,
-                    result JSON NOT NULL,
-                    created_at TIMESTAMPTZ NOT NULL,
-                    PRIMARY KEY (username, command_id)
-                );
-                CREATE TABLE IF NOT EXISTS manual_trade_operations (
-                    operation_id VARCHAR PRIMARY KEY,
-                    manual_trade_id VARCHAR NOT NULL,
-                    username VARCHAR NOT NULL,
-                    command_id VARCHAR NOT NULL,
-                    operation VARCHAR NOT NULL,
-                    plan JSON NOT NULL,
-                    status VARCHAR NOT NULL,
-                    created_at TIMESTAMPTZ NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS manual_trade_operation_commands (
-                    username VARCHAR NOT NULL,
-                    command_id VARCHAR NOT NULL,
-                    payload_hash VARCHAR NOT NULL,
-                    result JSON NOT NULL,
-                    created_at TIMESTAMPTZ NOT NULL,
-                    PRIMARY KEY (username, command_id)
-                );
-                CREATE TABLE IF NOT EXISTS worker_recovery_commands (
-                    username VARCHAR NOT NULL,
-                    command_id VARCHAR NOT NULL,
-                    payload_hash VARCHAR NOT NULL,
-                    worker_id VARCHAR NOT NULL,
-                    operation VARCHAR NOT NULL,
-                    result JSON NOT NULL,
-                    created_at TIMESTAMPTZ NOT NULL,
-                    PRIMARY KEY (username, command_id)
                 );
                 CREATE SEQUENCE IF NOT EXISTS events_sequence START 1;
                 CREATE TABLE IF NOT EXISTS events (
@@ -4697,8 +4415,19 @@ class ControlLedger:
                 "ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS password_secret_deleted_at TIMESTAMPTZ"
             )
             self._connection.execute("ALTER TABLE workers ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ")
-            self._connection.execute("ALTER TABLE workers ADD COLUMN IF NOT EXISTS safety_state VARCHAR DEFAULT 'connected'")
             self._connection.execute("ALTER TABLE workers ADD COLUMN IF NOT EXISTS revoked_at TIMESTAMPTZ")
+            self._migrate_legacy_recovery_records()
+            self._connection.execute("ALTER TABLE workers DROP COLUMN IF EXISTS safety_state")
+            for table in (
+                "worker_freezes",
+                "manual_trading_target",
+                "manual_trades",
+                "manual_trade_commands",
+                "manual_trade_operations",
+                "manual_trade_operation_commands",
+                "worker_recovery_commands",
+            ):
+                self._connection.execute(f"DROP TABLE IF EXISTS {table}")
             self._connection.execute("ALTER TABLE product_pairs ADD COLUMN IF NOT EXISTS active_pair_key VARCHAR")
             self._connection.execute(
                 """
@@ -4716,7 +4445,6 @@ class ControlLedger:
             self._connection.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS product_pairs_active_pair_key_idx ON product_pairs(active_pair_key)"
             )
-            self._connection.execute("UPDATE workers SET safety_state = 'connected' WHERE safety_state IS NULL")
             self._connection.execute("ALTER TABLE product_catalog_analyses ADD COLUMN IF NOT EXISTS current_stage VARCHAR DEFAULT 'catalog'")
             self._connection.execute("ALTER TABLE product_catalog_analyses ADD COLUMN IF NOT EXISTS retry_count INTEGER DEFAULT 0")
             self._connection.execute("ALTER TABLE product_catalog_analyses DROP COLUMN IF EXISTS exceptions")
@@ -4765,6 +4493,64 @@ class ControlLedger:
             )
             self._migrate_alert_enrollment_reference()
             self._migrate_reconciliation_snapshots()
+            self._migrate_recovery_pair_observations()
+
+    def _migrate_legacy_recovery_records(self) -> None:
+        """Preserve legacy containment as broker-verified empty convergence before removal."""
+
+        affected_worker_ids: set[str] = set()
+        freeze_columns = self._table_columns("worker_freezes")
+        if "affected_worker_ids" in freeze_columns:
+            rows = self._connection.execute("SELECT affected_worker_ids FROM worker_freezes").fetchall()
+            for (serialized_workers,) in rows:
+                try:
+                    worker_ids = json.loads(serialized_workers)
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                if isinstance(worker_ids, list):
+                    affected_worker_ids.update(worker_id for worker_id in worker_ids if isinstance(worker_id, str))
+        manual_columns = self._table_columns("manual_trades")
+        if {"plan", "status"}.issubset(manual_columns):
+            rows = self._connection.execute(
+                """SELECT plan FROM manual_trades
+                   WHERE status IN ('scheduled', 'dispatching', 'active', 'needs_human')"""
+            ).fetchall()
+            for (serialized_plan,) in rows:
+                try:
+                    plan = json.loads(serialized_plan)
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                if isinstance(plan, dict) and isinstance(plan.get("legs"), list):
+                    affected_worker_ids.update(
+                        str(leg["worker_id"])
+                        for leg in plan["legs"]
+                        if isinstance(leg, dict) and isinstance(leg.get("worker_id"), str)
+                    )
+        for worker_id in affected_worker_ids:
+            active = self._connection.execute(
+                "SELECT 1 FROM workers WHERE worker_id = ? AND status = 'active'", [worker_id]
+            ).fetchone()
+            if active is None:
+                continue
+            current = self._account_recovery(worker_id) or AccountRecovery(worker_id=worker_id)
+            self._store_recovery_decision(
+                converge_empty(
+                    current,
+                    f"legacy-containment-{worker_id}",
+                    "Legacy containment was migrated to automatic empty convergence.",
+                ),
+                source="legacy_containment_migration",
+            )
+
+    def _table_columns(self, table_name: str) -> set[str]:
+        return {
+            str(row[0])
+            for row in self._connection.execute(
+                """SELECT column_name FROM information_schema.columns
+                   WHERE table_schema = 'main' AND table_name = ?""",
+                [table_name],
+            ).fetchall()
+        }
 
     def _migrate_alert_enrollment_reference(self) -> None:
         columns = {
@@ -4778,6 +4564,14 @@ class ControlLedger:
         )
         if worker_column[3]:
             self._connection.execute("ALTER TABLE alerts ALTER worker_id DROP NOT NULL")
+
+    def _migrate_recovery_pair_observations(self) -> None:
+        columns = {
+            row[1]
+            for row in self._connection.execute("PRAGMA table_info('recovery_pair_observations')").fetchall()
+        }
+        if "recovery_epoch" not in columns:
+            self._connection.execute("ALTER TABLE recovery_pair_observations ADD COLUMN recovery_epoch VARCHAR")
 
     def _migrate_reconciliation_snapshots(self) -> None:
         columns = {
@@ -4900,27 +4694,6 @@ def _summary_number(value: object) -> int | float | None:
 
 def _summary_boolean(value: object) -> bool | None:
     return value if isinstance(value, bool) else None
-
-
-def _exact_volume(lots: Decimal, specification: dict[str, Any]) -> bool:
-    try:
-        minimum = Decimal(str(specification["volume_min"]))
-        maximum = Decimal(str(specification["volume_max"]))
-        step = Decimal(str(specification["volume_step"]))
-    except (KeyError, InvalidOperation, ValueError):
-        return False
-    return step > 0 and minimum <= lots <= maximum and (lots - minimum) % step == 0
-
-
-def _pip_size(specification: dict[str, Any]) -> Decimal:
-    try:
-        point = Decimal(str(specification["point"]))
-        digits = int(specification["digits"])
-    except (KeyError, InvalidOperation, ValueError) as error:
-        raise LedgerError("Product pair has an invalid endpoint pip specification.") from error
-    if point <= 0:
-        raise LedgerError("Product pair has an invalid endpoint pip specification.")
-    return point * Decimal(10) ** max(0, digits - (2 if digits in {2, 3} else 4))
 
 
 def _hash(value: str) -> str:

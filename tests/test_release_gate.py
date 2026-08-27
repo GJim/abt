@@ -119,8 +119,8 @@ class TwoWorkerReleaseExerciseTests(unittest.TestCase):
                 self._exercise_session(client, first_key, first_worker, first_certificate, cursor=0, external_change=True)
                 self._exercise_session(client, second_key, second_worker, second_certificate, cursor=0, external_change=False)
 
-                alerts = client.get("/api/admin/alerts").json()
-                self.assertEqual("worker_frozen", alerts[-1]["alert_type"])
+                workers = {worker["worker_id"]: worker for worker in client.get("/api/admin/workers").json()}
+                self.assertEqual("CONVERGING_EMPTY", workers[first_worker]["recovery"]["lifecycle_state"])
                 self.assertEqual(
                     204,
                     client.post(f"/api/admin/workers/{first_worker}/revoke", headers={"X-CSRF-Token": csrf}).status_code,

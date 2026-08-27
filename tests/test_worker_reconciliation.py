@@ -16,6 +16,7 @@ from abt.worker.reconciliation import (
     _json_evidence,
     _order_check_diagnostics,
     _trader_read,
+    _serve_order_check,
     _serve_order_execute,
     _serve_trader_rpc,
     _serve_execution_recovery,
@@ -292,6 +293,39 @@ class WorkerReconciliationTests(unittest.TestCase):
         with self.assertRaisesRegex(WorkerEnrollmentError, "invalid symbol catalog"):
             _trader_read(mt5, {"type": "symbols"})
 
+    def test_margin_batch_reads_each_requested_calculation_without_broker_writes(self) -> None:
+        class MarginMT5(ReadOnlyMT5):
+            ORDER_TYPE_BUY = 0
+            ORDER_TYPE_SELL = 1
+
+            def order_calc_margin(self, action: int, symbol: str, volume: float, price: float) -> float:
+                self.calls.append(f"margin:{action}:{symbol}:{volume}:{price}")
+                return volume * 1_000
+
+        mt5 = MarginMT5()
+
+        result = _trader_read(
+            mt5,
+            {
+                "type": "calc_margin_batch",
+                "calculations": [
+                    {"symbol": "EURUSD", "volume": "1.00", "direction": "LONG", "price": "1.10000"},
+                    {"symbol": "EURUSD", "volume": "1.00", "direction": "SHORT", "price": "1.09990"},
+                ],
+            },
+        )
+
+        self.assertEqual(
+            {
+                "margins": [
+                    {"symbol": "EURUSD", "volume": "1.00", "direction": "LONG", "price": "1.10000", "margin": 1000},
+                    {"symbol": "EURUSD", "volume": "1.00", "direction": "SHORT", "price": "1.09990", "margin": 1000},
+                ]
+            },
+            result,
+        )
+        self.assertEqual(0, mt5.broker_write_calls)
+
     def test_mt5_last_error_diagnostic_is_safe_when_unavailable(self) -> None:
         self.assertIsNone(_mt5_last_error(object()))
 
@@ -365,6 +399,136 @@ class WorkerReconciliationTests(unittest.TestCase):
             session.error,
         )
 
+    def test_expired_order_check_returns_not_started_without_calling_mt5(self) -> None:
+        class MT5:
+            def terminal_info(self) -> object:
+                raise AssertionError("An expired order check must not access MT5.")
+
+            def order_check(self, _request: dict[str, object]) -> object:
+                raise AssertionError("An expired order check must not be sent.")
+
+        class Session:
+            response: dict[str, object] | None = None
+
+            def send_order_check(self, **kwargs: object) -> None:
+                self.response = kwargs
+
+        order = {
+            "action": "market",
+            "symbol": "EURUSD",
+            "volume": "0.01",
+            "direction": "LONG",
+            "filling_mode": "IOC",
+        }
+        session = Session()
+
+        _serve_order_check(
+            MT5(),  # type: ignore[arg-type]
+            session,  # type: ignore[arg-type]
+            {"request_id": "expired-check", "order": order, "expires_at": "2000-01-01T00:00:00Z"},
+        )
+
+        self.assertEqual(
+            {
+                "request_id": "expired-check",
+                "order": order,
+                "accepted": False,
+                "execution_state": "not_started",
+                "outcome": "expired_not_started",
+            },
+            session.response,
+        )
+
+    def test_expired_order_execute_returns_not_started_without_sending(self) -> None:
+        class MT5:
+            def terminal_info(self) -> object:
+                raise AssertionError("An expired order must not access MT5.")
+
+            def order_send(self, _request: dict[str, object]) -> object:
+                raise AssertionError("An expired order must not be sent.")
+
+        class Session:
+            response: dict[str, object] | None = None
+
+            def send_order_execute(self, **kwargs: object) -> None:
+                self.response = kwargs
+
+        order = {
+            "action": "market",
+            "symbol": "EURUSD",
+            "volume": "0.01",
+            "direction": "LONG",
+            "filling_mode": "IOC",
+        }
+        session = Session()
+
+        _serve_order_execute(
+            MT5(),  # type: ignore[arg-type]
+            session,  # type: ignore[arg-type]
+            {"request_id": "expired-send", "order": order, "expires_at": "2000-01-01T00:00:00Z"},
+        )
+
+        self.assertEqual(
+            {
+                "request_id": "expired-send",
+                "order": order,
+                "accepted": False,
+                "result": {},
+                "execution_state": "not_started",
+                "outcome": "expired_not_started",
+            },
+            session.response,
+        )
+
+    def test_lost_order_send_response_returns_unknown_after_send(self) -> None:
+        class MT5:
+            ORDER_TYPE_BUY = 0
+            ORDER_TYPE_SELL = 1
+            ORDER_FILLING_FOK = 0
+            ORDER_FILLING_IOC = 1
+            TRADE_ACTION_DEAL = 1
+
+            def terminal_info(self) -> object:
+                return {"trade_allowed": True, "tradeapi_disabled": False}
+
+            def positions_get(self) -> object:
+                return []
+
+            def symbol_info_tick(self, _symbol: str) -> object:
+                return {"bid": 1.1, "ask": 1.1001}
+
+            def order_send(self, _request: dict[str, object]) -> object:
+                raise TimeoutError("MT5 response was lost")
+
+        class Session:
+            response: dict[str, object] | None = None
+
+            def send_order_execute(self, **kwargs: object) -> None:
+                self.response = kwargs
+
+        order = {
+            "action": "market",
+            "symbol": "EURUSD",
+            "volume": "0.01",
+            "direction": "LONG",
+            "filling_mode": "IOC",
+        }
+        session = Session()
+
+        _serve_order_execute(MT5(), session, {"request_id": "unknown-send", "order": order})  # type: ignore[arg-type]
+
+        self.assertEqual(
+            {
+                "request_id": "unknown-send",
+                "order": order,
+                "accepted": False,
+                "result": {},
+                "execution_state": "sent",
+                "outcome": "unknown_after_send",
+            },
+            session.response,
+        )
+
     def test_execution_reconciliation_includes_position_open_price(self) -> None:
         class ReconciliationMT5:
             def orders_get(self) -> object:
@@ -375,7 +539,7 @@ class WorkerReconciliationTests(unittest.TestCase):
                     "ticket": 901,
                     "volume": 0.1,
                     "price_open": 1.1002,
-                    "comment": "abt:m:manual-trade",
+                    "comment": "abt:t:trader-intent",
                 }]
 
         class Session:
@@ -391,7 +555,7 @@ class WorkerReconciliationTests(unittest.TestCase):
             {
                 "type": "execution_reconcile_request",
                 "request_id": "request-1",
-                "execution_id": "abt:m:manual-trade",
+                "execution_id": "abt:t:trader-intent",
             },
         )
 
@@ -406,9 +570,43 @@ class WorkerReconciliationTests(unittest.TestCase):
                         "ticket": 901,
                         "volume": 0.1,
                         "price_open": 1.1002,
-                        "comment": "abt:m:manual-trade",
-                        "control_plane_command_id": "abt:m:manual-trade",
+                        "comment": "abt:t:trader-intent",
+                        "control_plane_command_id": "abt:t:trader-intent",
                     }],
+                },
+            },
+            session.response,
+        )
+
+    def test_account_recovery_reconciliation_returns_all_broker_exposure(self) -> None:
+        class ReconciliationMT5:
+            def orders_get(self) -> object:
+                return [{"ticket": 101, "volume_current": 0.1}]
+
+            def positions_get(self) -> object:
+                return [{"ticket": 901, "volume": 0.1, "price_open": 1.1002}]
+
+        class Session:
+            response: dict[str, object] | None = None
+
+            def send_execution_recovery(self, **kwargs: object) -> None:
+                self.response = kwargs
+
+        session = Session()
+        _serve_execution_recovery(
+            ReconciliationMT5(),  # type: ignore[arg-type]
+            session,  # type: ignore[arg-type]
+            {"type": "account_recovery_reconcile_request", "request_id": "recovery-1"},
+        )
+
+        self.assertEqual(
+            {
+                "request_id": "recovery-1",
+                "operation": "account_recovery_reconcile",
+                "accepted": True,
+                "result": {
+                    "orders": [{"ticket": 101, "volume_current": 0.1}],
+                    "positions": [{"ticket": 901, "volume": 0.1, "price_open": 1.1002}],
                 },
             },
             session.response,
@@ -943,7 +1141,7 @@ class SafetySession:
     def heartbeat(self) -> bool:
         return next(self._heartbeats)
 
-    def send_safety_state(self, state: str, reason: str) -> None:
+    def send_recovery_state(self, state: str, reason: str) -> None:
         self.states.append(state)
 
 
@@ -1015,5 +1213,5 @@ class AnalysisSession(MemoryOnlySession):
     def heartbeat(self) -> bool:
         raise StopIteration
 
-    def send_safety_state(self, state: str, reason: str) -> None:
+    def send_recovery_state(self, state: str, reason: str) -> None:
         pass

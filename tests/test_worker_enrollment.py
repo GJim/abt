@@ -379,7 +379,7 @@ class WorkerEnrollmentTests(unittest.TestCase):
         self.assertEqual("2026-08-17T00:00:00Z", request["period_end_utc"])
         self.assertEqual(["EURUSD"], request["symbols"])
 
-    def test_analysis_helper_buffers_order_check_requests(self) -> None:
+    def test_analysis_helper_schedules_order_check_requests(self) -> None:
         session = AuthenticatedWorkerSession(
             socket=FakeWebSocket(
                 [
@@ -402,21 +402,25 @@ class WorkerEnrollmentTests(unittest.TestCase):
         )
 
         analysis = session.receive_product_catalog_analysis()
-        order_check = session.receive_order_check(timeout=0)
+        order_check = session.receive_trader_rpc()
 
         self.assertEqual("analysis-123", analysis["analysis_id"])
-        self.assertEqual({"request_id": "order-check-123", "order": {"symbol": "EURUSD"}}, order_check)
+        assert order_check is not None
+        self.assertEqual(
+            {"request_id": "order-check-123", "order": {"symbol": "EURUSD"}},
+            order_check.request["worker_request"],
+        )
 
-    def test_execution_recovery_helper_accepts_worker_cleanup_requests(self) -> None:
+    def test_execution_recovery_helper_accepts_account_recovery_requests(self) -> None:
         session = AuthenticatedWorkerSession(
-            socket=FakeWebSocket([{"type": "worker_cleanup_reconcile_request", "request_id": "cleanup-123"}]),
+            socket=FakeWebSocket([{"type": "account_recovery_reconcile_request", "request_id": "recovery-123"}]),
             reconciliation_cursor=0,
         )
 
         request = session.receive_execution_recovery()
 
         self.assertEqual(
-            {"type": "worker_cleanup_reconcile_request", "request_id": "cleanup-123"},
+            {"type": "account_recovery_reconcile_request", "request_id": "recovery-123"},
             request,
         )
 
@@ -654,6 +658,15 @@ class WorkerCredentialTests(unittest.TestCase):
         )
         self.assertEqual(2, len(key_store.signed_payloads))
         self.assertNotIn("memory-only-password", "".join(certificate_socket.sent + session_socket.sent))
+
+    def test_authenticated_session_sends_recovery_epoch_and_journal_inventory(self) -> None:
+        socket = FakeWebSocket([{"type": "recovery_sync_accepted", "epoch": "epoch-1"}])
+        session = AuthenticatedWorkerSession(socket=socket, reconciliation_cursor=0, recovery_epoch="epoch-1")
+
+        session.send_recovery_sync([{"effect_id": "effect-1", "state": "send_started", "payload": {"action": "market"}}])
+
+        self.assertIn('"type":"recovery_sync"', socket.sent[0])
+        self.assertNotIn("password", socket.sent[0])
 
     def test_buffers_analysis_request_while_waiting_for_reconciliation_acknowledgement(self) -> None:
         socket = FakeWebSocket(

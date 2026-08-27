@@ -778,6 +778,11 @@ li {
   color: #9a3412;
 }
 
+.worker-health-recovering {
+  background: #fef3c7;
+  color: #92400e;
+}
+
 .worker-health-human-action {
   background: #fee4e2;
   color: #b42318;

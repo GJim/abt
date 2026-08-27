@@ -110,6 +110,51 @@ class TraderProtocolTests(unittest.TestCase):
 
         self.assertEqual("calc_margin", request.payload.type)  # type: ignore[union-attr]
 
+    def test_accepts_a_bounded_batch_of_margin_calculations(self) -> None:
+        request = trader_rpc_request_adapter.validate_python(
+            {
+                "type": "trader_rpc_request",
+                "request_id": "request-1",
+                "kind": "read",
+                "payload": {
+                    "type": "calc_margin_batch",
+                    "calculations": [
+                        {
+                            "symbol": "EURUSD",
+                            "volume": "1.00",
+                            "direction": "LONG",
+                            "price": "1.10000",
+                        },
+                        {
+                            "symbol": "EURUSD",
+                            "volume": "1.00",
+                            "direction": "SHORT",
+                            "price": "1.09990",
+                        },
+                    ],
+                },
+            }
+        )
+
+        self.assertEqual("calc_margin_batch", request.payload.type)  # type: ignore[union-attr]
+
+    def test_rejects_an_invalid_margin_calculation_batch_before_mt5(self) -> None:
+        for calculations in (
+            [],
+            [{"symbol": "EURUSD", "volume": "1.00", "direction": "BUY", "price": "1.10000"}],
+            [{"symbol": "EURUSD", "volume": "1.00", "direction": "LONG", "price": "1.10000", "extra": True}],
+        ):
+            with self.subTest(calculations=calculations):
+                with self.assertRaises(ValidationError):
+                    trader_rpc_request_adapter.validate_python(
+                        {
+                            "type": "trader_rpc_request",
+                            "request_id": "request-1",
+                            "kind": "read",
+                            "payload": {"type": "calc_margin_batch", "calculations": calculations},
+                        }
+                    )
+
     def test_accepts_a_typed_symbols_read(self) -> None:
         request = trader_rpc_request_adapter.validate_python(
             {

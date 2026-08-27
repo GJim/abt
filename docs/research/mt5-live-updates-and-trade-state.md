@@ -1,7 +1,7 @@
 # MT5 Live Updates and Trade State
 
-**Scope:** MT5 terminal Python (`MetaTrader5`) integration for the manual-trading
-and worker-recovery pages. Sources are official MetaQuotes documentation.
+**Scope:** MT5 terminal Python (`MetaTrader5`) integration for Worker monitoring
+and automatic account recovery. Sources are official MetaQuotes documentation.
 
 ## Result
 

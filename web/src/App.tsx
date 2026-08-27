@@ -13,11 +13,9 @@ import { AuditEventsPage } from './AuditEventsPage'
 import { AnalysisHistoryPage } from './AnalysisHistoryPage'
 import { ProductPairsListPage } from './ProductPairsListPage'
 import { IntentWorkspacePage } from './IntentWorkspacePage'
-import { ManualTradingPage } from './ManualTradingPage'
 import { RegistrationInvitesPage } from './RegistrationInvitesPage'
 import { TraderManagementPage } from './TraderManagementPage'
 import { WorkerManagementPage } from './WorkerManagementPage'
-import { WorkerRecoveryPage } from './WorkerRecoveryPage'
 import { formatTimestamp as formatDateTime } from './formatting'
 import './App.css'
 import './Console.css'
@@ -58,18 +56,26 @@ type LiveWorkerState = {
   positions: EnrollmentEvidence[]
 }
 
+export type AccountRecovery = {
+  lifecycle_state: string
+  desired_state: string
+  revision: number
+  incident_id: string | null
+  directive: {
+    kind: string
+    reason: string
+    revision: number
+    tickets?: string[]
+  }
+  updated_at: string
+}
+
 export type AccountWorker = {
   worker_id: string
   login: number
   server: string
   connectivity: string
-  safety_state: string
-  freeze: {
-    source: string
-    affected_worker_ids: string[]
-    audit: { reason: string }
-    frozen_at: string
-  } | null
+  recovery: AccountRecovery | null
   latest_snapshot: {
     cursor: number
     observed_at: string
@@ -440,7 +446,7 @@ const STAGE_LABELS: Record<string, string> = {
 }
 
 const LIVE_REFRESH_TIMEOUT_MS = 10_000
-type ConsolePage = 'main' | 'launch' | 'audit' | 'snapshots' | 'recovery' | 'manual-trading' | 'history' | 'active-pairs' | 'retired-pairs' | 'invites' | 'traders' | 'intents'
+type ConsolePage = 'main' | 'launch' | 'audit' | 'snapshots' | 'history' | 'active-pairs' | 'retired-pairs' | 'invites' | 'traders' | 'intents'
 
 function App() {
   const location = useLocation()
@@ -1005,8 +1011,6 @@ function App() {
               <Link aria-current={consolePage === 'active-pairs' ? 'page' : undefined} to="/pairs/active">Current pairs</Link>
               <Link aria-current={consolePage === 'retired-pairs' ? 'page' : undefined} to="/pairs/retired">Retired pairs</Link>
               <Link aria-current={consolePage === 'snapshots' ? 'page' : undefined} to="/workers">Workers</Link>
-              <Link aria-current={consolePage === 'recovery' ? 'page' : undefined} to="/worker-recovery">Worker recovery</Link>
-              <Link aria-current={consolePage === 'manual-trading' ? 'page' : undefined} to="/manual-trading">Manual trading</Link>
               <Link aria-current={consolePage === 'invites' ? 'page' : undefined} to="/registration-invites">Registration invites</Link>
               <Link aria-current={consolePage === 'traders' ? 'page' : undefined} to="/traders">Traders</Link>
               <Link aria-current={consolePage === 'intents' ? 'page' : undefined} to="/intents">Intents</Link>
@@ -1060,10 +1064,6 @@ function App() {
               onRevokeWorker={revokeWorker}
               workers={workers}
             />
-          ) : consolePage === 'recovery' ? (
-            <WorkerRecoveryPage csrfToken={csrfToken} onChanged={refreshManagementData} workers={workers} />
-          ) : consolePage === 'manual-trading' ? (
-            <ManualTradingPage csrfToken={csrfToken} onChanged={refreshManagementData} productPairs={productPairs} workers={workers} />
           ) : consolePage === 'invites' ? (
             <RegistrationInvitesPage csrfToken={csrfToken} />
           ) : consolePage === 'traders' ? (
@@ -2000,7 +2000,7 @@ function ProductPairCard({
                 <div className="section-header">
                   <div>
                     <h5>{worker.login} on {worker.server}</h5>
-                    <p>{worker.connectivity} / {worker.safety_state}</p>
+                    <p>{worker.connectivity} / {worker.recovery ? `recovery ${humanizeToken(worker.recovery.lifecycle_state)}` : 'no active recovery'}</p>
                   </div>
                   <span className={`status-badge ${applicabilityStatusClassName(state)}`}>
                     {humanizeApplicabilityStatus(state)}
@@ -2427,10 +2427,6 @@ function readConsolePage(pathname: string): ConsolePage {
       return 'audit'
     case '/workers':
       return 'snapshots'
-    case '/worker-recovery':
-      return 'recovery'
-    case '/manual-trading':
-      return 'manual-trading'
     case '/registration-invites':
       return 'invites'
     case '/analysis/history':
@@ -2455,8 +2451,8 @@ function workerEligibilityReason(worker: AccountWorker) {
   if (worker.connectivity !== 'connected') {
     return 'Worker is not currently connected.'
   }
-  if (worker.safety_state !== 'connected') {
-    return `Safety state is ${humanizeToken(worker.safety_state)}.`
+  if (worker.recovery?.lifecycle_state && worker.recovery.lifecycle_state !== 'READY') {
+    return `Automatic recovery is ${humanizeToken(worker.recovery.lifecycle_state)}.`
   }
   return null
 }

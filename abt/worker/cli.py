@@ -12,6 +12,7 @@ from typing import TextIO
 import httpx
 
 from .enrollment import EnrollmentTransport, MT5Client, WorkerEnrollmentError, register_worker
+from .effect_journal import WorkerEffectJournal
 from .identity import (
     WorkerIdentity,
     default_identity_path,
@@ -368,6 +369,7 @@ def _reconcile_with_certificate_maintenance(
                         _close(transport)
 
             try:
+                effect_journal = WorkerEffectJournal(identity_path.with_suffix(".effects.sqlite"))
                 reconnect_worker_session(
                     open_session=lambda: open_authenticated_worker_session(
                         controller_url=current_identity.controller_url,
@@ -381,12 +383,16 @@ def _reconcile_with_certificate_maintenance(
                     login=current_identity.login,
                     server=current_identity.server,
                     maintenance=maintain,
+                    effect_journal=effect_journal,
                 )
                 return
             except WorkerCertificateRotated:
                 _close(current_key)
                 current_identity = load_identity(identity_path)
                 current_key = key_store_factory(current_identity.key_name)
+            finally:
+                if "effect_journal" in locals():
+                    effect_journal.close()
     finally:
         _close(current_key)
 

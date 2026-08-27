@@ -95,9 +95,9 @@ Trader inventory queries.
 historical ticks are limited to 1,000 records per request; callers split and
 de-duplicate larger time ranges. Operations support
 `market`, `pending` (`limit`, `stop`, or `stop_limit`), `cancel`, `close`, and
-`modify_sl_tp`. Operations are refused for a disconnected, frozen, or
-`needs_human` Worker. The controller records both the request and its Worker
-result before emitting the JSONL result.
+`modify_sl_tp`. Operations are refused for a disconnected Worker or one whose account recovery
+lifecycle is not eligible for the requested work. The controller records both
+the request and its Worker result before emitting the JSONL result.
 
 ### Active-pair historical tick analysis
 

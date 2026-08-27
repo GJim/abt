@@ -11,11 +11,14 @@ from strategy.realtime_arbitrage import (
     Endpoint,
     Pair,
     RealtimeArbitrage,
+    HedgedEntryContained,
+    SizingPlan,
     StrategyConfig,
     StrategyError,
     TradeCandidate,
     TraderGateway,
     WorkerMarketDataUnavailable,
+    WorkerRpcUnavailable,
     main,
 )
 
@@ -29,6 +32,9 @@ class FakeGateway:
         self.unavailable_catalog_workers: set[str] = set()
         self.live_symbol_results: dict[str, dict[str, object]] = {}
         self.live_symbol_rejections: set[str] = set()
+        self.hedged_entries: list[dict[str, object]] = []
+        self.hedged_entry_result: dict[str, object] = {"command_id": "entry", "status": "accepted", "legs": []}
+        self.protected_pairs: list[tuple[str, list[dict[str, object]]]] = []
 
     def request(self, worker_id: str, *, kind: str, request: dict[str, object]) -> dict[str, object]:
         self.calls.append((worker_id, kind, request))
@@ -53,7 +59,14 @@ class FakeGateway:
                 raise StrategyError("Worker rejected live symbol configuration.")
             return self.live_symbol_results.get(worker_id, {"symbols": request["symbols"]})
         if request["type"] == "calc_margin":
-            return {"margin": 1_000.0}
+            return {"margin": 1_000.0 * float(request["volume"])}
+        if request["type"] == "calc_margin_batch":
+            return {
+                "margins": [
+                    {**calculation, "margin": 1_000.0 * float(calculation["volume"])}
+                    for calculation in request["calculations"]
+                ]
+            }
         if request["type"] == "current_positions":
             return {"positions": self.positions.get(worker_id, [])}
         if request["type"] == "current_orders":
@@ -66,6 +79,14 @@ class FakeGateway:
             return {"profit": profit}
         return {"operation": request["type"], "result": {}}
 
+    def protected_pair(self, pair_id: str, legs: list[dict[str, object]]) -> dict[str, object]:
+        self.protected_pairs.append((pair_id, legs))
+        return {"pair_id": pair_id, "lifecycle_state": "CATCHING_UP"}
+
+    def hedged_entry(self, payload: dict[str, object]) -> dict[str, object]:
+        self.hedged_entries.append(payload)
+        return self.hedged_entry_result
+
     @staticmethod
     def symbol_specification(symbol: dict[str, object]) -> dict[str, object]:
         return {
@@ -77,6 +98,7 @@ class FakeGateway:
             "trade_contract_size": 100_000.0,
             "volume_min": 0.01,
             "volume_step": 0.01,
+            "volume_max": 100.0,
             "filling_mode": 3,
             "order_mode": 3,
             **symbol,
@@ -86,16 +108,23 @@ class FakeGateway:
         self.calls.append(("", "query", {"query": query}))
         return {
             "workers": [
-                {"worker_id": "audacity", "connectivity": "connected", "safety_state": "connected"},
-                {"worker_id": "ftmo", "connectivity": "connected", "safety_state": "connected"},
-                {"worker_id": "worker-a", "connectivity": "connected", "safety_state": "connected"},
-                {"worker_id": "worker-b", "connectivity": "connected", "safety_state": "connected"},
+                {"worker_id": "audacity", "connectivity": "connected"},
+                {"worker_id": "ftmo", "connectivity": "connected"},
+                {"worker_id": "worker-a", "connectivity": "connected"},
+                {"worker_id": "worker-b", "connectivity": "connected"},
             ]
         }
 
 
-def configuration(*, execute: bool = True) -> StrategyConfig:
-    return StrategyConfig(0.4, 0.1, 100, 0.03, 0.02, 1, 40, 5, 180, time(16), 300, execute)
+def configuration(
+    *,
+    execute: bool = True,
+    max_exposure_usd: float | None = None,
+    max_margin_ratio: float = 0.1,
+) -> StrategyConfig:
+    return StrategyConfig(
+        0.4, 100, 0.03, 0.02, max_exposure_usd, max_margin_ratio, 1, 40, 5, 180, time(16), 300, 30, execute
+    )
 
 
 class RealtimeArbitrageTests(unittest.TestCase):
@@ -105,6 +134,72 @@ class RealtimeArbitrageTests(unittest.TestCase):
         gateway._deferred = deque()
 
         self.assertIsNone(gateway.market_data(timeout_seconds=0.001))
+
+    def test_rpc_rejection_preserves_worker_reason(self) -> None:
+        gateway = TraderGateway.__new__(TraderGateway)
+        gateway._messages = Queue()
+        gateway._deferred = deque()
+
+        def reject(payload: dict[str, object]) -> None:
+            gateway._messages.put(
+                {
+                    "type": "trader_rpc_result",
+                    "request_id": payload["request_id"],
+                    "status": "rejected",
+                    "result": {"reason": "The MT5 market order was rejected: retcode=10030 comment='Unsupported filling mode'."},
+                }
+            )
+
+        gateway._send = reject
+
+        with self.assertRaisesRegex(StrategyError, "retcode=10030.*Unsupported filling mode"):
+            gateway.request("worker-a", kind="operation", request={"type": "market"})
+
+    def test_retryable_rpc_rejection_identifies_unavailable_worker_and_kind(self) -> None:
+        gateway = TraderGateway.__new__(TraderGateway)
+        gateway._messages = Queue()
+        gateway._deferred = deque()
+
+        def reject(payload: dict[str, object]) -> None:
+            gateway._messages.put(
+                {
+                    "type": "trader_rpc_result",
+                    "request_id": payload["request_id"],
+                    "status": "rejected",
+                    "result": {"reason": "Selected worker is disconnected.", "retryable": True},
+                }
+            )
+
+        gateway._send = reject
+
+        with self.assertRaises(WorkerRpcUnavailable) as raised:
+            gateway.request("worker-a", kind="read", request={"type": "current_orders"})
+
+        self.assertEqual(("worker-a", "read"), (raised.exception.worker_id, raised.exception.kind))
+
+    def test_hedged_entry_recovers_its_durable_outcome_from_a_replayed_event(self) -> None:
+        gateway = TraderGateway.__new__(TraderGateway)
+        gateway._messages = Queue()
+        gateway._deferred = deque()
+
+        def replay(payload: dict[str, object]) -> None:
+            gateway._messages.put(
+                {
+                    "type": "event",
+                    "event_id": 17,
+                    "event_type": "hedged_entry_completed",
+                    "payload": {
+                        "command_id": payload["command_id"],
+                        "outcome": {"command_id": payload["command_id"], "status": "accepted", "legs": []},
+                    },
+                }
+            )
+
+        gateway._send = replay
+
+        result = gateway.hedged_entry({"type": "hedged_entry"})
+
+        self.assertEqual("accepted", result["status"])
 
     def test_market_data_unavailable_identifies_the_disconnected_worker(self) -> None:
         gateway = TraderGateway.__new__(TraderGateway)
@@ -123,6 +218,77 @@ class RealtimeArbitrageTests(unittest.TestCase):
         strategy = RealtimeArbitrage(gateway, first=Endpoint("worker-a"), second=Endpoint("worker-b"), config=configuration())
 
         strategy._suspend_for_worker_disconnect(WorkerMarketDataUnavailable("worker-a", "worker_session_unavailable"))
+
+        self.assertFalse(strategy.stopped)
+        self.assertEqual({"first"}, strategy.unavailable_endpoints)
+        self.assertIsNotNone(strategy.worker_disconnect_deadline)
+
+    def test_read_rpc_disconnect_suspends_active_pair_for_read_grace_period(self) -> None:
+        gateway = FakeGateway()
+        strategy = RealtimeArbitrage(gateway, first=Endpoint("worker-a"), second=Endpoint("worker-b"), config=configuration())
+        strategy.pair = Pair(
+            "EURUSD", "long_first_short_second", 1.2, 1.2, 11, 22, "LONG", "SHORT", 0.1, datetime.now(UTC)
+        )
+        gateway.positions = {
+            "worker-a": [{"ticket": 11, "symbol": "EURUSD", "type": 0, "volume": 0.1}],
+            "worker-b": [{"ticket": 22, "symbol": "EURUSD", "type": 1, "volume": 0.1}],
+        }
+        request = gateway.request
+
+        def unavailable(worker_id: str, *, kind: str, request: dict[str, object]) -> dict[str, object]:
+            if worker_id == "worker-b" and request["type"] == "current_orders":
+                raise WorkerRpcUnavailable(worker_id, kind, "Worker session is unavailable.")
+            return request_gateway(worker_id, kind=kind, request=request)
+
+        request_gateway = request
+        gateway.request = unavailable  # type: ignore[method-assign]
+
+        with self.assertRaises(WorkerRpcUnavailable):
+            strategy._check_active_pair_integrity()
+        strategy._suspend_for_worker_disconnect(WorkerRpcUnavailable("worker-b", "read", "Worker session is unavailable."))
+
+        assert strategy.worker_disconnect_deadline is not None
+        remaining = (strategy.worker_disconnect_deadline - datetime.now(UTC)).total_seconds()
+        self.assertFalse(strategy.stopped)
+        self.assertGreater(remaining, 299)
+        self.assertLessEqual(remaining, 300)
+
+    def test_write_rpc_disconnect_uses_short_grace_and_requires_safety_shutdown_after_recovery(self) -> None:
+        gateway = FakeGateway()
+        strategy = RealtimeArbitrage(gateway, first=Endpoint("worker-a"), second=Endpoint("worker-b"), config=configuration())
+        gateway.positions = {"worker-a": [{"ticket": 11, "volume": 0.1}]}
+
+        strategy._suspend_for_worker_disconnect(WorkerRpcUnavailable("worker-b", "operation", "Worker session is unavailable."))
+
+        assert strategy.worker_disconnect_deadline is not None
+        remaining = (strategy.worker_disconnect_deadline - datetime.now(UTC)).total_seconds()
+        self.assertTrue(strategy.unresolved_write_failure)
+        self.assertGreater(remaining, 29)
+        self.assertLessEqual(remaining, 30)
+        with self.assertRaisesRegex(StrategyError, "operation outcome was unavailable"):
+            strategy._recover_worker_market_data({"worker_id": "worker-b"})
+        self.assertTrue(strategy.stopped)
+        self.assertIn(
+            ("worker-a", "operation", {"type": "close", "ticket": "11", "volume": "0.10"}),
+            gateway.calls,
+        )
+
+    def test_daily_equity_read_disconnect_suspends_before_any_trading_decision(self) -> None:
+        gateway = FakeGateway()
+        strategy = RealtimeArbitrage(gateway, first=Endpoint("worker-a"), second=Endpoint("worker-b"), config=configuration())
+        stop = Event()
+        request = gateway.request
+
+        def unavailable(worker_id: str, *, kind: str, request: dict[str, object]) -> dict[str, object]:
+            if worker_id == "worker-a" and request["type"] == "account_info":
+                stop.set()
+                raise WorkerRpcUnavailable(worker_id, kind, "Worker session is unavailable.")
+            return request_gateway(worker_id, kind=kind, request=request)
+
+        request_gateway = request
+        gateway.request = unavailable  # type: ignore[method-assign]
+
+        strategy.run(stop)
 
         self.assertFalse(strategy.stopped)
         self.assertEqual({"first"}, strategy.unavailable_endpoints)
@@ -147,21 +313,199 @@ class RealtimeArbitrageTests(unittest.TestCase):
             closes,
         )
 
-    def test_halts_before_any_order_when_calculated_margin_exceeds_half_equity(self) -> None:
+    def test_skips_entry_when_margin_budget_cannot_cover_minimum_volume(self) -> None:
         gateway = FakeGateway()
-        strategy = RealtimeArbitrage(gateway, first=Endpoint("worker-a"), second=Endpoint("worker-b"), config=configuration(execute=False))
+        strategy = RealtimeArbitrage(
+            gateway,
+            first=Endpoint("worker-a"),
+            second=Endpoint("worker-b"),
+            config=configuration(execute=False, max_exposure_usd=5_000),
+        )
         strategy.quotes["first"]["EURUSD"] = (datetime.now(UTC), 1.2, 1.2001)
         strategy.quotes["second"]["EURUSD"] = (datetime.now(UTC), 1.2, 1.2001)
-        strategy.margin_per_lot = {
-            ("EURUSD", "first", "SHORT"): (datetime.now(UTC), 30_000),
-            ("EURUSD", "second", "LONG"): (datetime.now(UTC), 1_000),
+        strategy.sizing_plans = {
+            ("EURUSD", "short_first_long_second"): SizingPlan(
+                volume=0.0,
+                first_margin_limit=400,
+                second_margin_limit=400,
+                computed_at=datetime.now(UTC),
+            )
         }
         calls_before_open = len(gateway.calls)
 
-        with self.assertRaisesRegex(StrategyError, "exceeds 50%"):
-            strategy._open(TradeCandidate("EURUSD", "short_first_long_second", 0.001))
+        strategy._open(TradeCandidate("EURUSD", "short_first_long_second", 0.001))
 
         self.assertFalse(any(kind == "operation" for _, kind, _ in gateway.calls[calls_before_open:]))
+
+    def test_cached_sizing_snapshot_reserves_headroom_and_becomes_stale_after_ten_minutes(self) -> None:
+        gateway = FakeGateway()
+        strategy = RealtimeArbitrage(
+            gateway,
+            first=Endpoint("worker-a"),
+            second=Endpoint("worker-b"),
+            config=configuration(execute=False, max_exposure_usd=5_000),
+        )
+        now = datetime.now(UTC)
+        strategy.quotes["first"]["EURUSD"] = (now, 1.2, 1.2001)
+        strategy.quotes["second"]["EURUSD"] = (now, 1.2, 1.2001)
+
+        for symbol in strategy.shared_symbols:
+            strategy.quotes["first"][symbol] = (now, 1.2, 1.2001)
+            strategy.quotes["second"][symbol] = (now, 1.2, 1.2001)
+
+        strategy._refresh_sizing_snapshot_if_due()
+
+        plan = strategy._sizing_plan_for("EURUSD", "short_first_long_second")
+        assert plan is not None
+        self.assertEqual(0.4, plan.volume)
+        self.assertEqual((400.0, 400.0), (plan.first_margin_limit, plan.second_margin_limit))
+        batches = [
+            (worker, request["calculations"])
+            for worker, kind, request in gateway.calls
+            if kind == "read" and request["type"] == "calc_margin_batch"
+        ]
+        self.assertEqual(2, len(batches))
+        strategy.sizing_plans[("EURUSD", "short_first_long_second")] = SizingPlan(
+            volume=0.4,
+            first_margin_limit=400,
+            second_margin_limit=400,
+            computed_at=datetime.now(UTC) - timedelta(minutes=10),
+        )
+        self.assertIsNone(strategy._sizing_plan_for("EURUSD", "short_first_long_second"))
+
+    def test_open_uses_one_hedged_entry_command_not_two_market_operations(self) -> None:
+        gateway = FakeGateway()
+        strategy = RealtimeArbitrage(
+            gateway,
+            first=Endpoint("worker-a"),
+            second=Endpoint("worker-b"),
+            config=configuration(execute=True, max_exposure_usd=5_000),
+        )
+        now = datetime.now(UTC)
+        for symbol in strategy.shared_symbols:
+            strategy.quotes["first"][symbol] = (now, 1.2, 1.2001)
+            strategy.quotes["second"][symbol] = (now, 1.2, 1.2001)
+        strategy._refresh_sizing_snapshot_if_due()
+        gateway.positions = {
+            "worker-a": [{"ticket": 11, "symbol": "EURUSD", "type": 1, "volume": 0.4, "price_open": 1.2}],
+            "worker-b": [{"ticket": 22, "symbol": "EURUSD", "type": 0, "volume": 0.4, "price_open": 1.2001}],
+        }
+        calls_before_open = len(gateway.calls)
+
+        strategy._open(TradeCandidate("EURUSD", "short_first_long_second", 0.001))
+
+        self.assertEqual(1, len(gateway.hedged_entries))
+        self.assertIn("expires_at", gateway.hedged_entries[0])
+        self.assertEqual(
+            [
+                {
+                    "worker_id": "worker-a",
+                    "symbol": "EURUSD",
+                    "volume": "0.40",
+                    "direction": "SHORT",
+                    "filling_mode": "FOK",
+                    "margin_limit": "400.00",
+                },
+                {
+                    "worker_id": "worker-b",
+                    "symbol": "EURUSD",
+                    "volume": "0.40",
+                    "direction": "LONG",
+                    "filling_mode": "FOK",
+                    "margin_limit": "400.00",
+                },
+            ],
+            [
+                gateway.hedged_entries[0]["first"],
+                gateway.hedged_entries[0]["second"],
+            ],
+        )
+        self.assertFalse(
+            any(
+                kind == "operation" and request["type"] == "market"
+                for _, kind, request in gateway.calls[calls_before_open:]
+            )
+        )
+        self.assertEqual("entry", gateway.protected_pairs[0][0])
+        self.assertEqual(["worker-a", "worker-b"], [leg["worker_id"] for leg in gateway.protected_pairs[0][1]])
+
+    def test_contained_hedged_entry_never_falls_back_to_individual_market_or_close_operations(self) -> None:
+        gateway = FakeGateway()
+        gateway.hedged_entry_result = {
+            "command_id": "entry",
+            "status": "contained",
+            "reason": "A market-leg outcome was failed or unknown after paired dispatch.",
+            "legs": [],
+        }
+        strategy = RealtimeArbitrage(
+            gateway,
+            first=Endpoint("worker-a"),
+            second=Endpoint("worker-b"),
+            config=configuration(execute=True, max_exposure_usd=5_000),
+        )
+        now = datetime.now(UTC)
+        for symbol in strategy.shared_symbols:
+            strategy.quotes["first"][symbol] = (now, 1.2, 1.2001)
+            strategy.quotes["second"][symbol] = (now, 1.2, 1.2001)
+        strategy._refresh_sizing_snapshot_if_due()
+        calls_before_open = len(gateway.calls)
+
+        with self.assertRaises(HedgedEntryContained):
+            strategy._open(TradeCandidate("EURUSD", "short_first_long_second", 0.001))
+        strategy.shutdown()
+
+        self.assertTrue(strategy.stopped)
+        self.assertTrue(strategy.controller_containment_required)
+        self.assertFalse(
+            any(
+                kind == "operation" and request["type"] in {"market", "close"}
+                for _, kind, request in gateway.calls[calls_before_open:]
+            )
+        )
+
+    def test_unacknowledged_hedged_entry_never_falls_back_to_individual_close_operations(self) -> None:
+        gateway = FakeGateway()
+
+        def unavailable(payload: dict[str, object]) -> dict[str, object]:
+            gateway.hedged_entries.append(payload)
+            raise StrategyError("Timed out waiting for the controller hedged-entry outcome.")
+
+        gateway.hedged_entry = unavailable  # type: ignore[method-assign]
+        strategy = RealtimeArbitrage(
+            gateway,
+            first=Endpoint("worker-a"),
+            second=Endpoint("worker-b"),
+            config=configuration(execute=True, max_exposure_usd=5_000),
+        )
+        now = datetime.now(UTC)
+        for symbol in strategy.shared_symbols:
+            strategy.quotes["first"][symbol] = (now, 1.2, 1.2001)
+            strategy.quotes["second"][symbol] = (now, 1.2, 1.2001)
+        strategy._refresh_sizing_snapshot_if_due()
+        calls_before_open = len(gateway.calls)
+
+        with self.assertRaisesRegex(HedgedEntryContained, "acknowledgement was unavailable"):
+            strategy._open(TradeCandidate("EURUSD", "short_first_long_second", 0.001))
+        strategy.shutdown()
+
+        self.assertTrue(strategy.stopped)
+        self.assertTrue(strategy.controller_containment_required)
+        self.assertFalse(
+            any(
+                kind == "operation" and request["type"] in {"market", "close"}
+                for _, kind, request in gateway.calls[calls_before_open:]
+            )
+        )
+
+    def test_exposure_cap_never_exceeds_current_equity(self) -> None:
+        strategy = RealtimeArbitrage(
+            FakeGateway(),
+            first=Endpoint("worker-a"),
+            second=Endpoint("worker-b"),
+            config=configuration(max_exposure_usd=10_000),
+        )
+
+        self.assertEqual({"first": 5_000, "second": 5_000}, strategy.exposure_caps)
 
     def test_emergency_protection_sets_broker_sl_and_tp_at_equal_dollar_amounts(self) -> None:
         gateway = FakeGateway()
@@ -171,6 +515,7 @@ class RealtimeArbitrageTests(unittest.TestCase):
             "first", "EURUSD",
             {"ticket": 11, "price_open": 1.2},
             "LONG",
+            0.1,
         )
 
         operation = next(
@@ -183,11 +528,66 @@ class RealtimeArbitrageTests(unittest.TestCase):
         self.assertAlmostEqual(40, (1.2 - float(operation["sl"])) * 10_000, places=3)
         self.assertAlmostEqual(40, (float(operation["tp"]) - 1.2) * 10_000, places=3)
 
+    def test_emergency_stop_loss_does_not_exceed_exposure_trade_loss_limit(self) -> None:
+        gateway = FakeGateway()
+        strategy = RealtimeArbitrage(
+            gateway,
+            first=Endpoint("worker-a"),
+            second=Endpoint("worker-b"),
+            config=configuration(max_exposure_usd=1_000),
+        )
+
+        strategy._set_emergency_protection("first", "EURUSD", {"ticket": 11, "price_open": 1.2}, "LONG", 0.1)
+
+        operation = next(
+            request
+            for worker, kind, request in gateway.calls
+            if worker == "worker-a" and kind == "operation" and request["type"] == "modify_sl_tp"
+        )
+        self.assertAlmostEqual(20, (1.2 - float(operation["sl"])) * 10_000, places=3)
+        self.assertAlmostEqual(20, (float(operation["tp"]) - 1.2) * 10_000, places=3)
+
+    def test_emergency_stop_loss_does_not_exceed_remaining_daily_loss_limit(self) -> None:
+        gateway = FakeGateway()
+        strategy = RealtimeArbitrage(
+            gateway,
+            first=Endpoint("worker-a"),
+            second=Endpoint("worker-b"),
+            config=configuration(max_exposure_usd=5_000),
+        )
+        strategy.accounts["first"].equity = 4_880
+
+        strategy._set_emergency_protection("first", "EURUSD", {"ticket": 11, "price_open": 1.2}, "LONG", 0.1)
+
+        operation = next(
+            request
+            for worker, kind, request in gateway.calls
+            if worker == "worker-a" and kind == "operation" and request["type"] == "modify_sl_tp"
+        )
+        self.assertAlmostEqual(30, (1.2 - float(operation["sl"])) * 10_000, places=3)
+        self.assertAlmostEqual(30, (float(operation["tp"]) - 1.2) * 10_000, places=3)
+
+    def test_rejects_entry_after_daily_loss_budget_is_exhausted(self) -> None:
+        gateway = FakeGateway()
+        strategy = RealtimeArbitrage(
+            gateway,
+            first=Endpoint("worker-a"),
+            second=Endpoint("worker-b"),
+            config=configuration(execute=False, max_exposure_usd=5_000),
+        )
+        strategy.accounts["first"].equity = 4_850
+        calls_before_open = len(gateway.calls)
+
+        with self.assertRaisesRegex(StrategyError, "daily loss budget exhausted"):
+            strategy._open(TradeCandidate("EURUSD", "short_first_long_second", 0.001))
+
+        self.assertFalse(any(kind == "operation" for _, kind, _ in gateway.calls[calls_before_open:]))
+
     def test_missing_active_pair_ticket_immediately_flattens_the_remaining_leg(self) -> None:
         gateway = FakeGateway()
         strategy = RealtimeArbitrage(gateway, first=Endpoint("worker-a"), second=Endpoint("worker-b"), config=configuration())
         strategy.pair = Pair(
-            "EURUSD", "long_first_short_second", 1.2, 1.2, 5_000, 5_000, 11, 22, "LONG", "SHORT", datetime.now(UTC)
+            "EURUSD", "long_first_short_second", 1.2, 1.2, 11, 22, "LONG", "SHORT", 0.1, datetime.now(UTC)
         )
         gateway.positions = {
             "worker-a": [],
@@ -210,12 +610,11 @@ class RealtimeArbitrageTests(unittest.TestCase):
             "long_first_short_second",
             1.2,
             1.2,
-            5_000,
-            5_000,
             11,
             22,
             "LONG",
             "SHORT",
+            0.1,
             datetime.now(UTC) - timedelta(seconds=179),
         )
 
@@ -353,14 +752,7 @@ class RealtimeArbitrageTests(unittest.TestCase):
                     config=configuration(execute=True),
                 )
 
-                strategy._market("first", "EURUSD", "LONG")
-
-                request = next(
-                    request
-                    for worker, kind, request in reversed(gateway.calls)
-                    if worker == "worker-a" and kind == "operation" and request["type"] == "market"
-                )
-                self.assertEqual(expected, request["filling_mode"])
+                self.assertEqual(expected, strategy.shared_symbols["EURUSD"].filling_mode)
 
     def test_rejects_symbols_without_a_shared_executable_filling_mode(self) -> None:
         gateway = FakeGateway()
@@ -447,7 +839,7 @@ class RealtimeArbitrageTests(unittest.TestCase):
     def test_active_pair_never_opens_a_different_symbol(self) -> None:
         gateway = FakeGateway()
         strategy = RealtimeArbitrage(gateway, first=Endpoint("worker-a"), second=Endpoint("worker-b"), config=configuration(execute=False))
-        strategy.pair = Pair("EURUSD", "short_first_long_second", 1.2, 1.2, 5_000, 5_000, 0, 0, "SHORT", "LONG", datetime.now(UTC))
+        strategy.pair = Pair("EURUSD", "short_first_long_second", 1.2, 1.2, 0, 0, "SHORT", "LONG", 0.1, datetime.now(UTC))
         opened: list[TradeCandidate] = []
         strategy._open = opened.append  # type: ignore[method-assign]
         strategy._cutoff_reached = lambda: False  # type: ignore[method-assign]
@@ -471,7 +863,7 @@ class RealtimeArbitrageTests(unittest.TestCase):
     def test_active_pair_symbol_drives_integrity_and_pnl(self) -> None:
         gateway = FakeGateway()
         strategy = RealtimeArbitrage(gateway, first=Endpoint("worker-a"), second=Endpoint("worker-b"), config=configuration())
-        strategy.pair = Pair("XAUUSD", "short_first_long_second", 2_000, 2_000, 5_000, 5_000, 11, 22, "SHORT", "LONG", datetime.now(UTC))
+        strategy.pair = Pair("XAUUSD", "short_first_long_second", 2_000, 2_000, 11, 22, "SHORT", "LONG", 0.1, datetime.now(UTC))
         gateway.positions = {
             "worker-a": [{"ticket": 11, "symbol": "XAUUSD", "type": 1, "volume": 0.1}],
             "worker-b": [{"ticket": 22, "symbol": "XAUUSD", "type": 0, "volume": 0.1}],
@@ -509,11 +901,17 @@ class RealtimeArbitrageTests(unittest.TestCase):
             profit_requests,
         )
 
-    def test_removed_symbol_and_pip_flags_are_rejected(self) -> None:
-        with self.assertRaises(SystemExit):
-            main(["--symbol", "EURUSD"])
-        with self.assertRaises(SystemExit):
-            main(["--entry-edge-pips", "0.4"])
+    def test_removed_and_invalid_sizing_flags_are_rejected(self) -> None:
+        for arguments in (
+            ["--symbol", "EURUSD"],
+            ["--entry-edge-pips", "0.4"],
+            ["--lots", "0.1"],
+            ["--max-margin-ratio", "0.51"],
+            ["--max-exposure-usd", "0"],
+        ):
+            with self.subTest(arguments=arguments):
+                with self.assertRaises(SystemExit):
+                    main(arguments)
 
 
 if __name__ == "__main__":

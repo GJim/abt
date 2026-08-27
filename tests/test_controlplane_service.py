@@ -42,15 +42,13 @@ from abt.controlplane.service import (
     _analyze_product_catalogs,
     _broadcast_trader_market_data,
     _cancel_intent,
-    _dispatch_manual_trade,
-    _dispatch_manual_trade_operation,
-    _cleanup_frozen_worker,
     _dispatch_accepted_trader_intent,
     _delete_expired_pending_secrets,
     _market_data_statistics,
     _trader_market_snapshots,
     _preflight_management_intent,
     _preflight_trader_intent,
+    _execute_hedged_entry,
     _request_market_data_with_retry,
     _shared_supported_filling_modes,
     _intent_order,
@@ -241,7 +239,7 @@ class TraderIntentPreflightTests(unittest.IsolatedAsyncioTestCase):
             def trader_command_result(self, *_: object) -> None:
                 return None
 
-            def frozen_worker_ids(self, _worker_ids: list[str]) -> set[str]:
+            def recovery_admission_blocked(self, _worker_ids: list[str]) -> set[str]:
                 return set()
 
             def product_pairs(self) -> list[dict[str, object]]:
@@ -373,7 +371,7 @@ class TraderIntentPreflightTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual({"status": "rejected_preflight"}, result)
 
-    async def test_rejects_a_frozen_worker_before_management_or_trader_preflight_dispatch(self) -> None:
+    async def test_rejects_a_recovering_worker_before_management_or_trader_preflight_dispatch(self) -> None:
         class Ledger:
             rejected: tuple[object, ...] | None = None
             management_rejected: tuple[object, ...] | None = None
@@ -384,7 +382,7 @@ class TraderIntentPreflightTests(unittest.IsolatedAsyncioTestCase):
             def management_command_result(self, *_: object) -> None:
                 return None
 
-            def frozen_worker_ids(self, _worker_ids: list[str]) -> set[str]:
+            def recovery_admission_blocked(self, _worker_ids: list[str]) -> set[str]:
                 return {"worker-a"}
 
             def product_pairs(self) -> list[dict[str, object]]:
@@ -423,417 +421,279 @@ class TraderIntentPreflightTests(unittest.IsolatedAsyncioTestCase):
         result = await _preflight_trader_intent(
             ledger,  # type: ignore[arg-type]
             {}, {},
-            "trader-123", "intent-frozen-worker", payload,
+            "trader-123", "intent-recovering-worker", payload,
         )
         management_result = await _preflight_management_intent(
             ledger,  # type: ignore[arg-type]
             {}, {},
-            "ABCDEF", "management-intent-frozen-worker", payload,
+            "ABCDEF", "management-intent-recovering-worker", payload,
         )
 
         self.assertEqual({"status": "rejected_preflight"}, result)
         self.assertEqual({"status": "rejected_preflight"}, management_result)
         assert ledger.rejected is not None
         assert ledger.management_rejected is not None
-        self.assertEqual("Frozen worker cannot be selected for a new trade: worker-a.", ledger.rejected[3])
-        self.assertEqual("Frozen worker cannot be selected for a new trade: worker-a.", ledger.management_rejected[3])
+        self.assertEqual("Worker recovery is incomplete: worker-a.", ledger.rejected[3])
+        self.assertEqual("Worker recovery is incomplete: worker-a.", ledger.management_rejected[3])
 
 
-class WorkerIsolationTests(unittest.IsolatedAsyncioTestCase):
-    async def test_manual_trade_reconciles_zero_price_market_response_before_protection(self) -> None:
-        first_connection = object()
-        second_connection = object()
-        calls: list[str] = []
-        activated: list[list[dict[str, object]]] = []
-        freezes: list[tuple[str, list[str], dict[str, object]]] = []
+class HedgedEntryExecutionTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _payload() -> dict[str, object]:
+        return {
+            "type": "hedged_entry",
+            "expires_at": (datetime.now(UTC) + timedelta(seconds=5)).isoformat(),
+            "first": {
+                "worker_id": "worker-a",
+                "symbol": "EURUSD",
+                "volume": "0.10",
+                "direction": "LONG",
+                "filling_mode": "FOK",
+                "margin_limit": "400",
+            },
+            "second": {
+                "worker_id": "worker-b",
+                "symbol": "EURUSD",
+                "volume": "0.10",
+                "direction": "SHORT",
+                "filling_mode": "FOK",
+                "margin_limit": "400",
+            },
+        }
 
-        class Ledger:
-            def claim_manual_trade_dispatch(self, _manual_trade_id: str) -> bool:
-                return True
+    @staticmethod
+    def _order(leg: dict[str, object]) -> dict[str, object]:
+        return {
+            "action": "market",
+            "symbol": leg["symbol"],
+            "volume": leg["volume"],
+            "direction": leg["direction"],
+            "filling_mode": leg["filling_mode"],
+        }
 
-            def manual_trade_plan(self, _manual_trade_id: str) -> dict[str, object]:
-                return {
-                    "interval_seconds": 0,
-                    "legs": [
-                        {
-                            "worker_id": "worker-a",
-                            "symbol": "EURUSD",
-                            "direction": "BUY",
-                            "lots": "0.1",
-                            "pip_size": "0.0001",
-                            "stop_loss_pips": "10",
-                            "take_profit_pips": "20",
-                        },
-                        {
-                            "worker_id": "worker-b",
-                            "symbol": "EURUSD.a",
-                            "direction": "SELL",
-                            "lots": "0.2",
-                            "pip_size": "0.0001",
-                            "stop_loss_pips": "10",
-                            "take_profit_pips": "20",
-                        },
-                    ],
-                }
+    class _Ledger:
+        def __init__(self) -> None:
+            self.result: dict[str, object] | None = None
+            self.recoveries: list[tuple[str, list[str], dict[str, object]]] = []
 
-            def frozen_worker_ids(self, _worker_ids: list[str]) -> set[str]:
-                return set()
+        def trader_command_result(self, *_: object) -> dict[str, object] | None:
+            return self.result
 
-            def record_manual_trade_event(
-                self, _manual_trade_id: str, _event_type: str, _payload: dict[str, object], *, status: str | None = None
-            ) -> None:
-                return None
+        def begin_hedged_entry_command(
+            self, _: str, __: str, ___: dict[str, object]
+        ) -> tuple[dict[str, object] | None, bool]:
+            return self.result, self.result is None
 
-            def activate_manual_trade(self, _manual_trade_id: str, active_legs: list[dict[str, object]]) -> None:
-                activated.append(active_legs)
+        def active_trader(self, _: str) -> None:
+            return None
 
-            def freeze_workers(self, source: str, worker_ids: list[str], audit: dict[str, object]) -> None:
-                freezes.append((source, worker_ids, audit))
+        def recovery_admission_blocked(self, _: list[str]) -> set[str]:
+            return set()
 
-        async def order_execute(connection: object, order: dict[str, object]) -> dict[str, object]:
-            calls.append(str(order["action"]))
-            if order["action"] == "protect":
-                return {"accepted": True, "order": order}
-            ticket = 501 if connection is first_connection else 502
+        def record_hedged_entry_command(
+            self, _: str, __: str, ___: dict[str, object], result: dict[str, object]
+        ) -> dict[str, object]:
+            self.result = result
+            return result
+
+        def begin_empty_convergence(self, worker_ids: list[str], source: str, audit: dict[str, object]) -> None:
+            self.recoveries.append((source, worker_ids, audit))
+
+    async def test_preflights_and_dispatches_both_legs_concurrently_under_a_pair_lock(self) -> None:
+        payload = self._payload()
+        ledger = self._Ledger()
+        first_connection, second_connection = object(), object()
+        checks_entered: set[object] = set()
+        sends_entered: set[object] = set()
+        checks_ready = asyncio.Event()
+        sends_ready = asyncio.Event()
+        release_checks = asyncio.Event()
+        release_sends = asyncio.Event()
+
+        async def check(connection: object, order: dict[str, object], **_: object) -> dict[str, object]:
+            checks_entered.add(connection)
+            if len(checks_entered) == 2:
+                checks_ready.set()
+            await release_checks.wait()
             return {
+                "type": "order_check_response",
+                "analysis_id": "order_check",
+                "request_id": "check",
                 "accepted": True,
                 "order": order,
-                "result": {
-                    "retcode": 10009,
-                    "order": ticket,
-                    "deal": 0,
-                    "price": 0.0,
-                    "bid": 0.0,
-                    "ask": 0.0,
-                    "position": (
-                        {"ticket": 901, "volume": "0.1", "price_open": "1.1002"}
-                        if connection is first_connection
-                        else {"ticket": 902, "volume": "0.2", "price_open": "1.0998"}
-                    ),
-                },
+                "diagnostics": {"retcode": 0, "margin": 100},
             }
 
-        with (
-            patch("abt.controlplane.service._connected_worker_session", side_effect=[first_connection, second_connection]),
-            patch("abt.controlplane.service._request_order_execute", side_effect=order_execute),
-        ):
-            await _dispatch_manual_trade(
-                Ledger(),  # type: ignore[arg-type]
-                {"worker-a": {object()}, "worker-b": {object()}},  # type: ignore[arg-type]
+        async def execute(connection: object, order: dict[str, object], **_: object) -> dict[str, object]:
+            sends_entered.add(connection)
+            if len(sends_entered) == 2:
+                sends_ready.set()
+            await release_sends.wait()
+            return {"type": "order_execute_response", "request_id": "send", "accepted": True, "order": order, "result": {"retcode": 10009}}
+
+        task = asyncio.create_task(
+            _execute_hedged_entry(
+                ledger,  # type: ignore[arg-type]
+                {"worker-a": {first_connection}, "worker-b": {second_connection}},  # type: ignore[arg-type]
                 {},
-                "manual-1",
+                "trader-1",
+                "entry-1",
+                payload,
             )
-
-        self.assertEqual(
-            ["market", "protect", "market", "protect"],
-            calls,
         )
-        self.assertEqual([], freezes)
-        self.assertEqual(1, len(activated))
-        self.assertEqual(["501", "502"], [leg["market_order_ticket"] for leg in activated[0]])
-        self.assertEqual(["901", "902"], [leg["position_ticket"] for leg in activated[0]])
-        self.assertEqual(["1.1002", "1.0998"], [leg["fill_price"] for leg in activated[0]])
-        for leg in activated[0]:
-            reconciliation = leg["reconciliation"]
-            self.assertIsInstance(reconciliation, dict)
-            self.assertTrue(str(reconciliation["observed_at"]).endswith("+00:00"))
-            self.assertEqual(str(leg["position_ticket"]), str(reconciliation["position"]["ticket"]))
-
-    async def test_manual_trade_freezes_before_protection_for_unresolved_reconciliation(self) -> None:
-        for positions in (
-            [],
-            [
-                [
-                    {"ticket": 901, "volume": "0.1", "price_open": "1.1002"},
-                    {"ticket": 902, "volume": "0.1", "price_open": "1.1003"},
-                ][0],
-                {"ticket": 902, "volume": "0.1", "price_open": "1.1003"},
-            ],
-            [{"ticket": 901, "volume": "0.1", "price_open": "0"}],
+        with patch("abt.controlplane.service._request_order_check", side_effect=check), patch(
+            "abt.controlplane.service._request_order_execute", side_effect=execute
         ):
-            with self.subTest(positions=positions):
-                first_connection = object()
-                calls: list[str] = []
-                events: list[tuple[str, str | None, dict[str, object]]] = []
-                freezes: list[tuple[str, list[str], dict[str, object]]] = []
+            await asyncio.wait_for(checks_ready.wait(), timeout=1)
+            self.assertEqual({first_connection, second_connection}, checks_entered)
+            release_checks.set()
+            await asyncio.wait_for(sends_ready.wait(), timeout=1)
+            self.assertEqual({first_connection, second_connection}, sends_entered)
+            release_sends.set()
+            result = await task
 
-                class Ledger:
-                    def claim_manual_trade_dispatch(self, _manual_trade_id: str) -> bool:
-                        return True
+        self.assertEqual("accepted", result["status"])
+        self.assertEqual([], ledger.recoveries)
 
-                    def manual_trade_plan(self, _manual_trade_id: str) -> dict[str, object]:
-                        return {
-                            "interval_seconds": 0,
-                            "legs": [
-                                {
-                                    "worker_id": "worker-a",
-                                    "symbol": "EURUSD",
-                                    "direction": "BUY",
-                                    "lots": "0.1",
-                                    "pip_size": "0.0001",
-                                    "stop_loss_pips": "10",
-                                    "take_profit_pips": "20",
-                                },
-                                {
-                                    "worker_id": "worker-b",
-                                    "symbol": "EURUSD.a",
-                                    "direction": "SELL",
-                                    "lots": "0.2",
-                                    "pip_size": "0.0001",
-                                    "stop_loss_pips": "10",
-                                    "take_profit_pips": "20",
-                                },
-                            ],
-                        }
+    async def test_rejected_preflight_sends_neither_order(self) -> None:
+        payload = self._payload()
+        ledger = self._Ledger()
+        sent: list[dict[str, object]] = []
 
-                    def frozen_worker_ids(self, _worker_ids: list[str]) -> set[str]:
-                        return set()
-
-                    def record_manual_trade_event(
-                        self, _manual_trade_id: str, event_type: str, payload: dict[str, object], *,
-                        status: str | None = None,
-                    ) -> None:
-                        events.append((event_type, status, payload))
-
-                    def activate_manual_trade(self, _manual_trade_id: str, _active_legs: list[dict[str, object]]) -> None:
-                        self.fail("A missing or ambiguous position must not activate the manual trade.")
-
-                    def freeze_workers(self, source: str, worker_ids: list[str], audit: dict[str, object]) -> None:
-                        freezes.append((source, worker_ids, audit))
-
-                async def order_execute(_connection: object, order: dict[str, object]) -> dict[str, object]:
-                    calls.append(str(order["action"]))
-                    return {
-                        "accepted": True,
-                        "order": order,
-                        "result": {
-                            "retcode": 10009,
-                            "order": 501,
-                            "deal": 0,
-                            "price": 0.0,
-                            "bid": 0.0,
-                            "ask": 0.0,
-                        },
-                    }
-
-                async def reconcile(
-                    _connection: object, operation: str, _payload: dict[str, str]
-                ) -> dict[str, object]:
-                    calls.append("reconcile")
-                    return {"accepted": True, "operation": operation, "result": {"orders": [], "positions": positions}}
-
-                with (
-                    patch("abt.controlplane.service._connected_worker_session", return_value=first_connection),
-                    patch("abt.controlplane.service._request_order_execute", side_effect=order_execute),
-                    patch("abt.controlplane.service._execution_recovery_request", side_effect=reconcile),
-                ):
-                    await _dispatch_manual_trade(
-                        Ledger(),  # type: ignore[arg-type]
-                        {"worker-a": {object()}, "worker-b": {object()}},  # type: ignore[arg-type]
-                        {},
-                        "manual-1",
-                    )
-
-                self.assertEqual(["market"], calls)
-                self.assertEqual([("manual_trade_execution_frozen", "needs_human")], [
-                    (event_type, status) for event_type, status, _payload in events
-                ])
-                self.assertIn("confirmed position evidence", str(events[0][2]["reason"]))
-                self.assertEqual(
-                    [("manual_trade_execution_anomaly", ["worker-a", "worker-b"])],
-                    [(source, worker_ids) for source, worker_ids, _audit in freezes],
-                )
-
-    async def test_exit_closes_verified_remaining_leg_and_marks_external_closure_for_human_review(self) -> None:
-        first_connection = object()
-        second_connection = object()
-        closed_tickets: list[str] = []
-        events: list[tuple[str, str | None, dict[str, object]]] = []
-        freezes: list[tuple[str, list[str], dict[str, object]]] = []
-
-        class Ledger:
-            def claim_manual_trade_operation_dispatch(self, _operation_id: str) -> bool:
-                return True
-
-            def manual_trade_operation(self, _operation_id: str) -> dict[str, object]:
-                return {
-                    "manual_trade_id": "manual-1",
-                    "operation": "exit",
-                    "plan": {
-                        "manual_trade_id": "manual-1",
-                        "operation": "exit",
-                        "legs": [
-                            {"worker_id": "worker-a", "position": "101"},
-                            {"worker_id": "worker-b", "position": "202"},
-                        ],
-                    },
-                }
-
-            def frozen_worker_ids(self, _worker_ids: list[str]) -> set[str]:
-                return set()
-
-            def record_manual_trade_operation(
-                self, _operation_id: str, event_type: str, payload: dict[str, object], *, status: str | None = None
-            ) -> None:
-                events.append((event_type, status, payload))
-
-            def freeze_workers(self, source: str, worker_ids: list[str], audit: dict[str, object]) -> None:
-                freezes.append((source, worker_ids, audit))
-
-        async def recovery(
-            _connection: object, operation: str, payload: dict[str, str]
-        ) -> dict[str, object]:
-            if operation == "manual_position_reconcile":
-                if not reconciliation_results:
-                    self.fail("The operation reconciled more times than expected.")
-                result = reconciliation_results[0].pop(0)
-                if not reconciliation_results[0]:
-                    reconciliation_results.pop(0)
-                return {"accepted": True, "operation": operation, "result": result}
-            self.assertEqual("execution_close", operation)
-            closed_tickets.append(payload["ticket"])
-            return {"accepted": True}
-
-        reconciliation_results = [
-            [
-                {"orders": [], "positions": []},
-                {"orders": [], "positions": [{"ticket": "202", "volume": "0.2"}]},
-            ],
-            [
-                {"orders": [], "positions": []},
-                {"orders": [], "positions": []},
-            ],
-        ]
-        with (
-            patch("abt.controlplane.service._connected_worker_session", side_effect=[first_connection, second_connection]),
-            patch("abt.controlplane.service._execution_recovery_request", side_effect=recovery),
-        ):
-            await _dispatch_manual_trade_operation(
-                Ledger(),  # type: ignore[arg-type]
-                {"worker-a": {object()}, "worker-b": {object()}},  # type: ignore[arg-type]
-                {},
-                "exit-1",
-            )
-
-        self.assertEqual(["202"], closed_tickets)
-        self.assertEqual(
-            [("manual_trade_operation_frozen", "needs_human")],
-            [(event_type, status) for event_type, status, _payload in events],
-        )
-        self.assertIn("already closed externally", str(events[0][2]["reason"]))
-        self.assertEqual(
-            [(
-                "manual_trade_operation_anomaly",
-                ["worker-a", "worker-b"],
-                {
-                    "manual_trade_id": "manual-1",
-                    "operation_id": "exit-1",
-                    "reason": events[0][2]["reason"],
-                },
-            )],
-            freezes,
-        )
-
-    async def test_dispatch_does_not_send_orders_when_a_worker_freezes_after_preflight(self) -> None:
-        events: list[tuple[str, str | None]] = []
-
-        class Ledger:
-            def claim_accepted_intent_dispatch(self, _intent_id: str) -> bool:
-                return True
-
-            def frozen_worker_ids(self, _worker_ids: list[str]) -> set[str]:
-                return {"worker-a"}
-
-            def record_intent_execution(
-                self, _intent_id: str, event_type: str, _payload: dict[str, object], *, status: str | None = None
-            ) -> None:
-                events.append((event_type, status))
-
-        async def order_execute_must_not_run(*_: object, **__: object) -> dict[str, object]:
-            self.fail("a frozen worker must not receive a new order")
-
-        with (
-            patch("abt.controlplane.service._connected_worker_session", side_effect=[object(), object()]),
-            patch("abt.controlplane.service._request_order_execute", side_effect=order_execute_must_not_run),
-        ):
-            await _dispatch_accepted_trader_intent(
-                Ledger(),  # type: ignore[arg-type]
-                {"worker-a": {object()}, "worker-b": {object()}},
-                {},
-                "intent-123",
-                "FOK",
-                [
-                    {"worker_id": "worker-a", "order": {"symbol": "EURUSD"}},
-                    {"worker_id": "worker-b", "order": {"symbol": "EURUSD"}},
-                ],
-            )
-
-        self.assertEqual(
-            [("intent_dispatch_started", None), ("intent_execution_frozen", "needs_human")],
-            events,
-        )
-
-    async def test_partial_ioc_execution_freezes_workers_without_attempting_pair_recovery(self) -> None:
-        events: list[tuple[str, dict[str, object], str | None]] = []
-        freezes: list[tuple[str, list[str], dict[str, object]]] = []
-
-        class Ledger:
-            def claim_accepted_intent_dispatch(self, _intent_id: str) -> bool:
-                return True
-
-            def frozen_worker_ids(self, _worker_ids: list[str]) -> set[str]:
-                return set()
-
-            def record_intent_execution(
-                self, _intent_id: str, event_type: str, payload: dict[str, object], *, status: str | None = None
-            ) -> None:
-                events.append((event_type, payload, status))
-
-            def freeze_workers(self, source: str, worker_ids: list[str], audit: dict[str, object]) -> None:
-                freezes.append((source, worker_ids, audit))
-
-        async def execute(_connection: object, order: dict[str, object]) -> dict[str, object]:
+        async def check(_: object, order: dict[str, object], **__: object) -> dict[str, object]:
             return {
-                "accepted": order["symbol"] == "EURUSD.a",
+                "type": "order_check_response",
+                "analysis_id": "order_check",
+                "request_id": "check",
+                "accepted": True,
                 "order": order,
-                "result": {"ticket": 101},
+                "diagnostics": {"retcode": 0, "margin": 401},
             }
 
-        with (
-            patch("abt.controlplane.service._connected_worker_session", side_effect=[object(), object()]),
-            patch("abt.controlplane.service._request_order_execute", side_effect=execute),
-            patch(
-                "abt.controlplane.service._execution_recovery_request",
-                side_effect=AssertionError("an anomaly must not attempt pair recovery"),
-            ),
+        async def execute(_: object, order: dict[str, object], **__: object) -> dict[str, object]:
+            sent.append(order)
+            raise AssertionError("A rejected preflight must not submit either order.")
+
+        with patch("abt.controlplane.service._request_order_check", side_effect=check), patch(
+            "abt.controlplane.service._request_order_execute", side_effect=execute
         ):
-            await _dispatch_accepted_trader_intent(
-                Ledger(),  # type: ignore[arg-type]
-                {"worker-a": {object()}, "worker-b": {object()}},
+            result = await _execute_hedged_entry(
+                ledger,  # type: ignore[arg-type]
+                {"worker-a": {object()}, "worker-b": {object()}},  # type: ignore[arg-type]
                 {},
-                "intent-123",
-                "IOC",
-                [
-                    {"worker_id": "worker-a", "order": {"symbol": "EURUSD.a"}},
-                    {"worker_id": "worker-b", "order": {"symbol": "EURUSD"}},
-                ],
+                "trader-1",
+                "entry-2",
+                payload,
             )
 
+        self.assertEqual("rejected_preflight", result["status"])
+        self.assertEqual([], sent)
+        self.assertEqual([], ledger.recoveries)
+
+    async def test_rejects_a_malformed_or_non_hedged_pair_before_contacting_workers(self) -> None:
+        payload = self._payload()
+        payload["first"] = {**payload["first"], "unexpected": True}  # type: ignore[dict-item]
+        ledger = self._Ledger()
+
+        with patch("abt.controlplane.service._request_order_check") as check, patch(
+            "abt.controlplane.service._request_order_execute"
+        ) as execute:
+            result = await _execute_hedged_entry(
+                ledger,  # type: ignore[arg-type]
+                {}, {},
+                "trader-1",
+                "entry-invalid",
+                payload,
+            )
+
+        self.assertEqual("rejected_preflight", result["status"])
+        check.assert_not_called()
+        execute.assert_not_called()
+
+    async def test_expired_pair_is_rejected_before_contacting_workers(self) -> None:
+        payload = {**self._payload(), "expires_at": (datetime.now(UTC) - timedelta(seconds=1)).isoformat()}
+        ledger = self._Ledger()
+
+        with patch("abt.controlplane.service._request_order_check") as check, patch(
+            "abt.controlplane.service._request_order_execute"
+        ) as execute:
+            result = await _execute_hedged_entry(
+                ledger,  # type: ignore[arg-type]
+                {}, {},
+                "trader-1",
+                "entry-expired",
+                payload,
+            )
+
+        self.assertEqual("rejected_preflight", result["status"])
+        self.assertIn("expiry", result["reason"])
+        check.assert_not_called()
+        execute.assert_not_called()
+
+    async def test_in_progress_pair_starts_account_recovery_without_redispatching(self) -> None:
+        payload = self._payload()
+        ledger = self._Ledger()
+        ledger.result = {"command_id": "entry-recovery", "status": "in_progress", "legs": []}
+
+        with patch("abt.controlplane.service._request_order_check") as check, patch(
+            "abt.controlplane.service._request_order_execute"
+        ) as execute:
+            result = await _execute_hedged_entry(
+                ledger,  # type: ignore[arg-type]
+                {}, {},
+                "trader-1",
+                "entry-recovery",
+                payload,
+            )
+
+        self.assertEqual("contained", result["status"])
         self.assertEqual(
-            ("intent_execution_frozen", "needs_human"),
-            (events[-1][0], events[-1][2]),
+            [("hedged_entry_execution_anomaly", ["worker-a", "worker-b"], ledger.recoveries[0][2])],
+            [(source, worker_ids, audit) for source, worker_ids, audit in ledger.recoveries],
         )
+        check.assert_not_called()
+        execute.assert_not_called()
+
+    async def test_one_leg_dispatch_failure_starts_account_recovery_with_complete_leg_outcomes(self) -> None:
+        payload = self._payload()
+        ledger = self._Ledger()
+        first_connection, second_connection = object(), object()
+
+        async def check(_: object, order: dict[str, object], **__: object) -> dict[str, object]:
+            return {
+                "type": "order_check_response",
+                "analysis_id": "order_check",
+                "request_id": "check",
+                "accepted": True,
+                "order": order,
+                "diagnostics": {"retcode": 0, "margin": 100},
+            }
+
+        async def execute(connection: object, order: dict[str, object], **__: object) -> dict[str, object]:
+            if connection is second_connection:
+                raise asyncio.TimeoutError
+            return {"type": "order_execute_response", "request_id": "send", "accepted": True, "order": order, "result": {"retcode": 10009}}
+
+        with patch("abt.controlplane.service._request_order_check", side_effect=check), patch(
+            "abt.controlplane.service._request_order_execute", side_effect=execute
+        ):
+            result = await _execute_hedged_entry(
+                ledger,  # type: ignore[arg-type]
+                {"worker-a": {first_connection}, "worker-b": {second_connection}},  # type: ignore[arg-type]
+                {},
+                "trader-1",
+                "entry-3",
+                payload,
+            )
+
+        self.assertEqual("contained", result["status"])
+        self.assertEqual(["accepted", "unknown"], [leg["dispatch"]["status"] for leg in result["legs"]])  # type: ignore[index]
         self.assertEqual(
-            [(
-                "intent_execution_anomaly",
-                ["worker-a", "worker-b"],
-                {
-                    "intent_id": "intent-123",
-                    "reason": "Incomplete IOC entry requires worker isolation.",
-                },
-            )],
-            freezes,
+            [("hedged_entry_execution_anomaly", ["worker-a", "worker-b"], ledger.recoveries[0][2])],
+            [(source, worker_ids, audit) for source, worker_ids, audit in ledger.recoveries],
         )
+
+
 
 
 class IntentCancellationTests(unittest.IsolatedAsyncioTestCase):
@@ -877,7 +737,7 @@ class IntentCancellationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_rejects_cancellation_when_reconciliation_observes_a_fill(self) -> None:
         events: list[tuple[str, str | None]] = []
-        freezes: list[tuple[str, list[str], dict[str, object]]] = []
+        recoveries: list[tuple[str, list[str], dict[str, object]]] = []
 
         class Ledger:
             def record_intent_execution(
@@ -885,8 +745,8 @@ class IntentCancellationTests(unittest.IsolatedAsyncioTestCase):
             ) -> None:
                 events.append((event_type, status))
 
-            def freeze_workers(self, source: str, worker_ids: list[str], audit: dict[str, object]) -> None:
-                freezes.append((source, worker_ids, audit))
+            def begin_empty_convergence(self, worker_ids: list[str], source: str, audit: dict[str, object]) -> None:
+                recoveries.append((source, worker_ids, audit))
 
         with (
             patch("abt.controlplane.service._connected_worker_session", side_effect=[object(), object()]),
@@ -911,19 +771,19 @@ class IntentCancellationTests(unittest.IsolatedAsyncioTestCase):
                     "reason": "Cancellation observed broker exposure.",
                 }),
             ],
-            freezes,
+            recoveries,
         )
-        self.assertEqual(("intent_execution_frozen", "needs_human"), events[-1])
+        self.assertEqual(("intent_account_recovery_started", "needs_human"), events[-1])
 
-    async def test_single_leg_execution_timeout_freezes_participating_workers(self) -> None:
+    async def test_single_leg_execution_timeout_starts_account_recovery(self) -> None:
         events: list[tuple[str, str | None]] = []
-        freezes: list[tuple[str, list[str], dict[str, object]]] = []
+        recoveries: list[tuple[str, list[str], dict[str, object]]] = []
 
         class Ledger:
             def claim_accepted_intent_dispatch(self, _intent_id: str) -> bool:
                 return True
 
-            def frozen_worker_ids(self, _worker_ids: list[str]) -> set[str]:
+            def recovery_admission_blocked(self, _worker_ids: list[str]) -> set[str]:
                 return set()
 
             def record_intent_execution(
@@ -931,8 +791,8 @@ class IntentCancellationTests(unittest.IsolatedAsyncioTestCase):
             ) -> None:
                 events.append((event_type, status))
 
-            def freeze_workers(self, source: str, worker_ids: list[str], audit: dict[str, object]) -> None:
-                freezes.append((source, worker_ids, audit))
+            def begin_empty_convergence(self, worker_ids: list[str], source: str, audit: dict[str, object]) -> None:
+                recoveries.append((source, worker_ids, audit))
 
         async def execution(*args: object, **_: object) -> dict[str, object]:
             if args[0] == "first":
@@ -953,7 +813,7 @@ class IntentCancellationTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertIn(("incomplete_entry_detected", "working"), events)
-        self.assertIn(("intent_execution_frozen", "needs_human"), events)
+        self.assertIn(("intent_account_recovery_started", "needs_human"), events)
         self.assertEqual(
             [(
                 "intent_execution_anomaly",
@@ -963,7 +823,7 @@ class IntentCancellationTests(unittest.IsolatedAsyncioTestCase):
                     "reason": "Incomplete FOK entry requires worker isolation.",
                 },
             )],
-            freezes,
+            recoveries,
         )
 
 
@@ -1663,10 +1523,10 @@ class ControlPlaneServiceTests(unittest.TestCase):
             base_url="https://testserver",
         )
         try:
-            for path in ("/", "/manual-trading"):
-                response = client.get(path)
-                self.assertEqual(200, response.status_code)
-                self.assertIn("Management access", response.text)
+            response = client.get("/")
+            self.assertEqual(200, response.status_code)
+            self.assertIn("Management access", response.text)
+            self.assertEqual(404, client.get("/manual-trading").status_code)
         finally:
             client.close()
 
@@ -1867,7 +1727,7 @@ class ControlPlaneServiceTests(unittest.TestCase):
             self.assertNotEqual(first_snapshot_id, second_snapshot_id)
             websocket.send_json({"type": "delta", "cursor": 1, "observed_at": "2026-08-16T00:01:00+00:00",
                                  "entity": "position", "ticket": "51", "change": "volume_changed",
-                                 "record": {"ticket": 51, "volume": 1.0}})
+                                 "record": {"ticket": 51, "volume": 1.0, "control_plane_command_id": "test-managed"}})
             self.assertEqual({"type": "accepted", "cursor": 1}, websocket.receive_json())
 
         with self.client.websocket_connect("/api/worker/session") as websocket:
@@ -1885,30 +1745,28 @@ class ControlPlaneServiceTests(unittest.TestCase):
             self.assertEqual({"type": "accepted", "cursor": 1}, websocket.receive_json())
             websocket.send_json({"type": "delta", "cursor": 2, "observed_at": "2026-08-16T00:21:00+00:00",
                                  "entity": "position", "ticket": "51", "change": "modified",
-                                 "record": {"ticket": 51, "volume": 1.0, "tp": 1.5}})
+                                 "record": {
+                                     "ticket": 51,
+                                     "volume": 1.0,
+                                     "tp": 1.5,
+                                     "control_plane_command_id": "test-managed",
+                                 }})
             self.assertEqual({"type": "accepted", "cursor": 2}, websocket.receive_json())
             websocket.send_json(
                 {
-                    "type": "safety_state",
-                    "state": "frozen",
+                    "type": "recovery_state",
+                    "state": "needs_human",
                     "reason": "Broker response could not be verified.",
                 }
             )
-            self.assertEqual({"type": "accepted", "state": "frozen"}, websocket.receive_json())
+            self.assertEqual({"type": "accepted", "state": "needs_human"}, websocket.receive_json())
 
         workers = self.client.get("/api/admin/workers").json()
         self.assertEqual("connected", workers[0]["connectivity"])
-        self.assertEqual("frozen", workers[0]["safety_state"])
-        self.assertEqual("external_broker_change", workers[0]["freeze"]["source"])
-        self.assertEqual([worker_id], workers[0]["freeze"]["affected_worker_ids"])
+        self.assertEqual("NEEDS_HUMAN", workers[0]["recovery"]["lifecycle_state"])
         self.assertEqual(
-            {
-                "cursor": 1,
-                "entity": "position",
-                "reason": "Unattributed external broker change requires account isolation.",
-                "ticket": "51",
-            },
-            workers[0]["freeze"]["audit"],
+            "Broker response could not be verified.",
+            workers[0]["recovery"]["directive"]["reason"],
         )
         self.assertEqual({"balance": 1000}, workers[0]["latest_snapshot"]["account"])
         self.assertEqual(["volume_changed", "modified"], [delta["change"] for delta in workers[0]["deltas"]])
@@ -1933,359 +1791,10 @@ class ControlPlaneServiceTests(unittest.TestCase):
             live_state,
         )
 
-    def test_admin_can_configure_and_observe_a_persistent_manual_trading_target(self) -> None:
-        ledger = self.app.state.ledger
-        _first_key, first_worker_id, _first_certificate = self._approved_worker(123456, "Broker-A")
-        _second_key, second_worker_id, _second_certificate = self._approved_worker(654321, "Broker-B")
-        with ledger._transaction():
-            ledger._connection.execute(
-                """INSERT INTO product_pairs (
-                       product_pair_id, status, endpoint_a_server, endpoint_a_symbol, endpoint_b_server, endpoint_b_symbol,
-                       active_pair_key, lot_relationship, policy_snapshot, analysis_period, reference_specifications,
-                       approval_evidence, source_workers, built_from_analysis_id, built_from_confirmation_id, built_by, created_at
-                   ) VALUES (?, 'active', 'Broker-A', 'EURUSD', 'Broker-B', 'EURUSD.a', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                [
-                    "pair-1", "Broker-A:EURUSD|Broker-B:EURUSD.a", json.dumps({"first_to_second": "1"}),
-                    json.dumps({}), json.dumps({}), json.dumps([]), json.dumps({}),
-                    json.dumps({}), "analysis-1", "confirmation-1", "ABCDEF", datetime.now(UTC),
-                ],
-            )
-        for worker_id in (first_worker_id, second_worker_id):
-            ledger.record_worker_session(worker_id)
-        ledger.record_live_state(
-            first_worker_id, "2026-08-22T00:00:00+00:00", True,
-            [{"symbol": "EURUSD", "bid": 1.1000, "ask": 1.1002, "broker_time": "2026-08-22T00:00:00+00:00"}],
-            [{"ticket": 101, "symbol": "EURUSD"}], [],
-        )
-        ledger.record_live_state(
-            second_worker_id, "2026-08-22T00:00:00+00:00", True,
-            [{"symbol": "EURUSD.a", "bid": 1.0998, "ask": 1.1000, "broker_time": "2026-08-22T00:00:00+00:00"}],
-            [], [{"ticket": 202, "symbol": "EURUSD.a"}],
-        )
-        login = self.client.post(
-            "/api/admin/login", json={"username": "ABCDEF", "password": "A-secure-admin-password!"}
-        )
 
-        configured = self.client.put(
-            "/api/admin/manual-trading-target",
-            headers={"X-CSRF-Token": login.json()["csrf_token"]},
-            json={
-                "pair_id": "pair-1",
-                "buy_worker_id": first_worker_id,
-                "sell_worker_id": second_worker_id,
-                "leg_order": "buy_to_sell",
-                "interval_seconds": 7,
-                "expected_revision": 0,
-            },
-        )
 
-        self.assertEqual(200, configured.status_code)
-        target = configured.json()
-        self.assertEqual("pair-1", target["pair"]["product_pair_id"])
-        self.assertEqual([first_worker_id, second_worker_id], [worker["worker_id"] for worker in target["workers"]])
-        self.assertEqual(first_worker_id, target["buy_worker_id"])
-        self.assertEqual(second_worker_id, target["sell_worker_id"])
-        self.assertEqual("buy_to_sell", target["leg_order"])
-        self.assertEqual(7, target["interval_seconds"])
-        self.assertEqual("EURUSD", target["workers"][0]["live_state"]["quotes"][0]["symbol"])
-        self.assertEqual(target, self.client.get("/api/admin/manual-trading-target").json())
-        ledger.freeze_workers("execution_anomaly", [first_worker_id], {"reason": "broker timeout"})
-        rejected = self.client.put(
-            "/api/admin/manual-trading-target",
-            headers={"X-CSRF-Token": login.json()["csrf_token"]},
-            json={
-                "pair_id": "pair-1",
-                "buy_worker_id": first_worker_id,
-                "sell_worker_id": second_worker_id,
-                "leg_order": "sell_to_buy",
-                "interval_seconds": 0,
-                "expected_revision": 1,
-            },
-        )
-        self.assertEqual(409, rejected.status_code)
-        self.assertEqual("Frozen workers cannot be selected for manual trading.", rejected.json()["detail"])
-        ledger.retire_product_pair("pair-1", "ABCDEF")
-        self.assertIsNone(self.client.get("/api/admin/manual-trading-target").json())
 
-    def test_admin_can_preview_and_submit_an_idempotent_protected_manual_trade(self) -> None:
-        ledger = self.app.state.ledger
-        _first_key, first_worker_id, _first_certificate = self._approved_worker(123456, "Broker-A")
-        _second_key, second_worker_id, _second_certificate = self._approved_worker(654321, "Broker-B")
-        specification = {
-            "allowed_directions": ["LONG", "SHORT"],
-            "volume_min": "0.1",
-            "volume_max": "100",
-            "volume_step": "0.1",
-            "point": "0.00001",
-            "digits": 5,
-        }
-        with ledger._transaction():
-            ledger._connection.execute(
-                """INSERT INTO product_pairs (
-                       product_pair_id, status, endpoint_a_server, endpoint_a_symbol, endpoint_b_server, endpoint_b_symbol,
-                       active_pair_key, lot_relationship, policy_snapshot, analysis_period, reference_specifications,
-                       approval_evidence, source_workers, built_from_analysis_id, built_from_confirmation_id, built_by, created_at
-                   ) VALUES (?, 'active', 'Broker-A', 'EURUSD', 'Broker-B', 'EURUSD.a', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                [
-                    "pair-manual", "Broker-A:EURUSD|Broker-B:EURUSD.a",
-                    json.dumps({"first_lots": "1", "second_lots": "2"}), json.dumps({}), json.dumps({}),
-                    json.dumps([
-                        {"server": "Broker-A", "symbol": "EURUSD", "specification": specification},
-                        {"server": "Broker-B", "symbol": "EURUSD.a", "specification": specification},
-                    ]),
-                    json.dumps({}), json.dumps({}), "analysis-1", "confirmation-1", "ABCDEF", datetime.now(UTC),
-                ],
-            )
-        for worker_id, symbol, bid, ask in (
-            (first_worker_id, "EURUSD", 1.1000, 1.1002),
-            (second_worker_id, "EURUSD.a", 1.0998, 1.1000),
-        ):
-            ledger.record_worker_session(worker_id)
-            ledger.record_live_state(
-                worker_id, "2026-08-22T00:00:00+00:00", True,
-                [{"symbol": symbol, "bid": bid, "ask": ask, "broker_time": "2026-08-22T00:00:00+00:00"}], [], [],
-            )
-        login = self.client.post(
-            "/api/admin/login", json={"username": "ABCDEF", "password": "A-secure-admin-password!"}
-        )
-        csrf = {"X-CSRF-Token": login.json()["csrf_token"]}
-        configured = self.client.put(
-            "/api/admin/manual-trading-target",
-            headers=csrf,
-            json={
-                "pair_id": "pair-manual",
-                "buy_worker_id": first_worker_id,
-                "sell_worker_id": second_worker_id,
-                "leg_order": "buy_to_sell",
-                "interval_seconds": 0,
-                "expected_revision": 0,
-            },
-        )
-        self.assertEqual(200, configured.status_code)
-        active = ledger.request_manual_trade(
-            "ABCDEF",
-            "manual-entry-active",
-            {
-                "target_revision": 1,
-                "base_lots": "0.1",
-                "stop_loss_pips": "10",
-                "take_profit_pips": "20",
-            },
-        )
-        ledger.activate_manual_trade(
-            active["manual_trade_id"],
-            [
-                {
-                    "worker_id": first_worker_id,
-                    "market_order_ticket": "91",
-                    "position_ticket": "101",
-                    "fill_price": "1.1002",
-                },
-                {
-                    "worker_id": second_worker_id,
-                    "market_order_ticket": "92",
-                    "position_ticket": "202",
-                    "fill_price": "1.0998",
-                },
-            ],
-        )
-        updated_target = self.client.put(
-            "/api/admin/manual-trading-target",
-            headers=csrf,
-            json={
-                "pair_id": "pair-manual",
-                "buy_worker_id": second_worker_id,
-                "sell_worker_id": first_worker_id,
-                "leg_order": "sell_to_buy",
-                "interval_seconds": 0,
-                "expected_revision": 1,
-            },
-        )
-        self.assertEqual(200, updated_target.status_code)
-        command = {
-            "command_id": "manual-entry-1",
-            "target_revision": 2,
-            "base_lots": "0.1",
-            "stop_loss_pips": "10",
-            "take_profit_pips": "20",
-        }
-        preview = self.client.post("/api/admin/manual-trades/preview", headers=csrf, json=command)
-        self.assertEqual(200, preview.status_code)
-        self.assertEqual(["0.1", "0.2"], [leg["lots"] for leg in preview.json()["legs"]])
-        self.assertEqual(["SELL", "BUY"], [leg["direction"] for leg in preview.json()["legs"]])
-        submitted = self.client.post("/api/admin/manual-trades", headers=csrf, json=command)
-        self.assertEqual(201, submitted.status_code)
-        self.assertEqual("scheduled", submitted.json()["status"])
-        self.assertEqual(submitted.json(), self.client.post("/api/admin/manual-trades", headers=csrf, json=command).json())
-        self.assertEqual(
-            {active["manual_trade_id"], submitted.json()["manual_trade_id"]},
-            {trade["manual_trade_id"] for trade in self.client.get("/api/admin/manual-trades").json()},
-        )
 
-    def test_admin_can_discard_unconfirmed_failed_manual_trade(self) -> None:
-        ledger = self.app.state.ledger
-        with ledger._transaction():
-            ledger._connection.execute(
-                """INSERT INTO manual_trades
-                   (manual_trade_id, username, command_id, target_revision, pair_id, plan, status, created_at)
-                   VALUES ('manual-failed', 'ABCDEF', 'entry-failed', 1, 'pair-1', ?, 'needs_human', ?)""",
-                [
-                    json.dumps({
-                        "legs": [],
-                        "active_legs": [{"worker_id": "worker-a"}, {"worker_id": "worker-b"}],
-                    }),
-                    datetime.now(UTC),
-                ],
-            )
-        login = self.client.post(
-            "/api/admin/login", json={"username": "ABCDEF", "password": "A-secure-admin-password!"}
-        )
-        response = self.client.delete(
-            "/api/admin/manual-trades/manual-failed",
-            headers={"X-CSRF-Token": login.json()["csrf_token"]},
-        )
-
-        self.assertEqual(200, response.status_code)
-        self.assertEqual({"manual_trade_id": "manual-failed", "status": "discarded"}, response.json())
-        self.assertEqual([], self.client.get("/api/admin/manual-trades").json())
-
-    def test_admin_cannot_discard_manual_trade_with_broker_evidence(self) -> None:
-        ledger = self.app.state.ledger
-        with ledger._transaction():
-            ledger._connection.execute(
-                """INSERT INTO manual_trades
-                   (manual_trade_id, username, command_id, target_revision, pair_id, plan, status, created_at)
-                   VALUES ('manual-evidenced', 'ABCDEF', 'entry-evidenced', 1, 'pair-1', ?, 'needs_human', ?)""",
-                [json.dumps({"legs": [], "active_legs": [{"position_ticket": "123"}]}), datetime.now(UTC)],
-            )
-        login = self.client.post(
-            "/api/admin/login", json={"username": "ABCDEF", "password": "A-secure-admin-password!"}
-        )
-        response = self.client.delete(
-            "/api/admin/manual-trades/manual-evidenced",
-            headers={"X-CSRF-Token": login.json()["csrf_token"]},
-        )
-
-        self.assertEqual(409, response.status_code)
-        self.assertEqual("Manual trade has broker execution evidence and cannot be discarded.", response.json()["detail"])
-
-    def test_admin_can_preview_and_submit_idempotent_active_manual_trade_operations(self) -> None:
-        ledger = self.app.state.ledger
-        _first_key, first_worker_id, _first_certificate = self._approved_worker(123456, "Broker-A")
-        _second_key, second_worker_id, _second_certificate = self._approved_worker(654321, "Broker-B")
-        plan = {
-            "pair_id": "pair-manual",
-            "target_revision": 1,
-            "legs": [
-                {
-                    "worker_id": first_worker_id, "symbol": "EURUSD", "direction": "BUY", "lots": "0.1",
-                    "pip_size": "0.0001", "stop_loss_pips": "10", "take_profit_pips": "20",
-                },
-                {
-                    "worker_id": second_worker_id, "symbol": "EURUSD.a", "direction": "SELL", "lots": "0.2",
-                    "pip_size": "0.0001", "stop_loss_pips": "10", "take_profit_pips": "20",
-                },
-            ],
-            "active_legs": [
-                {
-                    "worker_id": first_worker_id,
-                    "market_order_ticket": "91",
-                    "position_ticket": "101",
-                    "fill_price": "1.1002",
-                },
-                {
-                    "worker_id": second_worker_id,
-                    "market_order_ticket": "92",
-                    "position_ticket": "202",
-                    "fill_price": "1.0998",
-                },
-            ],
-        }
-        with ledger._transaction():
-            ledger._connection.execute(
-                """INSERT INTO product_pairs (
-                       product_pair_id, status, endpoint_a_server, endpoint_a_symbol, endpoint_b_server, endpoint_b_symbol,
-                       active_pair_key, lot_relationship, policy_snapshot, analysis_period, reference_specifications,
-                       approval_evidence, source_workers, built_from_analysis_id, built_from_confirmation_id, built_by, created_at
-                   ) VALUES (?, 'active', 'Broker-A', 'EURUSD', 'Broker-B', 'EURUSD.a', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                [
-                    "pair-manual", "Broker-A:EURUSD|Broker-B:EURUSD.a", json.dumps({}), json.dumps({}),
-                    json.dumps({}), json.dumps([]), json.dumps({}), json.dumps({}), "analysis-1", "confirmation-1",
-                    "ABCDEF", datetime.now(UTC),
-                ],
-            )
-        for worker_id, symbol, position in (
-            (first_worker_id, "EURUSD", 101),
-            (second_worker_id, "EURUSD.a", 202),
-        ):
-            ledger.record_worker_session(worker_id)
-            ledger.record_live_state(
-                worker_id,
-                "2026-08-22T00:00:00+00:00",
-                True,
-                [],
-                [],
-                [{"ticket": position, "symbol": symbol}],
-            )
-        with ledger._transaction():
-            ledger._connection.execute(
-                """INSERT INTO manual_trading_target
-                   (singleton, pair_id, first_worker_id, second_worker_id, leg_order, interval_seconds,
-                    revision, active_manual_trade_id, configured_by, configured_at)
-                   VALUES (TRUE, 'pair-manual', ?, ?, 'buy_to_sell', 0, 1, 'manual-active', 'ABCDEF', ?)""",
-                [first_worker_id, second_worker_id, datetime.now(UTC)],
-            )
-            ledger._connection.execute(
-                """INSERT INTO manual_trades
-                   (manual_trade_id, username, command_id, target_revision, pair_id, plan, status, created_at)
-                   VALUES ('manual-active', 'ABCDEF', 'entry-1', 1, 'pair-manual', ?, 'active', ?)""",
-                [json.dumps(plan), datetime.now(UTC)],
-            )
-        login = self.client.post(
-            "/api/admin/login", json={"username": "ABCDEF", "password": "A-secure-admin-password!"}
-        )
-        csrf = {"X-CSRF-Token": login.json()["csrf_token"]}
-
-        protection_preview = self.client.post(
-            "/api/admin/manual-trades/manual-active/protection/preview",
-            headers=csrf,
-            json={"command_id": "protection-1", "stop_loss_pips": "15", "take_profit_pips": "30"},
-        )
-        self.assertEqual(200, protection_preview.status_code)
-        self.assertEqual(
-            [("1.0987", "1.1032"), ("1.1013", "1.0968")],
-            [(leg["stop_loss"], leg["take_profit"]) for leg in protection_preview.json()["legs"]],
-        )
-        protection = self.client.post(
-            "/api/admin/manual-trades/manual-active/protection",
-            headers=csrf,
-            json={"command_id": "protection-1", "stop_loss_pips": "15", "take_profit_pips": "30"},
-        )
-        self.assertEqual(201, protection.status_code)
-        self.assertEqual(
-            protection.json(),
-            self.client.post(
-                "/api/admin/manual-trades/manual-active/protection",
-                headers=csrf,
-                json={"command_id": "protection-1", "stop_loss_pips": "15", "take_profit_pips": "30"},
-            ).json(),
-        )
-        exit_preview = self.client.post(
-            "/api/admin/manual-trades/manual-active/exit/preview", headers=csrf, json={"command_id": "exit-1"}
-        )
-        self.assertEqual(200, exit_preview.status_code)
-        self.assertEqual(["101", "202"], [leg["position"] for leg in exit_preview.json()["legs"]])
-        active_trade = self.client.get("/api/admin/manual-trades").json()[0]
-        self.assertEqual(["91", "92"], [leg["market_order_ticket"] for leg in active_trade["legs"]])
-        self.assertEqual(["101", "202"], [leg["position_ticket"] for leg in active_trade["legs"]])
-        self.assertEqual(["open", "open"], [leg["position_status"] for leg in active_trade["legs"]])
-        ledger.record_manual_trade_operation(
-            protection.json()["operation_id"],
-            "manual_trade_operation_frozen",
-            {"reason": "A leg closed externally."},
-            status="needs_human",
-        )
-        self.assertEqual("needs_human", self.client.get("/api/admin/manual-trades").json()[0]["status"])
 
     def test_admin_read_models_paginate_search_and_keep_snapshot_payloads_in_detail(self) -> None:
         _key, worker_id, _certificate = self._approved_worker(123456, "Broker-Search")
@@ -2417,9 +1926,9 @@ class ControlPlaneServiceTests(unittest.TestCase):
 
         pending_enrollment_id = self._create_pending_enrollment()
         _private_key, worker_id, _certificate = self._approved_worker(654321, "Broker-Live")
-        self.app.state.ledger.record_worker_safety_state(
+        self.app.state.ledger.report_worker_recovery_state(
             worker_id,
-            "lost_link_safety",
+            "needs_human",
             "controller_signal_lost",
         )
         self.assertEqual(
@@ -2442,12 +1951,9 @@ class ControlPlaneServiceTests(unittest.TestCase):
         enrollment_alert = next(
             alert for alert in dashboard["alerts"] if alert["alert_type"] == "worker_enrollment_pending_approval"
         )
-        safety_alert = next(alert for alert in dashboard["alerts"] if alert["alert_type"] == "worker_frozen")
         self.assertEqual("intervention_required", enrollment_alert["category"])
         self.assertEqual("administrator_approval_required", enrollment_alert["classification_reason"])
         self.assertEqual(pending_enrollment_id, enrollment_alert["enrollment_id"])
-        self.assertEqual("intervention_required", safety_alert["category"])
-        self.assertEqual("worker_safety_state", safety_alert["classification_reason"])
         self.assertEqual("intervention_required", dashboard["pending_enrollments"][0]["category"])
         self.assertEqual("approval_required", dashboard["pending_enrollments"][0]["classification_reason"])
         enrollment_intervention = next(
@@ -2466,23 +1972,9 @@ class ControlPlaneServiceTests(unittest.TestCase):
                 if key in {"item_type", "item_id", "category", "reason"}
             },
         )
-        alert_intervention = next(item for item in dashboard["interventions"] if item["item_type"] == "worker_alert")
-        self.assertEqual(
-            {
-                "item_type": "worker_alert",
-                "item_id": safety_alert["alert_id"],
-                "category": "intervention_required",
-                "reason": "worker_safety_state",
-            },
-            {
-                key: value
-                for key, value in alert_intervention.items()
-                if key in {"item_type", "item_id", "category", "reason"}
-            },
-        )
         worker = next(worker for worker in dashboard["workers"] if worker["worker_id"] == worker_id)
         self.assertEqual("intervention_required", worker["category"])
-        self.assertEqual("frozen", worker["classification_reason"])
+        self.assertEqual("account_recovery_NEEDS_HUMAN", worker["classification_reason"])
         self.assertEqual(UTC, datetime.fromisoformat(dashboard["generated_at"]).tzinfo)
 
     def test_enrollment_does_not_apply_a_client_ip_rate_limit(self) -> None:
@@ -2561,7 +2053,7 @@ class ControlPlaneServiceTests(unittest.TestCase):
         self.assertNotIn(secret_ref, retrying_store.passwords)
         self.assertEqual([], self.app.state.ledger.expire_pending_enrollments())
 
-    def test_unattributed_broker_delta_freezes_worker_and_revocation_blocks_wss(self) -> None:
+    def test_unattributed_broker_delta_starts_account_recovery_and_revocation_blocks_wss(self) -> None:
         private_key = ec.generate_private_key(ec.SECP256R1())
         public_key_pem = private_key.public_key().public_bytes(
             serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
@@ -2593,14 +2085,25 @@ class ControlPlaneServiceTests(unittest.TestCase):
             )
             self.assertEqual({"type": "accepted", "cursor": 1}, websocket.receive_json())
             worker = self.client.get("/api/admin/workers").json()[0]
-            self.assertEqual("frozen", worker["safety_state"])
-            alerts = self.client.get("/api/admin/alerts").json()
-            self.assertEqual(("high", "worker_frozen"), (alerts[-1]["priority"], alerts[-1]["alert_type"]))
+            self.assertEqual("CONVERGING_EMPTY", worker["recovery"]["lifecycle_state"])
+            self.assertEqual("EMPTY", worker["recovery"]["desired_state"])
+            self.assertEqual("REQUEST_SNAPSHOT", worker["recovery"]["directive"]["kind"])
             self.assertEqual(
                 204,
                 self.client.post(
                     f"/api/admin/workers/{worker_id}/revoke", headers={"X-CSRF-Token": login.json()["csrf_token"]}
                 ).status_code,
+            )
+            recovery_request = websocket.receive_json()
+            self.assertEqual("account_recovery_reconcile_request", recovery_request["type"])
+            websocket.send_json(
+                {
+                    "type": "execution_recovery_response",
+                    "request_id": recovery_request["request_id"],
+                    "operation": "account_recovery_reconcile",
+                    "accepted": True,
+                    "result": {"orders": [], "positions": []},
+                }
             )
             with self.assertRaises(Exception) as closed:
                 websocket.receive_json()
@@ -3319,7 +2822,7 @@ class ControlPlaneServiceTests(unittest.TestCase):
             )
             self.assertEqual(409, same_server.status_code)
 
-            first_socket.send_json({"type": "safety_state", "state": "needs_human", "reason": "manual_test"})
+            first_socket.send_json({"type": "recovery_state", "state": "needs_human", "reason": "test"})
             self.assertEqual({"type": "accepted", "state": "needs_human"}, first_socket.receive_json())
             unhealthy = self.client.post(
                 "/api/admin/product-catalog-analyses",
@@ -3340,7 +2843,7 @@ class ControlPlaneServiceTests(unittest.TestCase):
         self.assertEqual(409, disconnected.status_code)
 
         self.app.state.ledger._connection.execute(
-            "UPDATE workers SET safety_state = 'connected', last_seen_at = ? WHERE worker_id = ?",
+            "UPDATE workers SET last_seen_at = ? WHERE worker_id = ?",
             [datetime.now(UTC), second_worker],
         )
         self.assertEqual(

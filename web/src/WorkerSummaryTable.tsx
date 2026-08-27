@@ -9,7 +9,7 @@ export type WorkerSummaryWorker = {
   login: number
   server: string
   connectivity: string
-  safety_state: string
+  recovery: { lifecycle_state: string } | null
   latest_snapshot: WorkerSummarySnapshot | null
 }
 
@@ -96,8 +96,11 @@ function displayNumber(value: unknown) {
 }
 
 function getWorkerHealth(worker: WorkerSummaryWorker) {
-  if (worker.connectivity === 'revoked' || worker.safety_state !== 'connected' || worker.connectivity === 'disconnected') {
+  if (worker.connectivity === 'revoked' || worker.connectivity === 'disconnected') {
     return { label: 'Action needed', state: 'error' }
+  }
+  if (worker.recovery?.lifecycle_state && worker.recovery.lifecycle_state !== 'READY') {
+    return { label: 'Recovering', state: 'pending' }
   }
   if (worker.connectivity === 'stale' || isSnapshotStale(worker.latest_snapshot?.observed_at)) {
     return { label: 'Stale', state: 'warning' }

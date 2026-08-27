@@ -148,6 +148,12 @@ def run_trader_session(
             output.write(json.dumps(message, separators=(",", ":"), sort_keys=True) + "\n")
             output.flush()
             continue
+        if message_type == "trader_command_result":
+            if not isinstance(message.get("request_id"), str) or not message["request_id"] or not isinstance(message.get("result"), dict):
+                raise TraderEnrollmentError("The controller returned an invalid Trader command response.")
+            output.write(json.dumps(message, separators=(",", ":"), sort_keys=True) + "\n")
+            output.flush()
+            continue
         if message_type != "event" or not isinstance(message.get("event_id"), int):
             raise TraderEnrollmentError("The controller returned an invalid Trader event.")
         output.write(json.dumps(message, separators=(",", ":"), sort_keys=True) + "\n")
@@ -187,9 +193,22 @@ def _send_trader_commands(socket: TraderWebSocket, command_source: SimpleQueue[o
                 continue
             _send(socket, {"type": "query", **command})
             continue
+        if set(command) == {"request_id", "command_id", "payload"}:
+            if (
+                not isinstance(command["request_id"], str)
+                or not command["request_id"]
+                or not isinstance(command["command_id"], str)
+                or not command["command_id"]
+                or not isinstance(command["payload"], dict)
+                or command["payload"].get("type") not in {"hedged_entry", "protected_pair"}
+            ):
+                _write_jsonl_error(output, "Trader JSONL command contains invalid fields.")
+                continue
+            _send(socket, {"type": "command", "command_id": command["command_id"], "payload": command["payload"]})
+            continue
         if set(command) != {"request_id", "worker_id", "payload"}:
             _write_jsonl_error(
-                output, "Trader JSONL command must contain request_id and query, or request_id, worker_id, and payload."
+                output, "Trader JSONL command must contain request_id and query, request_id, command_id, and payload, or request_id, worker_id, and payload."
             )
             continue
         if (

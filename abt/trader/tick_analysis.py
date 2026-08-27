@@ -286,7 +286,7 @@ def select_safe_pair_workers(
             for worker_id, worker in active_workers.items()
             if worker.get("server") == server
             and worker.get("connectivity") == "connected"
-            and worker.get("safety_state") == "connected"
+            and _worker_allows_analysis(worker)
         ]
         preferred = next((candidate for candidate in safe_workers if candidate[0] == preferred_worker_id), None)
         if preferred is not None:
@@ -299,6 +299,14 @@ def select_safe_pair_workers(
             raise TickAnalysisError(f"Multiple connected, safe Workers are available for endpoint {server}:{symbol}.")
         selection.append((worker_id, symbol))
     return selection
+
+
+def _worker_allows_analysis(worker: Mapping[str, object]) -> bool:
+    recovery = worker.get("recovery")
+    return recovery is None or (
+        isinstance(recovery, Mapping)
+        and recovery.get("lifecycle_state") in {"READY", "ACTIVE_VERIFIED"}
+    )
 
 
 def _largest_directional_run(
