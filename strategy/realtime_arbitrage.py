@@ -817,6 +817,12 @@ class RealtimeArbitrage:
                         self._flatten_all()
                         self.completed_trades += 1
                         self.awaiting_clear_symbol = candidate.symbol
+                        if self.completed_trades >= self.config.maximum_trades:
+                            _LOGGER.info(
+                                "maximum_trades_completed completed_trades=%d",
+                                self.completed_trades,
+                            )
+                            return
                     continue
                 self._refresh_sizing_snapshot_if_due()
                 candidate = self._best_candidate()
