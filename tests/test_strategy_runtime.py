@@ -26,6 +26,7 @@ class ScriptedRelay:
         self.orders = {"worker-a": [], "worker-b": []}
         self.positions = {"worker-a": [], "worker-b": []}
         self.effects: list[tuple[str, str, str | None]] = []
+        self.events: list[str] = []
         self.reject_worker: str | None = None
         self.lose_receipt_worker: str | None = None
         self.next_ticket = 100
@@ -105,6 +106,27 @@ class ScriptedRelay:
             }
         }
 
+    def calc_profit(
+        self,
+        worker_id: str,
+        *,
+        symbol: str,
+        volume: str,
+        direction: str,
+        open_price: float,
+        close_price: float,
+        runtime_command_id: str,
+        request_id: str,
+        correlation: dict[str, object],
+    ) -> dict[str, object]:
+        self.events.append("calc_profit")
+        profit = (
+            (close_price - open_price) * 10_000
+            if direction == "LONG"
+            else (open_price - close_price) * 10_000
+        )
+        return {"profit": profit}
+
     def order_execute(
         self,
         worker_id: str,
@@ -149,6 +171,7 @@ class ScriptedRelay:
                 "diagnostics": {"margin": 10.0},
             }
         if kind == "order_execute":
+            self.events.append("entry")
             self.effects.append((worker_id, kind, effect_id))
             if worker_id == self.reject_worker:
                 return {"accepted": False, "execution_state": "not_started", "result": {}}
@@ -183,6 +206,7 @@ class ScriptedRelay:
                 "result": {"position": ticket, "order": ticket + 1000, "price": 1.1},
             }
         if kind == "operation":
+            self.events.append(str(request["type"]))
             self.effects.append((worker_id, str(request["type"]), effect_id))
             if request["type"] == "cancel":
                 if not self.preserve_close:
@@ -282,6 +306,37 @@ class StrategyRuntimeTests(unittest.TestCase):
         self.assertEqual({"command-1:worker-a:entry", "command-1:worker-b:entry"}, {
             effect_id for _, _, effect_id in relay.effects
         })
+
+    def test_entry_refines_fast_protection_after_broker_verified_entry(self) -> None:
+        relay = ScriptedRelay()
+        runtime = StrategyRuntime(":memory:", relay, worker_ids=("worker-a", "worker-b"))
+        self.addCleanup(runtime.close)
+        plan = replace(
+            pair_plan(),
+            first=replace(pair_plan().first, protection_loss_usd="40.00"),
+            second=replace(pair_plan().second, protection_loss_usd="40.00"),
+        )
+
+        result = runtime.enter(plan)
+
+        self.assertEqual(("active", "ACTIVE"), (result.status, result.state))
+        self.assertEqual(["entry", "entry"], relay.events[:2])
+        self.assertEqual(128, relay.events.count("calc_profit"))
+        self.assertEqual(2, relay.events.count("modify_sl_tp"))
+        active_plan = runtime.active_plan
+        assert active_plan is not None
+        self.assertEqual(1, active_plan.protection_revision)
+        self.assertEqual(("1.09601", "1.10399"), (
+            active_plan.first.stop_loss, active_plan.first.take_profit,
+        ))
+        self.assertEqual(("1.10399", "1.09601"), (
+            active_plan.second.stop_loss, active_plan.second.take_profit,
+        ))
+        self.assertTrue(all(
+            effect_id is not None and "entry-protection-refinement" in effect_id
+            for _worker_id, kind, effect_id in relay.effects
+            if kind == "modify_sl_tp"
+        ))
 
     def test_maximum_holding_age_arms_a_verified_synchronized_exit_corridor(self) -> None:
         relay = ScriptedRelay()

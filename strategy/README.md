@@ -84,15 +84,18 @@ the stream until a fresh snapshot arrives. Ctrl+C, the daily cutoff, risk
 limits, and integrity failures use the same durable close convergence rather
 than a controller command or direct fallback.
 
-Before each market command, the strategy uses the Worker broker `calc_profit`
-read and the current executable quote to derive requested absolute emergency
-SL and TP targets, each for
-the lower of `--emergency-stop-loss-usd` (default: US$40) and the endpoint's
-allocation-based 2% per-trade and remaining 3% daily loss limits in absolute
-projected P/L. It passes these targets in each Strategy Runtime entry effect; it never follows
-a fill with a separate `modify_sl_tp` operation. The matching dollar amount is used rather than the
-other broker's price because the brokers can quote different prices, spreads,
-precision, and contract terms. The Strategy Runtime remains non-active until Worker facts verify both legs.
+At initialization, and every three hours afterwards, the strategy reads each
+shared symbol's current broker specification. It only admits symbols whose
+profit currency is USD and whose positive tick value is equal for ordinary,
+profit, and loss calculations; excluded symbols and later eligibility or value
+changes are logged. At a signal, it converts the full
+`--emergency-stop-loss-usd` (default: US$40) directly from this cached USD
+per-point calibration, so no `calc_profit` reads delay the concurrent entry
+orders. After fresh Worker facts verify both entries, the Strategy Runtime
+uses broker `calc_profit` authority to calculate final targets and durably
+refines both owned tickets with concurrent journaled `modify_sl_tp` effects.
+The controller remains an opaque relay; the realtime strategy never writes
+individual final protection.
 
 A broker TP remains emergency protection, not the normal pair exit: the
 strategy normally closes both legs together on its reverse signal. Before a

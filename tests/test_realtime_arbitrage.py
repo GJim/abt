@@ -33,6 +33,7 @@ class FakeGateway:
         self.symbols: dict[str, list[dict[str, object]]] = {}
         self.catalog_results: dict[str, dict[str, object]] = {}
         self.unavailable_catalog_workers: set[str] = set()
+        self.symbol_info_results: dict[tuple[str, str], dict[str, object]] = {}
         self.live_symbol_results: dict[str, dict[str, object]] = {}
         self.live_symbol_rejections: set[str] = set()
 
@@ -58,6 +59,12 @@ class FakeGateway:
             if worker_id in self.live_symbol_rejections:
                 raise StrategyError("Worker rejected live symbol configuration.")
             return self.live_symbol_results.get(worker_id, {"symbols": request["symbols"]})
+        if request["type"] == "symbol_info":
+            symbol = str(request["symbol"])
+            return self.symbol_info_results.get(
+                (worker_id, symbol),
+                {"symbol": self.symbol_specification({"name": symbol})},
+            )
         if request["type"] == "calc_margin":
             return {"margin": 1_000.0 * float(request["volume"])}
         if request["type"] == "calc_margin_batch":
@@ -87,6 +94,10 @@ class FakeGateway:
             "digits": 5,
             "point": 0.00001,
             "trade_tick_size": 0.00001,
+            "trade_tick_value": 1.0,
+            "trade_tick_value_profit": 1.0,
+            "trade_tick_value_loss": 1.0,
+            "currency_profit": "USD",
             "trade_contract_size": 100_000.0,
             "volume_min": 0.01,
             "volume_step": 0.01,
@@ -687,6 +698,8 @@ class RealtimeArbitrageTests(unittest.TestCase):
         timed_exit = runtime.plan.timed_exit  # type: ignore[attr-defined]
         assert timed_exit is not None
         self.assertEqual(90, timed_exit.maximum_holding_seconds)
+        self.assertEqual("40", runtime.plan.first.protection_loss_usd)  # type: ignore[attr-defined]
+        self.assertEqual("40", runtime.plan.second.protection_loss_usd)  # type: ignore[attr-defined]
 
     def test_skips_entry_when_margin_budget_cannot_cover_minimum_volume(self) -> None:
         gateway = FakeGateway()
@@ -771,19 +784,22 @@ class RealtimeArbitrageTests(unittest.TestCase):
         self.assertAlmostEqual(40, (float(tp) - 1.2) * 10_000, places=3)
         self.assertFalse(any(kind == "operation" for _, kind, _ in gateway.calls[calls_before_targets:]))
 
-    def test_initial_protection_targets_use_broker_tick_price_before_entry(self) -> None:
+    def test_initial_protection_targets_round_cached_per_point_price_before_entry(self) -> None:
         gateway = FakeGateway()
         strategy = RealtimeArbitrage(gateway, first=Endpoint("worker-a"), second=Endpoint("worker-b"), config=configuration())
-        targets = iter((1.3904754166, 1.3812362498))
-        strategy._profit_target_price = lambda *_: next(targets)  # type: ignore[method-assign]
         calls_before_targets = len(gateway.calls)
 
         sl, tp = strategy._initial_protection_targets("first", "EURUSD", "SHORT", 1.38584, 0.12)
 
-        self.assertEqual(("1.39048", "1.38124"), (sl, tp))
-        self.assertFalse(any(kind == "operation" for _, kind, _ in gateway.calls[calls_before_targets:]))
+        self.assertEqual(("1.38917", "1.38251"), (sl, tp))
+        self.assertFalse(
+            any(
+                kind == "read" and request["type"] == "calc_profit"
+                for _, kind, request in gateway.calls[calls_before_targets:]
+            )
+        )
 
-    def test_emergency_stop_loss_does_not_exceed_exposure_trade_loss_limit(self) -> None:
+    def test_fast_emergency_stop_uses_the_full_configured_loss_limit(self) -> None:
         gateway = FakeGateway()
         strategy = RealtimeArbitrage(
             gateway,
@@ -794,10 +810,10 @@ class RealtimeArbitrageTests(unittest.TestCase):
 
         sl, tp = strategy._initial_protection_targets("first", "EURUSD", "LONG", 1.2, 0.1)
 
-        self.assertAlmostEqual(20, (1.2 - float(sl)) * 10_000, places=3)
-        self.assertAlmostEqual(20, (float(tp) - 1.2) * 10_000, places=3)
+        self.assertAlmostEqual(40, (1.2 - float(sl)) * 10_000, places=3)
+        self.assertAlmostEqual(40, (float(tp) - 1.2) * 10_000, places=3)
 
-    def test_emergency_stop_loss_does_not_exceed_remaining_daily_loss_limit(self) -> None:
+    def test_fast_emergency_stop_does_not_add_a_daily_loss_buffer(self) -> None:
         gateway = FakeGateway()
         strategy = RealtimeArbitrage(
             gateway,
@@ -809,8 +825,8 @@ class RealtimeArbitrageTests(unittest.TestCase):
 
         sl, tp = strategy._initial_protection_targets("first", "EURUSD", "LONG", 1.2, 0.1)
 
-        self.assertAlmostEqual(30, (1.2 - float(sl)) * 10_000, places=3)
-        self.assertAlmostEqual(30, (float(tp) - 1.2) * 10_000, places=3)
+        self.assertAlmostEqual(40, (1.2 - float(sl)) * 10_000, places=3)
+        self.assertAlmostEqual(40, (float(tp) - 1.2) * 10_000, places=3)
 
     def test_rejects_entry_after_daily_loss_budget_is_exhausted(self) -> None:
         gateway = FakeGateway()
@@ -1099,6 +1115,78 @@ class RealtimeArbitrageTests(unittest.TestCase):
 
                 with self.assertRaisesRegex(StrategyError, "invalid symbol catalog"):
                     RealtimeArbitrage(gateway, first=Endpoint("worker-a"), second=Endpoint("worker-b"), config=configuration())
+
+    def test_initial_calibration_excludes_non_usd_symbols_and_refresh_logs_only_changes(self) -> None:
+        gateway = FakeGateway()
+        invalid = gateway.symbol_specification(
+            {"name": "EURUSD", "currency_profit": "EUR"}
+        )
+        gateway.symbol_info_results["worker-a", "EURUSD"] = {"symbol": invalid}
+
+        with self.assertLogs("strategy.realtime_arbitrage", "INFO") as captured:
+            strategy = RealtimeArbitrage(
+                gateway,
+                first=Endpoint("worker-a"),
+                second=Endpoint("worker-b"),
+                config=configuration(execute=False),
+            )
+
+        self.assertNotIn("EURUSD", strategy.protection_calibrations)
+        self.assertTrue(any(
+            "protection_calibration_excluded symbol=EURUSD reason=first:non_usd_profit_currency"
+            in line
+            for line in captured.output
+        ))
+        now = datetime.now(UTC)
+        strategy.quotes["first"]["EURUSD"] = (now, 1.2, 1.2001)
+        strategy.quotes["second"]["EURUSD"] = (now, 1.2, 1.2001)
+        self.assertIsNone(strategy._candidate_for_symbol("EURUSD"))
+
+        gateway.symbol_info_results["worker-a", "EURUSD"] = {
+            "symbol": gateway.symbol_specification({"name": "EURUSD"})
+        }
+        strategy.protection_calibration_at = datetime.now(UTC) - timedelta(hours=3)
+        with self.assertLogs("strategy.realtime_arbitrage", "INFO") as refreshed:
+            strategy._refresh_protection_calibration_if_due()
+
+        self.assertIn("EURUSD", strategy.protection_calibrations)
+        self.assertTrue(any(
+            "protection_calibration_changed symbol=EURUSD" in line
+            for line in refreshed.output
+        ))
+        self.assertEqual(1, len(refreshed.output))
+        self.assertFalse(any(
+            "protection_calibration_excluded" in line for line in refreshed.output
+        ))
+
+    def test_sizing_ignores_shared_symbols_without_protection_calibration(self) -> None:
+        gateway = FakeGateway()
+        gateway.symbols = {
+            "worker-a": [{"name": "EURUSD"}, {"name": "AUDCAD"}],
+            "worker-b": [{"name": "EURUSD"}, {"name": "AUDCAD"}],
+        }
+        for worker_id in ("worker-a", "worker-b"):
+            gateway.symbol_info_results[worker_id, "AUDCAD"] = {
+                "symbol": gateway.symbol_specification(
+                    {"name": "AUDCAD", "currency_profit": "CAD"}
+                )
+            }
+        strategy = RealtimeArbitrage(
+            gateway,
+            first=Endpoint("worker-a"),
+            second=Endpoint("worker-b"),
+            config=configuration(execute=False),
+        )
+        now = datetime.now(UTC)
+        for name in ("first", "second"):
+            strategy.quotes[name]["EURUSD"] = (now, 1.2, 1.2001)
+
+        strategy._refresh_sizing_snapshot_if_due()
+
+        self.assertEqual(
+            {("EURUSD", "short_first_long_second"), ("EURUSD", "long_first_short_second")},
+            set(strategy.sizing_plans),
+        )
 
     def test_startup_catalog_ignores_untradable_symbols(self) -> None:
         gateway = FakeGateway()

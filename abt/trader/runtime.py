@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
@@ -47,6 +47,20 @@ class RuntimeRelay(Protocol):
         worker_id: str,
         *,
         symbol: str,
+        runtime_command_id: str,
+        request_id: str,
+        correlation: dict[str, object],
+    ) -> dict[str, object]: ...
+
+    def calc_profit(
+        self,
+        worker_id: str,
+        *,
+        symbol: str,
+        volume: str,
+        direction: str,
+        open_price: float,
+        close_price: float,
         runtime_command_id: str,
         request_id: str,
         correlation: dict[str, object],
@@ -99,6 +113,7 @@ class PairLegPlan:
     margin_limit: str
     stop_loss: str
     take_profit: str
+    protection_loss_usd: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,6 +162,7 @@ class PairPlan:
     first: PairLegPlan
     second: PairLegPlan
     timed_exit: TimedExitPolicy | None = None
+    protection_revision: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -180,7 +196,9 @@ class StrategyRuntime:
         after_transition: Callable[[str], None] | None = None,
     ) -> None:
         missing = [
-            name for name in ("snapshot", "symbol_info", "order_check", "order_execute", "operate")
+            name for name in (
+                "snapshot", "symbol_info", "calc_profit", "order_check", "order_execute", "operate"
+            )
             if not callable(getattr(relay, name, None))
         ]
         if missing:
@@ -595,8 +613,156 @@ class StrategyRuntime:
             return self.converge_empty("entry-verification-failed")
         activated_at = self._record_activation(plan, datetime.now(UTC))
         self._record_verified(plan, verified)
+        plan, verified = self._refine_entry_protection(plan, verified)
         self._set_state(plan, "ACTIVE", "ACTIVE", "Current Worker facts prove the protected pair.")
         return PairExecutionResult("active", "ACTIVE", *verified, activated_at=activated_at)
+
+    def _refine_entry_protection(
+        self,
+        plan: PairPlan,
+        verified: tuple[VerifiedLeg, VerifiedLeg],
+    ) -> tuple[PairPlan, tuple[VerifiedLeg, VerifiedLeg]]:
+        """Replace provisional entry protection with broker-calculated pair protection."""
+
+        if plan.first.protection_loss_usd is None and plan.second.protection_loss_usd is None:
+            return plan, verified
+        try:
+            targets = self._exact_protection_targets(plan, verified)
+        except Exception as error:
+            self._set_state(
+                plan, "CLOSING", "EMPTY",
+                f"Exact entry protection could not be calculated: {error}",
+            )
+            self.converge_empty("entry-protection-calculation-failed")
+            raise StrategyRuntimeError("Exact entry protection calculation failed.") from error
+        refined = replace(
+            plan,
+            first=replace(
+                plan.first, stop_loss=targets["first"]["sl"], take_profit=targets["first"]["tp"]
+            ),
+            second=replace(
+                plan.second, stop_loss=targets["second"]["sl"], take_profit=targets["second"]["tp"]
+            ),
+            protection_revision=plan.protection_revision + 1,
+        )
+        self._set_state(
+            refined, "REFINING_PROTECTION", "ACTIVE",
+            "Broker-verified entry is receiving exact pair-owned protection.",
+        )
+        prepared: dict[str, tuple[PairLegPlan, str, dict[str, object]]] = {}
+        for name, leg in (("first", refined.first), ("second", refined.second)):
+            effect_id = self._next_effect_id(
+                refined.command_id, leg.worker_id, "entry-protection-refinement"
+            )
+            operation = {
+                "type": "modify_sl_tp",
+                "symbol": leg.symbol,
+                "position": str(self._verified_ticket(refined, leg.worker_id)),
+                "sl": leg.stop_loss,
+                "tp": leg.take_profit,
+            }
+            self._prepare_effect(effect_id, refined.command_id, leg.worker_id, operation)
+            prepared[name] = (leg, effect_id, operation)
+        self._connection.executemany(
+            """UPDATE runtime_effects SET delivery_state = 'dispatching', updated_at = ?
+               WHERE effect_id = ? AND delivery_state = 'prepared'""",
+            [(_now(), effect_id) for _leg, effect_id, _operation in prepared.values()],
+        )
+        self._connection.commit()
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = {
+                name: executor.submit(
+                    self._safe_operate, refined, leg, effect_id, operation,
+                    "entry-protection-refinement",
+                )
+                for name, (leg, effect_id, operation) in prepared.items()
+            }
+            outcomes = {name: future.result() for name, future in futures.items()}
+        for name, outcome in outcomes.items():
+            self._record_effect_outcome(prepared[name][1], outcome)
+        facts = {
+            refined.first.worker_id: self._snapshot(
+                refined.first.worker_id, f"{refined.command_id}:entry-protection-verify"
+            ),
+            refined.second.worker_id: self._snapshot(
+                refined.second.worker_id, f"{refined.command_id}:entry-protection-verify"
+            ),
+        }
+        final = self._verify(refined, facts, receipts={})
+        if final is None:
+            self._set_state(
+                refined, "CLOSING", "EMPTY",
+                "Exact entry protection was not broker-verified on both owned legs.",
+            )
+            self.converge_empty("entry-protection-refinement-failed")
+            raise StrategyRuntimeError("Exact entry protection could not be broker-verified.")
+        self._record_verified(refined, final)
+        return refined, final
+
+    def _exact_protection_targets(
+        self,
+        plan: PairPlan,
+        verified: tuple[VerifiedLeg, VerifiedLeg],
+    ) -> dict[str, dict[str, str]]:
+        verified_by_worker = {leg.worker_id: leg for leg in verified}
+        constraints = self._current_symbol_constraints(plan)
+        if constraints is None:
+            raise StrategyRuntimeError("Current symbol constraints are unavailable.")
+        targets: dict[str, dict[str, str]] = {}
+        for name, leg in (("first", plan.first), ("second", plan.second)):
+            loss_limit = _positive_finite(leg.protection_loss_usd)
+            if loss_limit is None:
+                raise StrategyRuntimeError("Entry protection loss limit is invalid.")
+            entry = verified_by_worker[leg.worker_id].entry_price
+            tick_size = float(constraints[name]["tick_size"])
+            digits = int(constraints[name]["digits"])
+            stop_loss = self._broker_profit_target_price(
+                plan, leg, entry, -loss_limit
+            )
+            take_profit = self._broker_profit_target_price(
+                plan, leg, entry, loss_limit
+            )
+            targets[name] = {
+                "sl": _round_price(stop_loss, tick_size, digits, ROUND_CEILING if leg.direction == "LONG" else ROUND_FLOOR),
+                "tp": _round_price(take_profit, tick_size, digits, ROUND_FLOOR if leg.direction == "LONG" else ROUND_CEILING),
+            }
+        return targets
+
+    def _broker_profit_target_price(
+        self,
+        plan: PairPlan,
+        leg: PairLegPlan,
+        entry: float,
+        target_profit: float,
+    ) -> float:
+        lower, upper = entry * 0.5, entry * 1.5
+        for iteration in range(32):
+            candidate = (lower + upper) / 2
+            result = self.relay.calc_profit(
+                leg.worker_id,
+                symbol=leg.symbol,
+                volume=leg.volume,
+                direction=leg.direction,
+                open_price=entry,
+                close_price=candidate,
+                runtime_command_id=plan.command_id,
+                request_id=(
+                    f"{plan.command_id}:{leg.name}:entry-protection-profit:{iteration}"
+                ),
+                correlation={
+                    "pair_id": plan.pair_id,
+                    "leg": leg.name,
+                    "purpose": "entry-protection-refinement",
+                },
+            )
+            profit = _finite_float(result.get("profit"))
+            if profit is None:
+                raise StrategyRuntimeError("Worker returned invalid calculated profit.")
+            if (profit < target_profit) == (leg.direction == "LONG"):
+                lower = candidate
+            else:
+                upper = candidate
+        return (lower + upper) / 2
 
     def maintain(
         self,
@@ -1866,6 +2032,18 @@ class StrategyRuntime:
             if existing is not None and int(existing[0]) != leg.ticket:
                 raise StrategyRuntimeError("Current broker ticket differs from the durable verified leg.")
             if existing is not None:
+                self._connection.execute(
+                    """UPDATE runtime_verified_legs
+                       SET entry_price = ?, position = ?, receipt = ?
+                       WHERE pair_id = ? AND worker_id = ?""",
+                    (
+                        leg.entry_price,
+                        _canonical(leg.position),
+                        _canonical(leg.receipt),
+                        plan.pair_id,
+                        leg.worker_id,
+                    ),
+                )
                 continue
             self._connection.execute(
                 """INSERT INTO runtime_verified_legs
@@ -2037,6 +2215,7 @@ def _plan_json(plan: PairPlan) -> dict[str, object]:
         "first": asdict(plan.first),
         "second": asdict(plan.second),
         "timed_exit": asdict(plan.timed_exit) if plan.timed_exit is not None else None,
+        "protection_revision": plan.protection_revision,
     }
 
 
@@ -2053,6 +2232,7 @@ def _plan(value: dict[str, object]) -> PairPlan:
             if isinstance(value.get("timed_exit"), dict)
             else None
         ),
+        protection_revision=int(value.get("protection_revision", 0)),
     )
 
 
@@ -2076,6 +2256,11 @@ def _finite_float(value: object) -> float | None:
     except (TypeError, ValueError):
         return None
     return result if math.isfinite(result) else None
+
+
+def _positive_finite(value: object) -> float | None:
+    result = _finite_float(value)
+    return result if result is not None and result > 0 else None
 
 
 def _round_price(

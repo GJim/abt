@@ -42,6 +42,7 @@ NY = ZoneInfo("America/New_York")
 DEFAULT_TRADER_CONFIG = str(Path(__file__).with_name("trader.json"))
 _LOGGER = logging.getLogger(__name__)
 _MARGIN_SIZING_INTERVAL = timedelta(minutes=10)
+_PROTECTION_CALIBRATION_INTERVAL = timedelta(hours=3)
 _MARGIN_HEADROOM_FRACTION = 0.20
 _PAIR_ENTRY_EXPIRY = timedelta(seconds=5)
 
@@ -125,6 +126,12 @@ class SharedSymbol:
     volume_min: float
     volume_step: float
     volume_max: float
+
+
+@dataclass(frozen=True, slots=True)
+class ProtectionCalibration:
+    first_usd_per_point: float
+    second_usd_per_point: float
 
 
 @dataclass(slots=True)
@@ -370,6 +377,35 @@ class TraderGateway:
             worker_id,
             kind="read",
             request={"type": "symbol_info", "symbol": symbol},
+            runtime_command_id=runtime_command_id,
+            request_id=request_id,
+            correlation=correlation,
+        )
+
+    def calc_profit(
+        self,
+        worker_id: str,
+        *,
+        symbol: str,
+        volume: str,
+        direction: str,
+        open_price: float,
+        close_price: float,
+        runtime_command_id: str,
+        request_id: str,
+        correlation: dict[str, object],
+    ) -> dict[str, object]:
+        return self.request(
+            worker_id,
+            kind="read",
+            request={
+                "type": "calc_profit",
+                "symbol": symbol,
+                "volume": volume,
+                "direction": direction,
+                "open_price": f"{open_price:.10f}",
+                "close_price": f"{close_price:.10f}",
+            },
             runtime_command_id=runtime_command_id,
             request_id=request_id,
             correlation=correlation,
@@ -722,6 +758,10 @@ class RealtimeArbitrage:
         )
         self._verify_active_workers()
         self.shared_symbols = self._load_shared_symbols()
+        self.protection_calibrations: dict[str, ProtectionCalibration] = {}
+        self._protection_calibration_states: dict[str, str] = {}
+        self.protection_calibration_at: datetime | None = None
+        self._refresh_protection_calibration_if_due(initial=True)
         self._configure_live_symbols()
         self.accounts = {name: self._account(endpoint) for name, endpoint in self.endpoints.items()}
         self.exposure_caps = {
@@ -808,6 +848,7 @@ class RealtimeArbitrage:
         while not stop.is_set() and not self.stopped:
             try:
                 self._reset_daily_equity()
+                self._refresh_protection_calibration_if_due()
             except WorkerRpcUnavailable as error:
                 self._suspend_for_worker_disconnect(error)
                 continue
@@ -1029,6 +1070,70 @@ class RealtimeArbitrage:
         _LOGGER.info("shared_symbols_loaded count=%d", len(shared))
         return shared
 
+    def _refresh_protection_calibration_if_due(self, *, initial: bool = False) -> None:
+        now = datetime.now(UTC)
+        if (
+            not initial
+            and self.protection_calibration_at is not None
+            and now - self.protection_calibration_at < _PROTECTION_CALIBRATION_INTERVAL
+        ):
+            return
+        calibrations: dict[str, ProtectionCalibration] = {}
+        states: dict[str, str] = {}
+        for symbol in sorted(self.shared_symbols):
+            endpoint_values: dict[str, float] = {}
+            reasons: list[str] = []
+            for name, endpoint in self.endpoints.items():
+                result = self.gateway.request(
+                    endpoint.worker_id,
+                    kind="read",
+                    request={"type": "symbol_info", "symbol": symbol},
+                )
+                value, reason = _usd_per_point_calibration(result.get("symbol"), symbol)
+                if value is None:
+                    reasons.append(f"{name}:{reason}")
+                else:
+                    endpoint_values[name] = value
+            if reasons:
+                states[symbol] = ";".join(reasons)
+            else:
+                calibration = ProtectionCalibration(
+                    endpoint_values["first"], endpoint_values["second"]
+                )
+                calibrations[symbol] = calibration
+                states[symbol] = (
+                    f"eligible:first={calibration.first_usd_per_point:.12g},"
+                    f"second={calibration.second_usd_per_point:.12g}"
+                )
+        if initial:
+            for symbol in sorted(self.shared_symbols):
+                if symbol not in calibrations:
+                    _LOGGER.info(
+                        "protection_calibration_excluded symbol=%s reason=%s",
+                        symbol,
+                        states[symbol],
+                    )
+        else:
+            for symbol in sorted(set(self._protection_calibration_states) | set(states)):
+                before = self._protection_calibration_states.get(symbol)
+                after = states.get(symbol)
+                if before != after:
+                    _LOGGER.info(
+                        "protection_calibration_changed symbol=%s previous=%s current=%s",
+                        symbol,
+                        before or "unavailable",
+                        after or "unavailable",
+                    )
+        self.protection_calibrations = calibrations
+        self._protection_calibration_states = states
+        self.protection_calibration_at = now
+        if initial:
+            _LOGGER.info(
+                "protection_calibration_refreshed eligible_symbols=%d total_symbols=%d",
+                len(calibrations),
+                len(self.shared_symbols),
+            )
+
     def _configure_live_symbols(self) -> None:
         symbols = sorted(self.shared_symbols)
         for endpoint in self.endpoints.values():
@@ -1204,7 +1309,11 @@ class RealtimeArbitrage:
 
     def _candidate_for_symbol(self, symbol: str) -> TradeCandidate | None:
         specification = self.shared_symbols.get(symbol)
-        if specification is None or not self._quotes_fresh(symbol):
+        if (
+            specification is None
+            or symbol not in self.protection_calibrations
+            or not self._quotes_fresh(symbol)
+        ):
             return None
         _, first_bid, first_ask = self.quotes["first"][symbol]
         _, second_bid, second_ask = self.quotes["second"][symbol]
@@ -1217,7 +1326,11 @@ class RealtimeArbitrage:
         return min(eligible, key=lambda candidate: (-candidate.edge, candidate.direction)) if eligible else None
 
     def _best_candidate(self) -> TradeCandidate | None:
-        symbols = sorted(self.shared_symbols.keys() & self.quotes["first"].keys() & self.quotes["second"].keys())
+        symbols = sorted(
+            self.protection_calibrations.keys()
+            & self.quotes["first"].keys()
+            & self.quotes["second"].keys()
+        )
         candidates = [candidate for symbol in symbols if (candidate := self._candidate_for_symbol(symbol)) is not None]
         return min(candidates, key=lambda candidate: (-candidate.edge, candidate.symbol, candidate.direction)) if candidates else None
 
@@ -1225,7 +1338,7 @@ class RealtimeArbitrage:
         now = datetime.now(UTC)
         if self.sizing_snapshot_at is not None and now - self.sizing_snapshot_at < _MARGIN_SIZING_INTERVAL:
             return
-        symbols = sorted(self.shared_symbols)
+        symbols = sorted(self.protection_calibrations)
         if not all(self._quotes_fresh(symbol) for symbol in symbols):
             return
         calculations = {
@@ -1256,7 +1369,8 @@ class RealtimeArbitrage:
         first_margin_limit = self._hard_margin_limit("first")
         second_margin_limit = self._hard_margin_limit("second")
         plans: dict[tuple[str, str], SizingPlan] = {}
-        for symbol, specification in self.shared_symbols.items():
+        for symbol in symbols:
+            specification = self.shared_symbols[symbol]
             for direction, first_direction, second_direction in (
                 ("short_first_long_second", "SHORT", "LONG"),
                 ("long_first_short_second", "LONG", "SHORT"),
@@ -1384,11 +1498,13 @@ class RealtimeArbitrage:
                         "first", self.endpoints["first"].worker_id, symbol, first_direction,
                         _volume_text(volume, specification.volume_step), specification.filling_mode,
                         f"{plan.first_margin_limit:.2f}", first_stop_loss, first_take_profit,
+                        f"{self.config.emergency_stop_loss_usd:.10g}",
                     ),
                     second=PairLegPlan(
                         "second", self.endpoints["second"].worker_id, symbol, second_direction,
                         _volume_text(volume, specification.volume_step), specification.filling_mode,
                         f"{plan.second_margin_limit:.2f}", second_stop_loss, second_take_profit,
+                        f"{self.config.emergency_stop_loss_usd:.10g}",
                     ),
                     timed_exit=(
                         TimedExitPolicy(self.config.maximum_holding_seconds)
@@ -1408,6 +1524,7 @@ class RealtimeArbitrage:
                 self.stopped = True
                 self.needs_human = True
                 raise HedgedEntryContained(result.reason or "Strategy Runtime could not verify both protected legs.")
+            active_plan = getattr(self.runtime, "active_plan", None)
             self.pair = Pair(
                 symbol,
                 direction,
@@ -1420,10 +1537,10 @@ class RealtimeArbitrage:
                 volume,
                 datetime.now(UTC),
                 pair_plan.pair_id,
-                first_stop_loss,
-                first_take_profit,
-                second_stop_loss,
-                second_take_profit,
+                active_plan.first.stop_loss if active_plan is not None else first_stop_loss,
+                active_plan.first.take_profit if active_plan is not None else first_take_profit,
+                active_plan.second.stop_loss if active_plan is not None else second_stop_loss,
+                active_plan.second.take_profit if active_plan is not None else second_take_profit,
             )
             _LOGGER.info(
                 "pair_active_verified command_id=%s pair_id=%s first_ticket=%s second_ticket=%s",
@@ -1448,56 +1565,29 @@ class RealtimeArbitrage:
     def _initial_protection_targets(
         self, name: str, symbol: str, direction: str, entry: float, volume: float
     ) -> tuple[str, str]:
-        endpoint = self.endpoints[name]
-        loss_limit = min(
-            self.config.emergency_stop_loss_usd,
-            self.exposure_caps[name] * self.config.trade_loss_fraction,
-            self._remaining_daily_loss(name),
+        calibration = self.protection_calibrations.get(symbol)
+        if calibration is None:
+            raise StrategyError(f"Cannot fast-protect {symbol}: USD per-point calibration is unavailable.")
+        usd_per_point = (
+            calibration.first_usd_per_point if name == "first"
+            else calibration.second_usd_per_point
         )
-        if loss_limit <= 0:
-            raise StrategyError(f"Cannot protect {name} position: daily loss budget is exhausted.")
+        price_distance = (
+            self.config.emergency_stop_loss_usd
+            / (usd_per_point * volume)
+            * self.shared_symbols[symbol].point
+        )
         specification = self.shared_symbols[symbol]
-        sl = _tick_price_text(
-            self._profit_target_price(endpoint, symbol, direction, entry, volume, -loss_limit),
-            specification.trade_tick_size,
-        )
-        tp = _tick_price_text(
-            self._profit_target_price(endpoint, symbol, direction, entry, volume, loss_limit),
-            specification.trade_tick_size,
-        )
+        sl = _tick_price_text(entry - price_distance if direction == "LONG" else entry + price_distance, specification.trade_tick_size)
+        tp = _tick_price_text(entry + price_distance if direction == "LONG" else entry - price_distance, specification.trade_tick_size)
         _LOGGER.info(
             "initial_protection_calculated endpoint=%s sl=%.10f tp=%.10f magnitude_usd=%.2f",
             name,
             float(sl),
             float(tp),
-            loss_limit,
+            self.config.emergency_stop_loss_usd,
         )
         return sl, tp
-
-    def _profit_target_price(
-        self, endpoint: Endpoint, symbol: str, direction: str, entry: float, volume: float, target_profit: float
-    ) -> float:
-        lower, upper = entry * 0.5, entry * 1.5
-        for _ in range(32):
-            candidate = (lower + upper) / 2
-            result = self.gateway.request(
-                endpoint.worker_id,
-                kind="read",
-                request={
-                    "type": "calc_profit", "symbol": symbol,
-                    "volume": _volume_text(volume, self.shared_symbols[symbol].volume_step),
-                    "direction": direction, "open_price": f"{entry:.10f}", "close_price": f"{candidate:.10f}",
-                },
-            )
-            profit = result.get("profit")
-            if isinstance(profit, bool) or not isinstance(profit, (int, float)):
-                raise StrategyError("Worker returned invalid calculated profit.")
-            profit_increases_with_price = direction == "LONG"
-            if (profit < target_profit) == profit_increases_with_price:
-                lower = candidate
-            else:
-                upper = candidate
-        return (lower + upper) / 2
 
     def _risk_breached(self) -> bool:
         assert self.pair is not None
@@ -1554,7 +1644,7 @@ class RealtimeArbitrage:
                 self.stopped = True
                 raise StrategyError(result.reason or "Protected pair integrity diverged; runtime converged toward empty.")
             self.integrity_check_at = datetime.now(UTC) + timedelta(seconds=self.config.integrity_check_seconds)
-            _LOGGER.info(
+            _LOGGER.debug(
                 "pair_integrity_verified first_ticket=%s second_ticket=%s next_check_at=%s",
                 self.pair.first_ticket,
                 self.pair.second_ticket,
@@ -1680,6 +1770,45 @@ def _tick_price_text(price: float, tick_size: float) -> str:
 
 def _positive_finite(value: object) -> bool:
     return not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(value) and value > 0
+
+
+def _usd_per_point_calibration(
+    value: object,
+    symbol: str,
+) -> tuple[float | None, str]:
+    if not isinstance(value, dict) or value.get("name") != symbol:
+        return None, "missing_symbol_info"
+    currency_profit = value.get("currency_profit")
+    if not isinstance(currency_profit, str) or not currency_profit:
+        return None, "missing_or_invalid_per_point_inputs"
+    if currency_profit != "USD":
+        return None, "non_usd_profit_currency"
+    point = _calibration_number(value.get("point"))
+    tick_size = _calibration_number(value.get("trade_tick_size"))
+    tick_values = tuple(
+        _calibration_number(value.get(field))
+        for field in (
+            "trade_tick_value",
+            "trade_tick_value_profit",
+            "trade_tick_value_loss",
+        )
+    )
+    if point is None or tick_size is None or any(item is None for item in tick_values):
+        return None, "missing_or_invalid_per_point_inputs"
+    tick_value, profit_tick_value, loss_tick_value = tick_values
+    assert tick_value is not None and profit_tick_value is not None and loss_tick_value is not None
+    if not math.isclose(tick_value, profit_tick_value, rel_tol=0, abs_tol=1e-12) or not math.isclose(
+        tick_value, loss_tick_value, rel_tol=0, abs_tol=1e-12
+    ):
+        return None, "per_point_not_provably_constant"
+    usd_per_point = tick_value * point / tick_size
+    if not math.isfinite(usd_per_point) or usd_per_point <= 0:
+        return None, "missing_or_invalid_per_point_inputs"
+    return usd_per_point, ""
+
+
+def _calibration_number(value: object) -> float | None:
+    return float(value) if _positive_finite(value) else None
 
 
 def _floor_volume(maximum: float, minimum: float, step: float) -> float | None:
