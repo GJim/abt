@@ -3,8 +3,6 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from queue import SimpleQueue
-from threading import Thread
 import time
 from base64 import b64encode
 from collections.abc import Callable, Mapping
@@ -235,7 +233,6 @@ def main(
                 state_file=state_path(arguments.config),
                 identity_path=arguments.config,
                 worker_ids=tuple(arguments.worker_id) if arguments.worker_id else ("*",),
-                command_source=_jsonl_command_source(error_output) if arguments.jsonl else None,
             )
             return 0
         finally:
@@ -253,7 +250,6 @@ def connect_trader(
     identity: TraderIdentity, *, transport: TraderTransport, key_store_factory: Callable[[str], HardwareKeyStore],
     output: TextIO, error_output: TextIO, state_file: Path, identity_path: Path | None = None,
     worker_ids: tuple[str, ...] = ("*",),
-    command_source: SimpleQueue[object] | None = None,
     now: Callable[[], datetime] = lambda: datetime.now(UTC),
     sleep: Callable[[float], None] = time.sleep,
 ) -> None:
@@ -339,7 +335,6 @@ def connect_trader(
                         save_cursor=lambda cursor: save_acknowledged_cursor(state_file, cursor),
                         on_heartbeat=maintain_daily,
                         worker_ids=worker_ids,
-                        command_source=command_source,
                     )
                 finally:
                     socket.__exit__(None, None, None)
@@ -429,21 +424,4 @@ def _parser() -> argparse.ArgumentParser:
         action="append",
         help="subscribe to one active Worker's market data; repeat to subscribe to multiple Workers",
     )
-    connect.add_argument("--jsonl", action="store_true", help="accept Trader requests as JSON Lines from standard input")
     return parser
-
-
-def _jsonl_command_source(error_output: TextIO) -> SimpleQueue[object]:
-    commands: SimpleQueue[object] = SimpleQueue()
-
-    def read_commands() -> None:
-        for line in sys.stdin:
-            try:
-                command = json.loads(line)
-            except json.JSONDecodeError:
-                print("Ignoring invalid Trader JSONL command.", file=error_output)
-                continue
-            commands.put(command)
-
-    Thread(target=read_commands, name="abt-trader-jsonl-input", daemon=True).start()
-    return commands

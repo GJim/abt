@@ -123,3 +123,15 @@ class WorkerEffectJournalTests(unittest.TestCase):
             restarted.record_observation("effect-1", {"positions": []})
             self.assertEqual([], restarted.unresolved())
             restarted.close()
+
+    def test_same_effect_and_payload_replays_conclusive_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            journal = WorkerEffectJournal(Path(directory) / "effects.sqlite")
+            payload = {"action": "market", "symbol": "EURUSD"}
+            journal.prepare("effect-1", payload)
+            journal.mark_send_started("effect-1")
+            journal.record_receipt("effect-1", {"retcode": 10009, "order": 42})
+
+            self.assertEqual("receipt", journal.prepare("effect-1", payload))
+            self.assertEqual({"retcode": 10009, "order": 42}, journal.evidence("effect-1"))
+            journal.close()

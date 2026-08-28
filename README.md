@@ -59,68 +59,20 @@ device private key, and Trader certificate are never written to disk.
 abt-trader enroll
 abt-trader connect
 abt-trader connect --worker-id <worker-id>
-abt-trader connect --jsonl
 ```
 
-`connect` keeps a foreground authenticated WSS session, writes lifecycle
-events and subscribed market-data messages as JSON Lines to standard output,
-and sends diagnostics to standard error. It subscribes to all currently
-connected Workers by default; repeat `--worker-id` to limit it to selected
-Workers. A worker session ending emits `market_data_unavailable`, and its
-retained quotes are never replayed to a new Trader session. Existing
-Trader identity configuration is protected; use
+`connect` is a foreground authenticated connection diagnostic. The realtime
+arbitrage Strategy Runtime opens the same authenticated transport in-process;
+it does not launch `abt-trader` as a child process. Existing Trader identity
+configuration is protected; use
 `abt-trader enroll --replace-config` only for deliberate replacement.
 
-With `--jsonl`, `connect` accepts one command per standard-input line and
-writes correlated results to standard output. Every command has this envelope:
-
-```json
-{"request_id":"unique-id","worker_id":"approved-worker-id","payload":{"kind":"read","request":{"type":"account_info"}}}
-```
-
-Trader sessions can also query the controller's active inventory without
-supplying a Worker ID:
-
-```json
-{"request_id":"workers-1","query":"active_workers"}
-```
-
-`active_workers` returns each enabled Worker's ID, MT5 server, connectivity,
-and safety state. Product-pair management remains available through its
-management interfaces; it does not constrain direct Trader Worker RPC or
-Trader inventory queries.
-
-`payload.kind` is `read` or `operation`. Reads support `account_info`,
-`symbol_info`, `historical_ticks`, `current_orders`, and `current_positions`;
-historical ticks are limited to 1,000 records per request; callers split and
-de-duplicate larger time ranges. Operations support
-`market`, `pending` (`limit`, `stop`, or `stop_limit`), `cancel`, `close`, and
-`modify_sl_tp`. Operations are refused for a disconnected Worker or one whose account recovery
-lifecycle is not eligible for the requested work. The controller records both
-the request and its Worker result before emitting the JSONL result.
-
-### Active-pair historical tick analysis
-
-`scripts\analyze_active_pair_ticks.py` is a read-only, Trader-mediated report
-for one active product pair over the preceding 24 hours. It starts one
-long-lived `abt-trader connect --jsonl` child process, first checks the active
-pair and its source Workers, and refuses disconnected or unsafe Workers. It
-adaptively splits capped historical-tick reads and de-duplicates shared slice
-boundaries. The JSON report includes independent bid/ask rise and fall runs
-and both bid-to-opposite-ask cross directions.
-
-```powershell
-uv run python scripts\analyze_active_pair_ticks.py --pair-id <product-pair-id>
-```
-
-When exactly one pair is active, `--pair-id` may be omitted. Use `--help` for
-UTC end-time, tolerance, quote-staleness, and Trader executable/configuration
-options. The script begins with one-hour tick slices and subdivides only
-responses that reach the 1,000-record limit. The default trend tolerances are
-1%, 0.1%, and 0.01%.
-
-If the current context has open orders or positions, an interactive switch
-requires confirmation. `--yes` bypasses that prompt.
+The controller exposes Worker identity and connectivity for selection, then
+routes versioned request, outcome, and Worker-fact envelopes without
+interpreting their trading payloads. Pair policy, execution, verification,
+recovery, and close convergence are durable Strategy Runtime responsibilities.
+The management console has no pair, analysis, intent, order, position, or
+emergency-trading operations.
 
 ### NZDUSD cross-arbitrage simulation
 

@@ -2,9 +2,12 @@ from __future__ import annotations
 
 from collections import namedtuple
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
+import tempfile
 import unittest
 
 from abt.worker.enrollment import WorkerEnrollmentError, WorkerSessionDisconnected
+from abt.worker.effect_journal import WorkerEffectJournal
 from abt.worker.reconciliation import (
     AccountMismatchError,
     LiveWorkerMarketStateAdapter,
@@ -19,12 +22,11 @@ from abt.worker.reconciliation import (
     _serve_order_check,
     _serve_order_execute,
     _serve_trader_rpc,
-    _serve_execution_recovery,
+    _trader_operation,
     reconnect_worker_session,
     reconcile_authenticated_worker,
 )
 from abt.trader_protocol import MAX_LIVE_SYMBOLS
-from abt.worker.session import collect_market_data_evidence, collect_product_catalog_evidence
 
 
 class ReadOnlyMT5:
@@ -60,6 +62,97 @@ class ReadOnlyMT5:
 
 
 class WorkerReconciliationTests(unittest.TestCase):
+    def test_expired_order_effect_replays_durable_receipt_before_broker_checks(self) -> None:
+        class MT5:
+            TRADE_RETCODE_DONE = 10009
+            TRADE_RETCODE_PLACED = 10008
+
+        class Session:
+            response: dict[str, object] | None = None
+
+            def send_order_execute(self, **kwargs: object) -> None:
+                self.response = kwargs
+
+        with tempfile.TemporaryDirectory() as directory:
+            journal = WorkerEffectJournal(Path(directory) / "effects.sqlite3")
+            try:
+                order = {
+                    "action": "market",
+                    "symbol": "EURUSD",
+                    "volume": "0.01",
+                    "direction": "LONG",
+                    "filling_mode": "IOC",
+                }
+                journal.prepare("effect-1", order)
+                journal.mark_send_started("effect-1")
+                journal.record_receipt("effect-1", {"retcode": 10009, "position": {"ticket": 42}})
+                session = Session()
+
+                outcome = _serve_order_execute(
+                    MT5(),  # type: ignore[arg-type]
+                    session,  # type: ignore[arg-type]
+                    {
+                        "request_id": "request-1",
+                        "effect_id": "effect-1",
+                        "expires_at": "2000-01-01T00:00:00+00:00",
+                        "order": order,
+                    },
+                    effect_journal=journal,
+                )
+
+                self.assertEqual("completed", outcome)
+                self.assertTrue(session.response["accepted"])  # type: ignore[index]
+                self.assertEqual({"ticket": 42}, session.response["result"]["position"])  # type: ignore[index]
+            finally:
+                journal.close()
+
+    def test_completed_close_replays_receipt_without_repricing_or_resending(self) -> None:
+        class MT5:
+            ORDER_TYPE_BUY = 0
+            ORDER_TYPE_SELL = 1
+            POSITION_TYPE_BUY = 0
+            TRADE_ACTION_DEAL = 1
+            ORDER_FILLING_IOC = 1
+            TRADE_RETCODE_DONE = 10009
+
+            def __init__(self) -> None:
+                self.positions: list[dict[str, object]] = [
+                    {"ticket": 42, "symbol": "EURUSD", "type": self.POSITION_TYPE_BUY}
+                ]
+                self.order_send_calls = 0
+
+            def terminal_info(self) -> object:
+                return {"trade_allowed": True, "tradeapi_disabled": False}
+
+            def positions_get(self) -> object:
+                return self.positions
+
+            def symbol_info_tick(self, _symbol: str) -> object:
+                return {"bid": 1.1 + self.order_send_calls, "ask": 1.2 + self.order_send_calls}
+
+            def order_send(self, _request: dict[str, object]) -> object:
+                self.order_send_calls += 1
+                self.positions = []
+                return {"retcode": self.TRADE_RETCODE_DONE, "deal": 77, "price": 1.1}
+
+        with tempfile.TemporaryDirectory() as directory:
+            journal = WorkerEffectJournal(Path(directory) / "effects.sqlite3")
+            try:
+                mt5 = MT5()
+                payload = {"type": "close", "ticket": "42", "volume": "0.10"}
+
+                first = _trader_operation(
+                    mt5, payload, effect_journal=journal, effect_id="close-42"
+                )
+                replay = _trader_operation(
+                    mt5, payload, effect_journal=journal, effect_id="close-42"
+                )
+
+                self.assertEqual(first, replay)
+                self.assertEqual(1, mt5.order_send_calls)
+            finally:
+                journal.close()
+
     def test_receipt_adapter_ignores_unknown_nested_mt5_request(self) -> None:
         OrderSendResult = namedtuple(
             "OrderSendResult",
@@ -571,125 +664,6 @@ class WorkerReconciliationTests(unittest.TestCase):
             session.response,
         )
 
-    def test_execution_reconciliation_includes_position_open_price(self) -> None:
-        class ReconciliationMT5:
-            def orders_get(self) -> object:
-                return []
-
-            def positions_get(self) -> object:
-                return [{
-                    "ticket": 901,
-                    "volume": 0.1,
-                    "price_open": 1.1002,
-                    "comment": "abt:t:trader-intent",
-                }]
-
-        class Session:
-            response: dict[str, object] | None = None
-
-            def send_execution_recovery(self, **kwargs: object) -> None:
-                self.response = kwargs
-
-        session = Session()
-        _serve_execution_recovery(
-            ReconciliationMT5(),  # type: ignore[arg-type]
-            session,  # type: ignore[arg-type]
-            {
-                "type": "execution_reconcile_request",
-                "request_id": "request-1",
-                "execution_id": "abt:t:trader-intent",
-            },
-        )
-
-        self.assertEqual(
-            {
-                "request_id": "request-1",
-                "operation": "execution_reconcile",
-                "accepted": True,
-                "result": {
-                    "orders": [],
-                    "positions": [{
-                        "ticket": 901,
-                        "volume": 0.1,
-                        "price_open": 1.1002,
-                        "comment": "abt:t:trader-intent",
-                        "control_plane_command_id": "abt:t:trader-intent",
-                    }],
-                },
-            },
-            session.response,
-        )
-
-    def test_account_recovery_reconciliation_returns_all_broker_exposure(self) -> None:
-        class ReconciliationMT5:
-            def orders_get(self) -> object:
-                return [{"ticket": 101, "volume_current": 0.1}]
-
-            def positions_get(self) -> object:
-                return [{"ticket": 901, "volume": 0.1, "price_open": 1.1002}]
-
-        class Session:
-            response: dict[str, object] | None = None
-
-            def send_execution_recovery(self, **kwargs: object) -> None:
-                self.response = kwargs
-
-        session = Session()
-        _serve_execution_recovery(
-            ReconciliationMT5(),  # type: ignore[arg-type]
-            session,  # type: ignore[arg-type]
-            {"type": "account_recovery_reconcile_request", "request_id": "recovery-1"},
-        )
-
-        self.assertEqual(
-            {
-                "request_id": "recovery-1",
-                "operation": "account_recovery_reconcile",
-                "accepted": True,
-                "result": {
-                    "orders": [{"ticket": 101, "volume_current": 0.1}],
-                    "positions": [{"ticket": 901, "volume": 0.1, "price_open": 1.1002}],
-                },
-            },
-            session.response,
-        )
-
-    def test_execution_close_uses_position_record_not_ticket_key(self) -> None:
-        class CloseMT5:
-            POSITION_TYPE_BUY = 0
-            ORDER_TYPE_SELL = 1
-            ORDER_TYPE_BUY = 0
-            TRADE_ACTION_DEAL = 1
-            ORDER_FILLING_IOC = 1
-            TRADE_RETCODE_DONE = 10009
-
-            def positions_get(self) -> object:
-                return [{"ticket": 901, "symbol": "EURUSD", "type": self.POSITION_TYPE_BUY, "volume": 0.1}]
-
-            def symbol_info_tick(self, _symbol: str) -> object:
-                return {"bid": 1.1, "ask": 1.1002}
-
-            def order_send(self, request: dict[str, object]) -> object:
-                self.request = request
-                return {"retcode": self.TRADE_RETCODE_DONE}
-
-        class Session:
-            response: dict[str, object] | None = None
-
-            def send_execution_recovery(self, **kwargs: object) -> None:
-                self.response = kwargs
-
-        mt5 = CloseMT5()
-        session = Session()
-        _serve_execution_recovery(
-            mt5,  # type: ignore[arg-type]
-            session,  # type: ignore[arg-type]
-            {"type": "execution_close_request", "request_id": "request-1", "ticket": "901", "volume": "0.1"},
-        )
-
-        self.assertEqual(901, mt5.request["position"])
-        self.assertEqual({"request_id": "request-1", "operation": "execution_close", "accepted": True, "result": {"retcode": 10009}}, session.response)
-
     def test_publishes_diff_only_live_market_state_on_the_required_schedules(self) -> None:
         class LiveMT5(ReadOnlyMT5):
             def symbol_info_tick(self, symbol: str) -> object:
@@ -719,8 +693,8 @@ class WorkerReconciliationTests(unittest.TestCase):
         )
         self.assertEqual([], emitted[1:])
         self.assertEqual(4, mt5.calls.count("symbol_info_tick:EURUSD"))
-        self.assertEqual(3, mt5.calls.count("orders_get"))
-        self.assertEqual(3, mt5.calls.count("positions_get"))
+        self.assertEqual(0, mt5.calls.count("orders_get"))
+        self.assertEqual(0, mt5.calls.count("positions_get"))
         self.assertEqual(2, mt5.calls.count("terminal_info"))
 
     def test_order_check_diagnostics_include_rejection_and_quote(self) -> None:
@@ -896,7 +870,7 @@ class WorkerReconciliationTests(unittest.TestCase):
         self.assertEqual(["snapshot", "delta", "delta", "snapshot"], [event["type"] for event in emitted])
         self.assertEqual("state_changed", emitted[1]["change"])
         self.assertEqual("volume_changed", emitted[2]["change"])
-        self.assertEqual(2, emitted[-1]["cursor"])
+        self.assertEqual(4, emitted[-1]["cursor"])
         self.assertEqual(["account_info", "terminal_info", "orders_get", "positions_get"] * 4, mt5.calls)
         self.assertEqual(0, mt5.broker_write_calls)
 
@@ -928,7 +902,7 @@ class WorkerReconciliationTests(unittest.TestCase):
         mt5.positions[0]["volume"] = 1.0
         adapter.poll(started + timedelta(minutes=1))
 
-        self.assertEqual([7, 8], [event["cursor"] for event in emitted])
+        self.assertEqual([8, 9], [event["cursor"] for event in emitted])
         self.assertEqual(["snapshot", "delta"], [event["type"] for event in emitted])
 
     def test_schedules_each_read_only_poll_one_minute_apart(self) -> None:
@@ -996,134 +970,6 @@ class WorkerReconciliationTests(unittest.TestCase):
         self.assertEqual("snapshot", emitted[0]["type"])
         self.assertEqual(0, mt5.broker_write_calls)
 
-    def test_serves_catalog_analysis_requests_during_reconciliation(self) -> None:
-        mt5 = AnalysisMT5()
-        session = AnalysisSession(
-            {
-                "analysis_id": "analysis-123",
-                "request_id": "request-123",
-                "stage": "catalog",
-                "policy": {},
-            }
-        )
-
-        with self.assertRaises(StopIteration):
-            reconcile_authenticated_worker(
-                mt5=mt5,
-                session=session,
-                login=123456,
-                server="Broker-Demo",
-                now=lambda: datetime(2026, 8, 16, tzinfo=UTC),
-                sleep=lambda _: None,
-            )
-
-        self.assertEqual("analysis-123", session.analysis_response["analysis_id"])
-        self.assertEqual("request-123", session.analysis_response["request_id"])
-        self.assertEqual("catalog", session.analysis_response["stage"])
-        self.assertEqual(["EURUSD"], [symbol["symbol"] for symbol in session.analysis_response["symbols"]])
-        self.assertEqual(0, mt5.broker_write_calls)
-
-    def test_serves_m15_analysis_requests_during_reconciliation(self) -> None:
-        with self.assertLogs("abt.worker.reconciliation", level="DEBUG") as logs:
-            response = self._serve_market_data_analysis("m15_screening", "M15")
-
-        self.assertEqual("m15_screening", response["stage"])
-        self.assertEqual("M15", response["timeframe"])
-        self.assertTrue(
-            any("Collected M15 evidence for analysis analysis-123 request request-123 across 1 symbols in " in line for line in logs.output)
-        )
-
-    def test_serves_m1_analysis_requests_during_reconciliation(self) -> None:
-        response = self._serve_market_data_analysis("m1_verification", "M1")
-
-        self.assertEqual("m1_verification", response["stage"])
-        self.assertEqual("M1", response["timeframe"])
-
-    def test_sends_market_data_analysis_error_without_stopping_reconciliation(self) -> None:
-        mt5 = AnalysisMT5()
-        mt5.symbol_info_tick = lambda _: None  # type: ignore[method-assign]
-        session = AnalysisSession(
-            {
-                "analysis_id": "analysis-123",
-                "request_id": "request-123",
-                "stage": "m15_screening",
-                "policy": {},
-                "timeframe": "M15",
-                "period_start_utc": "2026-08-10T00:00:00Z",
-                "period_end_utc": "2026-08-17T00:00:00Z",
-                "symbols": ["EURUSD"],
-            }
-        )
-
-        with self.assertRaises(StopIteration):
-            reconcile_authenticated_worker(
-                mt5=mt5,
-                session=session,
-                login=123456,
-                server="Broker-Demo",
-                now=lambda: datetime(2026, 8, 16, tzinfo=UTC),
-                sleep=lambda _: None,
-            )
-
-        self.assertEqual(
-            {
-                "analysis_id": "analysis-123",
-                "request_id": "request-123",
-                "stage": "m15_screening",
-                "timeframe": "M15",
-                "reason": "No valid symbol_info_tick.time was available across 3 calibration samples for any requested symbol.",
-            },
-            session.analysis_error,
-        )
-
-    def test_identifies_missing_symbol_tick_calibration_evidence(self) -> None:
-        mt5 = AnalysisMT5()
-        mt5.symbol_info_tick = lambda _: None  # type: ignore[method-assign]
-
-        with self.assertRaisesRegex(
-            WorkerEnrollmentError,
-            "No valid symbol_info_tick.time was available across 3 calibration samples for any requested symbol.",
-        ):
-            collect_market_data_evidence(
-                mt5,
-                symbols=["CADCHF"],
-                timeframe="M15",
-                period_start_utc="2026-08-10T00:00:00Z",
-                period_end_utc="2026-08-17T00:00:00Z",
-                collected_at=datetime(2026, 8, 16, tzinfo=UTC),
-            )
-
-    def test_uses_another_requested_symbol_for_shared_market_data_calibration(self) -> None:
-        mt5 = AnalysisMT5()
-        tick_symbols: list[str] = []
-
-        def symbol_info_tick(symbol: str) -> object:
-            tick_symbols.append(symbol)
-            return None if symbol == "CADCHF" else {"time": 1_785_945_600}
-
-        mt5.symbol_info_tick = symbol_info_tick  # type: ignore[method-assign]
-        evidence = collect_market_data_evidence(
-            mt5,
-            symbols=["CADCHF", "EURUSD"],
-            timeframe="M15",
-            period_start_utc="2026-08-10T00:00:00Z",
-            period_end_utc="2026-08-17T00:00:00Z",
-            collected_at=datetime(2026, 8, 16, tzinfo=UTC),
-        )
-
-        self.assertEqual(["CADCHF", "EURUSD"], [symbol["symbol"] for symbol in evidence["symbols"]])
-        self.assertEqual(["CADCHF"] * 3 + ["EURUSD"] * 3, tick_symbols)
-
-    def test_collects_catalog_evidence_from_mt5_namedtuple_symbol_info(self) -> None:
-        mt5 = AnalysisMT5()
-        specification = mt5.symbols_get()[0]
-        symbol_info = namedtuple("SymbolInfo", specification)(**specification)
-        mt5.symbols_get = lambda: [symbol_info]  # type: ignore[method-assign]
-
-        evidence = collect_product_catalog_evidence(mt5, collected_at=datetime(2026, 8, 16, tzinfo=UTC))
-
-        self.assertEqual("EURUSD", evidence["symbols"][0]["symbol"])
-
     def _serve_market_data_analysis(self, stage: str, timeframe: str) -> dict[str, object]:
         mt5 = AnalysisMT5()
         session = AnalysisSession(
@@ -1165,6 +1011,9 @@ class MemoryOnlySession:
 
     def send_reconciliation(self, message: dict[str, object]) -> None:
         self._emitted.append(message)
+
+    def receive_worker_relay(self, timeout: float | None = None) -> bool:
+        raise StopIteration
 
 
 class ReconnectSession:

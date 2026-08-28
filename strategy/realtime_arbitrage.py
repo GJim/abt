@@ -3,29 +3,39 @@
 from __future__ import annotations
 
 import argparse
+from base64 import b64encode
+from hashlib import sha256
 import json
 import logging
 import math
 import signal
-import subprocess
 import sys
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
 from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
-from queue import Empty, Queue
-from threading import Event, Thread
+from queue import Queue
+from threading import Condition, Event, Lock, Thread
+from time import monotonic, sleep
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
+from abt.controlplane.crypto import trader_proof_payload
+from abt.trader.cli import HTTPTraderTransport
+from abt.trader.identity import load_identity
+from abt.trader.runtime import PairLegPlan, PairPlan, StrategyRuntime, StrategyRuntimeError
+from abt.trader.session import open_authenticated_trader_session
+from abt.trader_protocol import WorkerEffectRequested, WorkerReadRequested
+from abt.worker.keystore import WindowsCNGKeyStore
 
 NY = ZoneInfo("America/New_York")
 DEFAULT_TRADER_CONFIG = str(Path(__file__).with_name("trader.json"))
 _LOGGER = logging.getLogger(__name__)
 _MARGIN_SIZING_INTERVAL = timedelta(minutes=10)
 _MARGIN_HEADROOM_FRACTION = 0.20
-_HEDGED_ENTRY_EXPIRY = timedelta(seconds=5)
+_PAIR_ENTRY_EXPIRY = timedelta(seconds=5)
 
 
 class StrategyError(RuntimeError):
@@ -121,6 +131,10 @@ class Pair:
     volume: float
     opened_at: datetime
     pair_id: str | None = None
+    first_stop_loss: str | None = None
+    first_take_profit: str | None = None
+    second_stop_loss: str | None = None
+    second_take_profit: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,156 +153,539 @@ class SizingPlan:
 
 
 class TraderGateway:
-    """Hide JSONL process correlation behind one request/event interface."""
+    """Authenticated in-process relay adapter used by the Strategy Runtime."""
 
-    def __init__(self, command: list[str]) -> None:
-        _LOGGER.info("trader_gateway_start")
-        self._process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=None, text=True, encoding="utf-8", bufsize=1)
-        if self._process.stdin is None or self._process.stdout is None:
-            self.close()
-            raise StrategyError("Could not open Trader JSONL streams.")
-        self._messages: Queue[dict[str, object] | None] = Queue()
-        self._deferred: deque[dict[str, object]] = deque()
-        Thread(target=self._read, daemon=True).start()
+    def __init__(
+        self,
+        socket: object,
+        *,
+        trader_id: str,
+        worker_ids: tuple[str, ...],
+        owned_resources: tuple[object, ...] = (),
+        reconnect: Callable[[], object] | None = None,
+    ) -> None:
+        self._socket = socket
+        self.trader_id = trader_id
+        self._worker_ids = worker_ids
+        self._owned_resources = owned_resources
+        self._reconnect = reconnect
+        self._closing = Event()
+        self._connection_ready = Event()
+        self._connection_ready.set()
+        self._cursor_provider: Callable[[str], tuple[str | None, int, bool]] | None = None
+        self._send_lock = Lock()
+        self._fact_delivery_lock = Lock()
+        self._fact_queue: Queue[dict[str, object] | Event | None] = Queue()
+        self._messages_ready = Condition()
+        self._inbox: deque[dict[str, object]] = deque()
+        self._receiver_error: Exception | None = None
+        self._fact_delivery_error: Exception | None = None
+        self._disconnect_generation = 0
+        self._fact_sink: Callable[[dict[str, object]], object] | None = None
+        Thread(target=self._deliver_worker_facts_forever, name="strategy-runtime-facts", daemon=True).start()
+        Thread(target=self._receive_forever, name="strategy-runtime-relay", daemon=True).start()
+        self._send({"type": "subscribe", "worker_ids": list(worker_ids)})
+        self._wait_for(lambda message: message.get("type") == "subscribed")
+        self.resume_streams()
 
-    def request(self, worker_id: str, *, kind: str, request: dict[str, object]) -> dict[str, object]:
-        request_id = str(uuid4())
-        _LOGGER.debug("rpc_request worker=%s kind=%s type=%s request_id=%s", worker_id, kind, request["type"], request_id)
-        self._send({"request_id": request_id, "worker_id": worker_id, "payload": {"kind": kind, "request": request}})
-        while True:
-            message = self._next()
-            if message.get("type") == "trader_rpc_result" and message.get("request_id") == request_id:
-                if message.get("status") != "completed" or not isinstance(message.get("result"), dict):
-                    result = message.get("result")
-                    reason = result.get("reason") if isinstance(result, dict) else None
-                    detail = reason if isinstance(reason, str) and reason else "no rejection reason was provided"
-                    _LOGGER.error(
-                        "rpc_rejected worker=%s kind=%s type=%s request_id=%s reason=%s",
-                        worker_id, kind, request["type"], request_id, detail,
-                    )
-                    if isinstance(result, dict) and result.get("retryable") is True:
-                        raise WorkerRpcUnavailable(worker_id, kind, detail)
-                    raise StrategyError(f"Worker {worker_id} rejected {request['type']}: {detail}")
-                _LOGGER.debug("rpc_completed worker=%s kind=%s type=%s request_id=%s", worker_id, kind, request["type"], request_id)
-                return message["result"]
-            self._deferred.append(message)
+    @classmethod
+    def connect(cls, config_path: Path, *, worker_ids: tuple[str, ...]) -> TraderGateway:
+        identity = load_identity(config_path)
+        transport = HTTPTraderTransport()
+        key_store = WindowsCNGKeyStore(identity.key_name)
+        def connect_socket() -> tuple[object, str]:
+            challenge = transport.certificate_challenge(identity.controller_url, identity.enrollment_id)
+            trader_id = _required_gateway_text(challenge, "trader_id")
+            nonce = _required_gateway_text(challenge, "nonce")
+            signature = key_store.sign(
+                trader_proof_payload(purpose="certificate_delivery", trader_id=trader_id, nonce=nonce)
+            )
+            if not isinstance(signature, bytes):
+                raise StrategyError("The Windows CNG key returned an invalid signature.")
+            delivery = transport.certificate(
+                identity.controller_url, identity.enrollment_id, b64encode(signature).decode("ascii")
+            )
+            if _required_gateway_text(delivery, "trader_id") != trader_id:
+                raise StrategyError("The controller returned an invalid Trader certificate.")
+            socket, _ = open_authenticated_trader_session(
+                controller_url=identity.controller_url,
+                enrollment_id=identity.enrollment_id,
+                key_store=key_store,
+                certificate=(trader_id, _required_gateway_text(delivery, "certificate")),
+            )
+            return socket, trader_id
+
+        try:
+            socket, trader_id = connect_socket()
+
+            def reconnect_socket() -> object:
+                replacement, replacement_trader_id = connect_socket()
+                if replacement_trader_id != trader_id:
+                    replacement.__exit__(None, None, None)
+                    raise StrategyError("Trader identity changed during relay reconnection.")
+                return replacement
+
+            return cls(
+                socket,
+                trader_id=trader_id,
+                worker_ids=worker_ids,
+                owned_resources=(key_store, transport),
+                reconnect=reconnect_socket,
+            )
+        except Exception:
+            key_store.close()
+            transport.close()
+            raise
+
+    def request(
+        self,
+        worker_id: str,
+        *,
+        kind: str,
+        request: dict[str, object],
+        runtime_command_id: str | None = None,
+        request_id: str | None = None,
+        effect_id: str | None = None,
+        expires_at: datetime | None = None,
+        correlation: dict[str, object] | None = None,
+        _include_fact: bool = False,
+    ) -> dict[str, object]:
+        request_id = request_id or str(uuid4())
+        runtime_command_id = runtime_command_id or request_id
+        correlation = correlation or {"purpose": str(request.get("type", kind))}
+        canonical = json.dumps(request, separators=(",", ":"), sort_keys=True, ensure_ascii=False)
+        payload_hash = sha256(canonical.encode()).hexdigest()
+        request_type = request.get("type", request.get("action", kind))
+        _LOGGER.debug("rpc_request worker=%s kind=%s type=%s request_id=%s", worker_id, kind, request_type, request_id)
+        if kind == "read":
+            envelope = WorkerReadRequested(
+                trader_id=self.trader_id,
+                worker_id=worker_id,
+                runtime_command_id=runtime_command_id,
+                request_id=request_id,
+                payload_hash=payload_hash,
+                correlation=correlation,
+                payload=request,
+            ).model_dump(mode="json")
+        else:
+            operation = kind if kind in {"order_check", "order_execute"} else "trader_operation"
+            payload = {"operation": operation, "order": request} if operation != "trader_operation" else {
+                "operation": operation, "request": request
+            }
+            payload_hash = sha256(
+                json.dumps(payload, separators=(",", ":"), sort_keys=True, ensure_ascii=False).encode()
+            ).hexdigest()
+            envelope = WorkerEffectRequested(
+                trader_id=self.trader_id,
+                worker_id=worker_id,
+                runtime_command_id=runtime_command_id,
+                request_id=request_id,
+                effect_id=effect_id or f"{runtime_command_id}:{worker_id}:{request_id}",
+                expires_at=(expires_at or datetime.now(UTC) + timedelta(seconds=30)).isoformat(),
+                payload_hash=payload_hash,
+                correlation=correlation,
+                payload=payload,
+            ).model_dump(mode="json", exclude_none=True)
+        generation = self._disconnect_generation
+        self._send({"type": "relay", "worker_id": worker_id, "envelope": envelope})
+        message = self._wait_for(
+            lambda candidate: candidate.get("type") == "relay"
+            and isinstance(candidate.get("envelope"), dict)
+            and candidate["envelope"].get("request_id") == request_id,
+            generation=generation,
+        )
+        fact = message["envelope"]
+        assert isinstance(fact, dict)
+        if fact.get("accepted") is not True:
+            reason = fact.get("reason")
+            detail = reason if isinstance(reason, str) and reason else "no rejection reason was provided"
+            if kind in {"order_check", "order_execute"}:
+                return {
+                    "accepted": False,
+                    "execution_state": fact.get("execution_state"),
+                    "outcome": fact.get("outcome", "rejected"),
+                    "result": fact.get("result", {}),
+                    "reason": detail,
+                }
+            if kind == "read":
+                raise WorkerRpcUnavailable(worker_id, kind, detail)
+            raise StrategyError(f"Worker {worker_id} rejected {request_type}: {detail}")
+        result = fact.get("result")
+        if not isinstance(result, dict):
+            raise StrategyError(f"Worker {worker_id} returned an invalid relay outcome.")
+        if kind in {"order_check", "order_execute"}:
+            return {
+                "accepted": True,
+                **result,
+                "result": result,
+                "execution_state": fact.get("execution_state"),
+                "outcome": fact.get("outcome"),
+            }
+        if _include_fact:
+            return {
+                **result,
+                "recovery_epoch": fact.get("recovery_epoch"),
+                "snapshot_baseline": fact.get("snapshot_baseline"),
+                "observed_at": fact.get("observed_at"),
+            }
+        return result
+
+    def snapshot(
+        self,
+        worker_id: str,
+        *,
+        runtime_command_id: str,
+        request_id: str,
+        correlation: dict[str, object],
+    ) -> dict[str, object]:
+        return self.request(
+            worker_id,
+            kind="read",
+            request={"type": "broker_snapshot"},
+            runtime_command_id=runtime_command_id,
+            request_id=request_id,
+            correlation=correlation,
+            _include_fact=True,
+        )
+
+    def order_check(
+        self,
+        worker_id: str,
+        *,
+        order: dict[str, object],
+        runtime_command_id: str,
+        request_id: str,
+        expires_at: datetime,
+        correlation: dict[str, object],
+    ) -> dict[str, object]:
+        return self.request(
+            worker_id, kind="order_check", request=order,
+            runtime_command_id=runtime_command_id, request_id=request_id,
+            expires_at=expires_at, correlation=correlation,
+        )
+
+    def order_execute(
+        self,
+        worker_id: str,
+        *,
+        order: dict[str, object],
+        runtime_command_id: str,
+        request_id: str,
+        effect_id: str,
+        expires_at: datetime,
+        correlation: dict[str, object],
+    ) -> dict[str, object]:
+        return self.request(
+            worker_id, kind="order_execute", request=order,
+            runtime_command_id=runtime_command_id, request_id=request_id,
+            effect_id=effect_id, expires_at=expires_at, correlation=correlation,
+        )
+
+    def operate(
+        self,
+        worker_id: str,
+        *,
+        operation: dict[str, object],
+        runtime_command_id: str,
+        request_id: str,
+        effect_id: str,
+        expires_at: datetime,
+        correlation: dict[str, object],
+    ) -> dict[str, object]:
+        return self.request(
+            worker_id, kind="operation", request=operation,
+            runtime_command_id=runtime_command_id, request_id=request_id,
+            effect_id=effect_id, expires_at=expires_at, correlation=correlation,
+        )
 
     def query(self, query: str) -> dict[str, object]:
         request_id = str(uuid4())
         _LOGGER.debug("controller_query query=%s request_id=%s", query, request_id)
-        self._send({"request_id": request_id, "query": query})
-        while True:
-            message = self._next()
-            if message.get("type") == "trader_query_result" and message.get("request_id") == request_id:
-                if message.get("query") != query or not isinstance(message.get("result"), dict):
-                    raise StrategyError(f"Controller rejected {query}.")
-                return message["result"]
-            self._deferred.append(message)
-
-    def hedged_entry(self, payload: dict[str, object]) -> dict[str, object]:
-        request_id = str(uuid4())
-        _LOGGER.debug("hedged_entry_request request_id=%s", request_id)
-        self._send({"request_id": request_id, "command_id": request_id, "payload": payload})
-        while True:
-            message = self._next()
-            if message.get("type") == "trader_command_result" and message.get("request_id") == request_id:
-                result = message.get("result")
-                if not isinstance(result, dict) or not isinstance(result.get("status"), str):
-                    raise StrategyError("Controller returned an invalid hedged-entry result.")
-                return result
-            if (
-                message.get("type") == "event"
-                and message.get("event_type") == "hedged_entry_completed"
-                and isinstance(message.get("payload"), dict)
-                and message["payload"].get("command_id") == request_id
-                and isinstance(message["payload"].get("outcome"), dict)
-            ):
-                return message["payload"]["outcome"]
-            self._deferred.append(message)
-
-    def protected_pair_close(self, pair_id: str) -> dict[str, object]:
-        command_id = f"{pair_id}:close"
-        _LOGGER.debug("protected_pair_close_request pair_id=%s command_id=%s", pair_id, command_id)
-        self._send(
-            {
-                "request_id": command_id,
-                "command_id": command_id,
-                "payload": {"type": "protected_pair_close", "pair_id": pair_id},
-            }
+        generation = self._disconnect_generation
+        self._send({"type": "query", "request_id": request_id, "query": query})
+        message = self._wait_for(
+            lambda candidate: candidate.get("type") == "trader_query_result"
+            and candidate.get("request_id") == request_id,
+            generation=generation,
         )
-        while True:
-            message = self._next()
-            if message.get("type") == "trader_command_result" and message.get("request_id") == command_id:
-                result = message.get("result")
-                if not isinstance(result, dict) or not isinstance(result.get("status"), str):
-                    raise StrategyError("Controller returned an invalid protected-pair close result.")
-                return result
-            self._deferred.append(message)
+        if message.get("query") != query or not isinstance(message.get("result"), dict):
+            raise StrategyError(f"Controller rejected {query}.")
+        return message["result"]
 
     def market_data(self, *, timeout_seconds: float = 1) -> dict[str, object] | None:
         """Return the next market-data event, or None while the healthy stream is quiet."""
 
-        while True:
-            if self._deferred:
-                message = self._deferred.popleft()
-            else:
-                try:
-                    message = self._messages.get(timeout=timeout_seconds)
-                except Empty:
-                    return None
-                if message is None:
-                    raise StrategyError("Trader process exited.")
-            if message.get("type") == "market_data":
-                return message
-            if message.get("type") == "market_data_unavailable":
-                worker_id, reason = message.get("worker_id"), message.get("reason")
-                if not isinstance(worker_id, str) or not worker_id or not isinstance(reason, str) or not reason:
-                    raise StrategyError("Controller returned invalid market-data availability.")
-                raise WorkerMarketDataUnavailable(worker_id, reason)
+        try:
+            message = self._wait_for(
+                lambda candidate: candidate.get("type") in {"worker_stream", "market_data_unavailable"},
+                timeout=timeout_seconds,
+            )
+        except TimeoutError:
+            return None
+        if message.get("type") == "worker_stream":
+            worker_id = message.get("worker_id")
+            envelope = message.get("envelope")
+            if not isinstance(worker_id, str) or not isinstance(envelope, dict):
+                raise StrategyError("Controller returned an invalid Worker stream envelope.")
+            envelope_type = envelope.get("type")
+            if envelope_type == "live_state_snapshot":
+                connectivity = envelope.get("connectivity")
+                quotes = envelope.get("quotes")
+                observed_at = envelope.get("observed_at")
+                if not isinstance(connectivity, bool) or not isinstance(quotes, list) or not isinstance(observed_at, str):
+                    raise StrategyError("Worker returned invalid live-state evidence.")
+                if not connectivity:
+                    raise WorkerMarketDataUnavailable(worker_id, "worker_terminal_disconnected")
+                return {"type": "market_data", "worker_id": worker_id, "observed_at": observed_at, "quotes": quotes}
+            if envelope_type == "live_state_diff":
+                entity = envelope.get("entity")
+                value = envelope.get("value")
+                observed_at = envelope.get("observed_at")
+                if entity == "connectivity" and value is False:
+                    raise WorkerMarketDataUnavailable(worker_id, "worker_terminal_disconnected")
+                if entity == "quotes" and isinstance(value, list) and isinstance(observed_at, str):
+                    return {"type": "market_data", "worker_id": worker_id, "observed_at": observed_at, "quotes": value}
+                return None
+            raise StrategyError("Worker returned an unsupported live-state envelope.")
+        worker_id, reason = message.get("worker_id"), message.get("reason")
+        if not isinstance(worker_id, str) or not worker_id or not isinstance(reason, str) or not reason:
+            raise StrategyError("Controller returned invalid market-data availability.")
+        raise WorkerMarketDataUnavailable(worker_id, reason)
 
     def close(self) -> None:
-        if hasattr(self, "_process") and self._process.poll() is None:
-            _LOGGER.info("trader_gateway_stop")
-            self._process.terminate()
-            try:
-                self._process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self._process.kill()
+        self._closing.set()
+        fact_queue = getattr(self, "_fact_queue", None)
+        if fact_queue is not None:
+            fact_queue.put(None)
+        socket = getattr(self, "_socket", None)
+        if socket is not None:
+            socket.__exit__(None, None, None)
+        for resource in getattr(self, "_owned_resources", ()):
+            close = getattr(resource, "close", None)
+            if callable(close):
+                close()
+
+    def set_fact_sink(self, sink: Callable[[dict[str, object]], object]) -> None:
+        with self._fact_delivery_lock:
+            with self._messages_ready:
+                self._fact_sink = sink
+                facts = [
+                    message for message in self._inbox
+                    if message.get("type") == "worker_fact" and isinstance(message.get("envelope"), dict)
+                ]
+                for message in facts:
+                    self._inbox.remove(message)
+            for message in facts:
+                self._fact_queue.put(message["envelope"])  # type: ignore[arg-type]
+
+    def set_cursor_provider(
+        self, provider: Callable[[str], tuple[str | None, int, bool]]
+    ) -> None:
+        self._cursor_provider = provider
+
+    def configure_workers(self, worker_ids: tuple[str, str]) -> None:
+        self._worker_ids = worker_ids
+        self._send({"type": "subscribe", "worker_ids": list(worker_ids)})
+        self._wait_for(lambda message: message.get("type") == "subscribed")
+
+    def resume_streams(self) -> None:
+        cursors = []
+        for worker_id in self._worker_ids:
+            if worker_id == "*":
+                continue
+            epoch, event_id, _fresh = (
+                self._cursor_provider(worker_id)
+                if self._cursor_provider is not None
+                else (None, 0, False)
+            )
+            cursors.append(
+                {"worker_id": worker_id, "recovery_epoch": epoch, "event_id": event_id}
+            )
+        if not cursors:
+            return
+        self._fact_delivery_error = None
+        self._send({"type": "resume_workers", "cursors": cursors})
+        self._wait_for(lambda message: message.get("type") == "workers_resumed")
+        self._wait_for_fact_delivery()
 
     def _send(self, message: dict[str, object]) -> None:
-        if self._process.poll() is not None or self._process.stdin is None:
-            raise StrategyError("Trader process is not running.")
-        try:
-            self._process.stdin.write(json.dumps(message, separators=(",", ":")) + "\n")
-            self._process.stdin.flush()
-        except OSError as error:
-            raise StrategyError("Trader process is not running.") from error
+        if not self._connection_ready.wait(timeout=30):
+            raise StrategyError("Trader relay did not reconnect before the request deadline.")
+        self._send_raw(message)
 
-    def _next(self) -> dict[str, object]:
+    def _send_raw(self, message: dict[str, object]) -> None:
         try:
-            value = self._messages.get(timeout=30)
-        except Empty as error:
-            raise StrategyError("Timed out waiting for Trader data.") from error
-        if value is None:
-            raise StrategyError("Trader process exited.")
-        return value
+            with self._send_lock:
+                self._socket.send(json.dumps(message, separators=(",", ":"), sort_keys=True))
+        except (AttributeError, OSError) as error:
+            raise StrategyError("Trader relay is not connected.") from error
 
-    def _read(self) -> None:
-        assert self._process.stdout is not None
-        for line in self._process.stdout:
+    def _receive_forever(self) -> None:
+        while not self._closing.is_set():
             try:
-                value = json.loads(line)
-            except json.JSONDecodeError:
+                self._receive_connected()
+            except Exception as error:
+                self._connection_ready.clear()
+                with self._messages_ready:
+                    self._disconnect_generation += 1
+                    self._receiver_error = error
+                    self._messages_ready.notify_all()
+                if self._reconnect is None or self._closing.is_set():
+                    return
+                while not self._closing.is_set():
+                    try:
+                        socket = self._reconnect()
+                        self._socket = socket
+                        self._resume_after_reconnect()
+                        with self._messages_ready:
+                            self._receiver_error = None
+                            self._messages_ready.notify_all()
+                        self._connection_ready.set()
+                        break
+                    except Exception:
+                        sleep(1)
+
+    def _receive_connected(self) -> None:
+        while not self._closing.is_set():
+            value = json.loads(self._socket.recv())
+            if not isinstance(value, dict):
+                raise StrategyError("Trader relay returned invalid data.")
+            self._accept_incoming(value)
+
+    def _accept_incoming(self, value: dict[str, object]) -> None:
+        if value.get("type") == "heartbeat":
+            self._send_raw({"type": "heartbeat"})
+            return
+        if value.get("type") == "worker_fact_acknowledged":
+            return
+        if value.get("type") == "worker_fact" and isinstance(value.get("envelope"), dict):
+            with self._fact_delivery_lock:
+                if self._fact_sink is not None:
+                    self._fact_queue.put(value["envelope"])
+                else:
+                    with self._messages_ready:
+                        self._inbox.append(value)
+                        self._messages_ready.notify_all()
+            return
+        with self._messages_ready:
+            self._inbox.append(value)
+            self._messages_ready.notify_all()
+
+    def _deliver_worker_facts_forever(self) -> None:
+        while not self._closing.is_set():
+            envelope = self._fact_queue.get()
+            if envelope is None:
+                return
+            if isinstance(envelope, Event):
+                envelope.set()
                 continue
-            if isinstance(value, dict):
-                self._messages.put(value)
-        self._messages.put(None)
+            try:
+                self._deliver_worker_fact(envelope)
+            except Exception as error:
+                with self._messages_ready:
+                    self._fact_delivery_error = error
+                    self._receiver_error = error
+                    self._messages_ready.notify_all()
+
+    def _wait_for_fact_delivery(self) -> None:
+        barrier = Event()
+        self._fact_queue.put(barrier)
+        if not barrier.wait(30):
+            raise StrategyError("Timed out waiting for replayed Worker facts to become durable.")
+        if self._fact_delivery_error is not None:
+            raise StrategyError("A replayed Worker fact could not become durable.") from self._fact_delivery_error
+
+    def _deliver_worker_fact(self, envelope: dict[str, object]) -> None:
+        assert self._fact_sink is not None
+        worker_id = envelope.get("worker_id")
+        if worker_id not in self._worker_ids and "*" not in self._worker_ids:
+            return
+        self._fact_sink(envelope)
+        event_id = envelope.get("event_id", envelope.get("snapshot_baseline"))
+        recovery_epoch = envelope.get("recovery_epoch")
+        if (
+            isinstance(worker_id, str)
+            and isinstance(recovery_epoch, str)
+            and isinstance(event_id, int)
+            and not isinstance(event_id, bool)
+        ):
+            self._send_raw(
+                {
+                    "type": "ack_worker_fact",
+                    "worker_id": worker_id,
+                    "recovery_epoch": recovery_epoch,
+                    "event_id": event_id,
+                }
+            )
+
+    def _resume_after_reconnect(self) -> None:
+        self._send_raw({"type": "subscribe", "worker_ids": list(self._worker_ids)})
+        while True:
+            value = json.loads(self._socket.recv())
+            if not isinstance(value, dict):
+                raise StrategyError("Trader relay returned invalid data.")
+            if value.get("type") == "subscribed":
+                break
+            self._accept_incoming(value)
+        cursors = []
+        for worker_id in self._worker_ids:
+            if worker_id == "*":
+                continue
+            epoch, event_id, _fresh = (
+                self._cursor_provider(worker_id)
+                if self._cursor_provider is not None
+                else (None, 0, False)
+            )
+            cursors.append({"worker_id": worker_id, "recovery_epoch": epoch, "event_id": event_id})
+        if not cursors:
+            return
+        self._fact_delivery_error = None
+        self._send_raw({"type": "resume_workers", "cursors": cursors})
+        while True:
+            value = json.loads(self._socket.recv())
+            if not isinstance(value, dict):
+                raise StrategyError("Trader relay returned invalid data.")
+            if value.get("type") == "workers_resumed":
+                self._wait_for_fact_delivery()
+                return
+            self._accept_incoming(value)
+
+    def _wait_for(
+        self,
+        predicate: Callable[[dict[str, object]], bool],
+        *,
+        timeout: float = 30,
+        generation: int | None = None,
+    ) -> dict[str, object]:
+        deadline = monotonic() + timeout
+        with self._messages_ready:
+            while True:
+                if generation is not None and generation != self._disconnect_generation:
+                    raise StrategyError("Trader relay disconnected before the request outcome was received.")
+                for message in tuple(self._inbox):
+                    if predicate(message):
+                        self._inbox.remove(message)
+                        return message
+                if self._receiver_error is not None:
+                    raise StrategyError("Trader relay disconnected or returned invalid data.") from self._receiver_error
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    raise TimeoutError
+                self._messages_ready.wait(remaining)
 
 
 class RealtimeArbitrage:
     """Own one pair lifecycle; the caller only supplies endpoints and configuration."""
 
-    def __init__(self, gateway: TraderGateway, *, first: Endpoint, second: Endpoint, config: StrategyConfig) -> None:
+    def __init__(
+        self,
+        gateway: TraderGateway,
+        *,
+        first: Endpoint,
+        second: Endpoint,
+        config: StrategyConfig,
+        runtime_path: Path | str | None = None,
+    ) -> None:
         if first.worker_id == second.worker_id:
             raise StrategyError("Arbitrage endpoints must use different Workers.")
         self.gateway, self.endpoints, self.config = gateway, {"first": first, "second": second}, config
@@ -312,21 +709,56 @@ class RealtimeArbitrage:
                 exposure * self.config.max_margin_ratio,
                 exposure * self.config.max_margin_ratio * (1 - _MARGIN_HEADROOM_FRACTION),
             )
-        self._assert_empty_accounts()
         self.quotes: dict[str, dict[str, tuple[datetime, float, float]]] = {"first": {}, "second": {}}
         self.sizing_plans: dict[tuple[str, str], SizingPlan] = {}
         self.sizing_snapshot_at: datetime | None = None
         self.integrity_check_at: datetime | None = None
         self.pair: Pair | None = None
+        self.runtime = (
+            StrategyRuntime(runtime_path, gateway, worker_ids=(first.worker_id, second.worker_id))
+            if config.execute and runtime_path is not None
+            else None
+        )
         self.unavailable_endpoints: set[str] = set()
         self.worker_disconnect_deadline: datetime | None = None
         self.unresolved_write_failure = False
-        self.controller_containment_required = False
-        self.controller_owned_pair_pending = False
+        self.needs_human = False
         self.awaiting_clear_symbol: str | None = None
         self.stopped = False
         self.completed_trades = 0
         self._ny_date: object | None = None
+        if self.runtime is not None:
+            try:
+                recovered = self.runtime.recover()
+            except StrategyRuntimeError as error:
+                raise StrategyError(str(error)) from error
+            if recovered.state == "ACTIVE" and recovered.first is not None and recovered.second is not None:
+                plan = self.runtime.active_plan
+                if plan is None:
+                    raise StrategyError("The runtime recovered active broker facts without a durable pair plan.")
+                self.pair = Pair(
+                    plan.first.symbol,
+                    plan.direction,
+                    recovered.first.entry_price,
+                    recovered.second.entry_price,
+                    recovered.first.ticket,
+                    recovered.second.ticket,
+                    plan.first.direction,
+                    plan.second.direction,
+                    float(plan.first.volume),
+                    datetime.now(UTC),
+                    plan.pair_id,
+                    plan.first.stop_loss,
+                    plan.first.take_profit,
+                    plan.second.stop_loss,
+                    plan.second.take_profit,
+                )
+            elif recovered.state == "NEEDS_HUMAN":
+                self.needs_human = True
+                self.stopped = True
+                raise StrategyError(recovered.reason or "Strategy Runtime recovery requires operator action.")
+        else:
+            self._assert_empty_accounts()
         _LOGGER.info("strategy_initialized")
 
     def run(self, stop: Event) -> None:
@@ -382,14 +814,9 @@ class RealtimeArbitrage:
                             self._quote_text("first", self.pair.symbol),
                             self._quote_text("second", self.pair.symbol),
                         )
-                        active_pair_id = self.pair.pair_id
                         self._flatten_all()
-                        if self.config.execute and active_pair_id is not None:
-                            self.stopped = True
-                            _LOGGER.info("strategy_stopped_after_protected_pair_close pair_id=%s", active_pair_id)
-                            continue
                         self.completed_trades += 1
-                        self.awaiting_clear_symbol, self.pair = self.pair.symbol, None
+                        self.awaiting_clear_symbol = candidate.symbol
                     continue
                 self._refresh_sizing_snapshot_if_due()
                 candidate = self._best_candidate()
@@ -408,7 +835,7 @@ class RealtimeArbitrage:
 
     def shutdown(self) -> None:
         _LOGGER.info("strategy_shutdown_requested execute=%s", self.config.execute)
-        if self.config.execute and not self.controller_containment_required and not self.controller_owned_pair_pending:
+        if self.config.execute and not self.needs_human:
             self._flatten_all()
         _LOGGER.info("strategy_shutdown_complete")
 
@@ -435,8 +862,8 @@ class RealtimeArbitrage:
         }
         for endpoint in self.endpoints.values():
             worker = active.get(endpoint.worker_id)
-            if not isinstance(worker, dict) or worker.get("connectivity") != "connected" or not _worker_allows_entry(worker):
-                raise StrategyError(f"Worker {endpoint.worker_id} is not an active, safe Worker.")
+            if not isinstance(worker, dict) or worker.get("connectivity") != "connected":
+                raise StrategyError(f"Worker {endpoint.worker_id} is not active and routable.")
             _LOGGER.info("worker_verified worker=%s server=%s", endpoint.worker_id, worker.get("server"))
 
     def _load_shared_symbols(self) -> dict[str, SharedSymbol]:
@@ -751,73 +1178,65 @@ class RealtimeArbitrage:
                 "second", symbol, second_direction, second_entry, volume
             )
             try:
-                result = self.gateway.hedged_entry(
-                    {
-                        "type": "hedged_entry",
-                        "expires_at": (datetime.now(UTC) + _HEDGED_ENTRY_EXPIRY).isoformat(),
-                        "first": {
-                            "worker_id": self.endpoints["first"].worker_id,
-                            "symbol": symbol,
-                            "volume": _volume_text(volume, specification.volume_step),
-                            "direction": first_direction,
-                            "filling_mode": specification.filling_mode,
-                            "margin_limit": f"{plan.first_margin_limit:.2f}",
-                            "stop_loss": first_stop_loss,
-                            "take_profit": first_take_profit,
-                        },
-                        "second": {
-                            "worker_id": self.endpoints["second"].worker_id,
-                            "symbol": symbol,
-                            "volume": _volume_text(volume, specification.volume_step),
-                            "direction": second_direction,
-                            "filling_mode": specification.filling_mode,
-                            "margin_limit": f"{plan.second_margin_limit:.2f}",
-                            "stop_loss": second_stop_loss,
-                            "take_profit": second_take_profit,
-                        },
-                    }
+                if self.runtime is None:
+                    self.runtime = StrategyRuntime(
+                        ":memory:",
+                        self.gateway,
+                        worker_ids=(self.endpoints["first"].worker_id, self.endpoints["second"].worker_id),
+                    )
+                    self.runtime.recover()
+                command_id = str(uuid4())
+                pair_plan = PairPlan(
+                    pair_id=command_id,
+                    command_id=command_id,
+                    direction=direction,
+                    expires_at=datetime.now(UTC) + _PAIR_ENTRY_EXPIRY,
+                    first=PairLegPlan(
+                        "first", self.endpoints["first"].worker_id, symbol, first_direction,
+                        _volume_text(volume, specification.volume_step), specification.filling_mode,
+                        f"{plan.first_margin_limit:.2f}", first_stop_loss, first_take_profit,
+                    ),
+                    second=PairLegPlan(
+                        "second", self.endpoints["second"].worker_id, symbol, second_direction,
+                        _volume_text(volume, specification.volume_step), specification.filling_mode,
+                        f"{plan.second_margin_limit:.2f}", second_stop_loss, second_take_profit,
+                    ),
                 )
-            except StrategyError as error:
+                result = self.runtime.enter(pair_plan)
+            except (StrategyError, StrategyRuntimeError) as error:
                 self.stopped = True
-                self.controller_containment_required = True
-                raise HedgedEntryContained(f"Hedged entry acknowledgement was unavailable: {error}") from error
-            command_status = result.get("status")
-            if command_status == "rejected_preflight":
-                _LOGGER.info("entry_rejected_preflight symbol=%s direction=%s reason=%s", symbol, direction, result.get("reason"))
+                self.needs_human = True
+                raise HedgedEntryContained(f"Strategy Runtime could not prove safe entry: {error}") from error
+            if result.status == "empty":
+                _LOGGER.info("entry_rejected_preflight symbol=%s direction=%s reason=%s", symbol, direction, result.reason)
                 return
-            if command_status != "accepted":
+            if result.status != "active" or result.first is None or result.second is None:
                 self.stopped = True
-                self.controller_containment_required = True
-                raise HedgedEntryContained(
-                    f"Hedged entry outcome requires controller containment: {result.get('reason', command_status)!s}"
-                )
-            if result.get("lifecycle_state") != "CATCHING_UP":
-                self.stopped = True
-                self.controller_containment_required = True
-                raise HedgedEntryContained("Hedged entry was accepted without controller-owned paired verification.")
-            pair_id = result.get("pair_id")
-            if not isinstance(pair_id, str) or not pair_id:
-                self.stopped = True
-                self.controller_containment_required = True
-                raise HedgedEntryContained("Hedged entry was accepted without a controller-owned pair ID.")
+                self.needs_human = True
+                raise HedgedEntryContained(result.reason or "Strategy Runtime could not verify both protected legs.")
             self.pair = Pair(
                 symbol,
                 direction,
-                first_entry,
-                second_entry,
-                0,
-                0,
+                result.first.entry_price,
+                result.second.entry_price,
+                result.first.ticket,
+                result.second.ticket,
                 first_direction,
                 second_direction,
                 volume,
                 datetime.now(UTC),
-                pair_id,
+                pair_plan.pair_id,
+                first_stop_loss,
+                first_take_profit,
+                second_stop_loss,
+                second_take_profit,
             )
-            self.controller_owned_pair_pending = True
             _LOGGER.info(
-                "hedged_entry_accepted_awaiting_controller_verification command_id=%s pair_id=%s",
-                result.get("command_id"),
-                pair_id,
+                "pair_active_verified command_id=%s pair_id=%s first_ticket=%s second_ticket=%s",
+                pair_plan.command_id,
+                pair_plan.pair_id,
+                result.first.ticket,
+                result.second.ticket,
             )
             return
         except WorkerRpcUnavailable:
@@ -927,6 +1346,14 @@ class RealtimeArbitrage:
             self._check_integrity()
 
     def _check_integrity(self) -> None:
+        if self.runtime is not None and self.pair is not None and self.config.execute:
+            result = self.runtime.verify_active()
+            if result.state != "ACTIVE":
+                self.pair = None
+                self.stopped = True
+                raise StrategyError(result.reason or "Protected pair integrity diverged; runtime converged toward empty.")
+            self.integrity_check_at = datetime.now(UTC) + timedelta(seconds=self.config.integrity_check_seconds)
+            return
         for name, endpoint in self.endpoints.items():
             positions = self._records(endpoint, "current_positions", "positions")
             orders = self._records(endpoint, "current_orders", "orders")
@@ -999,55 +1426,18 @@ class RealtimeArbitrage:
         return float(profit)
 
     def _flatten_all(self) -> None:
-        if self.config.execute and self.pair is not None and self.pair.pair_id is not None:
-            result = self.gateway.protected_pair_close(self.pair.pair_id)
-            status = result.get("status")
-            if status not in {"accepted", "pending", "containing"}:
-                reason = result.get("reason")
-                detail = reason if isinstance(reason, str) and reason else str(status)
-                raise StrategyError(f"Controller rejected protected-pair close: {detail}")
-            _LOGGER.info(
-                "protected_pair_close_requested pair_id=%s status=%s lifecycle_state=%s revision=%s",
-                self.pair.pair_id,
-                status,
-                result.get("lifecycle_state"),
-                result.get("revision"),
-            )
+        if not self.config.execute:
             return
-        for name, endpoint in self.endpoints.items():
-            if not self.config.execute:
-                continue
-            result = self.gateway.request(endpoint.worker_id, kind="read", request={"type": "current_positions"})
-            positions = result.get("positions")
-            if not isinstance(positions, list):
-                raise StrategyError("Worker returned invalid positions.")
-            _LOGGER.info("flatten_positions endpoint=%s worker=%s count=%d", name, endpoint.worker_id, len(positions))
-            for position in positions:
-                if not isinstance(position, dict) or not isinstance(position.get("ticket"), int) or not isinstance(position.get("volume"), (int, float)):
-                    raise StrategyError("Worker returned an unclsoable position.")
-                symbol = position.get("symbol")
-                close_side = "SELL" if position.get("type") == 0 else "BUY" if position.get("type") == 1 else "UNKNOWN"
-                quote = self._quote_text(name, symbol) if isinstance(symbol, str) else "unavailable"
-                _LOGGER.info(
-                    "exit_close_request endpoint=%s symbol=%s close_side=%s ticket=%s volume=%.2f bid/ask=%s",
-                    name,
-                    symbol if isinstance(symbol, str) else "unknown",
-                    close_side,
-                    position["ticket"],
-                    float(position["volume"]),
-                    quote,
-                )
-                self.gateway.request(endpoint.worker_id, kind="operation", request={"type": "close", "ticket": str(position["ticket"]), "volume": f"{float(position['volume']):.2f}"})
-                _LOGGER.info(
-                    "position_closed endpoint=%s symbol=%s close_side=%s ticket=%s volume=%.2f bid/ask=%s",
-                    name,
-                    symbol if isinstance(symbol, str) else "unknown",
-                    close_side,
-                    position["ticket"],
-                    float(position["volume"]),
-                    quote,
-                )
-            self.accounts[name] = self._account(endpoint)
+        if self.runtime is None:
+            raise StrategyError("Durable Strategy Runtime is unavailable; refusing direct account mutation.")
+        try:
+            result = self.runtime.desire_empty("strategy-requested-close")
+        except StrategyRuntimeError as error:
+            raise StrategyError(str(error)) from error
+        if result.state != "EMPTY":
+            raise StrategyError(result.reason or f"Strategy Runtime close ended in {result.state}.")
+        self.pair = None
+        _LOGGER.info("pair_empty_verified")
 
     def _halt(self, reason: str) -> None:
         self.stopped = True
@@ -1055,8 +1445,8 @@ class RealtimeArbitrage:
         try:
             self._flatten_all()
         except StrategyError as error:
-            self.controller_containment_required = True
-            raise StrategyError(f"{reason}; emergency flatten unavailable: {error}") from error
+            self.needs_human = True
+            raise StrategyError(f"{reason}; Strategy Runtime close convergence unavailable: {error}") from error
         raise StrategyError(reason)
 
     def _reset_daily_equity(self) -> None:
@@ -1215,6 +1605,13 @@ def _ticket(position: dict[str, object]) -> int:
     return ticket
 
 
+def _required_gateway_text(value: object, field: str) -> str:
+    candidate = value.get(field) if isinstance(value, dict) else None
+    if not isinstance(candidate, str) or not candidate:
+        raise StrategyError("The controller returned an invalid Trader identity response.")
+    return candidate
+
+
 def _utc(value: str) -> datetime:
     parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     if parsed.tzinfo is None:
@@ -1248,8 +1645,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--flatten-at-ny", type=_ny_time, default=time(16, 0), metavar="HH:MM")
     parser.add_argument("--worker-disconnect-grace-seconds", type=float, default=300)
     parser.add_argument("--worker-write-disconnect-grace-seconds", type=float, default=30)
-    parser.add_argument("--trader-executable", default="abt-trader")
     parser.add_argument("--trader-config", default=DEFAULT_TRADER_CONFIG)
+    parser.add_argument(
+        "--runtime-state",
+        help="Strategy Runtime SQLite path; defaults beside the Trader identity.",
+    )
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("-v", "--verbose", action="store_true", help="emit DEBUG diagnostics")
     args = parser.parse_args(argv)
@@ -1282,32 +1682,46 @@ def main(argv: list[str] | None = None) -> int:
         args.integrity_check_seconds, args.minimum_hold_seconds,
         args.flatten_at_ny, args.worker_disconnect_grace_seconds, args.worker_write_disconnect_grace_seconds, args.execute,
     )
-    command = [args.trader_executable, "connect", "--jsonl", "--config", args.trader_config]
-    if args.first_worker is not None:
-        command.extend(["--worker-id", args.first_worker, "--worker-id", args.second_worker])
-    gateway, stop = TraderGateway(command), Event()
+    configured_workers = (
+        (args.first_worker, args.second_worker)
+        if args.first_worker is not None
+        else ("*",)
+    )
+    gateway = TraderGateway.connect(Path(args.trader_config), worker_ids=configured_workers)
+    stop = Event()
     signal.signal(signal.SIGINT, lambda *_: (_LOGGER.info("interrupt_received"), stop.set()))
     strategy: RealtimeArbitrage | None = None
+    exit_code = 0
     try:
         first_worker, second_worker = (
             (args.first_worker, args.second_worker)
             if args.first_worker is not None
             else _select_workers(gateway)
         )
-        strategy = RealtimeArbitrage(gateway, first=Endpoint(first_worker), second=Endpoint(second_worker), config=config)
+        runtime_path = Path(args.runtime_state) if args.runtime_state else Path(args.trader_config).with_suffix(".runtime.sqlite3")
+        strategy = RealtimeArbitrage(
+            gateway,
+            first=Endpoint(first_worker),
+            second=Endpoint(second_worker),
+            config=config,
+            runtime_path=runtime_path,
+        )
         strategy.run(stop)
-        return 0
     except StrategyError as error:
         _LOGGER.error("strategy_stopped reason=%s", error)
         print(f"Strategy stopped: {error}", file=sys.stderr)
-        return 1
+        exit_code = 1
     finally:
         if strategy is not None:
             try:
                 strategy.shutdown()
             except StrategyError as error:
-                print(f"Emergency flatten failed: {error}", file=sys.stderr)
+                print(f"Strategy Runtime close convergence failed: {error}", file=sys.stderr)
+                exit_code = 1
         gateway.close()
+        if strategy is not None and strategy.runtime is not None:
+            strategy.runtime.close()
+    return exit_code
 
 
 def _select_workers(gateway: TraderGateway) -> tuple[str, str]:
@@ -1321,7 +1735,6 @@ def _select_workers(gateway: TraderGateway) -> tuple[str, str]:
         if isinstance(worker, dict)
         and isinstance(worker.get("worker_id"), str)
         and worker.get("connectivity") == "connected"
-        and _worker_allows_entry(worker)
     ]
     if len(eligible) < 2:
         raise StrategyError("At least two connected, safe active Workers are required.")
@@ -1331,13 +1744,6 @@ def _select_workers(gateway: TraderGateway) -> tuple[str, str]:
     first = _selected_worker(eligible, "First Worker")
     second = _selected_worker(eligible, "Second Worker", excluded=first)
     return first, second
-
-
-def _worker_allows_entry(worker: dict[str, object]) -> bool:
-    recovery = worker.get("recovery")
-    return recovery is None or (
-        isinstance(recovery, dict) and recovery.get("lifecycle_state") == "READY"
-    )
 
 
 def _selected_worker(workers: list[dict[str, object]], label: str, *, excluded: str | None = None) -> str:

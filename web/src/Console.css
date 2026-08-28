@@ -182,27 +182,13 @@
   padding: 0.5rem 0;
 }
 
-.analysis-history-filters {
+.console-table-filters {
   align-items: end;
   gap: 0.75rem;
 }
 
-.analysis-history-filters > :last-child {
+.console-table-filters > :last-child {
   margin-left: 0;
-}
-
-.analysis-history-filter {
-  display: grid;
-  gap: 0.375rem;
-}
-
-.analysis-history-search-filter {
-  flex: 1 1 24rem;
-  max-width: 36rem;
-}
-
-.analysis-history-filter select {
-  min-width: 10rem;
 }
 
 .console-clickable-row {
@@ -327,16 +313,6 @@
   font-size: 0.6875rem;
   font-weight: 700;
   letter-spacing: 0.03em;
-}
-
-.intent-controls {
-  align-items: end;
-  width: fit-content;
-  margin-left: auto;
-}
-
-.intent-controls > :last-child {
-  margin-left: 0;
 }
 
 .registration-invite-issue {
@@ -577,25 +553,6 @@
 
 .snapshot-json-dialog-scrollable .console-raw-detail {
   max-height: 100%;
-}
-
-.intent-preflight-result {
-  display: grid;
-  gap: 0.75rem;
-  margin: 1rem 0;
-  padding: 1rem;
-  border: 1px solid color-mix(in srgb, var(--console-danger) 55%, var(--console-rule));
-  border-radius: 0.5rem;
-}
-
-.intent-preflight-result h2,
-.intent-preflight-result p {
-  margin: 0;
-}
-
-.intent-preflight-result .console-raw-detail {
-  max-height: min(24rem, 50dvh);
-  margin-top: 0.75rem;
 }
 
 .console-empty-state {

@@ -1,6 +1,10 @@
 # Lifecycle-Owned Protected Pair Management
 
-Status: ready-for-agent
+Status: wontfix
+
+Superseded by
+[`../strategy-owned-pair-lifecycle/spec.md`](../strategy-owned-pair-lifecycle/spec.md).
+The controller will not own protected-pair lifecycle.
 
 ## Problem Statement
 

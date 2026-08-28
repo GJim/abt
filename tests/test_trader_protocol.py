@@ -4,7 +4,12 @@ import unittest
 
 from pydantic import ValidationError
 
-from abt.trader_protocol import MAX_LIVE_SYMBOLS, trader_rpc_request_adapter, trader_rpc_response_adapter
+from abt.trader_protocol import (
+    MAX_LIVE_SYMBOLS,
+    trader_rpc_request_adapter,
+    trader_rpc_response_adapter,
+    worker_request_envelope_adapter,
+)
 
 
 class TraderProtocolTests(unittest.TestCase):
@@ -196,3 +201,33 @@ class TraderProtocolTests(unittest.TestCase):
                     "accepted": True,
                 }
             )
+
+    def test_accepts_typed_protected_order_effect_envelope(self) -> None:
+        request = worker_request_envelope_adapter.validate_python(
+            {
+                "type": "worker_effect_requested",
+                "protocol_version": 1,
+                "trader_id": "trader-1",
+                "worker_id": "worker-a",
+                "runtime_command_id": "command-1",
+                "request_id": "check-1",
+                "effect_id": "command-1:worker-a:entry",
+                "expires_at": "2026-08-28T08:00:00+00:00",
+                "payload_hash": "abc",
+                "correlation": {"pair_id": "pair-1", "leg": "first", "purpose": "entry"},
+                "payload": {
+                    "operation": "order_check",
+                    "order": {
+                        "action": "market",
+                        "symbol": "EURUSD",
+                        "volume": "0.10",
+                        "direction": "LONG",
+                        "filling_mode": "FOK",
+                        "sl": "1.09",
+                        "tp": "1.12",
+                    },
+                },
+            }
+        )
+
+        self.assertEqual("worker-a", request.worker_id)

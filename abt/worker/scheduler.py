@@ -209,7 +209,8 @@ class DeadlineAwareTraderRpcScheduler:
             )
             self._remember(command_id, payload_hash, outcome)
             return outcome
-        if expires_at is not None and admitted_at >= expires_at:
+        durable_effect = isinstance(raw.get("effect_id"), str) and bool(raw.get("effect_id"))
+        if expires_at is not None and admitted_at >= expires_at and not durable_effect:
             outcome = self._outcome(
                 request_id,
                 "expired_not_started",
@@ -266,7 +267,10 @@ class DeadlineAwareTraderRpcScheduler:
             ).total_seconds()
             if scheduled.expires_at is not None:
                 scheduled.telemetry["deadline_remaining_seconds"] = (scheduled.expires_at - now).total_seconds()
-                if now >= scheduled.expires_at:
+                durable_effect = isinstance(scheduled.request.get("effect_id"), str) and bool(
+                    scheduled.request.get("effect_id")
+                )
+                if now >= scheduled.expires_at and not durable_effect:
                     return scheduled.complete(
                         "expired_not_started",
                         "The controller-issued expiry elapsed before MT5 execution began.",

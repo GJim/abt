@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections import deque
 from datetime import timedelta
 import json
 import logging
@@ -19,7 +18,14 @@ from websockets.exceptions import ConnectionClosed, InvalidStatus
 from ..mt5.config import TimeCalibrationFamily
 from ..mt5.output import render
 from ..mt5.timecalibration import MARKET_DATA, render_calibration
-from ..trader_protocol import TraderRpcFailure, TraderRpcRequest, TraderRpcSuccess
+from ..trader_protocol import (
+    TraderRpcFailure,
+    TraderRpcRequest,
+    TraderRpcSuccess,
+    WorkerEffectRequested,
+    WorkerReadRequested,
+    worker_request_envelope_adapter,
+)
 from .credentials import (
     WebSocketConnector,
     WorkerWebSocket,
@@ -56,10 +62,11 @@ class AuthenticatedWorkerSession:
     worker_id: str = ""
     certificate: str = ""
     recovery_epoch: str = field(default_factory=lambda: str(uuid4()))
-    _analysis_requests: deque[dict[str, object]] = field(default_factory=deque, init=False, repr=False)
-    _execution_recovery_requests: deque[dict[str, object]] = field(default_factory=deque, init=False, repr=False)
     _trader_rpc_scheduler: DeadlineAwareTraderRpcScheduler = field(
         default_factory=DeadlineAwareTraderRpcScheduler, init=False, repr=False
+    )
+    _relay_requests: dict[str, WorkerReadRequested | WorkerEffectRequested] = field(
+        default_factory=dict, init=False, repr=False
     )
 
     def __enter__(self) -> Self:
@@ -83,15 +90,41 @@ class AuthenticatedWorkerSession:
 
     def send_reconciliation(self, message: dict[str, object]) -> None:
         try:
-            outgoing = (
-                {**message, "recovery_epoch": self.recovery_epoch}
-                if message.get("type") == "snapshot"
-                else message
-            )
+            cursor = message.get("cursor")
+            if not isinstance(cursor, int) or isinstance(cursor, bool):
+                raise WorkerEnrollmentError("The Worker reconciliation cursor is invalid.")
+            if message.get("type") == "snapshot":
+                envelope = {
+                    "type": "worker_snapshot",
+                    "protocol_version": 1,
+                    "worker_id": self.worker_id,
+                    "recovery_epoch": self.recovery_epoch,
+                    "snapshot_baseline": cursor,
+                    "observed_at": message.get("observed_at"),
+                    "orders": message.get("orders"),
+                    "positions": message.get("positions"),
+                }
+            elif message.get("type") == "delta":
+                change = "remove" if message.get("change") == "closed" else "upsert"
+                envelope = {
+                    "type": "worker_broker_delta",
+                    "protocol_version": 1,
+                    "worker_id": self.worker_id,
+                    "recovery_epoch": self.recovery_epoch,
+                    "event_id": cursor,
+                    "observed_at": message.get("observed_at"),
+                    "entity": message.get("entity"),
+                    "change": change,
+                    "record": message.get("record"),
+                }
+            else:
+                raise WorkerEnrollmentError("The Worker reconciliation message is invalid.")
+            outgoing = {"type": "worker_fact", "cursor": cursor, "envelope": envelope}
             _send(self.socket, outgoing)
             response = self._response()
-            if response.get("type") != "accepted" or response.get("cursor") != message.get("cursor"):
+            if response.get("type") != "accepted" or response.get("cursor") != cursor:
                 raise WorkerEnrollmentError("The controller rejected worker reconciliation.")
+            self.reconciliation_cursor = cursor
         except Exception as error:
             _raise_closed_connection(error, "reconciliation")
 
@@ -128,103 +161,19 @@ class AuthenticatedWorkerSession:
         except Exception as error:
             _raise_closed_connection(error, "recovery sync")
 
-    def receive_product_catalog_analysis(self, timeout: float | None = None) -> dict[str, object] | None:
-        if self._analysis_requests:
-            return self._parse_product_catalog_analysis(self._analysis_requests.popleft())
-        while True:
-            try:
-                response = _message(self.socket, timeout=timeout)
-            except TimeoutError:
-                return None
-            except Exception as error:
-                _raise_closed_connection(error, "analysis request")
-            if response.get("type") == "order_check_request":
-                self._queue_hedge_request(response)
-                continue
-            if response.get("type") == "order_execute_request":
-                self._queue_hedge_request(response)
-                continue
-            if _is_execution_recovery_request(response):
-                self._execution_recovery_requests.append(response)
-                continue
-            if response.get("type") == "trader_rpc_request":
-                self._queue_trader_rpc(response)
-                continue
-            return self._parse_product_catalog_analysis(response)
-
-    def receive_order_check(self, timeout: float | None = None) -> dict[str, object] | None:
-        try:
-            response = _message(self.socket, timeout=timeout)
-        except TimeoutError:
-            return None
-        except Exception as error:
-            _raise_closed_connection(error, "order-check request")
-        if response.get("type") != "order_check_request":
-            if response.get("type") == "order_execute_request":
-                self._queue_hedge_request(response)
-                return None
-            if _is_execution_recovery_request(response):
-                self._execution_recovery_requests.append(response)
-                return None
-            if response.get("type") == "trader_rpc_request":
-                self._queue_trader_rpc(response)
-                return None
-            self._analysis_requests.append(response)
-            return None
-        self._queue_hedge_request(response)
-        return None
-
     def _response(self) -> dict[str, object]:
         while True:
             response = _message(self.socket)
-            if response.get("type") == "product_catalog_analysis_request":
-                self._analysis_requests.append(response)
-                continue
-            if response.get("type") == "order_check_request":
-                self._queue_hedge_request(response)
-                continue
-            if response.get("type") == "order_execute_request":
-                self._queue_hedge_request(response)
-                continue
-            if _is_execution_recovery_request(response):
-                self._execution_recovery_requests.append(response)
-                continue
-            if response.get("type") == "trader_rpc_request":
-                self._queue_trader_rpc(response)
+            if response.get("type") == "worker_relay":
+                self._queue_worker_relay(response)
                 continue
             return response
 
-    def _parse_product_catalog_analysis(self, response: dict[str, object]) -> dict[str, object]:
-        if response.get("type") != "product_catalog_analysis_request":
-            raise WorkerEnrollmentError("The controller returned an invalid worker response.")
-        stage = response.get("stage", "catalog")
-        if stage not in {"catalog", "m15_screening", "m1_verification"}:
-            raise WorkerEnrollmentError("The controller returned an invalid worker response.")
-        result = {
-            "analysis_id": _required_text(response, "analysis_id"),
-            "request_id": _required_text(response, "request_id"),
-            "stage": stage,
-            "policy": response.get("policy") if isinstance(response.get("policy"), dict) else {},
-        }
-        if stage in {"m15_screening", "m1_verification"}:
-            raw_symbols = response.get("symbols")
-            result.update(
-                {
-                    "timeframe": _required_text(response, "timeframe"),
-                    "period_start_utc": _required_text(response, "period_start_utc"),
-                    "period_end_utc": _required_text(response, "period_end_utc"),
-                    "symbols": [symbol for symbol in raw_symbols] if isinstance(raw_symbols, list) else [],
-                }
-            )
-        return result
-
     def _parse_order_check(self, response: dict[str, object]) -> dict[str, object]:
-        expected_fields = {"type", "analysis_id", "request_id", "order"}
+        expected_fields = {"type", "request_id", "order"}
         if "expires_at" in response:
             expected_fields.add("expires_at")
         if set(response) != expected_fields or response.get("type") != "order_check_request":
-            raise WorkerEnrollmentError("The controller returned an invalid order-check request.")
-        if response.get("analysis_id") != "order_check":
             raise WorkerEnrollmentError("The controller returned an invalid order-check request.")
         request = {"request_id": _required_text(response, "request_id"), "order": response["order"]}
         if "expires_at" in response:
@@ -242,13 +191,15 @@ class AuthenticatedWorkerSession:
         request_id = str(request["request_id"])
         scheduled = {
             "request_id": request_id,
-            "command_id": f"{request_type}:{request_id}",
+            "command_id": request.get("effect_id", f"{request_type}:{request_id}"),
             "kind": "operation",
             "priority": "execution",
             "payload": {"type": request_type, "order": request["order"]},
             "worker_request_type": request_type,
             "worker_request": request,
         }
+        if "effect_id" in request:
+            scheduled["effect_id"] = request["effect_id"]
         if "expires_at" in request:
             scheduled["expires_at"] = request["expires_at"]
         outcome = self._trader_rpc_scheduler.admit(scheduled)
@@ -316,38 +267,16 @@ class AuthenticatedWorkerSession:
             response["execution_state"] = execution_state
             response["outcome"] = outcome
         try:
-            _send(self.socket, response)
+            _send(self.socket, self._relay_response(request_id, response) or response)
         except Exception as error:
             _raise_closed_connection(error, "order-check response")
 
     def send_order_check_error(self, *, request_id: str, reason: str) -> None:
         try:
-            _send(
-                self.socket,
-                {"type": "order_check_error", "analysis_id": "order_check", "request_id": request_id, "reason": reason},
-            )
+            response = {"type": "order_check_error", "analysis_id": "order_check", "request_id": request_id, "reason": reason}
+            _send(self.socket, self._relay_response(request_id, response) or response)
         except Exception as error:
             _raise_closed_connection(error, "order-check error response")
-
-    def receive_order_execute(self, timeout: float | None = None) -> dict[str, object] | None:
-        try:
-            response = _message(self.socket, timeout=timeout)
-        except TimeoutError:
-            return None
-        except Exception as error:
-            _raise_closed_connection(error, "order execution request")
-        if response.get("type") != "order_execute_request":
-            if response.get("type") == "order_check_request":
-                self._queue_hedge_request(response)
-            elif _is_execution_recovery_request(response):
-                self._execution_recovery_requests.append(response)
-            elif response.get("type") == "trader_rpc_request":
-                self._queue_trader_rpc(response)
-            else:
-                self._analysis_requests.append(response)
-            return None
-        self._queue_hedge_request(response)
-        return None
 
     def _parse_order_execute(self, response: dict[str, object]) -> dict[str, object]:
         expected_fields = {"type", "request_id", "order"}
@@ -394,36 +323,16 @@ class AuthenticatedWorkerSession:
             response["execution_state"] = execution_state
             response["outcome"] = outcome
         try:
-            _send(self.socket, response)
+            _send(self.socket, self._relay_response(request_id, response) or response)
         except Exception as error:
             _raise_closed_connection(error, "order execution response")
 
     def send_order_execute_error(self, *, request_id: str, reason: str) -> None:
         try:
-            _send(self.socket, {"type": "order_execute_error", "request_id": request_id, "reason": reason})
+            response = {"type": "order_execute_error", "request_id": request_id, "reason": reason}
+            _send(self.socket, self._relay_response(request_id, response) or response)
         except Exception as error:
             _raise_closed_connection(error, "order execution error response")
-
-    def receive_execution_recovery(self, timeout: float | None = None) -> dict[str, object] | None:
-        if self._execution_recovery_requests:
-            return self._parse_execution_recovery(self._execution_recovery_requests.popleft())
-        try:
-            response = _message(self.socket, timeout=timeout)
-        except TimeoutError:
-            return None
-        except Exception as error:
-            _raise_closed_connection(error, "execution recovery request")
-        if _is_execution_recovery_request(response):
-            return self._parse_execution_recovery(response)
-        if response.get("type") == "order_check_request":
-            self._queue_hedge_request(response)
-        elif response.get("type") == "order_execute_request":
-            self._queue_hedge_request(response)
-        elif response.get("type") == "trader_rpc_request":
-            self._queue_trader_rpc(response)
-        else:
-            self._analysis_requests.append(response)
-        return None
 
     def receive_trader_rpc(self) -> ScheduledTraderRpc | None:
         scheduled = self._trader_rpc_scheduler.next()
@@ -444,8 +353,23 @@ class AuthenticatedWorkerSession:
             return None
         return scheduled
 
+    def receive_worker_relay(self, timeout: float | None = None) -> bool:
+        try:
+            response = _message(self.socket, timeout=timeout)
+        except TimeoutError:
+            return False
+        except Exception as error:
+            _raise_closed_connection(error, "Worker relay request")
+        if response.get("type") != "worker_relay":
+            raise WorkerEnrollmentError("The controller returned an invalid Worker relay request.")
+        self._queue_worker_relay(response)
+        return True
+
     def _queue_trader_rpc(self, response: dict[str, object]) -> None:
-        envelope_fields = {"type", "request_id", "kind", "payload", "command_id", "payload_hash", "priority", "expires_at", "correlation"}
+        envelope_fields = {
+            "type", "request_id", "kind", "payload", "command_id", "effect_id",
+            "payload_hash", "priority", "expires_at", "correlation",
+        }
         if not set(response).issubset(envelope_fields):
             raise WorkerEnrollmentError("The controller returned an invalid Trader RPC request.")
         try:
@@ -456,7 +380,11 @@ class AuthenticatedWorkerSession:
             raise WorkerEnrollmentError("The controller returned an invalid Trader RPC request.") from error
         scheduled = {
             **request.model_dump(mode="json", exclude_none=True),
-            **{field: response[field] for field in ("command_id", "payload_hash", "priority", "expires_at", "correlation") if field in response},
+            **{
+                field: response[field]
+                for field in ("command_id", "effect_id", "payload_hash", "priority", "expires_at", "correlation")
+                if field in response
+            },
         }
         outcome = self._trader_rpc_scheduler.admit(scheduled)
         if outcome is not None and outcome.terminal:
@@ -468,8 +396,11 @@ class AuthenticatedWorkerSession:
             )
 
     def send_trader_rpc(
-        self, *, request_id: str, kind: str, accepted: bool, result: dict[str, object] | None = None,
+        self, *, request_id: str, kind: str, accepted: bool,
+        result: dict[str, object] | None = None,
         reason: str | None = None,
+        execution_state: str | None = None,
+        outcome: str | None = None,
     ) -> None:
         if kind not in {"read", "operation"} or not request_id or (accepted and result is None) or (not accepted and not reason):
             raise WorkerEnrollmentError("The worker cannot send an invalid Trader RPC response.")
@@ -478,159 +409,117 @@ class AuthenticatedWorkerSession:
             if accepted
             else TraderRpcFailure(request_id=request_id, kind=kind, reason=reason).model_dump(mode="json")
         )
+        if not accepted:
+            if execution_state is not None:
+                response["execution_state"] = execution_state
+            if outcome is not None:
+                response["outcome"] = outcome
         try:
-            _send(self.socket, response)
+            _send(self.socket, self._relay_response(request_id, response) or response)
         except Exception as error:
             _raise_closed_connection(error, "Trader RPC response")
 
-    def _parse_execution_recovery(self, response: dict[str, object]) -> dict[str, object]:
-        request_type = response.get("type")
-        if request_type == "account_recovery_reconcile_request" and set(response) == {"type", "request_id"}:
-            return {"type": request_type, "request_id": _required_text(response, "request_id")}
-        if request_type in {"account_recovery_cancel_request", "account_recovery_close_request"} and set(response) == {
-            "type", "request_id", "ticket", "volume"
-        }:
-            return {
-                "type": request_type,
-                "request_id": _required_text(response, "request_id"),
-                "ticket": _required_text(response, "ticket"),
-                "volume": _required_text(response, "volume"),
-            }
-        if request_type == "execution_reconcile_request" and set(response) == {"type", "request_id", "execution_id"}:
-            return {"type": request_type, "request_id": _required_text(response, "request_id"),
-                    "execution_id": _required_text(response, "execution_id")}
-        if request_type in {"execution_cancel_request", "execution_close_request"} and set(response) == {
-            "type", "request_id", "ticket", "volume"
-        }:
-            return {"type": request_type, "request_id": _required_text(response, "request_id"),
-                    "ticket": _required_text(response, "ticket"), "volume": _required_text(response, "volume")}
-        raise WorkerEnrollmentError("The controller returned an invalid execution recovery request.")
-
-    def send_execution_recovery(self, *, request_id: str, operation: str, accepted: bool,
-                                result: dict[str, object]) -> None:
+    def _queue_worker_relay(self, response: dict[str, object]) -> None:
+        if set(response) not in ({"type", "envelope"}, {"type", "request_id", "envelope"}) or not isinstance(response.get("envelope"), dict):
+            raise WorkerEnrollmentError("The controller returned an invalid Worker relay request.")
         try:
-            _send(self.socket, {"type": "execution_recovery_response", "request_id": request_id,
-                                "operation": operation, "accepted": accepted, "result": result})
-        except Exception as error:
-            _raise_closed_connection(error, "execution recovery response")
-
-    def send_execution_recovery_error(self, *, request_id: str, operation: str, reason: str) -> None:
-        try:
-            _send(self.socket, {"type": "execution_recovery_error", "request_id": request_id,
-                                "operation": operation, "reason": reason})
-        except Exception as error:
-            _raise_closed_connection(error, "execution recovery error response")
-
-    def send_product_catalog_analysis(
-        self,
-        *,
-        analysis_id: str,
-        request_id: str,
-        collected_at: str,
-        symbols: list[dict[str, object]],
-        stage: str = "catalog",
-        timeframe: str | None = None,
-        period_start_utc: str | None = None,
-        period_end_utc: str | None = None,
-    ) -> None:
-        response = {
-            "type": "product_catalog_analysis_response",
-            "stage": stage,
-            "analysis_id": analysis_id,
-            "request_id": request_id,
-            "collected_at": collected_at,
-            "symbols": symbols,
-        }
-        if stage in {"m15_screening", "m1_verification"}:
-            if not all(isinstance(value, str) and value for value in (timeframe, period_start_utc, period_end_utc)):
-                raise WorkerEnrollmentError("Market-data analysis responses must include timeframe and UTC period.")
-            response.update(
+            envelope = worker_request_envelope_adapter.validate_python(response["envelope"])
+        except ValidationError as error:
+            raise WorkerEnrollmentError("The controller returned an invalid Worker relay request.") from error
+        if self.worker_id and envelope.worker_id != self.worker_id:
+            raise WorkerEnrollmentError("The controller routed a Worker relay request to the wrong Worker.")
+        self._relay_requests[envelope.request_id] = envelope
+        dumped = envelope.model_dump(mode="json")
+        if isinstance(envelope, WorkerReadRequested):
+            self._queue_trader_rpc(
                 {
-                    "timeframe": timeframe,
-                    "period_start_utc": period_start_utc,
-                    "period_end_utc": period_end_utc,
+                    "type": "trader_rpc_request",
+                    "request_id": envelope.request_id,
+                    "kind": "read",
+                    "payload": dumped["payload"],
+                    "command_id": envelope.request_id,
+                    "payload_hash": envelope.payload_hash,
+                    "priority": "normal",
+                    "correlation": dumped["correlation"],
                 }
             )
-        try:
-            _send(self.socket, response)
-        except Exception as error:
-            _raise_closed_connection(error, "analysis response")
-
-    def send_product_catalog_analysis_error(
-        self,
-        *,
-        analysis_id: str,
-        request_id: str,
-        stage: str,
-        reason: str,
-        timeframe: str | None = None,
-    ) -> None:
-        if stage not in {"catalog", "m15_screening", "m1_verification"} or not reason:
-            raise WorkerEnrollmentError("The worker cannot send an invalid product catalog analysis error.")
-        response = {
-            "type": "product_catalog_analysis_error",
-            "analysis_id": analysis_id,
-            "request_id": request_id,
-            "stage": stage,
-            "reason": reason,
+            return
+        operation = envelope.payload.operation
+        if operation == "trader_operation":
+            self._queue_trader_rpc(
+                {
+                    "type": "trader_rpc_request",
+                    "request_id": envelope.request_id,
+                    "kind": "operation",
+                    "payload": dumped["payload"]["request"],
+                    "command_id": envelope.effect_id,
+                    "effect_id": envelope.effect_id,
+                    "priority": "protection",
+                    "expires_at": dumped["expires_at"],
+                    "correlation": dumped["correlation"],
+                }
+            )
+            return
+        request = {
+            "type": f"{operation}_request",
+            "request_id": envelope.request_id,
+            "order": dumped["payload"]["order"],
+            "expires_at": dumped["expires_at"],
         }
-        if stage in {"m15_screening", "m1_verification"}:
-            if not isinstance(timeframe, str) or not timeframe:
-                raise WorkerEnrollmentError("Market-data analysis errors must include a timeframe.")
-            response["timeframe"] = timeframe
-        try:
-            _send(self.socket, response)
-        except Exception as error:
-            _raise_closed_connection(error, "analysis error response")
+        if operation == "order_execute":
+            request["effect_id"] = envelope.effect_id
+        self._queue_hedge_request(request)
 
-
-def _is_execution_recovery_request(response: dict[str, object]) -> bool:
-    request_type = response.get("type")
-    return isinstance(request_type, str) and request_type.startswith(
-        ("execution_", "account_recovery_")
-    )
-
-
-def collect_product_catalog_evidence(
-    mt5: ProductCatalogReadOnlyMT5,
-    *,
-    collected_at: datetime | None = None,
-) -> dict[str, object]:
-    when = (datetime.now(UTC) if collected_at is None else collected_at).isoformat()
-    raw_symbols = mt5.symbols_get()
-    if not isinstance(raw_symbols, (list, tuple)):
-        raise WorkerEnrollmentError("The local MT5 terminal returned an invalid product catalog.")
-    return {"collected_at": when, "symbols": [_symbol_specification(symbol) for symbol in raw_symbols]}
-
-
-def collect_market_data_evidence(
-    mt5: MarketDataReadOnlyMT5,
-    *,
-    symbols: list[str],
-    timeframe: str,
-    period_start_utc: str,
-    period_end_utc: str,
-    collected_at: datetime | None = None,
-) -> dict[str, object]:
-    when = (datetime.now(UTC) if collected_at is None else collected_at).isoformat()
-    start = _parse_utc(period_start_utc)
-    end = _parse_utc(period_end_utc)
-    if start >= end:
-        raise WorkerEnrollmentError("The controller requested an invalid market-data interval.")
-    if not symbols or not all(isinstance(symbol, str) and symbol for symbol in symbols):
-        raise WorkerEnrollmentError("The controller requested invalid market-data symbols.")
-    calibration = _market_data_calibration(mt5, symbols)
-    return {
-        "collected_at": when,
-        "timeframe": timeframe,
-        "period_start_utc": period_start_utc,
-        "period_end_utc": period_end_utc,
-        "symbols": [
-            _market_data_symbol_evidence_with_retry(mt5, symbol, timeframe, start, end, calibration)
-            for symbol in symbols
-        ],
-    }
-
+    def _relay_response(
+        self, request_id: str, response: dict[str, object]
+    ) -> dict[str, object] | None:
+        envelope = self._relay_requests.pop(request_id, None)
+        if envelope is None:
+            return None
+        common = {
+            "protocol_version": envelope.protocol_version,
+            "trader_id": envelope.trader_id,
+            "worker_id": envelope.worker_id,
+            "runtime_command_id": envelope.runtime_command_id,
+            "request_id": envelope.request_id,
+            "payload_hash": envelope.payload_hash,
+            "correlation": envelope.model_dump(mode="json")["correlation"],
+            "recovery_epoch": self.recovery_epoch,
+            "observed_at": datetime.now(UTC).isoformat(),
+        }
+        if isinstance(envelope, WorkerReadRequested):
+            accepted = response.get("accepted") is True
+            fact = {
+                "type": "worker_read_completed",
+                **common,
+                "accepted": accepted,
+                "snapshot_baseline": self.reconciliation_cursor,
+                "result": response.get("result") if accepted else None,
+                "reason": None if accepted else response.get("reason", "Worker read was rejected."),
+            }
+        else:
+            accepted = response.get("accepted") is True
+            result = response.get("result")
+            if not isinstance(result, dict):
+                result = {
+                    key: response[key]
+                    for key in ("order", "diagnostics")
+                    if key in response
+                }
+            execution_state = response.get("execution_state")
+            if execution_state is None:
+                execution_state = "receipt" if accepted else "not_started"
+            fact = {
+                "type": "worker_effect_outcome",
+                **common,
+                "effect_id": envelope.effect_id,
+                "accepted": accepted,
+                "execution_state": execution_state,
+                "outcome": response.get("outcome", "accepted" if accepted else "rejected"),
+                "result": result,
+                "reason": None if accepted else response.get("reason"),
+            }
+        return {"type": "worker_relay", "request_id": request_id, "envelope": fact}
 
 def _market_data_symbol_evidence_with_retry(
     mt5: MarketDataReadOnlyMT5,

@@ -29,7 +29,7 @@ is:
 
 It therefore must not be silently classified as ordinary leveraged Forex.
 
-## Implication for product-pair analysis
+## Implication for Strategy Runtime symbol compatibility
 
 The worker must preserve the native MT5 `trade_calc_mode` value. The
 control-plane compares the two raw values for equality and does not translate

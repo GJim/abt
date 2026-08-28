@@ -86,6 +86,17 @@ class WorkerEffectJournal:
         ).fetchall()
         return [{"effect_id": row[0], "payload": json.loads(row[1]), "state": row[2]} for row in rows]
 
+    def evidence(self, effect_id: str) -> dict[str, object]:
+        row = self._connection.execute(
+            "SELECT state, evidence FROM broker_effects WHERE effect_id = ?", (effect_id,)
+        ).fetchone()
+        if row is None or row[0] not in {"receipt", "observed"} or row[1] is None:
+            raise EffectJournalError("Broker effect has no conclusive replay evidence.")
+        value = json.loads(row[1])
+        if not isinstance(value, dict):
+            raise EffectJournalError("Broker effect replay evidence is invalid.")
+        return value
+
     def _complete(self, effect_id: str, state: EffectState, evidence: dict[str, object]) -> None:
         row = self._connection.execute("SELECT state FROM broker_effects WHERE effect_id = ?", (effect_id,)).fetchone()
         if row is None:

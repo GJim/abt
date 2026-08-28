@@ -60,43 +60,6 @@ class FakeEcho:
 
 
 class TraderCommandTests(unittest.TestCase):
-    def test_connect_forwards_a_protected_pair_close_command(self) -> None:
-        class CloseSocket:
-            def __init__(self) -> None:
-                self.messages = iter(
-                    [
-                        '{"type":"subscribed","worker_ids":["*"]}',
-                        '{"type":"trader_command_result","request_id":"close-1",'
-                        '"result":{"pair_id":"pair-1","status":"accepted","lifecycle_state":"CONVERGING_EMPTY","revision":2}}',
-                    ]
-                )
-                self.sent: list[str] = []
-
-            def recv(self, timeout: float | None = None) -> str:
-                return next(self.messages)
-
-            def send(self, message: str) -> None:
-                self.sent.append(message)
-
-        socket = CloseSocket()
-        commands: SimpleQueue[object] = SimpleQueue()
-        commands.put(
-            {
-                "request_id": "close-1",
-                "command_id": "pair-1:close",
-                "payload": {"type": "protected_pair_close", "pair_id": "pair-1"},
-            }
-        )
-
-        with self.assertRaises(StopIteration):
-            run_trader_session(
-                socket, output=io.StringIO(), save_cursor=lambda _: None, command_source=commands
-            )  # type: ignore[arg-type]
-
-        self.assertIn(
-            '{"command_id":"pair-1:close","payload":{"pair_id":"pair-1","type":"protected_pair_close"},"type":"command"}',
-            socket.sent,
-        )
 
     def test_enroll_confirms_detected_ip_and_saves_only_non_secrets(self) -> None:
         with TemporaryDirectory() as directory:
@@ -280,14 +243,15 @@ class TraderCommandTests(unittest.TestCase):
             output.getvalue(),
         )
 
-    def test_connect_processes_market_data_interleaved_with_event_acknowledgement(self) -> None:
+    def test_connect_processes_worker_stream_interleaved_with_event_acknowledgement(self) -> None:
         class InterleavedSocket:
             def __init__(self) -> None:
                 self.messages = iter(
                     [
                         '{"type":"event","event_id":17,"payload":{"state":"accepted"}}',
-                        '{"type":"market_data","worker_id":"worker-1","observed_at":"2026-08-25T00:00:00+00:00",'
-                        '"quotes":[{"symbol":"EURUSD","bid":1.1,"ask":1.2}]}',
+                        '{"type":"worker_stream","worker_id":"worker-1","envelope":{"type":"live_state_snapshot",'
+                        '"observed_at":"2026-08-25T00:00:00+00:00","connectivity":true,'
+                        '"quotes":[{"symbol":"EURUSD","bid":1.1,"ask":1.2}]}}',
                         '{"type":"acknowledged","cursor":17}',
                     ]
                 )
@@ -312,7 +276,33 @@ class TraderCommandTests(unittest.TestCase):
             ],
             socket.sent,
         )
-        self.assertIn('"type":"market_data"', output.getvalue())
+        self.assertIn('"type":"worker_stream"', output.getvalue())
+
+    def test_connect_accepts_subscribe_confirmation_before_event_acknowledgement(self) -> None:
+        class SubscribeInterleavedSocket:
+            def __init__(self) -> None:
+                self.messages = iter(
+                    [
+                        '{"type":"event","event_id":17,"payload":{"state":"accepted"}}',
+                        '{"type":"subscribed","worker_ids":["*"]}',
+                        '{"type":"acknowledged","cursor":17}',
+                    ]
+                )
+                self.sent: list[str] = []
+
+            def recv(self, timeout: float | None = None) -> str:
+                return next(self.messages)
+
+            def send(self, message: str) -> None:
+                self.sent.append(message)
+
+        socket = SubscribeInterleavedSocket()
+        cursors: list[int] = []
+
+        with self.assertRaises(StopIteration):
+            run_trader_session(socket, output=io.StringIO(), save_cursor=cursors.append)  # type: ignore[arg-type]
+
+        self.assertEqual([17], cursors)
 
     def test_connect_subscribes_to_market_data_and_writes_it_without_acknowledging(self) -> None:
         class MarketDataSocket:
@@ -349,178 +339,6 @@ class TraderCommandTests(unittest.TestCase):
             '"type":"market_data","worker_id":"worker-1"}\n',
             output.getvalue(),
         )
-
-    def test_connect_sends_jsonl_request_and_writes_correlated_result(self) -> None:
-        class RpcSocket:
-            def __init__(self) -> None:
-                self.messages = iter(
-                    [
-                        '{"type":"trader_rpc_result","request_id":"read-1","status":"completed",'
-                        '"result":{"account":{"login":123456}}}',
-                    ]
-                )
-                self.sent: list[str] = []
-
-            def recv(self, timeout: float | None = None) -> str:
-                return next(self.messages)
-
-            def send(self, message: str) -> None:
-                self.sent.append(message)
-
-        commands: SimpleQueue[object] = SimpleQueue()
-        commands.put(
-            {
-                "request_id": "read-1",
-                "worker_id": "worker-1",
-                "payload": {"kind": "read", "request": {"type": "account_info"}},
-            }
-        )
-        socket = RpcSocket()
-        output = io.StringIO()
-
-        with self.assertRaises(StopIteration):
-            run_trader_session(socket, output=output, save_cursor=lambda _: None, command_source=commands)  # type: ignore[arg-type]
-
-        self.assertEqual(
-            [
-                '{"type":"subscribe","worker_ids":["*"]}',
-                '{"payload":{"kind":"read","request":{"type":"account_info"}},"request_id":"read-1",'
-                '"type":"request","worker_id":"worker-1"}',
-            ],
-            socket.sent,
-        )
-        self.assertEqual(
-            '{"request_id":"read-1","result":{"account":{"login":123456}},"status":"completed",'
-            '"type":"trader_rpc_result"}\n',
-            output.getvalue(),
-        )
-
-    def test_connect_sends_jsonl_controller_query_and_writes_result(self) -> None:
-        class QuerySocket:
-            def __init__(self) -> None:
-                self.messages = iter(
-                    [
-                        '{"type":"trader_query_result","request_id":"workers-1","query":"active_workers",'
-                        '"result":{"workers":[{"worker_id":"worker-a","server":"Broker-A",'
-                        '"connectivity":"connected"}]}}',
-                    ]
-                )
-                self.sent: list[str] = []
-
-            def recv(self, timeout: float | None = None) -> str:
-                return next(self.messages)
-
-            def send(self, message: str) -> None:
-                self.sent.append(message)
-
-        commands: SimpleQueue[object] = SimpleQueue()
-        commands.put({"request_id": "workers-1", "query": "active_workers"})
-        socket = QuerySocket()
-        output = io.StringIO()
-
-        with self.assertRaises(StopIteration):
-            run_trader_session(socket, output=output, save_cursor=lambda _: None, command_source=commands)  # type: ignore[arg-type]
-
-        self.assertEqual(
-            [
-                '{"type":"subscribe","worker_ids":["*"]}',
-                '{"query":"active_workers","request_id":"workers-1","type":"query"}',
-            ],
-            socket.sent,
-        )
-        self.assertEqual(
-            '{"query":"active_workers","request_id":"workers-1","result":{"workers":[{"connectivity":"connected",'
-            '"server":"Broker-A","worker_id":"worker-a"}]},"type":"trader_query_result"}\n',
-            output.getvalue(),
-        )
-
-    def test_connect_forwards_a_hedged_entry_command_and_correlates_its_result(self) -> None:
-        class CommandSocket:
-            def __init__(self) -> None:
-                self.messages = iter(
-                    [
-                        '{"type":"trader_command_result","request_id":"entry-1",'
-                        '"result":{"command_id":"entry-1","status":"accepted","legs":[]}}',
-                    ]
-                )
-                self.sent: list[str] = []
-
-            def recv(self, timeout: float | None = None) -> str:
-                return next(self.messages)
-
-            def send(self, message: str) -> None:
-                self.sent.append(message)
-
-        commands: SimpleQueue[object] = SimpleQueue()
-        commands.put(
-            {
-                "request_id": "entry-1",
-                "command_id": "entry-1",
-                "payload": {
-                    "type": "hedged_entry",
-                    "expires_at": "2026-08-27T10:00:05+00:00",
-                    "first": {
-                        "worker_id": "worker-a",
-                        "symbol": "EURUSD",
-                        "volume": "0.10",
-                        "direction": "LONG",
-                        "filling_mode": "FOK",
-                        "margin_limit": "400",
-                        "stop_loss": "1.09000",
-                        "take_profit": "1.11000",
-                    },
-                    "second": {
-                        "worker_id": "worker-b",
-                        "symbol": "EURUSD",
-                        "volume": "0.10",
-                        "direction": "SHORT",
-                        "filling_mode": "FOK",
-                        "margin_limit": "400",
-                        "stop_loss": "1.11000",
-                        "take_profit": "1.09000",
-                    },
-                },
-            }
-        )
-        socket = CommandSocket()
-        output = io.StringIO()
-
-        with self.assertRaises(StopIteration):
-            run_trader_session(socket, output=output, save_cursor=lambda _: None, command_source=commands)  # type: ignore[arg-type]
-
-        self.assertEqual(
-            [
-                '{"type":"subscribe","worker_ids":["*"]}',
-                '{"command_id":"entry-1","payload":{"expires_at":"2026-08-27T10:00:05+00:00","first":{"direction":"LONG","filling_mode":"FOK",'
-                '"margin_limit":"400","stop_loss":"1.09000","symbol":"EURUSD","take_profit":"1.11000","volume":"0.10","worker_id":"worker-a"},'
-                '"second":{"direction":"SHORT","filling_mode":"FOK","margin_limit":"400",'
-                '"stop_loss":"1.11000","symbol":"EURUSD","take_profit":"1.09000","volume":"0.10","worker_id":"worker-b"},"type":"hedged_entry"},'
-                '"type":"command"}',
-            ],
-            socket.sent,
-        )
-        self.assertEqual(
-            '{"request_id":"entry-1","result":{"command_id":"entry-1","legs":[],"status":"accepted"},'
-            '"type":"trader_command_result"}\n',
-            output.getvalue(),
-        )
-
-    def test_connect_rejects_product_pair_inventory_query(self) -> None:
-        class QuerySocket:
-            def recv(self, timeout: float | None = None) -> str:
-                raise StopIteration
-
-            def send(self, message: str) -> None:
-                pass
-
-        commands: SimpleQueue[object] = SimpleQueue()
-        commands.put({"request_id": "pairs-1", "query": "active_pairs"})
-        output = io.StringIO()
-
-        with self.assertRaises(StopIteration):
-            run_trader_session(QuerySocket(), output=output, save_cursor=lambda _: None, command_source=commands)  # type: ignore[arg-type]
-
-        self.assertIn("Trader JSONL query contains invalid fields.", output.getvalue())
 
 
 class FakeRotationTransport:

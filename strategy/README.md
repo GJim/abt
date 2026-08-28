@@ -5,7 +5,7 @@ connected account Workers. Each Worker must own a different MT5 terminal; do
 not use two named contexts that share one terminal.
 
 At startup the strategy asks the controller for `active_workers`, requires
-both specified Workers to be connected and safe, then reads each selected
+both specified Workers to be connected, then reads each selected
 Worker's complete `symbols` catalog once. It fails startup if either catalog is
 invalid or unavailable, and keeps only exact-name symbols that are tradable
 (trade mode 4), bidirectional, and have matching hard contract terms: trade
@@ -54,63 +54,58 @@ When prior closed trades have consumed part of an endpoint's daily loss limit,
 the remainder further caps the broker SL/TP target; the strategy refuses new
 entries once either endpoint has exhausted its daily loss budget.
 
-It is dry-run unless `--execute` is passed. In execution mode, an entry is one
-controller-owned `hedged_entry` command, not two strategy market operations.
-Each signal has one five-second expiry shared by both legs: the controller takes
-a deterministic pair-level Worker lock, runs both broker `order_check` calls
-concurrently, and dispatches only if both checks and the remaining shared
-deadline succeed. Checks do not reserve liquidity. Worker scheduling may reject
-an expired request before broker submission, which rejects the pair without
-sending either order; it must never present a post-send lost response as a safe
-rejection. Before market dispatch, the controller durably marks both accounts
-`ENTRY_UNCONFIRMED` and records the requested initial SL/TP. It supplies those
-targets in each Worker market-order effect, whose journal never resends an
-effect that crossed `send_started`. The controller persists the command,
-per-leg broker receipts, and timings before reporting its outcome. FOK is
-selected whenever both Workers support it; a failed FOK is rejected and never
-silently retried as IOC.
-If either send fails or is unknown after a counterpart may have been sent, the
-controller transitions both accounts to `CONVERGING_EMPTY`: it observes the
-broker state, cancels observed orders, observes again, closes observed
-positions, and requires a final empty observation. The strategy stops without
-attempting an unsafe individual-order fallback. After both protected market
-receipts, the controller binds their tickets to the durable pair and returns
-`CATCHING_UP`; only a fresh full snapshot from each Worker with matching
-ticket, symbol, side, volume, SL, TP, and no pending orders marks the pair
-`ACTIVE_VERIFIED`. Any cross-broker mismatch converges both accounts to empty.
-Ctrl+C
-and risk or integrity failures still flatten every position on both selected
-accounts. A disconnected Trader can recover the durable command outcome by its
-original command ID through the replayed `hedged_entry_completed` event; until
-then it treats the entry as potentially dispatched and does not race recovery
-with direct closes. Start only after confirming both accounts contain no
-unrelated positions.
+It is dry-run unless `--execute` is passed. Execution mode opens a local
+SQLite/WAL Strategy Runtime before evaluating live signals. That runtime owns
+the pair plan, command sequence, deterministic Worker effects, broker receipts,
+actual tickets and fills, lifecycle transitions, desired state, and per-Worker
+fact cursors. The controller authenticates and routes versioned envelopes but
+does not interpret orders, positions, pairs, or lifecycle state.
+
+Each signal has one five-second expiry shared by both legs. The Strategy
+Runtime sends the two exact broker `order_check` requests concurrently and
+dispatches only after both checks and the shared deadline succeed. Checks do
+not reserve liquidity. Each market effect has a deterministic ID; the Worker
+journal persists `send_started` immediately before MT5 submission and never
+blindly resends an effect that crossed it. FOK is selected whenever both
+Workers support it; a failed FOK is rejected and never silently retried as IOC.
+
+Receipts alone never make a pair active. Fresh Worker snapshots must prove the
+ticket, symbol, side, volume, SL, TP, and absence of pending orders on both
+legs. A rejection, lost receipt, asymmetric result, or verification mismatch
+moves the runtime toward `EMPTY`: it observes current facts, cancels only
+pair-owned orders, closes only pair-owned positions, and requires a final
+broker-verified empty snapshot. Any unrelated account exposure is preserved
+and moves the runtime to `NEEDS_HUMAN`.
+
+On restart or relay reconnect, the runtime resumes each Worker stream from its
+last committed cursor and obtains fresh full snapshots before making lifecycle
+decisions. Duplicate facts are ignored; an epoch change or cursor gap invalidates
+the stream until a fresh snapshot arrives. Ctrl+C, the daily cutoff, risk
+limits, and integrity failures use the same durable close convergence rather
+than a controller command or direct fallback.
 
 Before each market command, the strategy uses the Worker broker `calc_profit`
 read and the current executable quote to derive requested absolute emergency
 SL and TP targets, each for
 the lower of `--emergency-stop-loss-usd` (default: US$40) and the endpoint's
 allocation-based 2% per-trade and remaining 3% daily loss limits in absolute
-projected P/L. It passes these targets only in the controller-owned
-`hedged_entry` command; it never follows a fill with generic `modify_sl_tp` or
-`protected_pair` writes. The matching dollar amount is used rather than the
+projected P/L. It passes these targets in each Strategy Runtime entry effect; it never follows
+a fill with a separate `modify_sl_tp` operation. The matching dollar amount is used rather than the
 other broker's price because the brokers can quote different prices, spreads,
-precision, and contract terms. The strategy remains stopped while controller
-verification is pending rather than treating broker receipts as a verified
-hedge.
+precision, and contract terms. The Strategy Runtime remains non-active until Worker facts verify both legs.
 
 A broker TP remains emergency protection, not the normal pair exit: the
 strategy normally closes both legs together on its reverse signal. If either
 broker protection closes a leg, the next market-data event immediately verifies
-both expected positions; its missing ticket triggers an immediate market close
-of the remaining leg and stops the strategy.
+both expected positions; its missing ticket triggers durable close convergence for the remaining owned leg and
+stops the strategy.
 
 Every `--integrity-check-seconds` (default: five), it reads both accounts'
 orders and positions while idle. While a pair is active, this check runs on
 every market-data event. At startup both accounts must be empty; while a pair is active,
 each account must contain exactly its expected ticket, symbol, direction, and
-volume, with no pending orders. Any mismatch is treated as an external account
-operation, logged, and followed by the configured full-account shutdown.
+volume, with no pending orders. Any mismatch is treated as an external account operation and moves the runtime
+toward `EMPTY` or `NEEDS_HUMAN` without mutating unrelated exposure.
 
 When the controller reports selected Worker market data unavailable, the
 strategy pauses all broker reads and trading decisions for

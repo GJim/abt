@@ -1,6 +1,12 @@
 # Trader intent execution
 
-Status: ready-for-agent
+Status: wontfix
+
+Its Trader identity and authenticated communication requirements are retained
+by
+[`../strategy-owned-pair-lifecycle/spec.md`](../strategy-owned-pair-lifecycle/spec.md).
+Its controller-owned intent execution and management trading operations are
+superseded and will be removed.
 
 ## Problem statement
 

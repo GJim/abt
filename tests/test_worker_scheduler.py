@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from hashlib import sha256
 import json
 import unittest
 
@@ -71,6 +72,18 @@ class WorkerSchedulerTests(unittest.TestCase):
         self.assertIn("dequeued_at", dequeued.telemetry)  # type: ignore[union-attr]
         self.assertIn("completed_at", dequeued.telemetry)  # type: ignore[union-attr]
 
+    def test_expired_durable_effect_reaches_journal_replay_before_send_guard(self) -> None:
+        scheduler = self._scheduler()
+        request = _request(
+            "durable-replay",
+            priority="execution",
+            expires_at=self.clock.now() - timedelta(seconds=1),
+        )
+        request["effect_id"] = "effect-1"
+
+        self.assertIsNone(scheduler.admit(request))
+        self.assertIsInstance(scheduler.next(), ScheduledTraderRpc)
+
     def test_rechecks_expiry_immediately_before_order_send(self) -> None:
         scheduler = self._scheduler()
         self.assertIsNone(scheduler.admit(_request("expired-before-send", priority="execution", expires_at=self.clock.now() + timedelta(seconds=1))))
@@ -97,6 +110,8 @@ class WorkerSchedulerTests(unittest.TestCase):
 
         self.assertEqual(1, mt5.order_send_calls)
         self.assertEqual("unknown_after_send", session.responses[0]["reason"].split(":", 1)[0])
+        self.assertEqual("sent", session.responses[0]["execution_state"])
+        self.assertEqual("unknown_after_send", session.responses[0]["outcome"])
 
     def test_freeze_rejects_ordinary_work_but_admits_emergency(self) -> None:
         scheduler = self._scheduler()
@@ -150,7 +165,6 @@ class WorkerSchedulerTests(unittest.TestCase):
         session._queue_hedge_request(
             {
                 "type": "order_check_request",
-                "analysis_id": "order_check",
                 "request_id": "execution",
                 "order": {"action": "market"},
             }
@@ -179,7 +193,6 @@ class WorkerSchedulerTests(unittest.TestCase):
         order_check = session._parse_order_check(
             {
                 "type": "order_check_request",
-                "analysis_id": "order_check",
                 "request_id": "check",
                 "order": order,
                 "expires_at": "2026-08-27T00:00:01Z",
@@ -196,6 +209,104 @@ class WorkerSchedulerTests(unittest.TestCase):
 
         self.assertEqual("2026-08-27T00:00:01+00:00", order_check["expires_at"])
         self.assertEqual("2026-08-27T00:00:01+00:00", order_execute["expires_at"])
+
+    def test_worker_relay_preserves_end_to_end_metadata_and_effect_id(self) -> None:
+        socket = _RecordingSocket()
+        session = AuthenticatedWorkerSession(
+            socket=socket, reconciliation_cursor=0, worker_id="worker-a"
+        )  # type: ignore[arg-type]
+        session._trader_rpc_scheduler = self._scheduler()
+        envelope = {
+            "type": "worker_effect_requested",
+            "protocol_version": 1,
+            "trader_id": "trader-1",
+            "worker_id": "worker-a",
+            "runtime_command_id": "command-1",
+            "request_id": "execute-1",
+            "effect_id": "command-1:worker-a:entry",
+            "expires_at": (self.clock.now() + timedelta(seconds=30)).isoformat(),
+            "payload_hash": "payload-hash",
+            "correlation": {"pair_id": "pair-1", "leg": "first", "purpose": "entry"},
+            "payload": {
+                "operation": "order_execute",
+                "order": {
+                    "action": "market",
+                    "symbol": "EURUSD",
+                    "volume": "0.10",
+                    "direction": "LONG",
+                    "filling_mode": "FOK",
+                    "sl": "1.09",
+                    "tp": "1.12",
+                },
+            },
+        }
+
+        session._queue_worker_relay({"type": "worker_relay", "request_id": "execute-1", "envelope": envelope})
+        scheduled = session.receive_trader_rpc()
+        self.assertEqual("command-1:worker-a:entry", scheduled.request["worker_request"]["effect_id"])  # type: ignore[index,union-attr]
+        session.send_order_execute(
+            request_id="execute-1",
+            order=envelope["payload"]["order"],  # type: ignore[index]
+            accepted=True,
+            result={"position": 101},
+        )
+
+        relayed = json.loads(socket.sent[-1])
+        self.assertEqual("worker_relay", relayed["type"])
+        self.assertEqual("command-1:worker-a:entry", relayed["envelope"]["effect_id"])
+        self.assertEqual("payload-hash", relayed["envelope"]["payload_hash"])
+
+    def test_worker_relay_read_uses_request_identity_without_an_effect_id(self) -> None:
+        session = AuthenticatedWorkerSession(
+            socket=_RecordingSocket(), reconciliation_cursor=0, worker_id="worker-a"
+        )  # type: ignore[arg-type]
+        session._trader_rpc_scheduler = self._scheduler()
+        payload = {"type": "current_positions"}
+        envelope = {
+            "type": "worker_read_requested",
+            "protocol_version": 1,
+            "trader_id": "trader-1",
+            "worker_id": "worker-a",
+            "runtime_command_id": "command-1",
+            "request_id": "positions-1",
+            "payload_hash": _canonical_hash(payload),
+            "correlation": {"purpose": "fresh-snapshot"},
+            "payload": payload,
+        }
+
+        session._queue_worker_relay({"type": "worker_relay", "envelope": envelope})
+        scheduled = session.receive_trader_rpc()
+
+        self.assertIsInstance(scheduled, ScheduledTraderRpc)
+        self.assertEqual("positions-1", scheduled.command_id)  # type: ignore[union-attr]
+
+    def test_worker_relay_generic_effect_uses_effect_identity(self) -> None:
+        session = AuthenticatedWorkerSession(
+            socket=_RecordingSocket(), reconciliation_cursor=0, worker_id="worker-a"
+        )  # type: ignore[arg-type]
+        session._trader_rpc_scheduler = self._scheduler()
+        operation = {"type": "close", "ticket": "101", "volume": "0.10"}
+        payload = {"operation": "trader_operation", "request": operation}
+        envelope = {
+            "type": "worker_effect_requested",
+            "protocol_version": 1,
+            "trader_id": "trader-1",
+            "worker_id": "worker-a",
+            "runtime_command_id": "command-1",
+            "request_id": "close-1",
+            "effect_id": "command-1:worker-a:close:101:attempt-1",
+            "expires_at": (self.clock.now() + timedelta(seconds=30)).isoformat(),
+            "payload_hash": _canonical_hash(payload),
+            "correlation": {"pair_id": "pair-1", "purpose": "close:101"},
+            "payload": payload,
+        }
+
+        session._queue_worker_relay({"type": "worker_relay", "envelope": envelope})
+        scheduled = session.receive_trader_rpc()
+
+        self.assertIsInstance(scheduled, ScheduledTraderRpc)
+        self.assertEqual(envelope["effect_id"], scheduled.command_id)  # type: ignore[union-attr]
+        self.assertEqual(operation, scheduled.request["payload"])  # type: ignore[union-attr]
 
     def test_queued_expired_hedge_request_returns_its_order_schema(self) -> None:
         socket = _RecordingSocket()
@@ -280,6 +391,12 @@ class _RecordingSocket:
 
     def send(self, message: str) -> None:
         self.sent.append(message)
+
+
+def _canonical_hash(payload: dict[str, object]) -> str:
+    return sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    ).hexdigest()
 
 
 def _request(

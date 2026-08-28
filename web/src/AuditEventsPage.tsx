@@ -124,7 +124,7 @@ export function AuditEventsPage({ csrfToken }: AuditEventsPageProps) {
 
   return (
     <section aria-label="Audit events">
-      <div className="console-table-actions analysis-history-filters" role="search">
+      <div className="console-table-actions console-table-filters" role="search">
         <label htmlFor="audit-events-search">Search</label>
         <input
           id="audit-events-search"

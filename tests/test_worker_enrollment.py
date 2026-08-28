@@ -351,123 +351,6 @@ class WorkerEnrollmentTests(unittest.TestCase):
         self.assertIn("WebSocket closed by controller with code 1008.", errors.getvalue())
         self.assertNotIn("never-display-this-password", errors.getvalue())
 
-    def test_analysis_helper_accepts_m1_verification_requests(self) -> None:
-        session = AuthenticatedWorkerSession(
-            socket=FakeWebSocket(
-                [
-                    {
-                        "type": "product_catalog_analysis_request",
-                        "analysis_id": "analysis-123",
-                        "request_id": "request-123",
-                        "stage": "m1_verification",
-                        "policy": {"label": "FX catalog"},
-                        "timeframe": "M1",
-                        "period_start_utc": "2026-08-10T00:00:00Z",
-                        "period_end_utc": "2026-08-17T00:00:00Z",
-                        "symbols": ["EURUSD"],
-                    }
-                ]
-            ),
-            reconciliation_cursor=0,
-        )
-
-        request = session.receive_product_catalog_analysis()
-
-        self.assertEqual("m1_verification", request["stage"])
-        self.assertEqual("M1", request["timeframe"])
-        self.assertEqual("2026-08-10T00:00:00Z", request["period_start_utc"])
-        self.assertEqual("2026-08-17T00:00:00Z", request["period_end_utc"])
-        self.assertEqual(["EURUSD"], request["symbols"])
-
-    def test_analysis_helper_schedules_order_check_requests(self) -> None:
-        session = AuthenticatedWorkerSession(
-            socket=FakeWebSocket(
-                [
-                    {
-                        "type": "order_check_request",
-                        "analysis_id": "order_check",
-                        "request_id": "order-check-123",
-                        "order": {"symbol": "EURUSD"},
-                    },
-                    {
-                        "type": "product_catalog_analysis_request",
-                        "analysis_id": "analysis-123",
-                        "request_id": "request-123",
-                        "stage": "catalog",
-                        "policy": {},
-                    },
-                ]
-            ),
-            reconciliation_cursor=0,
-        )
-
-        analysis = session.receive_product_catalog_analysis()
-        order_check = session.receive_trader_rpc()
-
-        self.assertEqual("analysis-123", analysis["analysis_id"])
-        assert order_check is not None
-        self.assertEqual(
-            {"request_id": "order-check-123", "order": {"symbol": "EURUSD"}},
-            order_check.request["worker_request"],
-        )
-
-    def test_execution_recovery_helper_accepts_account_recovery_requests(self) -> None:
-        session = AuthenticatedWorkerSession(
-            socket=FakeWebSocket([{"type": "account_recovery_reconcile_request", "request_id": "recovery-123"}]),
-            reconciliation_cursor=0,
-        )
-
-        request = session.receive_execution_recovery()
-
-        self.assertEqual(
-            {"type": "account_recovery_reconcile_request", "request_id": "recovery-123"},
-            request,
-        )
-
-    def test_order_check_response_includes_broker_diagnostics(self) -> None:
-        socket = FakeWebSocket([])
-        session = AuthenticatedWorkerSession(socket=socket, reconciliation_cursor=0)
-
-        session.send_order_check(
-            request_id="order-check-123",
-            order={"symbol": "EURUSD"},
-            accepted=False,
-            diagnostics={"retcode": 10016, "comment": "Invalid stops", "quote": {"bid": 1.2345, "ask": 1.2347}},
-        )
-
-        self.assertEqual(
-            {
-                "type": "order_check_response",
-                "analysis_id": "order_check",
-                "request_id": "order-check-123",
-                "accepted": False,
-                "order": {"symbol": "EURUSD"},
-                "diagnostics": {"retcode": 10016, "comment": "Invalid stops", "quote": {"bid": 1.2345, "ask": 1.2347}},
-            },
-            json.loads(socket.sent[-1]),
-        )
-
-    def test_analysis_helper_includes_period_fields_in_market_data_responses(self) -> None:
-        socket = FakeWebSocket([])
-        session = AuthenticatedWorkerSession(socket=socket, reconciliation_cursor=0)
-
-        session.send_product_catalog_analysis(
-            analysis_id="analysis-123",
-            request_id="request-123",
-            collected_at="2026-08-17T07:05:00Z",
-            symbols=[{"symbol": "EURUSD", "bars": [], "time_metadata": {}}],
-            stage="m1_verification",
-            timeframe="M1",
-            period_start_utc="2026-08-10T00:00:00Z",
-            period_end_utc="2026-08-17T00:00:00Z",
-        )
-
-        payload = json.loads(socket.sent[-1])
-        self.assertEqual("m1_verification", payload["stage"])
-        self.assertEqual("M1", payload["timeframe"])
-        self.assertEqual("2026-08-10T00:00:00Z", payload["period_start_utc"])
-        self.assertEqual("2026-08-17T00:00:00Z", payload["period_end_utc"])
-
 
 class FailingTransport:
     def __init__(self, password: str) -> None:
@@ -668,29 +551,47 @@ class WorkerCredentialTests(unittest.TestCase):
         self.assertIn('"type":"recovery_sync"', socket.sent[0])
         self.assertNotIn("password", socket.sent[0])
 
-    def test_buffers_analysis_request_while_waiting_for_reconciliation_acknowledgement(self) -> None:
+    def test_worker_originates_typed_snapshot_and_delta_envelopes(self) -> None:
         socket = FakeWebSocket(
-            [
-                {
-                    "type": "product_catalog_analysis_request",
-                    "analysis_id": "analysis-123",
-                    "request_id": "request-123",
-                    "stage": "catalog",
-                    "policy": {},
-                },
-                {"type": "accepted", "cursor": 0},
-            ]
+            [{"type": "accepted", "cursor": 4}, {"type": "accepted", "cursor": 5}]
         )
-        session = AuthenticatedWorkerSession(socket=socket, reconciliation_cursor=0)
+        session = AuthenticatedWorkerSession(
+            socket=socket,
+            reconciliation_cursor=3,
+            worker_id="worker-123",
+            recovery_epoch="epoch-1",
+        )
 
         session.send_reconciliation(
-            {"type": "snapshot", "cursor": 0, "observed_at": "2026-08-16T00:00:00+00:00",
-             "account": {}, "terminal": {}, "orders": [], "positions": []}
+            {
+                "type": "snapshot",
+                "cursor": 4,
+                "observed_at": "2026-08-28T08:00:00+00:00",
+                "account": {},
+                "terminal": {},
+                "orders": [{"ticket": 10}],
+                "positions": [{"ticket": 20}],
+            }
         )
-        request = session.receive_product_catalog_analysis(timeout=0)
+        session.send_reconciliation(
+            {
+                "type": "delta",
+                "cursor": 5,
+                "observed_at": "2026-08-28T08:00:01+00:00",
+                "entity": "position",
+                "ticket": "20",
+                "change": "closed",
+                "record": {"ticket": 20},
+            }
+        )
 
-        self.assertEqual("analysis-123", request["analysis_id"])
-        self.assertEqual("request-123", request["request_id"])
+        snapshot, delta = (json.loads(value) for value in socket.sent)
+        self.assertEqual("worker_snapshot", snapshot["envelope"]["type"])
+        self.assertEqual("epoch-1", snapshot["envelope"]["recovery_epoch"])
+        self.assertEqual([{"ticket": 20}], snapshot["envelope"]["positions"])
+        self.assertEqual("worker_broker_delta", delta["envelope"]["type"])
+        self.assertEqual("remove", delta["envelope"]["change"])
+        self.assertEqual(5, session.reconciliation_cursor)
 
     def test_names_session_phase_when_controller_closes_websocket(self) -> None:
         key_store = FakeKeyStore()

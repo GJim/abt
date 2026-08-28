@@ -5,7 +5,6 @@ from base64 import b64encode
 from collections import deque
 from collections.abc import Callable, Iterable
 from pathlib import Path
-from queue import Empty, SimpleQueue
 from time import monotonic
 from typing import Protocol, TextIO
 from urllib.parse import urlsplit, urlunsplit
@@ -81,7 +80,6 @@ def run_trader_session(
     save_cursor: Callable[[int], None],
     on_heartbeat: Callable[[], None] | None = None,
     worker_ids: tuple[str, ...] = ("*",),
-    command_source: SimpleQueue[object] | None = None,
 ) -> None:
     """Run one foreground connection until it disconnects."""
 
@@ -91,13 +89,11 @@ def run_trader_session(
     while True:
         if on_heartbeat is not None:
             on_heartbeat()
-        if command_source is not None:
-            _send_trader_commands(socket, command_source, output)
         if pending_messages:
             message = pending_messages.popleft()
         else:
             try:
-                message = _message(socket, timeout=1 if command_source is not None else 30)
+                message = _message(socket, timeout=30)
             except TimeoutError:
                 if monotonic() - last_heartbeat >= 30:
                     _send(socket, {"type": "heartbeat"})
@@ -111,6 +107,26 @@ def run_trader_session(
         if message_type == "heartbeat_ack":
             continue
         if message_type == "subscribed":
+            continue
+        if message_type == "workers_resumed":
+            continue
+        if message_type == "worker_fact":
+            if (
+                not isinstance(message.get("worker_id"), str)
+                or not isinstance(message.get("envelope"), dict)
+            ):
+                raise TraderEnrollmentError("The controller returned an invalid Worker fact.")
+            output.write(json.dumps(message, separators=(",", ":"), sort_keys=True) + "\n")
+            output.flush()
+            continue
+        if message_type == "worker_stream":
+            if (
+                not isinstance(message.get("worker_id"), str)
+                or not isinstance(message.get("envelope"), dict)
+            ):
+                raise TraderEnrollmentError("The controller returned an invalid Worker stream.")
+            output.write(json.dumps(message, separators=(",", ":"), sort_keys=True) + "\n")
+            output.flush()
             continue
         if message_type == "market_data":
             if (
@@ -170,72 +186,26 @@ def run_trader_session(
             if acknowledged.get("type") == "heartbeat":
                 _send(socket, {"type": "heartbeat"})
                 continue
+            if acknowledged.get("type") == "subscribed":
+                if not isinstance(acknowledged.get("worker_ids"), list) or not all(
+                    isinstance(worker_id, str) and worker_id for worker_id in acknowledged["worker_ids"]
+                ):
+                    raise TraderEnrollmentError("The controller returned an invalid Trader subscription response.")
+                continue
             if acknowledged.get("type") in {
                 "market_data",
                 "market_data_unavailable",
                 "trader_query_result",
                 "trader_rpc_result",
                 "trader_command_result",
+                "worker_fact",
+                "worker_stream",
+                "workers_resumed",
             }:
                 pending_messages.append(acknowledged)
                 continue
             raise TraderEnrollmentError("The controller rejected Trader event acknowledgement.")
         save_cursor(cursor)
-
-
-def _send_trader_commands(socket: TraderWebSocket, command_source: SimpleQueue[object], output: TextIO) -> None:
-    while True:
-        try:
-            command = command_source.get_nowait()
-        except Empty:
-            return
-        if not isinstance(command, dict):
-            _write_jsonl_error(output, "Trader JSONL command must be an object.")
-            continue
-        if set(command) == {"request_id", "query"}:
-            if (
-                not isinstance(command["request_id"], str)
-                or not command["request_id"]
-                or command["query"] != "active_workers"
-            ):
-                _write_jsonl_error(output, "Trader JSONL query contains invalid fields.")
-                continue
-            _send(socket, {"type": "query", **command})
-            continue
-        if set(command) == {"request_id", "command_id", "payload"}:
-            if (
-                not isinstance(command["request_id"], str)
-                or not command["request_id"]
-                or not isinstance(command["command_id"], str)
-                or not command["command_id"]
-                or not isinstance(command["payload"], dict)
-                or command["payload"].get("type") not in {"hedged_entry", "protected_pair", "protected_pair_close"}
-            ):
-                _write_jsonl_error(output, "Trader JSONL command contains invalid fields.")
-                continue
-            _send(socket, {"type": "command", "command_id": command["command_id"], "payload": command["payload"]})
-            continue
-        if set(command) != {"request_id", "worker_id", "payload"}:
-            _write_jsonl_error(
-                output, "Trader JSONL command must contain request_id and query, request_id, command_id, and payload, or request_id, worker_id, and payload."
-            )
-            continue
-        if (
-            not isinstance(command["request_id"], str)
-            or not command["request_id"]
-            or not isinstance(command["worker_id"], str)
-            or not command["worker_id"]
-            or not isinstance(command["payload"], dict)
-        ):
-            _write_jsonl_error(output, "Trader JSONL command contains invalid fields.")
-            continue
-        _send(socket, {"type": "request", **command})
-
-
-def _write_jsonl_error(output: TextIO, reason: str) -> None:
-    output.write(json.dumps({"type": "local_error", "reason": reason}, separators=(",", ":"), sort_keys=True) + "\n")
-    output.flush()
-
 
 def _send_proof(
     socket: TraderWebSocket, key_store: HardwareKeyStore, challenge: dict[str, object], purpose: str, trader_id: str

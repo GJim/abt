@@ -15,6 +15,9 @@ class _ProtocolModel(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
 
+PROTOCOL_VERSION = 1
+
+
 class BrokerReceipt(_ProtocolModel):
     retcode: int
     deal: int | None = None
@@ -86,8 +89,21 @@ class CurrentPositionsRead(_ProtocolModel):
     type: Literal["current_positions"]
 
 
+class BrokerSnapshotRead(_ProtocolModel):
+    type: Literal["broker_snapshot"]
+
+
 TraderRead = Annotated[
-    AccountInfoRead | SymbolInfoRead | SymbolsRead | CalcMarginRead | CalcMarginBatchRead | CalcProfitRead | HistoricalTicksRead | CurrentOrdersRead | CurrentPositionsRead,
+    AccountInfoRead
+    | SymbolInfoRead
+    | SymbolsRead
+    | CalcMarginRead
+    | CalcMarginBatchRead
+    | CalcProfitRead
+    | HistoricalTicksRead
+    | CurrentOrdersRead
+    | CurrentPositionsRead
+    | BrokerSnapshotRead,
     Field(discriminator="type"),
 ]
 
@@ -171,7 +187,12 @@ class TraderRpcRequest(_ProtocolModel):
         ):
             raise ValueError("Trader read requests require a read payload.")
         if self.kind == "operation" and isinstance(
-            self.payload,                                     (AccountInfoRead, SymbolInfoRead, SymbolsRead, CalcMarginRead, CalcMarginBatchRead, CalcProfitRead, HistoricalTicksRead, CurrentOrdersRead, CurrentPositionsRead)
+            self.payload,
+            (
+                AccountInfoRead, SymbolInfoRead, SymbolsRead, CalcMarginRead, CalcMarginBatchRead,
+                CalcProfitRead, HistoricalTicksRead, CurrentOrdersRead, CurrentPositionsRead,
+                BrokerSnapshotRead,
+            ),
         ):
             raise ValueError("Trader operation requests require an operation payload.")
         return self
@@ -197,3 +218,163 @@ TraderRpcResponse = Annotated[TraderRpcSuccess | TraderRpcFailure, Field(discrim
 
 trader_rpc_request_adapter = TypeAdapter(TraderRpcRequest)
 trader_rpc_response_adapter = TypeAdapter(TraderRpcResponse)
+
+
+class RelayCorrelation(_ProtocolModel):
+    pair_id: str | None = None
+    leg: Literal["first", "second"] | None = None
+    purpose: str
+
+
+class ProtectedMarketOrder(_ProtocolModel):
+    action: Literal["market"]
+    symbol: str
+    volume: str
+    direction: Literal["LONG", "SHORT"]
+    filling_mode: Literal["FOK", "IOC"]
+    sl: str
+    tp: str
+
+
+class WorkerReadRequested(_ProtocolModel):
+    type: Literal["worker_read_requested"] = "worker_read_requested"
+    protocol_version: Literal[1] = PROTOCOL_VERSION
+    trader_id: str
+    worker_id: str
+    runtime_command_id: str
+    request_id: str
+    payload_hash: str
+    correlation: RelayCorrelation
+    payload: TraderRead
+
+
+class WorkerEffectPayload(_ProtocolModel):
+    operation: Literal["order_check", "order_execute", "trader_operation"]
+    order: ProtectedMarketOrder | None = None
+    request: TraderOperation | None = None
+
+    @model_validator(mode="after")
+    def matching_operation(self) -> WorkerEffectPayload:
+        if self.operation in {"order_check", "order_execute"} and self.order is None:
+            raise ValueError("Order effects require a protected market order.")
+        if self.operation == "trader_operation" and self.request is None:
+            raise ValueError("Trader operation effects require a request.")
+        if self.order is not None and self.request is not None:
+            raise ValueError("Worker effects contain either an order or a request.")
+        return self
+
+
+class WorkerEffectRequested(_ProtocolModel):
+    type: Literal["worker_effect_requested"] = "worker_effect_requested"
+    protocol_version: Literal[1] = PROTOCOL_VERSION
+    trader_id: str
+    worker_id: str
+    runtime_command_id: str
+    effect_id: str
+    request_id: str
+    expires_at: str
+    payload_hash: str
+    correlation: RelayCorrelation
+    payload: WorkerEffectPayload
+
+    @field_validator("expires_at")
+    @classmethod
+    def valid_expiry(cls, value: str) -> str:
+        from datetime import datetime
+
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            raise ValueError("Worker effect expiry must include an offset.")
+        return value
+
+
+class WorkerReadCompleted(_ProtocolModel):
+    type: Literal["worker_read_completed"] = "worker_read_completed"
+    protocol_version: Literal[1] = PROTOCOL_VERSION
+    trader_id: str
+    worker_id: str
+    runtime_command_id: str
+    request_id: str
+    payload_hash: str
+    correlation: RelayCorrelation
+    recovery_epoch: str
+    snapshot_baseline: int
+    observed_at: str
+    accepted: bool
+    result: dict[str, object] | None = None
+    reason: str | None = None
+
+
+class WorkerEffectOutcome(_ProtocolModel):
+    type: Literal["worker_effect_outcome"] = "worker_effect_outcome"
+    protocol_version: Literal[1] = PROTOCOL_VERSION
+    trader_id: str
+    worker_id: str
+    runtime_command_id: str
+    effect_id: str
+    request_id: str
+    payload_hash: str
+    correlation: RelayCorrelation
+    recovery_epoch: str
+    observed_at: str
+    accepted: bool
+    execution_state: Literal["not_started", "sent", "receipt"] | None = None
+    outcome: str
+    result: dict[str, object]
+    reason: str | None = None
+
+
+class WorkerSnapshot(_ProtocolModel):
+    type: Literal["worker_snapshot"] = "worker_snapshot"
+    protocol_version: Literal[1] = PROTOCOL_VERSION
+    worker_id: str
+    recovery_epoch: str
+    snapshot_baseline: int
+    observed_at: str
+    orders: list[dict[str, object]]
+    positions: list[dict[str, object]]
+
+
+class WorkerBrokerDelta(_ProtocolModel):
+    type: Literal["worker_broker_delta"] = "worker_broker_delta"
+    protocol_version: Literal[1] = PROTOCOL_VERSION
+    worker_id: str
+    recovery_epoch: str
+    event_id: int
+    observed_at: str
+    entity: Literal["order", "position"]
+    change: Literal["upsert", "remove"]
+    record: dict[str, object]
+    originating_effect_id: str | None = None
+
+
+class WorkerStreamResumed(_ProtocolModel):
+    type: Literal["worker_stream_resumed"] = "worker_stream_resumed"
+    protocol_version: Literal[1] = PROTOCOL_VERSION
+    worker_id: str
+    recovery_epoch: str
+    after_event_id: int
+
+
+class WorkerStreamGap(_ProtocolModel):
+    type: Literal["worker_stream_gap"] = "worker_stream_gap"
+    protocol_version: Literal[1] = PROTOCOL_VERSION
+    worker_id: str
+    recovery_epoch: str
+    expected_event_id: int
+    received_event_id: int
+
+
+WorkerRequestEnvelope = Annotated[WorkerReadRequested | WorkerEffectRequested, Field(discriminator="type")]
+WorkerFactEnvelope = Annotated[
+    WorkerReadCompleted
+    | WorkerEffectOutcome
+    | WorkerSnapshot
+    | WorkerBrokerDelta
+    | WorkerStreamResumed
+    | WorkerStreamGap,
+    Field(discriminator="type"),
+]
+
+worker_request_envelope_adapter = TypeAdapter(WorkerRequestEnvelope)
+worker_fact_envelope_adapter = TypeAdapter(WorkerFactEnvelope)
