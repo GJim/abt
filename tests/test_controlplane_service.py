@@ -43,6 +43,7 @@ from abt.controlplane.service import (
     _broadcast_trader_market_data,
     _cancel_intent,
     _dispatch_accepted_trader_intent,
+    _execution_recovery_message,
     _delete_expired_pending_secrets,
     _market_data_statistics,
     _trader_market_snapshots,
@@ -144,6 +145,29 @@ class TraderMarketSubscriptionTests(unittest.TestCase):
         for value in ([], ["*", "worker-1"], [""]):
             with self.assertRaises(ValueError):
                 _trader_market_subscription(value)
+
+
+class ExecutionRecoveryRequestTests(unittest.TestCase):
+    def test_account_recovery_close_excludes_position_observation_fields(self) -> None:
+        message = _execution_recovery_message(
+            "account_recovery_close",
+            "recovery-123",
+            {
+                "ticket": "901",
+                "volume": "0.1",
+                "price_open": "1.1002",
+            },
+        )
+
+        self.assertEqual(
+            {
+                "type": "account_recovery_close_request",
+                "request_id": "recovery-123",
+                "ticket": "901",
+                "volume": "0.1",
+            },
+            message,
+        )
 
 
 class MarketDataAlignmentTests(unittest.TestCase):
@@ -450,6 +474,8 @@ class HedgedEntryExecutionTests(unittest.IsolatedAsyncioTestCase):
                 "direction": "LONG",
                 "filling_mode": "FOK",
                 "margin_limit": "400",
+                "stop_loss": "1.09000",
+                "take_profit": "1.11000",
             },
             "second": {
                 "worker_id": "worker-b",
@@ -458,6 +484,8 @@ class HedgedEntryExecutionTests(unittest.IsolatedAsyncioTestCase):
                 "direction": "SHORT",
                 "filling_mode": "FOK",
                 "margin_limit": "400",
+                "stop_loss": "1.11000",
+                "take_profit": "1.09000",
             },
         }
 
@@ -469,12 +497,16 @@ class HedgedEntryExecutionTests(unittest.IsolatedAsyncioTestCase):
             "volume": leg["volume"],
             "direction": leg["direction"],
             "filling_mode": leg["filling_mode"],
+            "sl": leg["stop_loss"],
+            "tp": leg["take_profit"],
         }
 
     class _Ledger:
         def __init__(self) -> None:
             self.result: dict[str, object] | None = None
             self.recoveries: list[tuple[str, list[str], dict[str, object]]] = []
+            self.unconfirmed: list[tuple[list[str], str, str, dict[str, object]]] = []
+            self.protected_pairs: list[tuple[str, list[dict[str, object]]]] = []
 
         def trader_command_result(self, *_: object) -> dict[str, object] | None:
             return self.result
@@ -498,6 +530,22 @@ class HedgedEntryExecutionTests(unittest.IsolatedAsyncioTestCase):
 
         def begin_empty_convergence(self, worker_ids: list[str], source: str, audit: dict[str, object]) -> None:
             self.recoveries.append((source, worker_ids, audit))
+
+        def begin_entry_unconfirmed(
+            self, worker_ids: list[str], incident_id: str, source: str, audit: dict[str, object]
+        ) -> None:
+            self.unconfirmed.append((worker_ids, incident_id, source, audit))
+
+        def activate_hedged_entry_protected_pair(
+            self, _: str, command_id: str, legs: list[dict[str, object]]
+        ) -> dict[str, object]:
+            self.protected_pairs.append((command_id, legs))
+            return {
+                "pair_id": command_id,
+                "worker_ids": [str(leg["worker_id"]) for leg in legs],
+                "lifecycle_state": "CATCHING_UP",
+                "revision": 0,
+            }
 
     async def test_preflights_and_dispatches_both_legs_concurrently_under_a_pair_lock(self) -> None:
         payload = self._payload()
@@ -529,7 +577,13 @@ class HedgedEntryExecutionTests(unittest.IsolatedAsyncioTestCase):
             if len(sends_entered) == 2:
                 sends_ready.set()
             await release_sends.wait()
-            return {"type": "order_execute_response", "request_id": "send", "accepted": True, "order": order, "result": {"retcode": 10009}}
+            return {
+                "type": "order_execute_response",
+                "request_id": "send",
+                "accepted": True,
+                "order": order,
+                "result": {"retcode": 10009, "position": {"ticket": 11 if connection is first_connection else 22}},
+            }
 
         task = asyncio.create_task(
             _execute_hedged_entry(
@@ -549,10 +603,43 @@ class HedgedEntryExecutionTests(unittest.IsolatedAsyncioTestCase):
             release_checks.set()
             await asyncio.wait_for(sends_ready.wait(), timeout=1)
             self.assertEqual({first_connection, second_connection}, sends_entered)
+            self.assertEqual(
+                [(["worker-a", "worker-b"], "entry-1")],
+                [(worker_ids, incident_id) for worker_ids, incident_id, _, _ in ledger.unconfirmed],
+            )
             release_sends.set()
             result = await task
 
         self.assertEqual("accepted", result["status"])
+        self.assertEqual(("entry-1", "CATCHING_UP"), (result["pair_id"], result["lifecycle_state"]))
+        self.assertEqual(
+            [
+                (
+                    "entry-1",
+                    [
+                        {
+                            "worker_id": "worker-a",
+                            "ticket": "11",
+                            "symbol": "EURUSD",
+                            "side": "0",
+                            "volume": "0.10",
+                            "stop_loss": "1.09000",
+                            "take_profit": "1.11000",
+                        },
+                        {
+                            "worker_id": "worker-b",
+                            "ticket": "22",
+                            "symbol": "EURUSD",
+                            "side": "1",
+                            "volume": "0.10",
+                            "stop_loss": "1.11000",
+                            "take_profit": "1.09000",
+                        },
+                    ],
+                )
+            ],
+            ledger.protected_pairs,
+        )
         self.assertEqual([], ledger.recoveries)
 
     async def test_rejected_preflight_sends_neither_order(self) -> None:
@@ -648,8 +735,8 @@ class HedgedEntryExecutionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual("contained", result["status"])
         self.assertEqual(
-            [("hedged_entry_execution_anomaly", ["worker-a", "worker-b"], ledger.recoveries[0][2])],
-            [(source, worker_ids, audit) for source, worker_ids, audit in ledger.recoveries],
+            [(["worker-a", "worker-b"], "entry-recovery")],
+            [(worker_ids, incident_id) for worker_ids, incident_id, _, _ in ledger.unconfirmed],
         )
         check.assert_not_called()
         execute.assert_not_called()
@@ -689,8 +776,12 @@ class HedgedEntryExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("contained", result["status"])
         self.assertEqual(["accepted", "unknown"], [leg["dispatch"]["status"] for leg in result["legs"]])  # type: ignore[index]
         self.assertEqual(
-            [("hedged_entry_execution_anomaly", ["worker-a", "worker-b"], ledger.recoveries[0][2])],
-            [(source, worker_ids, audit) for source, worker_ids, audit in ledger.recoveries],
+            [(["worker-a", "worker-b"], "entry-3", "hedged_entry_dispatch_started", ledger.unconfirmed[0][3])],
+            ledger.unconfirmed,
+        )
+        self.assertEqual(
+            [(["worker-a", "worker-b"], "entry-3")],
+            [(worker_ids, incident_id) for worker_ids, incident_id, _, _ in ledger.unconfirmed],
         )
 
 
@@ -1272,6 +1363,62 @@ class ControlPlaneServiceTests(unittest.TestCase):
         self.assertEqual(200, events.status_code)
         self.assertIn("worker_certificate_rotated", [event["event_type"] for event in events.json()["items"]])
 
+    def test_trader_inventory_query_serializes_worker_recovery(self) -> None:
+        _, worker_id, _ = self._approved_worker(123456, "Broker-Demo")
+        self.app.state.ledger.begin_empty_convergence(
+            [worker_id],
+            "test_recovery",
+            {"reason": "Test account recovery serialization."},
+        )
+        private_key = ec.generate_private_key(ec.SECP256R1())
+        public_key_pem = private_key.public_key().public_bytes(
+            serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
+        ).decode("utf-8")
+        invite = self.app.state.ledger.create_registration_invite("ABCDEF", "trader")
+        enrollment_payload = json.dumps(
+            {"claimed_public_ip": "203.0.113.4", "registration_invite": invite, "strategy_name": "mean-reversion"},
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        enrollment = self.client.post(
+            "/api/traders/enrollments",
+            json={
+                "registration_invite": invite,
+                "strategy_name": "mean-reversion",
+                "claimed_public_ip": "203.0.113.4",
+                "public_key_pem": public_key_pem,
+                "proof_signature": base64.b64encode(
+                    private_key.sign(enrollment_payload, ec.ECDSA(hashes.SHA256()))
+                ).decode("ascii"),
+            },
+        )
+        login = self.client.post(
+            "/api/admin/login", json={"username": "ABCDEF", "password": "A-secure-admin-password!"}
+        )
+        approval = self.client.post(
+            f"/api/admin/traders/enrollments/{enrollment.json()['registration_id']}/approve",
+            headers={"X-CSRF-Token": login.json()["csrf_token"]},
+        ).json()
+
+        with self.client.websocket_connect("/api/traders/session") as websocket:
+            websocket.send_json({"trader_id": approval["trader_id"], "certificate": approval["certificate"]})
+            challenge = websocket.receive_json()
+            proof = private_key.sign(
+                trader_proof_payload(
+                    purpose=challenge["purpose"], trader_id=challenge["trader_id"], nonce=challenge["nonce"]
+                ),
+                ec.ECDSA(hashes.SHA256()),
+            )
+            websocket.send_json({"signature": base64.b64encode(proof).decode("ascii")})
+            websocket.receive_json()
+            websocket.send_json({"type": "query", "request_id": "workers-1", "query": "active_workers"})
+            response = websocket.receive_json()
+
+        self.assertEqual("trader_query_result", response["type"])
+        self.assertEqual("workers-1", response["request_id"])
+        self.assertEqual("CONVERGING_EMPTY", response["result"]["workers"][0]["recovery"]["lifecycle_state"])
+        self.assertIsInstance(response["result"]["workers"][0]["recovery"]["updated_at"], str)
+
     def test_approved_trader_can_authenticate_to_the_command_websocket(self) -> None:
         private_key = ec.generate_private_key(ec.SECP256R1())
         public_key_pem = private_key.public_key().public_bytes(
@@ -1345,6 +1492,87 @@ class ControlPlaneServiceTests(unittest.TestCase):
         self.assertEqual(result["event_id"], event["event_id"])
         self.assertEqual(event["event_id"], resumed["cursor"])
         self.assertEqual(unacknowledged_event["event_id"], automatically_replayed["event_id"])
+
+    def test_authenticated_trader_can_request_protected_pair_empty_convergence(self) -> None:
+        private_key = ec.generate_private_key(ec.SECP256R1())
+        public_key_pem = private_key.public_key().public_bytes(
+            serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
+        ).decode("utf-8")
+        invite = self.app.state.ledger.create_registration_invite("ABCDEF", "trader")
+        enrollment_payload = json.dumps(
+            {"claimed_public_ip": "203.0.113.4", "registration_invite": invite, "strategy_name": "mean-reversion"},
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        enrollment = self.client.post(
+            "/api/traders/enrollments",
+            json={
+                "registration_invite": invite,
+                "strategy_name": "mean-reversion",
+                "claimed_public_ip": "203.0.113.4",
+                "public_key_pem": public_key_pem,
+                "proof_signature": base64.b64encode(
+                    private_key.sign(enrollment_payload, ec.ECDSA(hashes.SHA256()))
+                ).decode("ascii"),
+            },
+        )
+        login = self.client.post(
+            "/api/admin/login", json={"username": "ABCDEF", "password": "A-secure-admin-password!"}
+        )
+        approval = self.client.post(
+            f"/api/admin/traders/enrollments/{enrollment.json()['registration_id']}/approve",
+            headers={"X-CSRF-Token": login.json()["csrf_token"]},
+        ).json()
+        with self.app.state.ledger._transaction():
+            for worker_id, login, server in (("worker-a", 123456, "Broker-A"), ("worker-b", 654321, "Broker-B")):
+                self.app.state.ledger._connection.execute(
+                    """INSERT INTO workers
+                       (worker_id, enrollment_id, login, server, certificate, status, approved_at)
+                       VALUES (?, ?, ?, ?, ?, 'active', ?)""",
+                    [worker_id, f"enrollment-{worker_id}", login, server, f"certificate:{worker_id}", datetime.now(UTC)],
+                )
+        self.app.state.ledger.register_protected_pair(
+            approval["trader_id"],
+            "pair-close",
+            [
+                {"worker_id": "worker-a", "ticket": "10", "symbol": "EURUSD.a", "side": "0", "volume": "0.1", "stop_loss": "1.0", "take_profit": "1.2"},
+                {"worker_id": "worker-b", "ticket": "20", "symbol": "EURUSD", "side": "1", "volume": "0.1", "stop_loss": "1.3", "take_profit": "1.1"},
+            ],
+        )
+
+        with self.client.websocket_connect("/api/traders/session") as websocket:
+            websocket.send_json({"trader_id": approval["trader_id"], "certificate": approval["certificate"]})
+            challenge = websocket.receive_json()
+            proof = private_key.sign(
+                trader_proof_payload(
+                    purpose=challenge["purpose"], trader_id=challenge["trader_id"], nonce=challenge["nonce"]
+                ),
+                ec.ECDSA(hashes.SHA256()),
+            )
+            websocket.send_json({"signature": base64.b64encode(proof).decode("ascii")})
+            websocket.receive_json()
+            websocket.send_json(
+                {
+                    "type": "command",
+                    "command_id": "close-001",
+                    "payload": {"type": "protected_pair_close", "pair_id": "pair-close"},
+                }
+            )
+            messages = [websocket.receive_json() for _ in range(3)]
+
+        response = next(message for message in messages if message["type"] == "trader_command_result")
+        event = next(message for message in messages if message.get("event_type") == "protected_pair_close_requested")
+        self.assertEqual("trader_command_result", response["type"])
+        self.assertEqual("close-001", response["request_id"])
+        self.assertEqual(
+            ("accepted", "desired_empty_requested", "pair-close", "CONVERGING_EMPTY"),
+            tuple(response["result"][key] for key in ("status", "reason_code", "pair_id", "lifecycle_state")),
+        )
+        self.assertEqual("protected_pair_close_requested", event["event_type"])
+        self.assertEqual(
+            {"CONVERGING_EMPTY"},
+            {record["lifecycle_state"] for record in self.app.state.ledger.account_recoveries()},
+        )
 
     def test_worker_and_trader_reject_invalid_registration_invites(self) -> None:
         private_key = ec.generate_private_key(ec.SECP256R1())
@@ -1687,7 +1915,7 @@ class ControlPlaneServiceTests(unittest.TestCase):
             )
             websocket.send_json({"signature": base64.b64encode(signature).decode("ascii")})
             websocket.receive_json()
-            websocket.send_json({"type": "snapshot", "cursor": 0, "observed_at": "2026-08-16T00:00:00+00:00",
+            websocket.send_json({"type": "snapshot", "cursor": 0, "observed_at": "2026-08-16T00:00:00+00:00", "recovery_epoch": "epoch-1",
                                  "account": {"balance": 1000}, "terminal": {"connected": True},
                                  "orders": [], "positions": []})
             self.assertEqual({"type": "accepted", "cursor": 0}, websocket.receive_json())
@@ -1719,7 +1947,7 @@ class ControlPlaneServiceTests(unittest.TestCase):
             )
             self.assertEqual({"type": "live_state_accepted"}, websocket.receive_json())
             first_snapshot_id = self.client.get("/api/admin/workers").json()[0]["latest_snapshot"]["snapshot_id"]
-            websocket.send_json({"type": "snapshot", "cursor": 0, "observed_at": "2026-08-16T00:10:00+00:00",
+            websocket.send_json({"type": "snapshot", "cursor": 0, "observed_at": "2026-08-16T00:10:00+00:00", "recovery_epoch": "epoch-1",
                                  "account": {"balance": 1000}, "terminal": {"connected": True},
                                  "orders": [], "positions": []})
             self.assertEqual({"type": "accepted", "cursor": 0}, websocket.receive_json())
@@ -1739,7 +1967,7 @@ class ControlPlaneServiceTests(unittest.TestCase):
             )
             websocket.send_json({"signature": base64.b64encode(signature).decode("ascii")})
             self.assertEqual({"type": "authenticated", "worker_id": worker_id, "cursor": 1}, websocket.receive_json())
-            websocket.send_json({"type": "snapshot", "cursor": 1, "observed_at": "2026-08-16T00:20:00+00:00",
+            websocket.send_json({"type": "snapshot", "cursor": 1, "observed_at": "2026-08-16T00:20:00+00:00", "recovery_epoch": "epoch-2",
                                  "account": {"balance": 1000}, "terminal": {"connected": True},
                                  "orders": [], "positions": []})
             self.assertEqual({"type": "accepted", "cursor": 1}, websocket.receive_json())

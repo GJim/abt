@@ -62,18 +62,23 @@ concurrently, and dispatches only if both checks and the remaining shared
 deadline succeed. Checks do not reserve liquidity. Worker scheduling may reject
 an expired request before broker submission, which rejects the pair without
 sending either order; it must never present a post-send lost response as a safe
-rejection. The controller persists the command, per-leg broker receipts, and
-timings before reporting its outcome. FOK is selected whenever both Workers
-support it; a failed FOK is rejected and never silently retried as IOC.
+rejection. Before market dispatch, the controller durably marks both accounts
+`ENTRY_UNCONFIRMED` and records the requested initial SL/TP. It supplies those
+targets in each Worker market-order effect, whose journal never resends an
+effect that crossed `send_started`. The controller persists the command,
+per-leg broker receipts, and timings before reporting its outcome. FOK is
+selected whenever both Workers support it; a failed FOK is rejected and never
+silently retried as IOC.
 If either send fails or is unknown after a counterpart may have been sent, the
 controller transitions both accounts to `CONVERGING_EMPTY`: it observes the
 broker state, cancels observed orders, observes again, closes observed
 positions, and requires a final empty observation. The strategy stops without
-attempting an unsafe individual-order fallback. After both SL/TP writes, it
-registers the expected protected legs; only a fresh full snapshot from each
-Worker with matching ticket, symbol, side, volume, SL, TP, and no pending
-orders marks the pair `ACTIVE_VERIFIED`. Any cross-broker mismatch converges
-both accounts to empty. Ctrl+C
+attempting an unsafe individual-order fallback. After both protected market
+receipts, the controller binds their tickets to the durable pair and returns
+`CATCHING_UP`; only a fresh full snapshot from each Worker with matching
+ticket, symbol, side, volume, SL, TP, and no pending orders marks the pair
+`ACTIVE_VERIFIED`. Any cross-broker mismatch converges both accounts to empty.
+Ctrl+C
 and risk or integrity failures still flatten every position on both selected
 accounts. A disconnected Trader can recover the durable command outcome by its
 original command ID through the replayed `hedged_entry_completed` event; until
@@ -81,13 +86,18 @@ then it treats the entry as potentially dispatched and does not race recovery
 with direct closes. Start only after confirming both accounts contain no
 unrelated positions.
 
-After each confirmed market fill, the strategy uses the Worker broker
-`calc_profit` read to derive an emergency SL and TP, each for
+Before each market command, the strategy uses the Worker broker `calc_profit`
+read and the current executable quote to derive requested absolute emergency
+SL and TP targets, each for
 the lower of `--emergency-stop-loss-usd` (default: US$40) and the endpoint's
 allocation-based 2% per-trade and remaining 3% daily loss limits in absolute
-projected P/L, and applies them together with `modify_sl_tp`. The matching
-dollar amount is used rather than the other broker's price because the brokers
-can quote different prices, spreads, precision, and contract terms.
+projected P/L. It passes these targets only in the controller-owned
+`hedged_entry` command; it never follows a fill with generic `modify_sl_tp` or
+`protected_pair` writes. The matching dollar amount is used rather than the
+other broker's price because the brokers can quote different prices, spreads,
+precision, and contract terms. The strategy remains stopped while controller
+verification is pending rather than treating broker receipts as a verified
+hedge.
 
 A broker TP remains emergency protection, not the normal pair exit: the
 strategy normally closes both legs together on its reverse signal. If either

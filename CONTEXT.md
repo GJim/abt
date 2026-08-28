@@ -92,6 +92,18 @@ _Avoid_: 反向訂單
 **帳戶復原生命週期**:
 以 broker observation 作事實、主控台 ledger desired state 作目標的帳戶安全狀態機。`ENTRY_UNCONFIRMED`、`CATCHING_UP`、`CONVERGING_EMPTY`、`ACTIVE_VERIFIED`、`READY`、`NEEDS_HUMAN` 與 `REVOKED` 都會持久化；只有 `READY` 可接受新進場。routine uncertain effect 以觀測後的新補償 effect 收斂，不以重送或永久 freeze 處理。
 
+**已驗證受保護配對**:
+兩個 broker-observed legs 與其 ticket、方向、數量及 SL/TP 均符合相同 pair revision 的開放避險，狀態為 `ACTIVE_VERIFIED`。它不是可建立新曝險的 `READY` 帳戶，但 pair owner 可只針對已驗證的 legs 降低曝險。
+_Avoid_: 已完成復原帳戶
+
+**進場資格與減曝險權限**:
+`READY` 是建立新曝險的唯一資格；減少既有已驗證曝險是獨立權限，不能因帳戶不是 `READY` 而一併拒絕。
+_Avoid_: 通用 operation 權限
+
+**受保護配對指令**:
+Trader 對其擁有的配對反向避險提交的持久化開倉、保護更新或平倉意圖。平倉指令宣告兩腿的 desired state 為 `EMPTY`，不是要求重送特定 broker close；主控台以 Account Recovery Lifecycle、Worker effect journal 與新的 broker observation 完成收斂。
+_Avoid_: 配對的逐腿 Trader worker operation
+
 **Worker effect journal**:
 帳戶工作者本機 SQLite/WAL 的 broker write 證據簿。每個 effect 在 MT5 write 前寫入 `prepared`，緊接 send 前寫入 `send_started`，receipt 或 broker observation 後保存證據。`send_started` effect 永遠不得以相同 effect ID 重送。
 

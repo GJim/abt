@@ -1400,7 +1400,11 @@ def _json_value(value: object) -> object:
 def _broker_order_request(mt5: object, order: dict[str, object]) -> dict[str, object]:
     if order.get("action") == "market":
         required = ("symbol", "volume", "direction", "filling_mode")
-        if set(order) != {"action", *required} or order.get("direction") not in {"LONG", "SHORT"}:
+        protection = ("sl", "tp")
+        expected_fields = {"action", *required}
+        if all(field in order for field in protection):
+            expected_fields.update(protection)
+        if set(order) != expected_fields or order.get("direction") not in {"LONG", "SHORT"}:
             raise WorkerEnrollmentError("The controller requested an invalid market order.")
         if order.get("filling_mode") not in {"FOK", "IOC"} or not all(isinstance(order[field], str) and order[field] for field in required):
             raise WorkerEnrollmentError("The controller requested an invalid market order.")
@@ -1411,7 +1415,7 @@ def _broker_order_request(mt5: object, order: dict[str, object]) -> dict[str, ob
             price = tick.get(price_key)
             if isinstance(price, bool) or not isinstance(price, (int, float)) or price <= 0:
                 raise ValueError
-            return {
+            request = {
                 "action": getattr(mt5, "TRADE_ACTION_DEAL"),
                 "symbol": order["symbol"],
                 "volume": float(str(order["volume"])),
@@ -1419,6 +1423,12 @@ def _broker_order_request(mt5: object, order: dict[str, object]) -> dict[str, ob
                 "price": price,
                 "type_filling": getattr(mt5, "ORDER_FILLING_FOK" if order["filling_mode"] == "FOK" else "ORDER_FILLING_IOC"),
             }
+            if protection[0] in order:
+                values = {field: float(str(order[field])) for field in protection}
+                if not all(math.isfinite(value) and value > 0 for value in values.values()):
+                    raise ValueError
+                request.update(values)
+            return request
         except (TypeError, ValueError, AttributeError) as error:
             raise WorkerEnrollmentError("The controller requested an invalid market order.") from error
     if order.get("action") == "protect":

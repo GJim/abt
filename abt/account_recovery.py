@@ -7,6 +7,8 @@ state and next recovery action; transports and MT5 access remain adapters.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
+from math import isfinite
 from typing import Literal
 
 
@@ -241,11 +243,49 @@ def _matches_protected_leg(
     if orders or len(positions) != 1:
         return False
     position = positions[0]
+    expected_volume = _canonical_decimal(expected.volume)
+    expected_stop_loss = _canonical_decimal(expected.stop_loss)
+    expected_take_profit = _canonical_decimal(expected.take_profit)
+    observed_volume = _canonical_decimal(position.get("volume"))
+    observed_stop_loss = _canonical_decimal(position.get("sl", position.get("stop_loss")))
+    observed_take_profit = _canonical_decimal(position.get("tp", position.get("take_profit")))
+    if None in (
+        expected_volume,
+        expected_stop_loss,
+        expected_take_profit,
+        observed_volume,
+        observed_stop_loss,
+        observed_take_profit,
+    ):
+        return False
     return (
         str(position.get("ticket")) == expected.ticket
         and str(position.get("symbol")) == expected.symbol
         and str(position.get("type", position.get("side"))) == expected.side
-        and str(position.get("volume")) == expected.volume
-        and str(position.get("sl", position.get("stop_loss"))) == expected.stop_loss
-        and str(position.get("tp", position.get("take_profit"))) == expected.take_profit
+        and observed_volume == expected_volume
+        and observed_stop_loss == expected_stop_loss
+        and observed_take_profit == expected_take_profit
     )
+
+
+def _canonical_decimal(value: object) -> Decimal | None:
+    """Return finite Decimal evidence only for supported broker value types."""
+
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, Decimal):
+        result = value
+    elif isinstance(value, int):
+        result = Decimal(value)
+    elif isinstance(value, float):
+        if not isfinite(value):
+            return None
+        result = Decimal(str(value))
+    elif isinstance(value, str):
+        try:
+            result = Decimal(value)
+        except (InvalidOperation, ValueError):
+            return None
+    else:
+        return None
+    return result if result.is_finite() else None

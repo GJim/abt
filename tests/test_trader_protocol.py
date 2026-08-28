@@ -77,6 +77,25 @@ class TraderProtocolTests(unittest.TestCase):
                 }
             )
 
+    def test_rejects_protection_fields_on_generic_market_operation(self) -> None:
+        with self.assertRaises(ValidationError):
+            trader_rpc_request_adapter.validate_python(
+                {
+                    "type": "trader_rpc_request",
+                    "request_id": "request-1",
+                    "kind": "operation",
+                    "payload": {
+                        "type": "market",
+                        "symbol": "EURUSD",
+                        "volume": "0.01",
+                        "direction": "LONG",
+                        "filling_mode": "FOK",
+                        "sl": "1.09000",
+                        "tp": "1.11000",
+                    },
+                }
+            )
+
     def test_rejects_read_kind_with_an_operation_payload(self) -> None:
         with self.assertRaises(ValidationError):
             trader_rpc_request_adapter.validate_python(

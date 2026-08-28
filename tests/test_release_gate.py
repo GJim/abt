@@ -175,7 +175,7 @@ class TwoWorkerReleaseExerciseTests(unittest.TestCase):
             websocket.send_json({"type": "password_request"})
             self.assertTrue(websocket.receive_json()["password"])
             websocket.send_json(
-                {"type": "snapshot", "cursor": cursor, "observed_at": "2026-08-16T00:00:00+00:00",
+                {"type": "snapshot", "cursor": cursor, "observed_at": "2026-08-16T00:00:00+00:00", "recovery_epoch": "epoch-1",
                  "account": {"login": worker_id}, "terminal": {"trade_allowed": False}, "orders": [], "positions": []}
             )
             self.assertEqual({"type": "accepted", "cursor": cursor}, websocket.receive_json())

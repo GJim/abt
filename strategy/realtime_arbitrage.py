@@ -11,7 +11,7 @@ import subprocess
 import sys
 from collections import deque
 from dataclasses import dataclass
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
 from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
 from queue import Empty, Queue
@@ -101,6 +101,7 @@ class SymbolSpecification:
 @dataclass(frozen=True, slots=True)
 class SharedSymbol:
     point: float
+    trade_tick_size: float
     filling_mode: str
     volume_min: float
     volume_step: float
@@ -119,6 +120,7 @@ class Pair:
     second_direction: str
     volume: float
     opened_at: datetime
+    pair_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -204,21 +206,22 @@ class TraderGateway:
                 return message["payload"]["outcome"]
             self._deferred.append(message)
 
-    def protected_pair(self, pair_id: str, legs: list[dict[str, object]]) -> dict[str, object]:
-        command_id = f"{pair_id}:protected"
+    def protected_pair_close(self, pair_id: str) -> dict[str, object]:
+        command_id = f"{pair_id}:close"
+        _LOGGER.debug("protected_pair_close_request pair_id=%s command_id=%s", pair_id, command_id)
         self._send(
             {
                 "request_id": command_id,
                 "command_id": command_id,
-                "payload": {"type": "protected_pair", "pair_id": pair_id, "legs": legs},
+                "payload": {"type": "protected_pair_close", "pair_id": pair_id},
             }
         )
         while True:
             message = self._next()
             if message.get("type") == "trader_command_result" and message.get("request_id") == command_id:
                 result = message.get("result")
-                if not isinstance(result, dict):
-                    raise StrategyError("Controller returned an invalid protected-pair result.")
+                if not isinstance(result, dict) or not isinstance(result.get("status"), str):
+                    raise StrategyError("Controller returned an invalid protected-pair close result.")
                 return result
             self._deferred.append(message)
 
@@ -255,8 +258,11 @@ class TraderGateway:
     def _send(self, message: dict[str, object]) -> None:
         if self._process.poll() is not None or self._process.stdin is None:
             raise StrategyError("Trader process is not running.")
-        self._process.stdin.write(json.dumps(message, separators=(",", ":")) + "\n")
-        self._process.stdin.flush()
+        try:
+            self._process.stdin.write(json.dumps(message, separators=(",", ":")) + "\n")
+            self._process.stdin.flush()
+        except OSError as error:
+            raise StrategyError("Trader process is not running.") from error
 
     def _next(self) -> dict[str, object]:
         try:
@@ -316,6 +322,7 @@ class RealtimeArbitrage:
         self.worker_disconnect_deadline: datetime | None = None
         self.unresolved_write_failure = False
         self.controller_containment_required = False
+        self.controller_owned_pair_pending = False
         self.awaiting_clear_symbol: str | None = None
         self.stopped = False
         self.completed_trades = 0
@@ -365,8 +372,22 @@ class RealtimeArbitrage:
                                 max(0, remaining),
                             )
                             continue
-                        _LOGGER.info("reverse_signal_close symbol=%s old_direction=%s new_direction=%s", self.pair.symbol, self.pair.direction, candidate.direction)
+                        _LOGGER.info(
+                            "reverse_signal_close symbol=%s old_direction=%s new_direction=%s edge=%.10g "
+                            "first_bid/ask=%s second_bid/ask=%s",
+                            self.pair.symbol,
+                            self.pair.direction,
+                            candidate.direction,
+                            candidate.edge,
+                            self._quote_text("first", self.pair.symbol),
+                            self._quote_text("second", self.pair.symbol),
+                        )
+                        active_pair_id = self.pair.pair_id
                         self._flatten_all()
+                        if self.config.execute and active_pair_id is not None:
+                            self.stopped = True
+                            _LOGGER.info("strategy_stopped_after_protected_pair_close pair_id=%s", active_pair_id)
+                            continue
                         self.completed_trades += 1
                         self.awaiting_clear_symbol, self.pair = self.pair.symbol, None
                     continue
@@ -387,7 +408,7 @@ class RealtimeArbitrage:
 
     def shutdown(self) -> None:
         _LOGGER.info("strategy_shutdown_requested execute=%s", self.config.execute)
-        if self.config.execute and not self.controller_containment_required:
+        if self.config.execute and not self.controller_containment_required and not self.controller_owned_pair_pending:
             self._flatten_all()
         _LOGGER.info("strategy_shutdown_complete")
 
@@ -440,6 +461,7 @@ class RealtimeArbitrage:
                 continue
             shared[symbol] = SharedSymbol(
                 point=first.point,
+                trade_tick_size=first.trade_tick_size,
                 filling_mode=filling_mode,
                 volume_min=first.volume_min,
                 volume_step=first.volume_step,
@@ -681,6 +703,10 @@ class RealtimeArbitrage:
             return None
         return plan
 
+    def _quote_text(self, name: str, symbol: str) -> str:
+        quote = self.quotes[name].get(symbol)
+        return "unavailable" if quote is None else f"{quote[1]:.10g}/{quote[2]:.10g}"
+
     def _open(self, candidate: TradeCandidate) -> None:
         symbol, direction = candidate.symbol, candidate.direction
         first_direction, second_direction = ("SHORT", "LONG") if direction == "short_first_long_second" else ("LONG", "SHORT")
@@ -692,12 +718,15 @@ class RealtimeArbitrage:
             return
         volume = plan.volume
         _LOGGER.info(
-            "entry_signal symbol=%s direction=%s edge=%s first_side=%s second_side=%s volume=%s",
+            "entry_signal symbol=%s direction=%s edge=%.10g first_side=%s bid/ask=%s "
+            "second_side=%s bid/ask=%s volume=%s",
             symbol,
             direction,
             candidate.edge,
-            first_direction,
-            second_direction,
+            "SELL" if first_direction == "SHORT" else "BUY",
+            self._quote_text("first", symbol),
+            "SELL" if second_direction == "SHORT" else "BUY",
+            self._quote_text("second", symbol),
             _volume_text(volume, self.shared_symbols[symbol].volume_step),
         )
         try:
@@ -713,6 +742,14 @@ class RealtimeArbitrage:
                 )
                 return
             specification = self.shared_symbols[symbol]
+            first_entry = self._entry_price("first", symbol, first_direction)
+            second_entry = self._entry_price("second", symbol, second_direction)
+            first_stop_loss, first_take_profit = self._initial_protection_targets(
+                "first", symbol, first_direction, first_entry, volume
+            )
+            second_stop_loss, second_take_profit = self._initial_protection_targets(
+                "second", symbol, second_direction, second_entry, volume
+            )
             try:
                 result = self.gateway.hedged_entry(
                     {
@@ -725,6 +762,8 @@ class RealtimeArbitrage:
                             "direction": first_direction,
                             "filling_mode": specification.filling_mode,
                             "margin_limit": f"{plan.first_margin_limit:.2f}",
+                            "stop_loss": first_stop_loss,
+                            "take_profit": first_take_profit,
                         },
                         "second": {
                             "worker_id": self.endpoints["second"].worker_id,
@@ -733,6 +772,8 @@ class RealtimeArbitrage:
                             "direction": second_direction,
                             "filling_mode": specification.filling_mode,
                             "margin_limit": f"{plan.second_margin_limit:.2f}",
+                            "stop_loss": second_stop_loss,
+                            "take_profit": second_take_profit,
                         },
                     }
                 )
@@ -750,64 +791,51 @@ class RealtimeArbitrage:
                 raise HedgedEntryContained(
                     f"Hedged entry outcome requires controller containment: {result.get('reason', command_status)!s}"
                 )
-            first_position = self._expected_position("first", symbol, first_direction, volume)
-            second_position = self._expected_position("second", symbol, second_direction, volume)
-            first_leg = self._set_emergency_protection("first", symbol, first_position, first_direction, volume)
-            second_leg = self._set_emergency_protection("second", symbol, second_position, second_direction, volume)
-            pair_id = result.get("command_id")
+            if result.get("lifecycle_state") != "CATCHING_UP":
+                self.stopped = True
+                self.controller_containment_required = True
+                raise HedgedEntryContained("Hedged entry was accepted without controller-owned paired verification.")
+            pair_id = result.get("pair_id")
             if not isinstance(pair_id, str) or not pair_id:
-                raise StrategyError("Controller did not return the durable hedged-entry command ID.")
-            self.gateway.protected_pair(pair_id, [first_leg, second_leg])
+                self.stopped = True
+                self.controller_containment_required = True
+                raise HedgedEntryContained("Hedged entry was accepted without a controller-owned pair ID.")
+            self.pair = Pair(
+                symbol,
+                direction,
+                first_entry,
+                second_entry,
+                0,
+                0,
+                first_direction,
+                second_direction,
+                volume,
+                datetime.now(UTC),
+                pair_id,
+            )
+            self.controller_owned_pair_pending = True
+            _LOGGER.info(
+                "hedged_entry_accepted_awaiting_controller_verification command_id=%s pair_id=%s",
+                result.get("command_id"),
+                pair_id,
+            )
+            return
         except WorkerRpcUnavailable:
             raise
         except HedgedEntryContained:
             raise
         except Exception as error:
             self._halt(f"unhedged entry: {error}")
-        self.pair = Pair(
-            symbol,
-            direction,
-            _positive(first_position.get("price_open"), "first position price_open"),
-            _positive(second_position.get("price_open"), "second position price_open"),
-            _ticket(first_position),
-            _ticket(second_position),
-            first_direction,
-            second_direction,
-            volume,
-            datetime.now(UTC),
-        )
-        _LOGGER.info(
-            "pair_opened symbol=%s direction=%s volume=%s first_entry=%.5f second_entry=%.5f",
-            symbol,
-            direction,
-            _volume_text(volume, self.shared_symbols[symbol].volume_step),
-            self.pair.first_entry,
-            self.pair.second_entry,
-        )
+    def _entry_price(self, name: str, symbol: str, direction: str) -> float:
+        quote = self.quotes[name].get(symbol)
+        if quote is None:
+            raise StrategyError(f"Worker {self.endpoints[name].worker_id} has no current entry quote.")
+        return quote[2] if direction == "LONG" else quote[1]
 
-    def _expected_position(self, name: str, symbol: str, direction: str, volume: float) -> dict[str, object]:
+    def _initial_protection_targets(
+        self, name: str, symbol: str, direction: str, entry: float, volume: float
+    ) -> tuple[str, str]:
         endpoint = self.endpoints[name]
-        result = self.gateway.request(endpoint.worker_id, kind="read", request={"type": "current_positions"})
-        positions = result.get("positions")
-        expected_type = 0 if direction == "LONG" else 1
-        matching = [
-            position
-            for position in positions if isinstance(position, dict)
-            and position.get("symbol") == symbol
-            and position.get("type") == expected_type
-            and _volume_matches(position.get("volume"), volume)
-        ] if isinstance(positions, list) else []
-        if len(matching) != 1:
-            raise StrategyError(f"Worker {endpoint.worker_id} did not confirm one expected position.")
-        return matching[0]
-
-    def _set_emergency_protection(
-        self, name: str, symbol: str, position: dict[str, object], direction: str, volume: float
-    ) -> dict[str, object]:
-        if not self.config.execute:
-            return
-        endpoint = self.endpoints[name]
-        entry = _positive(position.get("price_open"), "position price_open")
         loss_limit = min(
             self.config.emergency_stop_loss_usd,
             self.exposure_caps[name] * self.config.trade_loss_fraction,
@@ -815,40 +843,23 @@ class RealtimeArbitrage:
         )
         if loss_limit <= 0:
             raise StrategyError(f"Cannot protect {name} position: daily loss budget is exhausted.")
-        sl = self._profit_target_price(endpoint, symbol, direction, entry, volume, -loss_limit)
-        tp = self._profit_target_price(endpoint, symbol, direction, entry, volume, loss_limit)
-        self.gateway.request(
-            endpoint.worker_id,
-            kind="operation",
-            request={
-                "type": "modify_sl_tp",
-                "symbol": symbol,
-                "position": str(_ticket(position)),
-                "sl": f"{sl:.10f}",
-                "tp": f"{tp:.10f}",
-            },
+        specification = self.shared_symbols[symbol]
+        sl = _tick_price_text(
+            self._profit_target_price(endpoint, symbol, direction, entry, volume, -loss_limit),
+            specification.trade_tick_size,
+        )
+        tp = _tick_price_text(
+            self._profit_target_price(endpoint, symbol, direction, entry, volume, loss_limit),
+            specification.trade_tick_size,
         )
         _LOGGER.info(
-            "emergency_protection_set endpoint=%s ticket=%s sl=%.10f tp=%.10f magnitude_usd=%.2f",
+            "initial_protection_calculated endpoint=%s sl=%.10f tp=%.10f magnitude_usd=%.2f",
             name,
-            _ticket(position),
-            sl,
-            tp,
+            float(sl),
+            float(tp),
             loss_limit,
         )
-        side = position.get("type", 0 if direction == "LONG" else 1)
-        position_volume = position.get("volume", volume)
-        if isinstance(side, bool) or not isinstance(side, int) or isinstance(position_volume, bool) or not isinstance(position_volume, (int, float)):
-            raise StrategyError(f"Worker {endpoint.worker_id} returned an invalid protected position.")
-        return {
-            "worker_id": endpoint.worker_id,
-            "ticket": str(_ticket(position)),
-            "symbol": symbol,
-            "side": str(side),
-            "volume": str(position_volume),
-            "stop_loss": f"{sl:.10f}",
-            "take_profit": f"{tp:.10f}",
-        }
+        return sl, tp
 
     def _profit_target_price(
         self, endpoint: Endpoint, symbol: str, direction: str, entry: float, volume: float, target_profit: float
@@ -988,6 +999,21 @@ class RealtimeArbitrage:
         return float(profit)
 
     def _flatten_all(self) -> None:
+        if self.config.execute and self.pair is not None and self.pair.pair_id is not None:
+            result = self.gateway.protected_pair_close(self.pair.pair_id)
+            status = result.get("status")
+            if status not in {"accepted", "pending", "containing"}:
+                reason = result.get("reason")
+                detail = reason if isinstance(reason, str) and reason else str(status)
+                raise StrategyError(f"Controller rejected protected-pair close: {detail}")
+            _LOGGER.info(
+                "protected_pair_close_requested pair_id=%s status=%s lifecycle_state=%s revision=%s",
+                self.pair.pair_id,
+                status,
+                result.get("lifecycle_state"),
+                result.get("revision"),
+            )
+            return
         for name, endpoint in self.endpoints.items():
             if not self.config.execute:
                 continue
@@ -999,14 +1025,38 @@ class RealtimeArbitrage:
             for position in positions:
                 if not isinstance(position, dict) or not isinstance(position.get("ticket"), int) or not isinstance(position.get("volume"), (int, float)):
                     raise StrategyError("Worker returned an unclsoable position.")
+                symbol = position.get("symbol")
+                close_side = "SELL" if position.get("type") == 0 else "BUY" if position.get("type") == 1 else "UNKNOWN"
+                quote = self._quote_text(name, symbol) if isinstance(symbol, str) else "unavailable"
+                _LOGGER.info(
+                    "exit_close_request endpoint=%s symbol=%s close_side=%s ticket=%s volume=%.2f bid/ask=%s",
+                    name,
+                    symbol if isinstance(symbol, str) else "unknown",
+                    close_side,
+                    position["ticket"],
+                    float(position["volume"]),
+                    quote,
+                )
                 self.gateway.request(endpoint.worker_id, kind="operation", request={"type": "close", "ticket": str(position["ticket"]), "volume": f"{float(position['volume']):.2f}"})
-                _LOGGER.info("position_closed endpoint=%s ticket=%s volume=%.2f", name, position["ticket"], float(position["volume"]))
+                _LOGGER.info(
+                    "position_closed endpoint=%s symbol=%s close_side=%s ticket=%s volume=%.2f bid/ask=%s",
+                    name,
+                    symbol if isinstance(symbol, str) else "unknown",
+                    close_side,
+                    position["ticket"],
+                    float(position["volume"]),
+                    quote,
+                )
             self.accounts[name] = self._account(endpoint)
 
     def _halt(self, reason: str) -> None:
         self.stopped = True
         _LOGGER.warning("strategy_halt reason=%s", reason)
-        self._flatten_all()
+        try:
+            self._flatten_all()
+        except StrategyError as error:
+            self.controller_containment_required = True
+            raise StrategyError(f"{reason}; emergency flatten unavailable: {error}") from error
         raise StrategyError(reason)
 
     def _reset_daily_equity(self) -> None:
@@ -1023,6 +1073,12 @@ def _positive(value: object, field: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
         raise StrategyError(f"Invalid {field}.")
     return float(value)
+
+
+def _tick_price_text(price: float, tick_size: float) -> str:
+    tick = Decimal(str(tick_size))
+    normalized = (Decimal(str(price)) / tick).to_integral_value(rounding=ROUND_HALF_UP) * tick
+    return format(normalized.normalize(), "f")
 
 
 def _positive_finite(value: object) -> bool:

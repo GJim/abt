@@ -92,6 +92,244 @@ class ControlLedgerTests(unittest.TestCase):
                 trader_id, "entry-001", {**payload, "first": {**payload["first"], "volume": "0.20"}}, outcome
             )
 
+    def test_accepted_hedged_entry_binds_controller_protection_before_paired_verification(self) -> None:
+        with self.ledger._transaction():
+            for worker_id, login, server in (("worker-a", 123456, "Broker-A"), ("worker-b", 654321, "Broker-B")):
+                self.ledger._connection.execute(
+                    """INSERT INTO workers
+                       (worker_id, enrollment_id, login, server, certificate, status, approved_at)
+                       VALUES (?, ?, ?, ?, ?, 'active', ?)""",
+                    [worker_id, f"enrollment-{worker_id}", login, server, f"certificate:{worker_id}", datetime.now(UTC)],
+                )
+        owner_enrollment = self.ledger.create_trader_enrollment(
+            strategy_name="realtime-arbitrage", claimed_public_ip="203.0.113.4", public_key_pem="owner-key"
+        )
+        owner_id = self.ledger.approve_trader_enrollment(
+            owner_enrollment["registration_id"], "ABCDEF", lambda value, *_: f"certificate:{value}"
+        )
+        other_enrollment = self.ledger.create_trader_enrollment(
+            strategy_name="other-strategy", claimed_public_ip="203.0.113.5", public_key_pem="other-key"
+        )
+        other_id = self.ledger.approve_trader_enrollment(
+            other_enrollment["registration_id"], "ABCDEF", lambda value, *_: f"certificate:{value}"
+        )
+        legs = [
+            {
+                "worker_id": "worker-a",
+                "ticket": "10",
+                "symbol": "EURUSD",
+                "side": "0",
+                "volume": "0.10",
+                "stop_loss": "1.09000",
+                "take_profit": "1.11000",
+            },
+            {
+                "worker_id": "worker-b",
+                "ticket": "20",
+                "symbol": "EURUSD",
+                "side": "1",
+                "volume": "0.10",
+                "stop_loss": "1.11000",
+                "take_profit": "1.09000",
+            },
+        ]
+
+        self.ledger.begin_entry_unconfirmed(
+            ["worker-a", "worker-b"],
+            "entry-protected",
+            "hedged_entry_dispatch_started",
+            {"trader_id": owner_id, "command_id": "entry-protected", "reason": "Dispatch is about to begin."},
+        )
+        self.assertEqual(
+            ("entry-protected", "ENTRY_UNCONFIRMED"),
+            (
+                self.ledger._connection.execute(
+                    "SELECT pair_id, lifecycle_state FROM recovery_pairs WHERE pair_id = ?",
+                    ["entry-protected"],
+                ).fetchone()
+            ),
+        )
+        with self.assertRaisesRegex(LedgerError, "Workers are already managed"):
+            self.ledger.register_protected_pair(other_id, "other-pair", legs)
+
+        accepted = self.ledger.activate_hedged_entry_protected_pair(owner_id, "entry-protected", legs)
+
+        self.assertEqual(
+            ("entry-protected", "CATCHING_UP", 0),
+            (accepted["pair_id"], accepted["lifecycle_state"], accepted["revision"]),
+        )
+        self.assertEqual(
+            {("CATCHING_UP", "PROTECTED_LEG")},
+            {(record["lifecycle_state"], record["desired_state"]) for record in self.ledger.account_recoveries()},
+        )
+        self.ledger.record_worker_recovery_sync("worker-a", "epoch-a", [])
+        self.ledger.record_worker_recovery_sync("worker-b", "epoch-b", [])
+        self.ledger.record_snapshot(
+            "worker-a", 0, "2026-08-27T12:00:00+00:00", {}, {}, [],
+            [{"ticket": 10, "symbol": "EURUSD", "type": 0, "volume": 0.1, "sl": 1.09, "tp": 1.11}],
+            recovery_epoch="superseded-epoch",
+        )
+        self.assertEqual(
+            {"CATCHING_UP"},
+            {record["lifecycle_state"] for record in self.ledger.account_recoveries()},
+        )
+        self.ledger.record_snapshot(
+            "worker-a", 0, "2026-08-27T12:00:00+00:00", {}, {}, [],
+            [{"ticket": 10, "symbol": "EURUSD", "type": 0, "volume": 0.1, "sl": 1.09, "tp": 1.11}],
+            recovery_epoch="epoch-a",
+        )
+        self.assertEqual(
+            {"CATCHING_UP"},
+            {record["lifecycle_state"] for record in self.ledger.account_recoveries()},
+        )
+        self.ledger.record_snapshot(
+            "worker-b", 0, "2026-08-27T12:00:00+00:00", {}, {}, [],
+            [{"ticket": 20, "symbol": "EURUSD", "type": 1, "volume": 0.1, "sl": 1.11, "tp": 1.09}],
+        )
+
+        self.assertEqual(
+            {"ACTIVE_VERIFIED"},
+            {record["lifecycle_state"] for record in self.ledger.account_recoveries()},
+        )
+        self.assertIn("hedged_entry_protection_accepted", [event["event_type"] for event in self.ledger.events()])
+
+    def test_hedged_entry_ticket_marks_commentless_position_delta_as_controlled(self) -> None:
+        with self.ledger._transaction():
+            for worker_id, login, server in [
+                ("worker-a", 123456, "Broker-A"),
+                ("worker-b", 654321, "Broker-B"),
+            ]:
+                self.ledger._connection.execute(
+                    """INSERT INTO workers
+                       (worker_id, enrollment_id, login, server, certificate, status, approved_at)
+                       VALUES (?, ?, ?, ?, ?, 'active', ?)""",
+                    [worker_id, f"enrollment-{worker_id}", login, server, f"certificate:{worker_id}", datetime.now(UTC)],
+                )
+        enrollment = self.ledger.create_trader_enrollment(
+            strategy_name="realtime-arbitrage",
+            claimed_public_ip="203.0.113.4",
+            public_key_pem="public-key",
+        )
+        trader_id = self.ledger.approve_trader_enrollment(
+            enrollment["registration_id"], "ABCDEF", lambda value, *_: f"certificate:{value}"
+        )
+        payload = {
+            "type": "hedged_entry",
+            "expires_at": "2026-08-27T10:00:05+00:00",
+            "first": {"worker_id": "worker-a", "symbol": "EURUSD", "volume": "0.10", "direction": "LONG"},
+            "second": {"worker_id": "worker-b", "symbol": "EURUSD", "volume": "0.10", "direction": "SHORT"},
+        }
+        outcome = {
+            "type": "command_result",
+            "command_id": "entry-ticket-001",
+            "status": "accepted",
+            "legs": [
+                {
+                    "worker_id": "worker-a",
+                    "dispatch": {
+                        "status": "accepted",
+                        "response": {"accepted": True, "result": {"position": {"ticket": 42}}},
+                    },
+                },
+                {
+                    "worker_id": "worker-b",
+                    "dispatch": {
+                        "status": "accepted",
+                        "response": {"accepted": True, "result": {"position": {"ticket": 84}}},
+                    },
+                },
+            ],
+        }
+        self.ledger.begin_hedged_entry_command(trader_id, "entry-ticket-001", payload)
+        self.ledger.record_hedged_entry_command(trader_id, "entry-ticket-001", payload, outcome)
+
+        self.ledger.record_delta(
+            "worker-a",
+            1,
+            "2026-08-20T00:00:00+00:00",
+            "position",
+            "42",
+            "created",
+            {"ticket": 42, "volume": 0.1},
+        )
+
+        self.assertNotIn("external_broker_change", [event["event_type"] for event in self.ledger.events()])
+        self.assertEqual([], self.ledger.account_recoveries())
+        self.ledger.record_delta(
+            "worker-a",
+            2,
+            "2026-08-20T00:01:00+00:00",
+            "position",
+            "42",
+            "modified",
+            {"ticket": 42, "volume": 0.1, "tp": 1.3},
+        )
+        self.assertIn("external_broker_change", [event["event_type"] for event in self.ledger.events()])
+
+    def test_hedged_entry_delta_before_receipt_is_held_then_resolved_as_controlled(self) -> None:
+        with self.ledger._transaction():
+            self.ledger._connection.execute(
+                """INSERT INTO workers
+                   (worker_id, enrollment_id, login, server, certificate, status, approved_at)
+                   VALUES ('worker-a', 'enrollment-a', 123456, 'Broker-A', 'certificate:a', 'active', ?)""",
+                [datetime.now(UTC)],
+            )
+        enrollment = self.ledger.create_trader_enrollment(
+            strategy_name="realtime-arbitrage",
+            claimed_public_ip="203.0.113.4",
+            public_key_pem="public-key",
+        )
+        trader_id = self.ledger.approve_trader_enrollment(
+            enrollment["registration_id"], "ABCDEF", lambda value, *_: f"certificate:{value}"
+        )
+        payload = {
+            "type": "hedged_entry",
+            "expires_at": "2026-08-27T10:00:05+00:00",
+            "first": {"worker_id": "worker-a", "symbol": "EURUSD", "volume": "0.10", "direction": "LONG"},
+            "second": {"worker_id": "worker-b", "symbol": "EURUSD", "volume": "0.10", "direction": "SHORT"},
+        }
+        self.ledger.begin_hedged_entry_command(trader_id, "entry-pending-001", payload)
+        self.ledger.record_delta(
+            "worker-a",
+            1,
+            "2026-08-20T00:00:00+00:00",
+            "position",
+            "42",
+            "created",
+            {"ticket": 42, "volume": 0.1},
+        )
+        pending = self.ledger._connection.execute(
+            """SELECT state FROM trader_ticket_transitions
+               WHERE worker_id = 'worker-a' AND ticket = '42'"""
+        ).fetchone()
+        self.assertEqual(("pending",), pending)
+        self.assertNotIn("external_broker_change", [event["event_type"] for event in self.ledger.events()])
+
+        self.ledger.record_hedged_entry_command(
+            trader_id,
+            "entry-pending-001",
+            payload,
+            {
+                "type": "command_result",
+                "command_id": "entry-pending-001",
+                "status": "accepted",
+                "legs": [{
+                    "worker_id": "worker-a",
+                    "dispatch": {
+                        "status": "accepted",
+                        "response": {"accepted": True, "result": {"position": {"ticket": 42}}},
+                    },
+                }],
+            },
+        )
+
+        resolved = self.ledger._connection.execute(
+            """SELECT state FROM trader_ticket_transitions
+               WHERE worker_id = 'worker-a' AND ticket = '42'"""
+        ).fetchone()
+        self.assertEqual(("bound",), resolved)
+        self.assertIn("trader_ticket_attribution_resolved", [event["event_type"] for event in self.ledger.events()])
+
     def test_migration_removes_legacy_manual_and_freeze_schema(self) -> None:
         self.ledger.close()
         path = Path(self._directory.name) / "ledger.duckdb"
@@ -286,6 +524,17 @@ class ControlLedgerTests(unittest.TestCase):
             )
         )
         self.assertEqual({"worker-a"}, self.ledger.recovery_admission_blocked(["worker-a"]))
+        self.ledger.record_delta(
+            "worker-a",
+            1,
+            "2026-08-20T00:00:00+00:00",
+            "position",
+            "20",
+            "removed",
+            {"ticket": 20},
+        )
+        self.assertIn("account_recovery_effect_observed", [event["event_type"] for event in self.ledger.events()])
+        self.assertNotIn("external_broker_change", [event["event_type"] for event in self.ledger.events()])
         cancelling = self.ledger.record_recovery_observation(
             "worker-a", [{"ticket": 10, "volume_current": 0.1}], [{"ticket": 20, "volume": 0.1}]
         )
@@ -300,6 +549,76 @@ class ControlLedgerTests(unittest.TestCase):
         assert ready is not None
         self.assertEqual("READY", ready["lifecycle_state"])
         self.assertEqual(set(), self.ledger.recovery_admission_blocked(["worker-a"]))
+
+    def test_post_dispatch_entry_uncertainty_is_durable_before_empty_convergence(self) -> None:
+        with self.ledger._transaction():
+            for worker_id, login, server in (("worker-a", 123456, "Broker-A"), ("worker-b", 654321, "Broker-B")):
+                self.ledger._connection.execute(
+                    """INSERT INTO workers
+                       (worker_id, enrollment_id, login, server, certificate, status, approved_at)
+                       VALUES (?, ?, ?, ?, ?, 'active', ?)""",
+                    [worker_id, f"enrollment-{worker_id}", login, server, f"certificate:{worker_id}", datetime.now(UTC)],
+                )
+        audit = {
+            "trader_id": "trader-1",
+            "command_id": "entry-1",
+            "reason": "A market-leg outcome was failed or unknown after paired dispatch.",
+            "legs": [],
+        }
+
+        recoveries = self.ledger.begin_entry_unconfirmed(
+            ["worker-a", "worker-b"], "hedged-entry:entry-1", "hedged_entry_execution_anomaly", audit
+        )
+
+        self.assertEqual(
+            {("ENTRY_UNCONFIRMED", "EMPTY", "REQUEST_SNAPSHOT")},
+            {(record["lifecycle_state"], record["desired_state"], record["directive"]["kind"]) for record in recoveries},
+        )
+        transitions = [
+            event
+            for event in self.ledger.events()
+            if event["event_type"] == "account_recovery_transition"
+            and event["payload"]["source"] == "hedged_entry_execution_anomaly"
+        ]
+        self.assertEqual({"worker-a", "worker-b"}, {event["payload"]["worker_id"] for event in transitions})
+        event = next(event for event in self.ledger.events() if event["event_type"] == "hedged_entry_unconfirmed")
+        self.assertEqual(("hedged-entry:entry-1", ["worker-a", "worker-b"]), (
+            event["payload"]["incident_id"], event["payload"]["worker_ids"]
+        ))
+
+    def test_single_leg_direct_observation_cannot_verify_a_protected_pair(self) -> None:
+        enrollment = self.ledger.create_trader_enrollment(
+            strategy_name="realtime-arbitrage", claimed_public_ip="203.0.113.4", public_key_pem="trader-key"
+        )
+        trader_id = self.ledger.approve_trader_enrollment(
+            enrollment["registration_id"], "ABCDEF", lambda value, *_: f"certificate:{value}"
+        )
+        with self.ledger._transaction():
+            for worker_id, login, server in (("worker-a", 123456, "Broker-A"), ("worker-b", 654321, "Broker-B")):
+                self.ledger._connection.execute(
+                    """INSERT INTO workers
+                       (worker_id, enrollment_id, login, server, certificate, status, approved_at)
+                       VALUES (?, ?, ?, ?, ?, 'active', ?)""",
+                    [worker_id, f"enrollment-{worker_id}", login, server, f"certificate:{worker_id}", datetime.now(UTC)],
+                )
+        self.ledger.register_protected_pair(
+            trader_id,
+            "pair-1",
+            [
+                {"worker_id": "worker-a", "ticket": "10", "symbol": "EURUSD.a", "side": "0", "volume": "0.1", "stop_loss": "1.0", "take_profit": "1.2"},
+                {"worker_id": "worker-b", "ticket": "20", "symbol": "EURUSD", "side": "1", "volume": "0.1", "stop_loss": "1.3", "take_profit": "1.1"},
+            ],
+        )
+
+        observed = self.ledger.record_recovery_observation(
+            "worker-a", [], [{"ticket": 10, "symbol": "EURUSD.a", "type": 0, "volume": 0.1, "sl": 1.0, "tp": 1.2}]
+        )
+
+        assert observed is not None
+        self.assertEqual(
+            ("CATCHING_UP", "PROTECTED_LEG", "REQUEST_SNAPSHOT"),
+            (observed["lifecycle_state"], observed["desired_state"], observed["directive"]["kind"]),
+        )
 
     def test_revocation_remains_a_terminal_account_recovery_state(self) -> None:
         with self.ledger._transaction():
@@ -368,6 +687,222 @@ class ControlLedgerTests(unittest.TestCase):
         )
         states = {item["worker_id"]: item["lifecycle_state"] for item in self.ledger.account_recoveries()}
         self.assertEqual({"worker-a": "CONVERGING_EMPTY", "worker-b": "CONVERGING_EMPTY"}, states)
+
+    def test_generic_trader_operations_cannot_manage_registered_protected_pair_accounts(self) -> None:
+        enrollment = self.ledger.create_trader_enrollment(
+            strategy_name="realtime-arbitrage", claimed_public_ip="203.0.113.4", public_key_pem="trader-key"
+        )
+        trader_id = self.ledger.approve_trader_enrollment(
+            enrollment["registration_id"], "ABCDEF", lambda value, *_: f"certificate:{value}"
+        )
+        other_enrollment = self.ledger.create_trader_enrollment(
+            strategy_name="other-strategy", claimed_public_ip="203.0.113.5", public_key_pem="other-trader-key"
+        )
+        other_trader_id = self.ledger.approve_trader_enrollment(
+            other_enrollment["registration_id"], "ABCDEF", lambda value, *_: f"certificate:{value}"
+        )
+        worker_ids = []
+        for login, server in ((123456, "Broker-A"), (654321, "Broker-B")):
+            challenge, _ = self.ledger.issue_enrollment_challenge()
+            enrollment_record = self.ledger.create_enrollment(
+                login=login,
+                server=server,
+                public_key_pem=f"worker-key-{login}",
+                account_info={"login": login},
+                terminal_info={"name": "MetaTrader 5"},
+                password_secret_ref=f"abt/data/mt5/pending/{login}",
+                enrollment_challenge=challenge,
+            )
+            worker_ids.append(
+                self.ledger.approve_enrollment(
+                    enrollment_record.enrollment_id, "ABCDEF", lambda worker_id, *_: f"certificate:{worker_id}"
+                )
+            )
+        first_worker_id, second_worker_id = worker_ids
+        self.ledger.register_protected_pair(
+            trader_id,
+            "pair-1",
+            [
+                {"worker_id": first_worker_id, "ticket": "10", "symbol": "EURUSD.a", "side": "0", "volume": "0.1", "stop_loss": "1.0", "take_profit": "1.2"},
+                {"worker_id": second_worker_id, "ticket": "20", "symbol": "EURUSD", "side": "1", "volume": "0.1", "stop_loss": "1.3", "take_profit": "1.1"},
+            ],
+        )
+        self.ledger._connection.execute(
+            """INSERT INTO trader_ticket_transitions
+                   (worker_id, ticket, trader_id, command_id, expected_entity, expected_change, state, recorded_at)
+               VALUES (?, '10', ?, 'entry-1', 'position', 'created', 'bound', ?)""",
+            [first_worker_id, trader_id, datetime.now(UTC)],
+        )
+        self.ledger.record_worker_recovery_sync(first_worker_id, "epoch-a", [])
+        self.ledger.record_worker_recovery_sync(second_worker_id, "epoch-b", [])
+        self.ledger.record_snapshot(
+            first_worker_id, 0, "2026-08-27T12:00:00+00:00", {}, {}, [],
+            [{"ticket": 10, "symbol": "EURUSD.a", "type": 0, "volume": 0.1, "sl": 1.0, "tp": 1.2}],
+        )
+        self.ledger.record_snapshot(
+            second_worker_id, 0, "2026-08-27T12:00:00+00:00", {}, {}, [],
+            [{"ticket": 20, "symbol": "EURUSD", "type": 1, "volume": 0.1, "sl": 1.3, "tp": 1.1}],
+        )
+        self.ledger.record_worker_session(first_worker_id)
+
+        close = self.ledger.request_trader_worker_rpc(
+            trader_id, "close-expected", first_worker_id, "operation", {"type": "close", "ticket": "10", "volume": "0.1"}
+        )
+        entry = self.ledger.request_trader_worker_rpc(
+            trader_id, "new-entry", first_worker_id, "operation", {"type": "market", "symbol": "EURUSD.a", "volume": "0.1"}
+        )
+        other_close = self.ledger.request_trader_worker_rpc(
+            trader_id, "close-other", first_worker_id, "operation", {"type": "close", "ticket": "11", "volume": "0.1"}
+        )
+        unowned_close = self.ledger.request_trader_worker_rpc(
+            other_trader_id, "close-unowned", first_worker_id, "operation", {"type": "close", "ticket": "10", "volume": "0.1"}
+        )
+
+        self.assertFalse(close["dispatch"])
+        self.assertFalse(entry["dispatch"])
+        self.assertFalse(other_close["dispatch"])
+        self.assertFalse(unowned_close["dispatch"])
+        pair_close = self.ledger.request_protected_pair_close(
+            trader_id, "pair-close-active", {"type": "protected_pair_close", "pair_id": "pair-1"}
+        )
+        self.assertEqual(
+            ("accepted", "CONVERGING_EMPTY"),
+            (pair_close["status"], pair_close["lifecycle_state"]),
+        )
+        self.assertEqual([first_worker_id, second_worker_id], pair_close["worker_ids"])
+        ready = self.ledger.record_recovery_observation(first_worker_id, [], [])
+        assert ready is not None
+        self.assertEqual("READY", ready["lifecycle_state"])
+        after_empty = self.ledger.request_trader_worker_rpc(
+            trader_id,
+            "write-after-empty",
+            first_worker_id,
+            "operation",
+            {"type": "market", "symbol": "EURUSD.a", "volume": "0.1"},
+        )
+        self.assertFalse(after_empty["dispatch"])
+        second_ready = self.ledger.record_recovery_observation(second_worker_id, [], [])
+        assert second_ready is not None
+        self.assertEqual("READY", second_ready["lifecycle_state"])
+        after_pair_empty = self.ledger.request_trader_worker_rpc(
+            trader_id,
+            "write-after-pair-empty",
+            first_worker_id,
+            "operation",
+            {"type": "market", "symbol": "EURUSD.a", "volume": "0.1"},
+        )
+        self.assertTrue(after_pair_empty["dispatch"])
+        completion = next(event for event in self.ledger.events() if event["event_type"] == "recovery_pair_empty_verified")
+        self.assertEqual((trader_id, "pair-1"), (completion["payload"]["trader_id"], completion["payload"]["pair_id"]))
+        self.assertIn(
+            completion["event_id"],
+            [event["event_id"] for event in self.ledger.trader_events_after(trader_id, 0)],
+        )
+        self.assertEqual(
+            ("expired",),
+            self.ledger._connection.execute(
+                """SELECT state FROM trader_ticket_transitions
+                   WHERE worker_id = ? AND ticket = '10'""",
+                [first_worker_id],
+            ).fetchone(),
+        )
+        repeat_close = self.ledger.request_protected_pair_close(
+            trader_id, "pair-close-empty", {"type": "protected_pair_close", "pair_id": "pair-1"}
+        )
+        self.assertEqual(
+            ("accepted", "already_empty_verified", "EMPTY_VERIFIED"),
+            (repeat_close["status"], repeat_close["reason_code"], repeat_close["lifecycle_state"]),
+        )
+        after_terminal_pair_close = self.ledger.request_trader_worker_rpc(
+            trader_id,
+            "write-after-terminal-pair-close",
+            first_worker_id,
+            "operation",
+            {"type": "market", "symbol": "EURUSD.a", "volume": "0.1"},
+        )
+        self.assertTrue(after_terminal_pair_close["dispatch"])
+        self.ledger.record_delta(
+            first_worker_id,
+            1,
+            "2026-08-20T00:00:00+00:00",
+            "position",
+            "10",
+            "modified",
+            {"ticket": 10, "volume": 0.1, "tp": 1.3},
+        )
+        self.assertIn("external_broker_change", [event["event_type"] for event in self.ledger.events()])
+        self.ledger.report_worker_recovery_state(first_worker_id, "needs_human", "Broker outcome is uncertain.")
+        terminal_close = self.ledger.request_protected_pair_close(
+            trader_id, "pair-close-needs-human", {"type": "protected_pair_close", "pair_id": "pair-1"}
+        )
+        self.assertEqual(
+            ("rejected", "protected_pair_terminal"),
+            (terminal_close["status"], terminal_close["reason_code"]),
+        )
+
+    def test_protected_pair_close_is_owner_scoped_idempotent_empty_convergence(self) -> None:
+        enrollment = self.ledger.create_trader_enrollment(
+            strategy_name="realtime-arbitrage", claimed_public_ip="203.0.113.4", public_key_pem="trader-key"
+        )
+        trader_id = self.ledger.approve_trader_enrollment(
+            enrollment["registration_id"], "ABCDEF", lambda value, *_: f"certificate:{value}"
+        )
+        other_enrollment = self.ledger.create_trader_enrollment(
+            strategy_name="other-strategy", claimed_public_ip="203.0.113.5", public_key_pem="other-trader-key"
+        )
+        other_trader_id = self.ledger.approve_trader_enrollment(
+            other_enrollment["registration_id"], "ABCDEF", lambda value, *_: f"certificate:{value}"
+        )
+        with self.ledger._transaction():
+            for worker_id, login, server in (("worker-a", 123456, "Broker-A"), ("worker-b", 654321, "Broker-B")):
+                self.ledger._connection.execute(
+                    """INSERT INTO workers
+                       (worker_id, enrollment_id, login, server, certificate, status, approved_at)
+                       VALUES (?, ?, ?, ?, ?, 'active', ?)""",
+                    [worker_id, f"enrollment-{worker_id}", login, server, f"certificate:{worker_id}", datetime.now(UTC)],
+                )
+        self.ledger.register_protected_pair(
+            trader_id,
+            "pair-close",
+            [
+                {"worker_id": "worker-a", "ticket": "10", "symbol": "EURUSD.a", "side": "0", "volume": "0.1", "stop_loss": "1.0", "take_profit": "1.2"},
+                {"worker_id": "worker-b", "ticket": "20", "symbol": "EURUSD", "side": "1", "volume": "0.1", "stop_loss": "1.3", "take_profit": "1.1"},
+            ],
+        )
+        payload = {"type": "protected_pair_close", "pair_id": "pair-close"}
+
+        accepted = self.ledger.request_protected_pair_close(trader_id, "close-001", payload)
+        replay = self.ledger.request_protected_pair_close(trader_id, "close-001", payload)
+
+        self.assertEqual(accepted, replay)
+        self.assertEqual(
+            ("accepted", "desired_empty_requested", "pair-close", 1, "CONVERGING_EMPTY"),
+            tuple(accepted[key] for key in ("status", "reason_code", "pair_id", "revision", "lifecycle_state")),
+        )
+        self.assertEqual(
+            {("CONVERGING_EMPTY", "EMPTY"), ("CONVERGING_EMPTY", "EMPTY")},
+            {(record["lifecycle_state"], record["desired_state"]) for record in self.ledger.account_recoveries()},
+        )
+        event = next(event for event in self.ledger.events() if event["event_type"] == "protected_pair_close_requested")
+        self.assertEqual(trader_id, event["payload"]["trader_id"])
+        self.assertEqual("pair-close", event["payload"]["outcome"]["pair_id"])
+
+        unowned = self.ledger.request_protected_pair_close(
+            other_trader_id, "close-unowned", {"type": "protected_pair_close", "pair_id": "pair-close"}
+        )
+        missing = self.ledger.request_protected_pair_close(
+            trader_id, "close-missing", {"type": "protected_pair_close", "pair_id": "pair-missing"}
+        )
+        self.ledger.revoke_worker("worker-a", "ABCDEF")
+        terminal = self.ledger.request_protected_pair_close(
+            trader_id, "close-terminal", {"type": "protected_pair_close", "pair_id": "pair-close"}
+        )
+
+        self.assertEqual(("rejected", "protected_pair_not_owned"), (unowned["status"], unowned["reason_code"]))
+        self.assertEqual(("rejected", "protected_pair_not_found", "MISSING"), (
+            missing["status"], missing["reason_code"], missing["lifecycle_state"]
+        ))
+        self.assertEqual(("rejected", "protected_pair_terminal"), (terminal["status"], terminal["reason_code"]))
 
     def test_protected_pair_disconnect_waits_for_snapshots(self) -> None:
         enrollment = self.ledger.create_trader_enrollment(
@@ -528,10 +1063,10 @@ class ControlLedgerTests(unittest.TestCase):
         worker_id = self.ledger.approve_enrollment(
             worker_enrollment.enrollment_id, "ABCDEF", lambda worker_id, *_: f"certificate:{worker_id}"
         )
-        payload = {"type": "current_positions"}
+        payload = {"type": "market", "symbol": "EURUSD", "volume": "0.1"}
 
-        first = self.ledger.request_trader_worker_rpc(trader_id, "request-1", worker_id, "read", payload)
-        retry = self.ledger.request_trader_worker_rpc(trader_id, "request-1", worker_id, "read", payload)
+        first = self.ledger.request_trader_worker_rpc(trader_id, "request-1", worker_id, "operation", payload)
+        retry = self.ledger.request_trader_worker_rpc(trader_id, "request-1", worker_id, "operation", payload)
 
         self.assertTrue(first["dispatch"])
         self.assertFalse(retry["dispatch"])

@@ -33,8 +33,21 @@ class FakeGateway:
         self.live_symbol_results: dict[str, dict[str, object]] = {}
         self.live_symbol_rejections: set[str] = set()
         self.hedged_entries: list[dict[str, object]] = []
-        self.hedged_entry_result: dict[str, object] = {"command_id": "entry", "status": "accepted", "legs": []}
+        self.hedged_entry_result: dict[str, object] = {
+            "command_id": "entry",
+            "pair_id": "entry",
+            "status": "accepted",
+            "lifecycle_state": "CATCHING_UP",
+            "legs": [],
+        }
         self.protected_pairs: list[tuple[str, list[dict[str, object]]]] = []
+        self.protected_pair_closes: list[str] = []
+        self.protected_pair_close_result: dict[str, object] = {
+            "pair_id": "entry",
+            "status": "accepted",
+            "lifecycle_state": "CONVERGING_EMPTY",
+            "revision": 1,
+        }
 
     def request(self, worker_id: str, *, kind: str, request: dict[str, object]) -> dict[str, object]:
         self.calls.append((worker_id, kind, request))
@@ -86,6 +99,10 @@ class FakeGateway:
     def hedged_entry(self, payload: dict[str, object]) -> dict[str, object]:
         self.hedged_entries.append(payload)
         return self.hedged_entry_result
+
+    def protected_pair_close(self, pair_id: str) -> dict[str, object]:
+        self.protected_pair_closes.append(pair_id)
+        return self.protected_pair_close_result
 
     @staticmethod
     def symbol_specification(symbol: dict[str, object]) -> dict[str, object]:
@@ -313,6 +330,118 @@ class RealtimeArbitrageTests(unittest.TestCase):
             closes,
         )
 
+    def test_active_pair_flatten_submits_one_protected_pair_close_without_worker_operations(self) -> None:
+        gateway = FakeGateway()
+        strategy = RealtimeArbitrage(
+            gateway, first=Endpoint("audacity"), second=Endpoint("ftmo"), config=configuration()
+        )
+        strategy.pair = Pair(
+            "EURUSD",
+            "long_first_short_second",
+            1.2,
+            1.2,
+            11,
+            22,
+            "LONG",
+            "SHORT",
+            0.1,
+            datetime.now(UTC),
+            "pair-1",
+        )
+        calls_before_flatten = len(gateway.calls)
+
+        strategy._flatten_all()
+
+        self.assertEqual(["pair-1"], gateway.protected_pair_closes)
+        self.assertFalse(
+            any(kind == "operation" for _, kind, _ in gateway.calls[calls_before_flatten:])
+        )
+
+    def test_reverse_signal_stops_after_requesting_a_protected_pair_close(self) -> None:
+        gateway = FakeGateway()
+        strategy = RealtimeArbitrage(
+            gateway, first=Endpoint("audacity"), second=Endpoint("ftmo"), config=configuration()
+        )
+        strategy.pair = Pair(
+            "EURUSD",
+            "long_first_short_second",
+            1.2,
+            1.2,
+            11,
+            22,
+            "LONG",
+            "SHORT",
+            0.1,
+            datetime.now(UTC) - timedelta(minutes=5),
+            "pair-1",
+        )
+        strategy._flatten_all()
+        strategy.stopped = True
+
+        strategy.shutdown()
+
+        self.assertEqual(["pair-1", "pair-1"], gateway.protected_pair_closes)
+
+    def test_entry_and_exit_logs_include_bid_ask_context(self) -> None:
+        gateway = FakeGateway()
+        strategy = RealtimeArbitrage(
+            gateway,
+            first=Endpoint("worker-a"),
+            second=Endpoint("worker-b"),
+            config=configuration(execute=False, max_exposure_usd=5_000),
+        )
+        now = datetime.now(UTC)
+        strategy.quotes["first"]["EURUSD"] = (now, 1.1000, 1.1002)
+        strategy.quotes["second"]["EURUSD"] = (now, 1.0998, 1.1000)
+        strategy.sizing_plans = {
+            ("EURUSD", "short_first_long_second"): SizingPlan(
+                volume=0.1,
+                first_margin_limit=400,
+                second_margin_limit=400,
+                computed_at=now,
+            )
+        }
+
+        with self.assertLogs("strategy.realtime_arbitrage", "INFO") as captured:
+            strategy._open(TradeCandidate("EURUSD", "short_first_long_second", 0.0001))
+
+        self.assertTrue(
+            any(
+                "entry_signal symbol=EURUSD direction=short_first_long_second edge=0.0001 "
+                "first_side=SELL bid/ask=1.1/1.1002 second_side=BUY bid/ask=1.0998/1.1 volume=0.10" in line
+                for line in captured.output
+            )
+        )
+
+        strategy.config = configuration(execute=True)
+        strategy.quotes["first"]["EURUSD"] = (now, 1.1000, 1.1002)
+        gateway.positions["worker-a"] = [{"ticket": 11, "symbol": "EURUSD", "type": 0, "volume": 0.1}]
+        with self.assertLogs("strategy.realtime_arbitrage", "INFO") as captured:
+            strategy._flatten_all()
+
+        self.assertTrue(
+            any(
+                "exit_close_request endpoint=first symbol=EURUSD close_side=SELL ticket=11 volume=0.10 bid/ask=1.1/1.1002"
+                in line
+                for line in captured.output
+            )
+        )
+
+    def test_halt_requires_controller_containment_when_trader_is_unavailable(self) -> None:
+        gateway = FakeGateway()
+        strategy = RealtimeArbitrage(gateway, first=Endpoint("audacity"), second=Endpoint("ftmo"), config=configuration())
+
+        def unavailable(_: str, *, kind: str, request: dict[str, object]) -> dict[str, object]:
+            raise StrategyError("Trader process is not running.")
+
+        gateway.request = unavailable  # type: ignore[method-assign]
+
+        with self.assertRaisesRegex(StrategyError, "entry failed.*emergency flatten unavailable"):
+            strategy._halt("entry failed")
+
+        self.assertTrue(strategy.controller_containment_required)
+        strategy.shutdown()
+
     def test_skips_entry_when_margin_budget_cannot_cover_minimum_volume(self) -> None:
         gateway = FakeGateway()
         strategy = RealtimeArbitrage(
@@ -386,10 +515,6 @@ class RealtimeArbitrageTests(unittest.TestCase):
             strategy.quotes["first"][symbol] = (now, 1.2, 1.2001)
             strategy.quotes["second"][symbol] = (now, 1.2, 1.2001)
         strategy._refresh_sizing_snapshot_if_due()
-        gateway.positions = {
-            "worker-a": [{"ticket": 11, "symbol": "EURUSD", "type": 1, "volume": 0.4, "price_open": 1.2}],
-            "worker-b": [{"ticket": 22, "symbol": "EURUSD", "type": 0, "volume": 0.4, "price_open": 1.2001}],
-        }
         calls_before_open = len(gateway.calls)
 
         strategy._open(TradeCandidate("EURUSD", "short_first_long_second", 0.001))
@@ -405,6 +530,8 @@ class RealtimeArbitrageTests(unittest.TestCase):
                     "direction": "SHORT",
                     "filling_mode": "FOK",
                     "margin_limit": "400.00",
+                    "stop_loss": "1.204",
+                    "take_profit": "1.196",
                 },
                 {
                     "worker_id": "worker-b",
@@ -413,6 +540,8 @@ class RealtimeArbitrageTests(unittest.TestCase):
                     "direction": "LONG",
                     "filling_mode": "FOK",
                     "margin_limit": "400.00",
+                    "stop_loss": "1.1961",
+                    "take_profit": "1.2041",
                 },
             ],
             [
@@ -422,12 +551,15 @@ class RealtimeArbitrageTests(unittest.TestCase):
         )
         self.assertFalse(
             any(
-                kind == "operation" and request["type"] == "market"
+                kind == "operation"
                 for _, kind, request in gateway.calls[calls_before_open:]
             )
         )
-        self.assertEqual("entry", gateway.protected_pairs[0][0])
-        self.assertEqual(["worker-a", "worker-b"], [leg["worker_id"] for leg in gateway.protected_pairs[0][1]])
+        self.assertEqual([], gateway.protected_pairs)
+        self.assertFalse(strategy.stopped)
+        self.assertTrue(strategy.controller_owned_pair_pending)
+        self.assertIsNotNone(strategy.pair)
+        self.assertEqual("entry", strategy.pair.pair_id)
 
     def test_contained_hedged_entry_never_falls_back_to_individual_market_or_close_operations(self) -> None:
         gateway = FakeGateway()
@@ -507,26 +639,30 @@ class RealtimeArbitrageTests(unittest.TestCase):
 
         self.assertEqual({"first": 5_000, "second": 5_000}, strategy.exposure_caps)
 
-    def test_emergency_protection_sets_broker_sl_and_tp_at_equal_dollar_amounts(self) -> None:
+    def test_initial_protection_targets_equal_dollar_amounts_without_a_worker_write(self) -> None:
         gateway = FakeGateway()
         strategy = RealtimeArbitrage(gateway, first=Endpoint("worker-a"), second=Endpoint("worker-b"), config=configuration())
+        calls_before_targets = len(gateway.calls)
 
-        strategy._set_emergency_protection(
-            "first", "EURUSD",
-            {"ticket": 11, "price_open": 1.2},
-            "LONG",
-            0.1,
-        )
+        sl, tp = strategy._initial_protection_targets("first", "EURUSD", "LONG", 1.2, 0.1)
 
-        operation = next(
-            request
-            for worker, kind, request in gateway.calls
-            if worker == "worker-a" and kind == "operation" and request["type"] == "modify_sl_tp"
-        )
-        self.assertLess(float(operation["sl"]), 1.2)
-        self.assertGreater(float(operation["tp"]), 1.2)
-        self.assertAlmostEqual(40, (1.2 - float(operation["sl"])) * 10_000, places=3)
-        self.assertAlmostEqual(40, (float(operation["tp"]) - 1.2) * 10_000, places=3)
+        self.assertLess(float(sl), 1.2)
+        self.assertGreater(float(tp), 1.2)
+        self.assertAlmostEqual(40, (1.2 - float(sl)) * 10_000, places=3)
+        self.assertAlmostEqual(40, (float(tp) - 1.2) * 10_000, places=3)
+        self.assertFalse(any(kind == "operation" for _, kind, _ in gateway.calls[calls_before_targets:]))
+
+    def test_initial_protection_targets_use_broker_tick_price_before_entry(self) -> None:
+        gateway = FakeGateway()
+        strategy = RealtimeArbitrage(gateway, first=Endpoint("worker-a"), second=Endpoint("worker-b"), config=configuration())
+        targets = iter((1.3904754166, 1.3812362498))
+        strategy._profit_target_price = lambda *_: next(targets)  # type: ignore[method-assign]
+        calls_before_targets = len(gateway.calls)
+
+        sl, tp = strategy._initial_protection_targets("first", "EURUSD", "SHORT", 1.38584, 0.12)
+
+        self.assertEqual(("1.39048", "1.38124"), (sl, tp))
+        self.assertFalse(any(kind == "operation" for _, kind, _ in gateway.calls[calls_before_targets:]))
 
     def test_emergency_stop_loss_does_not_exceed_exposure_trade_loss_limit(self) -> None:
         gateway = FakeGateway()
@@ -537,15 +673,10 @@ class RealtimeArbitrageTests(unittest.TestCase):
             config=configuration(max_exposure_usd=1_000),
         )
 
-        strategy._set_emergency_protection("first", "EURUSD", {"ticket": 11, "price_open": 1.2}, "LONG", 0.1)
+        sl, tp = strategy._initial_protection_targets("first", "EURUSD", "LONG", 1.2, 0.1)
 
-        operation = next(
-            request
-            for worker, kind, request in gateway.calls
-            if worker == "worker-a" and kind == "operation" and request["type"] == "modify_sl_tp"
-        )
-        self.assertAlmostEqual(20, (1.2 - float(operation["sl"])) * 10_000, places=3)
-        self.assertAlmostEqual(20, (float(operation["tp"]) - 1.2) * 10_000, places=3)
+        self.assertAlmostEqual(20, (1.2 - float(sl)) * 10_000, places=3)
+        self.assertAlmostEqual(20, (float(tp) - 1.2) * 10_000, places=3)
 
     def test_emergency_stop_loss_does_not_exceed_remaining_daily_loss_limit(self) -> None:
         gateway = FakeGateway()
@@ -557,15 +688,10 @@ class RealtimeArbitrageTests(unittest.TestCase):
         )
         strategy.accounts["first"].equity = 4_880
 
-        strategy._set_emergency_protection("first", "EURUSD", {"ticket": 11, "price_open": 1.2}, "LONG", 0.1)
+        sl, tp = strategy._initial_protection_targets("first", "EURUSD", "LONG", 1.2, 0.1)
 
-        operation = next(
-            request
-            for worker, kind, request in gateway.calls
-            if worker == "worker-a" and kind == "operation" and request["type"] == "modify_sl_tp"
-        )
-        self.assertAlmostEqual(30, (1.2 - float(operation["sl"])) * 10_000, places=3)
-        self.assertAlmostEqual(30, (float(operation["tp"]) - 1.2) * 10_000, places=3)
+        self.assertAlmostEqual(30, (1.2 - float(sl)) * 10_000, places=3)
+        self.assertAlmostEqual(30, (float(tp) - 1.2) * 10_000, places=3)
 
     def test_rejects_entry_after_daily_loss_budget_is_exhausted(self) -> None:
         gateway = FakeGateway()

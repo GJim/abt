@@ -360,6 +360,48 @@ class WorkerReconciliationTests(unittest.TestCase):
         self.assertNotIn("comment", buy)
         self.assertNotIn("magic", buy)
 
+    def test_controller_market_order_includes_validated_initial_protection(self) -> None:
+        class TradingMT5:
+            TRADE_ACTION_DEAL = 1
+            ORDER_TYPE_BUY = 0
+            ORDER_FILLING_FOK = 0
+
+            def symbol_info_tick(self, _symbol: str) -> object:
+                return {"bid": 1.1, "ask": 1.1002}
+
+        protected = _broker_order_request(
+            TradingMT5(),
+            {
+                "action": "market",
+                "symbol": "EURUSD",
+                "volume": "0.1",
+                "direction": "LONG",
+                "filling_mode": "FOK",
+                "sl": "1.0900",
+                "tp": "1.1100",
+            },
+        )
+
+        self.assertEqual((1.09, 1.11), (protected["sl"], protected["tp"]))
+        for invalid in (
+            {"sl": "1.0900"},
+            {"sl": "not-a-price", "tp": "1.1100"},
+            {"sl": "nan", "tp": "1.1100"},
+        ):
+            with self.subTest(invalid=invalid):
+                with self.assertRaisesRegex(WorkerEnrollmentError, "invalid market order"):
+                    _broker_order_request(
+                        TradingMT5(),
+                        {
+                            "action": "market",
+                            "symbol": "EURUSD",
+                            "volume": "0.1",
+                            "direction": "LONG",
+                            "filling_mode": "FOK",
+                            **invalid,
+                        },
+                    )
+
     def test_order_execution_reports_disabled_terminal_before_sending(self) -> None:
         class DisabledTerminalMT5:
             def terminal_info(self) -> object:

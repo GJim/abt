@@ -196,6 +196,13 @@ class TraderIntentCancellationPayload(BaseModel):
     intent_id: str = Field(min_length=1)
 
 
+class ProtectedPairClosePayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["protected_pair_close"]
+    pair_id: str = Field(min_length=1)
+
+
 class HedgedEntryLegPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -205,6 +212,8 @@ class HedgedEntryLegPayload(BaseModel):
     direction: Literal["LONG", "SHORT"]
     filling_mode: Literal["FOK", "IOC"]
     margin_limit: Decimal = Field(gt=0)
+    stop_loss: Decimal = Field(gt=0)
+    take_profit: Decimal = Field(gt=0)
 
 
 class HedgedEntryPayload(BaseModel):
@@ -1530,6 +1539,7 @@ def create_app(
                 try:
                     message = await asyncio.wait_for(websocket.receive_json(), timeout=30)
                 except asyncio.TimeoutError:
+                    await deliver_events_after(last_delivered_event_id)
                     await connection.send_json({"type": "heartbeat"})
                     last_controller_heartbeat = monotonic()
                     continue
@@ -1576,7 +1586,7 @@ def create_app(
                             "type": "trader_query_result",
                             "request_id": message["request_id"],
                             "query": query,
-                            "result": result,
+                            "result": jsonable_encoder(result),
                         }
                     )
                 elif (
@@ -1657,9 +1667,34 @@ def create_app(
                                 "result": result,
                             }
                         )
+                    elif payload.get("type") == "protected_pair_close":
+                        close = ProtectedPairClosePayload.model_validate(payload)
+                        result = ledger.request_protected_pair_close(
+                            trader.trader_id, message["command_id"], close.model_dump()
+                        )
+                        worker_ids = result.get("worker_ids")
+                        if (
+                            result.get("status") == "accepted"
+                            and result.get("lifecycle_state") == "CONVERGING_EMPTY"
+                            and isinstance(worker_ids, list)
+                            and len(worker_ids) == 2
+                            and all(isinstance(worker_id, str) and worker_id for worker_id in worker_ids)
+                        ):
+                            asyncio.create_task(
+                                _automatically_converge_accounts(
+                                    ledger, worker_connections, worker_execution_locks, worker_ids
+                                )
+                            )
+                        await connection.send_json(
+                            {
+                                "type": "trader_command_result",
+                                "request_id": message["command_id"],
+                                "result": result,
+                            }
+                        )
                     else:
                         raise ValueError("Invalid Trader command.")
-                    if payload.get("type") not in {"hedged_entry", "protected_pair"}:
+                    if payload.get("type") not in {"hedged_entry", "protected_pair", "protected_pair_close"}:
                         await websocket.send_json(result)
                     await deliver_events_after(last_delivered_event_id)
                 else:
@@ -2819,6 +2854,15 @@ async def _execute_hedged_entry_locked(
                     ),
                 )
             dispatch_timeout = _hedged_remaining_timeout(deadline)
+            _start_hedged_entry_recovery(
+                ledger,
+                worker_ids,
+                trader_id,
+                command_id,
+                "Hedged entry dispatch started; initial protection awaits broker evidence.",
+                outcomes,
+                source="hedged_entry_dispatch_started",
+            )
             dispatch_started = True
             dispatch_started_at = monotonic()
             dispatch_responses = await asyncio.gather(
@@ -2841,7 +2885,6 @@ async def _execute_hedged_entry_locked(
             dispatch_elapsed_ms = _elapsed_ms(dispatch_started_at)
             if any(cast(dict[str, object], outcome["dispatch"])["status"] != "accepted" for outcome in outcomes):
                 reason = "A market-leg outcome was failed or unknown after paired dispatch."
-                _start_hedged_entry_recovery(ledger, worker_ids, trader_id, command_id, reason, outcomes)
                 asyncio.create_task(
                     _automatically_converge_accounts(ledger, worker_connections, worker_execution_locks, worker_ids)
                 )
@@ -2861,6 +2904,11 @@ async def _execute_hedged_entry_locked(
                         dispatch_elapsed_ms=dispatch_elapsed_ms,
                     ),
                 )
+            protected_pair = ledger.activate_hedged_entry_protected_pair(
+                trader_id,
+                command_id,
+                _hedged_protected_legs(legs, outcomes),
+            )
             return _record_hedged_entry_result(
                 ledger,
                 trader_id,
@@ -2875,12 +2923,14 @@ async def _execute_hedged_entry_locked(
                     started_monotonic,
                     preflight_elapsed_ms=preflight_elapsed_ms,
                     dispatch_elapsed_ms=dispatch_elapsed_ms,
+                    pair_id=protected_pair["pair_id"],
+                    lifecycle_state=protected_pair["lifecycle_state"],
+                    revision=protected_pair["revision"],
                 ),
             )
     except (LedgerError, ValidationError, ValueError, asyncio.TimeoutError) as error:
         reason = str(error) or "The controller rejected the hedged entry."
         if dispatch_started and worker_ids:
-            _start_hedged_entry_recovery(ledger, worker_ids, trader_id, command_id, reason, outcomes)
             asyncio.create_task(
                 _automatically_converge_accounts(ledger, worker_connections, worker_execution_locks, worker_ids)
             )
@@ -2929,7 +2979,37 @@ def _hedged_market_order(leg: HedgedEntryLegPayload) -> dict[str, object]:
         "volume": str(leg.volume),
         "direction": leg.direction,
         "filling_mode": leg.filling_mode,
+        "sl": str(leg.stop_loss),
+        "tp": str(leg.take_profit),
     }
+
+
+def _hedged_protected_legs(
+    legs: list[HedgedEntryLegPayload], outcomes: list[dict[str, object]]
+) -> list[dict[str, object]]:
+    """Build the durable pair target from controller-dispatched protection and receipts."""
+
+    protected_legs: list[dict[str, object]] = []
+    for leg, outcome in zip(legs, outcomes, strict=True):
+        dispatch = outcome.get("dispatch")
+        response = dispatch.get("response") if isinstance(dispatch, dict) else None
+        result = response.get("result") if isinstance(response, dict) else None
+        position = result.get("position") if isinstance(result, dict) else None
+        ticket = position.get("ticket") if isinstance(position, dict) else None
+        if isinstance(ticket, bool) or not isinstance(ticket, (str, int)) or not str(ticket):
+            raise LedgerError("Accepted hedged entry did not return a position ticket for initial protection.")
+        protected_legs.append(
+            {
+                "worker_id": leg.worker_id,
+                "ticket": str(ticket),
+                "symbol": leg.symbol,
+                "side": "0" if leg.direction == "LONG" else "1",
+                "volume": str(leg.volume),
+                "stop_loss": str(leg.stop_loss),
+                "take_profit": str(leg.take_profit),
+            }
+        )
+    return protected_legs
 
 
 def _hedged_preflight_outcome(
@@ -3019,6 +3099,9 @@ def _hedged_entry_result(
     *,
     preflight_elapsed_ms: int | None = None,
     dispatch_elapsed_ms: int | None = None,
+    pair_id: str | None = None,
+    lifecycle_state: str | None = None,
+    revision: int | None = None,
 ) -> dict[str, Any]:
     result: dict[str, Any] = {
         "type": "command_result",
@@ -3038,6 +3121,12 @@ def _hedged_entry_result(
         result["timings"]["dispatch_elapsed_ms"] = dispatch_elapsed_ms
     if reason is not None:
         result["reason"] = reason
+    if pair_id is not None:
+        result["pair_id"] = pair_id
+    if lifecycle_state is not None:
+        result["lifecycle_state"] = lifecycle_state
+    if revision is not None:
+        result["revision"] = revision
     return result
 
 
@@ -3052,14 +3141,31 @@ def _start_hedged_entry_recovery(
     command_id: str,
     reason: str,
     outcomes: list[dict[str, object]],
+    *,
+    source: str = "hedged_entry_execution_anomaly",
 ) -> None:
     audit = {
         "trader_id": trader_id,
         "command_id": command_id,
         "reason": reason,
         "legs": outcomes,
+        "initial_protection": [
+            {
+                "worker_id": outcome.get("worker_id"),
+                "stop_loss": order.get("sl"),
+                "take_profit": order.get("tp"),
+            }
+            for outcome in outcomes
+            if isinstance((order := outcome.get("order")), dict)
+        ],
     }
-    ledger.begin_empty_convergence(worker_ids, "hedged_entry_execution_anomaly", audit)
+    ledger.begin_entry_unconfirmed(
+        worker_ids,
+        command_id,
+        source,
+        audit,
+    )
+
 
 
 def _record_hedged_entry_result(
@@ -3410,11 +3516,29 @@ async def _execution_recovery_request(
     request_id = str(uuid4())
     response = await _request_worker_analysis(
         connection, analysis_id=operation, stage=operation, timeout=30,
-        message={"type": f"{operation}_request", "request_id": request_id, **payload},
+        message=_execution_recovery_message(operation, request_id, payload),
     )
     if response.get("accepted") is not True or response.get("operation") != operation:
         raise LedgerError(f"Worker did not confirm {operation}.")
     return response
+
+
+def _execution_recovery_message(operation: str, request_id: str, payload: dict[str, str]) -> dict[str, str]:
+    message = {"type": f"{operation}_request", "request_id": request_id}
+    if operation == "account_recovery_reconcile":
+        if payload:
+            raise ValueError("Account recovery reconciliation does not accept a payload.")
+        return message
+    if operation == "execution_reconcile":
+        return {**message, "execution_id": payload["execution_id"]}
+    if operation in {
+        "execution_cancel",
+        "execution_close",
+        "account_recovery_cancel",
+        "account_recovery_close",
+    }:
+        return {**message, "ticket": payload["ticket"], "volume": payload["volume"]}
+    raise ValueError("Unknown execution recovery operation.")
 
 
 async def _automatically_converge_accounts(
@@ -4079,16 +4203,23 @@ def _is_authoritative_worker_session(
 
 
 def _record_snapshot(ledger: ControlLedger, worker_id: str, message: dict[str, object]) -> None:
-    required = {"type", "cursor", "observed_at", "account", "terminal", "orders", "positions"}
+    required = {"type", "cursor", "observed_at", "recovery_epoch", "account", "terminal", "orders", "positions"}
     if set(message) != required or not isinstance(message["cursor"], int) or isinstance(message["cursor"], bool):
         raise ValueError("Invalid protocol message.")
-    if not isinstance(message["observed_at"], str) or not isinstance(message["account"], dict) or not isinstance(message["terminal"], dict):
+    if (
+        not isinstance(message["observed_at"], str)
+        or not isinstance(message["recovery_epoch"], str)
+        or not message["recovery_epoch"]
+        or not isinstance(message["account"], dict)
+        or not isinstance(message["terminal"], dict)
+    ):
         raise ValueError("Invalid protocol message.")
     if not isinstance(message["orders"], list) or not isinstance(message["positions"], list):
         raise ValueError("Invalid protocol message.")
     ledger.record_snapshot(
         worker_id, message["cursor"], message["observed_at"], message["account"], message["terminal"],
         message["orders"], message["positions"],
+        recovery_epoch=message["recovery_epoch"],
     )
 
 

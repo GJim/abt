@@ -60,6 +60,44 @@ class FakeEcho:
 
 
 class TraderCommandTests(unittest.TestCase):
+    def test_connect_forwards_a_protected_pair_close_command(self) -> None:
+        class CloseSocket:
+            def __init__(self) -> None:
+                self.messages = iter(
+                    [
+                        '{"type":"subscribed","worker_ids":["*"]}',
+                        '{"type":"trader_command_result","request_id":"close-1",'
+                        '"result":{"pair_id":"pair-1","status":"accepted","lifecycle_state":"CONVERGING_EMPTY","revision":2}}',
+                    ]
+                )
+                self.sent: list[str] = []
+
+            def recv(self, timeout: float | None = None) -> str:
+                return next(self.messages)
+
+            def send(self, message: str) -> None:
+                self.sent.append(message)
+
+        socket = CloseSocket()
+        commands: SimpleQueue[object] = SimpleQueue()
+        commands.put(
+            {
+                "request_id": "close-1",
+                "command_id": "pair-1:close",
+                "payload": {"type": "protected_pair_close", "pair_id": "pair-1"},
+            }
+        )
+
+        with self.assertRaises(StopIteration):
+            run_trader_session(
+                socket, output=io.StringIO(), save_cursor=lambda _: None, command_source=commands
+            )  # type: ignore[arg-type]
+
+        self.assertIn(
+            '{"command_id":"pair-1:close","payload":{"pair_id":"pair-1","type":"protected_pair_close"},"type":"command"}',
+            socket.sent,
+        )
+
     def test_enroll_confirms_detected_ip_and_saves_only_non_secrets(self) -> None:
         with TemporaryDirectory() as directory:
             config_path = Path(directory) / "trader.json"
@@ -242,6 +280,40 @@ class TraderCommandTests(unittest.TestCase):
             output.getvalue(),
         )
 
+    def test_connect_processes_market_data_interleaved_with_event_acknowledgement(self) -> None:
+        class InterleavedSocket:
+            def __init__(self) -> None:
+                self.messages = iter(
+                    [
+                        '{"type":"event","event_id":17,"payload":{"state":"accepted"}}',
+                        '{"type":"market_data","worker_id":"worker-1","observed_at":"2026-08-25T00:00:00+00:00",'
+                        '"quotes":[{"symbol":"EURUSD","bid":1.1,"ask":1.2}]}',
+                        '{"type":"acknowledged","cursor":17}',
+                    ]
+                )
+                self.sent: list[str] = []
+
+            def recv(self, timeout: float | None = None) -> str:
+                return next(self.messages)
+
+            def send(self, message: str) -> None:
+                self.sent.append(message)
+
+        socket = InterleavedSocket()
+        output = io.StringIO()
+
+        with self.assertRaises(StopIteration):
+            run_trader_session(socket, output=output, save_cursor=lambda _: None)  # type: ignore[arg-type]
+
+        self.assertEqual(
+            [
+                '{"type":"subscribe","worker_ids":["*"]}',
+                '{"cursor":17,"type":"ack"}',
+            ],
+            socket.sent,
+        )
+        self.assertIn('"type":"market_data"', output.getvalue())
+
     def test_connect_subscribes_to_market_data_and_writes_it_without_acknowledging(self) -> None:
         class MarketDataSocket:
             def __init__(self) -> None:
@@ -394,6 +466,8 @@ class TraderCommandTests(unittest.TestCase):
                         "direction": "LONG",
                         "filling_mode": "FOK",
                         "margin_limit": "400",
+                        "stop_loss": "1.09000",
+                        "take_profit": "1.11000",
                     },
                     "second": {
                         "worker_id": "worker-b",
@@ -402,6 +476,8 @@ class TraderCommandTests(unittest.TestCase):
                         "direction": "SHORT",
                         "filling_mode": "FOK",
                         "margin_limit": "400",
+                        "stop_loss": "1.11000",
+                        "take_profit": "1.09000",
                     },
                 },
             }
@@ -416,9 +492,9 @@ class TraderCommandTests(unittest.TestCase):
             [
                 '{"type":"subscribe","worker_ids":["*"]}',
                 '{"command_id":"entry-1","payload":{"expires_at":"2026-08-27T10:00:05+00:00","first":{"direction":"LONG","filling_mode":"FOK",'
-                '"margin_limit":"400","symbol":"EURUSD","volume":"0.10","worker_id":"worker-a"},'
+                '"margin_limit":"400","stop_loss":"1.09000","symbol":"EURUSD","take_profit":"1.11000","volume":"0.10","worker_id":"worker-a"},'
                 '"second":{"direction":"SHORT","filling_mode":"FOK","margin_limit":"400",'
-                '"symbol":"EURUSD","volume":"0.10","worker_id":"worker-b"},"type":"hedged_entry"},'
+                '"stop_loss":"1.11000","symbol":"EURUSD","take_profit":"1.09000","volume":"0.10","worker_id":"worker-b"},"type":"hedged_entry"},'
                 '"type":"command"}',
             ],
             socket.sent,

@@ -86,15 +86,15 @@ def run_trader_session(
     """Run one foreground connection until it disconnects."""
 
     _send(socket, {"type": "subscribe", "worker_ids": list(worker_ids)})
-    pending_events: deque[dict[str, object]] = deque()
+    pending_messages: deque[dict[str, object]] = deque()
     last_heartbeat = monotonic()
     while True:
         if on_heartbeat is not None:
             on_heartbeat()
         if command_source is not None:
             _send_trader_commands(socket, command_source, output)
-        if pending_events:
-            message = pending_events.popleft()
+        if pending_messages:
+            message = pending_messages.popleft()
         else:
             try:
                 message = _message(socket, timeout=1 if command_source is not None else 30)
@@ -165,10 +165,19 @@ def run_trader_session(
             if acknowledged == {"type": "acknowledged", "cursor": cursor}:
                 break
             if acknowledged.get("type") == "event" and isinstance(acknowledged.get("event_id"), int):
-                pending_events.append(acknowledged)
+                pending_messages.append(acknowledged)
                 continue
             if acknowledged.get("type") == "heartbeat":
                 _send(socket, {"type": "heartbeat"})
+                continue
+            if acknowledged.get("type") in {
+                "market_data",
+                "market_data_unavailable",
+                "trader_query_result",
+                "trader_rpc_result",
+                "trader_command_result",
+            }:
+                pending_messages.append(acknowledged)
                 continue
             raise TraderEnrollmentError("The controller rejected Trader event acknowledgement.")
         save_cursor(cursor)
@@ -200,7 +209,7 @@ def _send_trader_commands(socket: TraderWebSocket, command_source: SimpleQueue[o
                 or not isinstance(command["command_id"], str)
                 or not command["command_id"]
                 or not isinstance(command["payload"], dict)
-                or command["payload"].get("type") not in {"hedged_entry", "protected_pair"}
+                or command["payload"].get("type") not in {"hedged_entry", "protected_pair", "protected_pair_close"}
             ):
                 _write_jsonl_error(output, "Trader JSONL command contains invalid fields.")
                 continue

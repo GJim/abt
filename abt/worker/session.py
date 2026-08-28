@@ -83,7 +83,12 @@ class AuthenticatedWorkerSession:
 
     def send_reconciliation(self, message: dict[str, object]) -> None:
         try:
-            _send(self.socket, message)
+            outgoing = (
+                {**message, "recovery_epoch": self.recovery_epoch}
+                if message.get("type") == "snapshot"
+                else message
+            )
+            _send(self.socket, outgoing)
             response = self._response()
             if response.get("type") != "accepted" or response.get("cursor") != message.get("cursor"):
                 raise WorkerEnrollmentError("The controller rejected worker reconciliation.")

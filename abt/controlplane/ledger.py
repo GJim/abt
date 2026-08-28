@@ -10,6 +10,7 @@ from base64 import urlsafe_b64decode, urlsafe_b64encode
 from binascii import Error as Base64Error
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Callable
 from uuid import uuid4
@@ -26,6 +27,7 @@ from ..account_recovery import (
     RecoveryPair,
     converge_empty,
     catching_up,
+    entry_unconfirmed,
     observe,
     observe_pair,
 )
@@ -1122,6 +1124,25 @@ class ControlLedger:
                 "INSERT INTO trader_commands (trader_id, command_id, payload_hash, result, created_at) VALUES (?, ?, ?, ?, ?)",
                 [trader_id, command_id, payload_hash, json.dumps(persisted, sort_keys=True), _utc_now()],
             )
+            for leg in (payload.get("first"), payload.get("second")):
+                if not isinstance(leg, dict) or not all(
+                    isinstance(leg.get(field), str) and leg[field] for field in ("worker_id", "symbol", "volume", "direction")
+                ):
+                    raise LedgerError("Hedged-entry command legs are invalid.")
+                self._connection.execute(
+                    """INSERT INTO trader_hedged_entry_legs
+                           (trader_id, command_id, worker_id, symbol, volume, direction, recorded_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    [
+                        trader_id,
+                        command_id,
+                        leg["worker_id"],
+                        leg["symbol"],
+                        leg["volume"],
+                        leg["direction"],
+                        _utc_now(),
+                    ],
+                )
             return persisted, True
 
     def record_hedged_entry_command(
@@ -1167,7 +1188,90 @@ class ControlLedger:
                        WHERE trader_id = ? AND command_id = ?""",
                     [json.dumps(persisted, sort_keys=True), trader_id, command_id],
                 )
+            self._record_hedged_entry_tickets(trader_id, command_id, result)
+            self._resolve_pending_ticket_attributions(trader_id, command_id)
             return persisted
+
+    def _record_hedged_entry_tickets(
+        self, trader_id: str, command_id: str, result: dict[str, Any]
+    ) -> None:
+        legs = result.get("legs")
+        if not isinstance(legs, list):
+            return
+        for leg in legs:
+            if not isinstance(leg, dict) or not isinstance(leg.get("worker_id"), str):
+                continue
+            dispatch = leg.get("dispatch")
+            if not isinstance(dispatch, dict):
+                continue
+            response = dispatch.get("response")
+            if not isinstance(response, dict) or response.get("accepted") is not True:
+                continue
+            broker_result = response.get("result")
+            if not isinstance(broker_result, dict):
+                continue
+            tickets: list[tuple[object, str]] = [(broker_result.get("order"), "order")]
+            position = broker_result.get("position")
+            if isinstance(position, dict):
+                tickets.append((position.get("ticket"), "position"))
+            for ticket, entity in tickets:
+                if isinstance(ticket, (str, int)) and not isinstance(ticket, bool):
+                    prior = self._connection.execute(
+                        """SELECT state FROM trader_ticket_transitions
+                           WHERE worker_id = ? AND ticket = ?""",
+                        [leg["worker_id"], str(ticket)],
+                    ).fetchone()
+                    self._connection.execute(
+                        """INSERT INTO trader_broker_tickets (worker_id, ticket, trader_id, command_id, recorded_at)
+                           VALUES (?, ?, ?, ?, ?) ON CONFLICT (worker_id, ticket) DO NOTHING""",
+                        [leg["worker_id"], str(ticket), trader_id, command_id, _utc_now()],
+                    )
+                    self._connection.execute(
+                        """INSERT INTO trader_ticket_transitions
+                               (worker_id, ticket, trader_id, command_id, expected_entity, expected_change,
+                                state, recorded_at, resolved_at)
+                           VALUES (?, ?, ?, ?, ?, 'created', 'bound', ?, ?)
+                           ON CONFLICT (worker_id, ticket) DO UPDATE SET
+                             trader_id = excluded.trader_id, command_id = excluded.command_id,
+                             expected_entity = excluded.expected_entity, expected_change = excluded.expected_change,
+                             state = 'bound', resolved_at = excluded.resolved_at, expired_at = NULL""",
+                        [leg["worker_id"], str(ticket), trader_id, command_id, entity, _utc_now(), _utc_now()],
+                    )
+                    self._event(
+                        "trader_ticket_attribution_resolved" if prior is not None and prior[0] == "pending"
+                        else "trader_ticket_transition_bound",
+                        {
+                            "trader_id": trader_id,
+                            "command_id": command_id,
+                            "worker_id": leg["worker_id"],
+                            "ticket": str(ticket),
+                            "entity": entity,
+                            "change": "created",
+                        },
+                    )
+
+    def _resolve_pending_ticket_attributions(self, trader_id: str, command_id: str) -> None:
+        rows = self._connection.execute(
+            """SELECT worker_id, ticket, expected_entity, expected_change, cursor, observed_at, record
+               FROM trader_ticket_transitions
+               WHERE trader_id = ? AND command_id = ? AND state = 'pending'""",
+            [trader_id, command_id],
+        ).fetchall()
+        for worker_id, ticket, entity, change, cursor, observed_at, record_json in rows:
+            self._connection.execute(
+                """UPDATE trader_ticket_transitions
+                   SET state = 'unattributed', resolved_at = ? WHERE worker_id = ? AND ticket = ?""",
+                [_utc_now(), worker_id, ticket],
+            )
+            self._record_external_broker_change(
+                str(worker_id),
+                int(cursor),
+                str(observed_at),
+                str(entity),
+                str(ticket),
+                str(change),
+                json.loads(record_json),
+            )
 
     def request_trader_worker_rpc(
         self, trader_id: str, request_id: str, worker_id: str, kind: str, payload: dict[str, Any]
@@ -1205,7 +1309,7 @@ class ControlLedger:
                 {"trader_id": trader_id, "request_id": request_id, "worker_id": worker_id, "kind": kind, "payload": payload},
             )
             if kind == "operation":
-                if self.recovery_admission_blocked([worker_id]):
+                if not self._trader_operation_allowed(worker_id):
                     result = {"reason": "Trader operations require an account with completed recovery."}
                     completed_event_id = self._event(
                         "trader_worker_result_recorded",
@@ -1497,6 +1601,8 @@ class ControlLedger:
         terminal: dict[str, object],
         orders: list[object],
         positions: list[object],
+        *,
+        recovery_epoch: str | None = None,
     ) -> None:
         with self._transaction():
             self._require_reconciliation_cursor(worker_id, cursor)
@@ -1528,6 +1634,7 @@ class ControlLedger:
                 snapshot_id,
                 [item for item in orders if isinstance(item, dict)],
                 [item for item in positions if isinstance(item, dict)],
+                recovery_epoch,
             )
 
     def begin_empty_convergence(
@@ -1575,6 +1682,177 @@ class ControlLedger:
                 records.append(self._recovery_record(decision.account, decision.directive))
             return records
 
+    def begin_entry_unconfirmed(
+        self, worker_ids: list[str], incident_id: str, source: str, audit: dict[str, object]
+    ) -> list[dict[str, Any]]:
+        """Persist uncertain post-dispatch entry effects before empty convergence."""
+
+        if not worker_ids or not incident_id or not source or not isinstance(audit.get("reason"), str) or not audit["reason"]:
+            raise LedgerError("Account recovery incident, source, workers, and reason are required.")
+        with self._transaction():
+            records: list[dict[str, Any]] = []
+            for worker_id in dict.fromkeys(worker_ids):
+                worker = self._connection.execute(
+                    "SELECT status FROM workers WHERE worker_id = ?", [worker_id]
+                ).fetchone()
+                if worker is None or worker[0] != "active":
+                    raise LedgerError("Worker is not active.")
+                current = self._account_recovery(worker_id) or AccountRecovery(worker_id=worker_id)
+                if current.state == "ENTRY_UNCONFIRMED" and current.incident_id == incident_id:
+                    decision = RecoveryDecision(
+                        current,
+                        RecoveryDirective("REQUEST_SNAPSHOT", "A broker entry outcome is unconfirmed.", current.revision),
+                    )
+                else:
+                    decision = entry_unconfirmed(current, incident_id)
+                    self._store_recovery_decision(decision, source=source, audit=audit)
+                records.append(self._recovery_record(decision.account, decision.directive))
+            event_id = self._event(
+                "hedged_entry_unconfirmed",
+                {
+                    "incident_id": incident_id,
+                    "worker_ids": list(dict.fromkeys(worker_ids)),
+                    "source": source,
+                    "audit": audit,
+                },
+            )
+            trader_id = audit.get("trader_id")
+            if isinstance(trader_id, str) and trader_id:
+                active_trader = self._connection.execute(
+                    "SELECT 1 FROM traders WHERE trader_id = ? AND status = 'active'",
+                    [trader_id],
+                ).fetchone()
+                if active_trader is not None:
+                    worker_ids = tuple(dict.fromkeys(worker_ids))
+                    existing_pair = self._connection.execute(
+                        "SELECT trader_id, worker_ids, lifecycle_state FROM recovery_pairs WHERE pair_id = ?",
+                        [incident_id],
+                    ).fetchone()
+                    if existing_pair is None:
+                        self._connection.execute(
+                            """INSERT INTO recovery_pairs
+                               (pair_id, trader_id, worker_ids, expected_legs, lifecycle_state, revision, updated_at)
+                               VALUES (?, ?, ?, ?, 'ENTRY_UNCONFIRMED', 0, ?)""",
+                            [incident_id, trader_id, json.dumps(worker_ids), "[]", _utc_now()],
+                        )
+                    elif existing_pair[0] != trader_id or existing_pair[1] != json.dumps(worker_ids):
+                        raise LedgerError("Unconfirmed hedged entry pair ID was reused with a different owner or Workers.")
+                    self._connection.execute(
+                        "INSERT INTO trader_events (trader_id, event_id) VALUES (?, ?)",
+                        [trader_id, event_id],
+                    )
+            return records
+
+    def activate_hedged_entry_protected_pair(
+        self, trader_id: str, command_id: str, legs: list[dict[str, object]]
+    ) -> dict[str, Any]:
+        """Bind accepted controller entry receipts to their pre-dispatch recovery ownership."""
+
+        if not command_id or len(legs) != 2:
+            raise LedgerError("Accepted hedged entry requires exactly two protected legs.")
+        required_leg_fields = {"worker_id", "ticket", "symbol", "side", "volume", "stop_loss", "take_profit"}
+        if any(set(leg) != required_leg_fields for leg in legs):
+            raise LedgerError("Accepted hedged entry protection is invalid.")
+        try:
+            expected = tuple(
+                ProtectedLeg(
+                    ticket=str(leg["ticket"]),
+                    symbol=str(leg["symbol"]),
+                    side=str(leg["side"]),
+                    volume=str(leg["volume"]),
+                    stop_loss=str(leg["stop_loss"]),
+                    take_profit=str(leg["take_profit"]),
+                )
+                for leg in legs
+            )
+            worker_ids = tuple(str(leg["worker_id"]) for leg in legs)
+        except KeyError as error:
+            raise LedgerError("Accepted hedged entry protection is invalid.") from error
+        if (
+            len(set(worker_ids)) != 2
+            or any(not value for value in worker_ids)
+            or any(not all(getattr(leg, field) for field in ("ticket", "symbol", "side", "volume", "stop_loss", "take_profit")) for leg in expected)
+        ):
+            raise LedgerError("Accepted hedged entry protection is invalid.")
+        expected_json = json.dumps([leg.__dict__ for leg in expected], sort_keys=True)
+        with self._transaction():
+            self.active_trader(trader_id)
+            existing = self._connection.execute(
+                """SELECT trader_id, worker_ids, expected_legs, lifecycle_state, revision
+                   FROM recovery_pairs WHERE pair_id = ?""",
+                [command_id],
+            ).fetchone()
+            if existing is not None:
+                if existing[0] != trader_id or existing[1] != json.dumps(worker_ids):
+                    raise LedgerError("Accepted hedged entry command ID was reused with different protection.")
+                if existing[2] == "[]" and existing[3] == "ENTRY_UNCONFIRMED":
+                    self._connection.execute(
+                        """UPDATE recovery_pairs
+                           SET expected_legs = ?, lifecycle_state = 'CATCHING_UP', updated_at = ?
+                           WHERE pair_id = ?""",
+                        [expected_json, _utc_now(), command_id],
+                    )
+                elif existing[2] != expected_json:
+                    raise LedgerError("Accepted hedged entry command ID was reused with different protection.")
+                else:
+                    return {
+                        "pair_id": command_id,
+                        "worker_ids": list(worker_ids),
+                        "lifecycle_state": existing[3],
+                        "revision": int(existing[4]),
+                    }
+            recoveries = [(worker_id, self._account_recovery(worker_id)) for worker_id in worker_ids]
+            if any(
+                recovery is None
+                or recovery.state != "ENTRY_UNCONFIRMED"
+                or recovery.incident_id != command_id
+                for _, recovery in recoveries
+            ):
+                raise LedgerError("Accepted hedged entry no longer owns both recovery accounts.")
+            pair = RecoveryPair(command_id, worker_ids, expected)
+            if existing is None:
+                self._connection.execute(
+                    """INSERT INTO recovery_pairs (pair_id, trader_id, worker_ids, expected_legs, lifecycle_state, revision, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    [command_id, trader_id, json.dumps(worker_ids), expected_json, pair.state, pair.revision, _utc_now()],
+                )
+            for worker_id, expected_leg in zip(worker_ids, expected, strict=True):
+                recovery = self._account_recovery(worker_id)
+                assert recovery is not None
+                account = AccountRecovery(
+                    worker_id=worker_id,
+                    state="CATCHING_UP",
+                    desired_state="PROTECTED_LEG",
+                    revision=recovery.revision + 1,
+                    incident_id=command_id,
+                    expected_leg=expected_leg,
+                )
+                self._store_recovery_decision(
+                    RecoveryDecision(
+                        account,
+                        RecoveryDirective(
+                            "REQUEST_SNAPSHOT",
+                            "Initial protected entry receipts require fresh paired broker snapshots.",
+                            account.revision,
+                        ),
+                    ),
+                    source="hedged_entry_protection_accepted",
+                    audit={"trader_id": trader_id, "command_id": command_id, "legs": legs},
+                )
+            event_id = self._event(
+                "hedged_entry_protection_accepted",
+                {"trader_id": trader_id, "command_id": command_id, "worker_ids": list(worker_ids), "legs": legs},
+            )
+            self._connection.execute(
+                "INSERT INTO trader_events (trader_id, event_id) VALUES (?, ?)", [trader_id, event_id]
+            )
+            return {
+                "pair_id": command_id,
+                "worker_ids": list(worker_ids),
+                "lifecycle_state": pair.state,
+                "revision": pair.revision,
+            }
+
     def recovery_admission_blocked(self, worker_ids: list[str]) -> set[str]:
         """Return accounts with recovery work that cannot receive a new entry."""
 
@@ -1588,6 +1866,18 @@ class ControlLedger:
                 worker_ids,
             ).fetchall()
         return {str(row[0]) for row in rows}
+
+    def _trader_operation_allowed(self, worker_id: str) -> bool:
+        protected_pair = self._connection.execute(
+            """SELECT worker_ids FROM recovery_pairs
+               WHERE lifecycle_state IN ('ENTRY_UNCONFIRMED', 'CATCHING_UP', 'ACTIVE_VERIFIED', 'CONVERGING_EMPTY')"""
+        ).fetchall()
+        if any(worker_id in json.loads(worker_ids) for (worker_ids,) in protected_pair):
+            return False
+        recovery = self._account_recovery(worker_id)
+        if recovery is None or recovery.state == "READY":
+            return True
+        return False
 
     def recovery_incident_workers(self, worker_id: str) -> list[str]:
         """Return every account that must converge with this recovery incident."""
@@ -1614,12 +1904,12 @@ class ControlLedger:
             ).fetchone() is None:
                 raise LedgerError("Worker is not active.")
             pairs = self._connection.execute(
-                """SELECT pair_id, worker_ids, lifecycle_state, revision FROM recovery_pairs
+                """SELECT pair_id, trader_id, worker_ids, lifecycle_state, revision FROM recovery_pairs
                    WHERE lifecycle_state IN ('CATCHING_UP', 'ACTIVE_VERIFIED')"""
             ).fetchall()
             protected_pairs = [
-                (str(pair_id), tuple(json.loads(worker_ids)), str(state), int(revision))
-                for pair_id, worker_ids, state, revision in pairs
+                (str(pair_id), str(trader_id), tuple(json.loads(worker_ids)), str(state), int(revision))
+                for pair_id, trader_id, worker_ids, state, revision in pairs
                 if worker_id in json.loads(worker_ids)
             ]
             if not protected_pairs:
@@ -1631,7 +1921,7 @@ class ControlLedger:
                     )
                     return True
                 return False
-            for pair_id, worker_ids, state, revision in protected_pairs:
+            for pair_id, trader_id, worker_ids, state, revision in protected_pairs:
                 self._connection.execute("DELETE FROM recovery_pair_observations WHERE pair_id = ?", [pair_id])
                 self._connection.execute(
                     """UPDATE recovery_pairs
@@ -1647,9 +1937,13 @@ class ControlLedger:
                             source=source,
                             audit=audit,
                         )
-                self._event(
+                event_id = self._event(
                     "recovery_pair_catching_up",
                     {"pair_id": pair_id, "worker_ids": list(worker_ids), "source": source, "audit": audit},
+                )
+                self._connection.execute(
+                    "INSERT INTO trader_events (trader_id, event_id) VALUES (?, ?)",
+                    [trader_id, event_id],
                 )
             return True
 
@@ -1687,6 +1981,14 @@ class ControlLedger:
             raise LedgerError("A protected recovery pair leg is invalid.")
         with self._transaction():
             self.active_trader(trader_id)
+            active_pair = self._connection.execute(
+                """SELECT pair_id FROM recovery_pairs
+                   WHERE lifecycle_state IN ('ENTRY_UNCONFIRMED', 'CATCHING_UP', 'ACTIVE_VERIFIED', 'CONVERGING_EMPTY')
+                     AND (CAST(worker_ids AS VARCHAR) LIKE ? OR CAST(worker_ids AS VARCHAR) LIKE ?)""",
+                [f"%{worker_ids[0]}%", f"%{worker_ids[1]}%"],
+            ).fetchone()
+            if active_pair is not None and active_pair[0] != pair_id:
+                raise LedgerError("Protected recovery pair Workers are already managed by an active pair.")
             existing = self._connection.execute(
                 "SELECT trader_id, worker_ids, expected_legs, lifecycle_state, revision FROM recovery_pairs WHERE pair_id = ?",
                 [pair_id],
@@ -1706,6 +2008,9 @@ class ControlLedger:
                     "SELECT 1 FROM workers WHERE worker_id = ? AND status = 'active'", [worker_id]
                 ).fetchone() is None:
                     raise LedgerError("Protected recovery pair Worker is not active.")
+                recovery = self._account_recovery(worker_id)
+                if recovery is not None and recovery.state != "READY":
+                    raise LedgerError("Protected recovery pair Worker recovery is incomplete.")
             pair = RecoveryPair(pair_id, worker_ids, expected)
             self._connection.execute(
                 """INSERT INTO recovery_pairs (pair_id, trader_id, worker_ids, expected_legs, lifecycle_state, revision, updated_at)
@@ -1725,8 +2030,111 @@ class ControlLedger:
                     RecoveryDecision(account, RecoveryDirective("REQUEST_SNAPSHOT", "Protected pair awaits fresh snapshots.", 1)),
                     source="protected_pair_registered",
                 )
-            self._event("recovery_pair_registered", {"pair_id": pair_id, "trader_id": trader_id, "worker_ids": worker_ids})
+            event_id = self._event(
+                "recovery_pair_registered",
+                {"pair_id": pair_id, "trader_id": trader_id, "worker_ids": worker_ids},
+            )
+            self._connection.execute(
+                "INSERT INTO trader_events (trader_id, event_id) VALUES (?, ?)",
+                [trader_id, event_id],
+            )
             return {"pair_id": pair_id, "worker_ids": list(worker_ids), "lifecycle_state": pair.state, "revision": pair.revision}
+
+    def request_protected_pair_close(
+        self, trader_id: str, command_id: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Durably change an owned protected pair's desired state to empty."""
+
+        if payload.get("type") != "protected_pair_close" or not isinstance(payload.get("pair_id"), str) or not payload["pair_id"]:
+            raise LedgerError("Protected pair close command is invalid.")
+        canonical_payload = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+        payload_hash = _hash(canonical_payload)
+        pair_id = payload["pair_id"]
+        worker_ids: tuple[str, ...] = ()
+        with self._transaction():
+            self.active_trader(trader_id)
+            existing = self._connection.execute(
+                "SELECT payload_hash, result FROM trader_commands WHERE trader_id = ? AND command_id = ?",
+                [trader_id, command_id],
+            ).fetchone()
+            if existing is not None:
+                if existing[0] != payload_hash:
+                    raise LedgerError("Trader command ID was reused with a different payload.")
+                return json.loads(existing[1])
+
+            pair = self._connection.execute(
+                """SELECT trader_id, worker_ids, lifecycle_state, revision
+                   FROM recovery_pairs WHERE pair_id = ?""",
+                [pair_id],
+            ).fetchone()
+            lifecycle_state = "MISSING" if pair is None else str(pair[2])
+            revision = None if pair is None else int(pair[3])
+            reason_code: str | None = None
+            if pair is None:
+                reason_code = "protected_pair_not_found"
+            elif pair[0] != trader_id:
+                reason_code = "protected_pair_not_owned"
+            else:
+                worker_ids = tuple(json.loads(pair[1]))
+                recoveries = [(worker_id, self._account_recovery(worker_id)) for worker_id in worker_ids]
+                if any(recovery is None for _, recovery in recoveries):
+                    reason_code = "protected_pair_recovery_missing"
+                elif any(recovery.state in {"NEEDS_HUMAN", "REVOKED"} for _, recovery in recoveries if recovery is not None):
+                    reason_code = "protected_pair_terminal"
+                elif lifecycle_state == "EMPTY_VERIFIED":
+                    reason_code = "already_empty_verified"
+                else:
+                    if lifecycle_state != "CONVERGING_EMPTY":
+                        revision = int(pair[3]) + 1
+                        lifecycle_state = "CONVERGING_EMPTY"
+                        self._connection.execute(
+                            """UPDATE recovery_pairs
+                               SET lifecycle_state = ?, revision = ?, updated_at = ?
+                               WHERE pair_id = ?""",
+                            [lifecycle_state, revision, _utc_now(), pair_id],
+                        )
+                    for _, recovery in recoveries:
+                        assert recovery is not None
+                        if recovery.desired_state != "EMPTY" or recovery.state != "CONVERGING_EMPTY":
+                            self._store_recovery_decision(
+                                converge_empty(
+                                    recovery,
+                                    pair_id,
+                                    "Trader requested protected pair close.",
+                                ),
+                                source="protected_pair_close",
+                                audit={"trader_id": trader_id, "command_id": command_id, "pair_id": pair_id},
+                            )
+
+            status = "rejected" if reason_code in {
+                "protected_pair_not_found",
+                "protected_pair_not_owned",
+                "protected_pair_recovery_missing",
+                "protected_pair_terminal",
+            } else "accepted"
+            event_type = "protected_pair_close_rejected" if status == "rejected" else "protected_pair_close_requested"
+            outcome: dict[str, Any] = {
+                "type": "command_result",
+                "command_id": command_id,
+                "status": status,
+                "pair_id": pair_id,
+                "worker_ids": list(worker_ids),
+                "revision": revision,
+                "lifecycle_state": lifecycle_state,
+            }
+            outcome["reason_code"] = reason_code or "desired_empty_requested"
+            event_id = self._event(
+                event_type,
+                {"trader_id": trader_id, "command_id": command_id, "command": payload, "outcome": outcome},
+            )
+            self._connection.execute("INSERT INTO trader_events (trader_id, event_id) VALUES (?, ?)", [trader_id, event_id])
+            persisted = {**outcome, "event_id": event_id}
+            self._connection.execute(
+                """INSERT INTO trader_commands (trader_id, command_id, payload_hash, result, created_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                [trader_id, command_id, payload_hash, json.dumps(persisted, sort_keys=True), _utc_now()],
+            )
+            return persisted
 
     def record_worker_recovery_sync(
         self, worker_id: str, epoch: str, journal: list[dict[str, object]]
@@ -1746,6 +2154,12 @@ class ControlLedger:
                    ON CONFLICT(worker_id) DO UPDATE SET epoch = excluded.epoch, journal = excluded.journal,
                      received_at = excluded.received_at""",
                 [worker_id, epoch, json.dumps(journal, sort_keys=True), _utc_now()],
+            )
+            self._connection.execute(
+                """UPDATE trader_ticket_transitions
+                   SET state = 'expired', expired_at = ?
+                   WHERE worker_id = ? AND state IN ('pending', 'bound')""",
+                [_utc_now(), worker_id],
             )
             self._connection.execute("DELETE FROM recovery_pair_observations WHERE worker_id = ?", [worker_id])
             pairs = self._connection.execute(
@@ -1816,6 +2230,16 @@ class ControlLedger:
             recovery = self._account_recovery(worker_id)
             if recovery is None:
                 return None
+            if recovery.desired_state == "PROTECTED_LEG":
+                directive = self._connection.execute(
+                    "SELECT last_directive FROM account_recoveries WHERE worker_id = ?", [worker_id]
+                ).fetchone()
+                assert directive is not None
+                raw = json.loads(directive[0])
+                return self._recovery_record(
+                    recovery,
+                    RecoveryDirective(raw["kind"], raw["reason"], raw["revision"], tuple(raw.get("tickets", []))),
+                )
             decision = (
                 RecoveryDecision(
                     recovery,
@@ -1890,23 +2314,93 @@ class ControlLedger:
                 "directive": directive_json,
             },
         )
+        self._complete_empty_recovery_pair(account)
+
+    def _complete_empty_recovery_pair(self, account: AccountRecovery) -> None:
+        if account.state != "READY" or account.desired_state != "EMPTY" or account.incident_id is None:
+            return
+        pair = self._connection.execute(
+            """SELECT trader_id, worker_ids, lifecycle_state, revision
+               FROM recovery_pairs WHERE pair_id = ?""",
+            [account.incident_id],
+        ).fetchone()
+        if pair is None or pair[2] not in {
+            "ENTRY_UNCONFIRMED",
+            "CATCHING_UP",
+            "ACTIVE_VERIFIED",
+            "CONVERGING_EMPTY",
+        }:
+            return
+        worker_ids = tuple(json.loads(pair[1]))
+        placeholders = ", ".join("?" for _ in worker_ids)
+        recoveries = self._connection.execute(
+            f"""SELECT worker_id, lifecycle_state, desired_state FROM account_recoveries
+                WHERE worker_id IN ({placeholders})""",
+            list(worker_ids),
+        ).fetchall()
+        states = {str(worker_id): (str(state), str(desired_state)) for worker_id, state, desired_state in recoveries}
+        if any(states.get(worker_id) != ("READY", "EMPTY") for worker_id in worker_ids):
+            return
+        revision = int(pair[3]) + 1
+        self._connection.execute(
+            """UPDATE recovery_pairs
+               SET lifecycle_state = 'EMPTY_VERIFIED', revision = ?, updated_at = ?
+               WHERE pair_id = ?""",
+            [revision, _utc_now(), account.incident_id],
+        )
+        self._connection.execute(
+            f"""UPDATE trader_ticket_transitions
+                SET state = 'expired', expired_at = ?
+                WHERE worker_id IN ({placeholders}) AND state IN ('pending', 'bound')""",
+            [_utc_now(), *worker_ids],
+        )
+        event_id = self._event(
+            "recovery_pair_empty_verified",
+            {
+                "pair_id": account.incident_id,
+                "trader_id": pair[0],
+                "worker_ids": list(worker_ids),
+                "revision": revision,
+            },
+        )
+        self._connection.execute(
+            "INSERT INTO trader_events (trader_id, event_id) VALUES (?, ?)",
+            [pair[0], event_id],
+        )
 
     def _record_pair_snapshot(
-        self, worker_id: str, snapshot_id: str, orders: list[dict[str, object]], positions: list[dict[str, object]]
+        self,
+        worker_id: str,
+        snapshot_id: str,
+        orders: list[dict[str, object]],
+        positions: list[dict[str, object]],
+        recovery_epoch: str | None,
     ) -> None:
         sync = self._connection.execute(
             "SELECT epoch FROM worker_recovery_syncs WHERE worker_id = ?", [worker_id]
         ).fetchone()
         if sync is None:
             return
-        recovery_epoch = str(sync[0])
+        current_epoch = str(sync[0])
+        if recovery_epoch is not None and recovery_epoch != current_epoch:
+            self._event(
+                "worker_recovery_snapshot_rejected",
+                {
+                    "worker_id": worker_id,
+                    "snapshot_id": snapshot_id,
+                    "recovery_epoch": recovery_epoch,
+                    "current_recovery_epoch": current_epoch,
+                },
+            )
+            return
+        recovery_epoch = current_epoch
         rows = self._connection.execute(
-            """SELECT pair_id, worker_ids, expected_legs, lifecycle_state, revision
+            """SELECT pair_id, trader_id, worker_ids, expected_legs, lifecycle_state, revision
                FROM recovery_pairs WHERE CAST(worker_ids AS VARCHAR) LIKE ?
                  AND lifecycle_state IN ('CATCHING_UP', 'ACTIVE_VERIFIED')""",
             [f"%{worker_id}%"],
         ).fetchall()
-        for pair_id, worker_ids_json, legs_json, state, revision in rows:
+        for pair_id, trader_id, worker_ids_json, legs_json, state, revision in rows:
             worker_ids = tuple(json.loads(worker_ids_json))
             if worker_id not in worker_ids:
                 continue
@@ -1962,9 +2456,13 @@ class ControlLedger:
                         ),
                         source="paired_snapshot_match",
                     )
-            self._event(
+            event_id = self._event(
                 "recovery_pair_snapshot_compared",
                 {"pair_id": pair_id, "state": decision.pair.state, "worker_ids": list(worker_ids)},
+            )
+            self._connection.execute(
+                "INSERT INTO trader_events (trader_id, event_id) VALUES (?, ?)",
+                [trader_id, event_id],
             )
 
     @staticmethod
@@ -2276,59 +2774,207 @@ class ControlLedger:
                     self._connection.execute(
                         "INSERT INTO trader_events (trader_id, event_id) VALUES (?, ?)", [trader_id, event_id]
                     )
-            else:
+            elif controlled_ticket := self._expected_ticket_transition(worker_id, ticket, entity, change):
                 self._event(
-                    "external_broker_change",
-                    {"worker_id": worker_id, "cursor": cursor, "entity": entity, "ticket": ticket, "change": change},
-                )
-                affected = self._connection.execute(
-                    """SELECT intent_id, trader_id FROM trader_intents
-                       WHERE status IN ('dispatching', 'working')
-                         AND CAST(preflight AS VARCHAR) LIKE ?""",
-                    [f"%{worker_id}%"],
-                ).fetchall()
-                for intent_id, trader_id in affected:
-                    payload = {
+                    "trader_broker_execution_observed",
+                    {
+                        "trader_id": controlled_ticket[0],
+                        "command_id": controlled_ticket[1],
                         "worker_id": worker_id,
                         "cursor": cursor,
                         "entity": entity,
                         "ticket": ticket,
                         "change": change,
-                        "reason": "Unattributed external broker change requires account recovery.",
-                    }
-                    execution_event_id = self._event(
-                        "intent_account_recovery_started",
-                        {"intent_id": intent_id, **payload},
-                    )
-                    self._connection.execute(
-                        """INSERT INTO trader_intent_execution_records
-                           (intent_id, event_id, event_type, payload, recorded_at)
-                           VALUES (?, ?, ?, ?, ?)""",
-                        [intent_id, execution_event_id, "intent_account_recovery_started",
-                         json.dumps(payload, separators=(",", ":"), sort_keys=True), _utc_now()],
-                    )
-                    self._connection.execute(
-                        "INSERT INTO trader_events (trader_id, event_id) VALUES (?, ?)",
-                        [trader_id, execution_event_id],
-                    )
-                    self._connection.execute(
-                        "UPDATE trader_intents SET status = 'needs_human' WHERE intent_id = ?",
-                        [intent_id],
-                    )
-                audit = {
-                    "reason": "Unattributed external broker change requires account recovery.",
-                    "cursor": cursor,
-                    "entity": entity,
-                    "ticket": ticket,
-                }
-                incident_id = str(uuid4())
-                for affected_worker_id in self._active_counterpart_worker_ids(worker_id):
-                    current = self._account_recovery(affected_worker_id) or AccountRecovery(worker_id=affected_worker_id)
-                    self._store_recovery_decision(
-                        converge_empty(current, incident_id, str(audit["reason"])),
-                        source="external_broker_change",
-                        audit=audit,
-                    )
+                    },
+                )
+            elif self._hold_pending_ticket_attribution(worker_id, cursor, observed_at, entity, ticket, change, record):
+                pass
+            else:
+                self._record_unattributed_delta(worker_id, cursor, observed_at, entity, ticket, change, record)
+
+    def _expected_ticket_transition(
+        self, worker_id: str, ticket: str, entity: str, change: str
+    ) -> tuple[str, str] | None:
+        row = self._connection.execute(
+            """SELECT trader_id, command_id, expected_entity, expected_change
+               FROM trader_ticket_transitions
+               WHERE worker_id = ? AND ticket = ? AND state = 'bound'""",
+            [worker_id, ticket],
+        ).fetchone()
+        if row is None or row[2] != entity or row[3] != change:
+            return None
+        return str(row[0]), str(row[1])
+
+    def _hold_pending_ticket_attribution(
+        self,
+        worker_id: str,
+        cursor: int,
+        observed_at: str,
+        entity: str,
+        ticket: str,
+        change: str,
+        record: dict[str, object],
+    ) -> bool:
+        if entity != "position" or change != "created":
+            return False
+        legs = self._connection.execute(
+            """SELECT leg.trader_id, leg.command_id, leg.symbol, leg.volume, leg.direction, command.result
+               FROM trader_hedged_entry_legs leg
+               JOIN trader_commands command
+                 ON command.trader_id = leg.trader_id AND command.command_id = leg.command_id
+               WHERE leg.worker_id = ?""",
+            [worker_id],
+        ).fetchall()
+        candidates = [
+            (str(trader_id), str(command_id))
+            for trader_id, command_id, symbol, volume, direction, result_json in legs
+            if json.loads(result_json).get("status") == "in_progress"
+            and self._matches_pending_hedged_entry_leg(record, str(symbol), str(volume), str(direction))
+        ]
+        if len(candidates) != 1:
+            return False
+        trader_id, command_id = candidates[0]
+        existing = self._connection.execute(
+            """SELECT state FROM trader_ticket_transitions WHERE worker_id = ? AND ticket = ?""",
+            [worker_id, ticket],
+        ).fetchone()
+        if existing is not None:
+            return existing[0] == "pending"
+        self._connection.execute(
+            """INSERT INTO trader_ticket_transitions
+                   (worker_id, ticket, trader_id, command_id, expected_entity, expected_change, state,
+                    cursor, observed_at, record, recorded_at)
+               VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)""",
+            [
+                worker_id,
+                ticket,
+                trader_id,
+                command_id,
+                entity,
+                change,
+                cursor,
+                observed_at,
+                json.dumps(record, sort_keys=True),
+                _utc_now(),
+            ],
+        )
+        self._event(
+            "trader_ticket_attribution_pending",
+            {
+                "trader_id": trader_id,
+                "command_id": command_id,
+                "worker_id": worker_id,
+                "ticket": ticket,
+                "cursor": cursor,
+            },
+        )
+        return True
+
+    @staticmethod
+    def _matches_pending_hedged_entry_leg(
+        record: dict[str, object], symbol: str, volume: str, direction: str
+    ) -> bool:
+        observed_symbol = record.get("symbol")
+        if observed_symbol is not None and str(observed_symbol) != symbol:
+            return False
+        observed_volume = record.get("volume", record.get("volume_current"))
+        if observed_volume is not None:
+            if isinstance(observed_volume, bool):
+                return False
+            try:
+                if Decimal(str(observed_volume)) != Decimal(volume):
+                    return False
+            except (InvalidOperation, ValueError):
+                return False
+        observed_direction = record.get("type", record.get("side"))
+        if observed_direction is not None:
+            expected_direction = "0" if direction == "LONG" else "1"
+            if str(observed_direction) not in {direction, expected_direction}:
+                return False
+        return True
+
+    def _record_unattributed_delta(
+        self,
+        worker_id: str,
+        cursor: int,
+        observed_at: str,
+        entity: str,
+        ticket: str,
+        change: str,
+        record: dict[str, object],
+    ) -> None:
+        recovery = self._account_recovery(worker_id)
+        if recovery is not None and recovery.desired_state == "EMPTY" and recovery.state != "READY":
+            self._event(
+                "account_recovery_effect_observed",
+                {"worker_id": worker_id, "cursor": cursor, "entity": entity, "ticket": ticket, "change": change},
+            )
+            return
+        self._record_external_broker_change(worker_id, cursor, observed_at, entity, ticket, change, record)
+
+    def _record_external_broker_change(
+        self,
+        worker_id: str,
+        cursor: int,
+        observed_at: str,
+        entity: str,
+        ticket: str,
+        change: str,
+        record: dict[str, object],
+    ) -> None:
+        self._event(
+            "external_broker_change",
+            {"worker_id": worker_id, "cursor": cursor, "entity": entity, "ticket": ticket, "change": change},
+        )
+        affected = self._connection.execute(
+            """SELECT intent_id, trader_id FROM trader_intents
+               WHERE status IN ('dispatching', 'working')
+                 AND CAST(preflight AS VARCHAR) LIKE ?""",
+            [f"%{worker_id}%"],
+        ).fetchall()
+        for intent_id, trader_id in affected:
+            payload = {
+                "worker_id": worker_id,
+                "cursor": cursor,
+                "entity": entity,
+                "ticket": ticket,
+                "change": change,
+                "reason": "Unattributed external broker change requires account recovery.",
+            }
+            execution_event_id = self._event(
+                "intent_account_recovery_started",
+                {"intent_id": intent_id, **payload},
+            )
+            self._connection.execute(
+                """INSERT INTO trader_intent_execution_records
+                   (intent_id, event_id, event_type, payload, recorded_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                [intent_id, execution_event_id, "intent_account_recovery_started",
+                 json.dumps(payload, separators=(",", ":"), sort_keys=True), _utc_now()],
+            )
+            self._connection.execute(
+                "INSERT INTO trader_events (trader_id, event_id) VALUES (?, ?)",
+                [trader_id, execution_event_id],
+            )
+            self._connection.execute(
+                "UPDATE trader_intents SET status = 'needs_human' WHERE intent_id = ?",
+                [intent_id],
+            )
+        audit = {
+            "reason": "Unattributed external broker change requires account recovery.",
+            "cursor": cursor,
+            "entity": entity,
+            "ticket": ticket,
+            "observed_at": observed_at,
+        }
+        incident_id = str(uuid4())
+        for affected_worker_id in self._active_counterpart_worker_ids(worker_id):
+            current = self._account_recovery(affected_worker_id) or AccountRecovery(worker_id=affected_worker_id)
+            self._store_recovery_decision(
+                converge_empty(current, incident_id, str(audit["reason"])),
+                source="external_broker_change",
+                audit=audit,
+            )
 
     def worker_reconciliation(self) -> list[dict[str, Any]]:
         now = _utc_now()
@@ -4119,6 +4765,40 @@ class ControlLedger:
                     requested_at TIMESTAMPTZ NOT NULL,
                     completed_at TIMESTAMPTZ,
                     PRIMARY KEY (trader_id, request_id)
+                );
+                CREATE TABLE IF NOT EXISTS trader_broker_tickets (
+                    worker_id VARCHAR NOT NULL,
+                    ticket VARCHAR NOT NULL,
+                    trader_id VARCHAR NOT NULL,
+                    command_id VARCHAR NOT NULL,
+                    recorded_at TIMESTAMPTZ NOT NULL,
+                    PRIMARY KEY (worker_id, ticket)
+                );
+                CREATE TABLE IF NOT EXISTS trader_hedged_entry_legs (
+                    trader_id VARCHAR NOT NULL,
+                    command_id VARCHAR NOT NULL,
+                    worker_id VARCHAR NOT NULL,
+                    symbol VARCHAR NOT NULL,
+                    volume VARCHAR NOT NULL,
+                    direction VARCHAR NOT NULL,
+                    recorded_at TIMESTAMPTZ NOT NULL,
+                    PRIMARY KEY (trader_id, command_id, worker_id)
+                );
+                CREATE TABLE IF NOT EXISTS trader_ticket_transitions (
+                    worker_id VARCHAR NOT NULL,
+                    ticket VARCHAR NOT NULL,
+                    trader_id VARCHAR NOT NULL,
+                    command_id VARCHAR NOT NULL,
+                    expected_entity VARCHAR NOT NULL,
+                    expected_change VARCHAR NOT NULL,
+                    state VARCHAR NOT NULL,
+                    cursor BIGINT,
+                    observed_at VARCHAR,
+                    record JSON,
+                    recorded_at TIMESTAMPTZ NOT NULL,
+                    resolved_at TIMESTAMPTZ,
+                    expired_at TIMESTAMPTZ,
+                    PRIMARY KEY (worker_id, ticket)
                 );
                 CREATE TABLE IF NOT EXISTS management_intent_commands (
                     username VARCHAR NOT NULL,

@@ -4,7 +4,16 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from abt.account_recovery import AccountRecovery, ProtectedLeg, RecoveryPair, converge_empty, entry_unconfirmed, observe, observe_pair
+from abt.account_recovery import (
+    AccountRecovery,
+    ProtectedLeg,
+    RecoveryPair,
+    _matches_protected_leg,
+    converge_empty,
+    entry_unconfirmed,
+    observe,
+    observe_pair,
+)
 from abt.worker.effect_journal import EffectJournalError, WorkerEffectJournal
 
 
@@ -63,6 +72,34 @@ class AccountRecoveryTests(unittest.TestCase):
         self.assertEqual(("CONVERGING_EMPTY", ("worker-a", "worker-b")), (
             mismatched.pair.state, mismatched.converge_worker_ids
         ))
+
+    def test_protected_leg_numeric_evidence_matches_canonical_values(self) -> None:
+        expected = ProtectedLeg("10", "EURUSD", "0", "0.10", "1.20000", "2")
+
+        matches = _matches_protected_leg(
+            expected,
+            [],
+            [{"ticket": 10, "symbol": "EURUSD", "type": 0, "volume": "0.1", "sl": 1.2, "tp": 2}],
+        )
+
+        self.assertTrue(matches)
+
+    def test_protected_leg_numeric_evidence_rejects_invalid_values(self) -> None:
+        expected = ProtectedLeg("10", "EURUSD", "0", "0.1", "1.2", "2")
+        valid_position = {"ticket": 10, "symbol": "EURUSD", "type": 0, "volume": 0.1, "sl": 1.2, "tp": 2}
+
+        for field, invalid_value in (
+            ("volume", True),
+            ("volume", float("nan")),
+            ("sl", float("inf")),
+            ("tp", "not-a-number"),
+        ):
+            with self.subTest(field=field, invalid_value=invalid_value):
+                position = valid_position | {field: invalid_value}
+                self.assertFalse(_matches_protected_leg(expected, [], [position]))
+
+        invalid_expected = ProtectedLeg("10", "EURUSD", "0", "invalid", "1.2", "2")
+        self.assertFalse(_matches_protected_leg(invalid_expected, [], [valid_position]))
 
 
 class WorkerEffectJournalTests(unittest.TestCase):
