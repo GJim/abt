@@ -405,6 +405,33 @@ class RealtimeArbitrageTests(unittest.TestCase):
         self.assertGreater(remaining, 299)
         self.assertLessEqual(remaining, 300)
 
+    def test_active_pair_integrity_waits_for_its_periodic_deadline(self) -> None:
+        class Runtime:
+            calls = 0
+
+            def verify_active(self) -> object:
+                self.calls += 1
+                return type("Result", (), {"state": "ACTIVE", "reason": None})()
+
+        gateway = FakeGateway()
+        strategy = RealtimeArbitrage(
+            gateway,
+            first=Endpoint("worker-a"),
+            second=Endpoint("worker-b"),
+            config=configuration(),
+        )
+        strategy.pair = Pair(
+            "EURUSD", "long_first_short_second", 1.2, 1.2, 11, 22,
+            "LONG", "SHORT", 0.1, datetime.now(UTC),
+        )
+        runtime = Runtime()
+        strategy.runtime = runtime  # type: ignore[assignment]
+        strategy.integrity_check_at = datetime.now(UTC) + timedelta(minutes=1)
+
+        strategy._check_active_pair_integrity()
+
+        self.assertEqual(0, runtime.calls)
+
     def test_write_rpc_disconnect_never_falls_back_to_direct_account_mutation(self) -> None:
         gateway = FakeGateway()
         strategy = RealtimeArbitrage(gateway, first=Endpoint("worker-a"), second=Endpoint("worker-b"), config=configuration())

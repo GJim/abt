@@ -1348,7 +1348,14 @@ class RealtimeArbitrage:
         self._check_integrity()
 
     def _check_active_pair_integrity(self) -> None:
-        if self.pair is not None and self.config.execute:
+        if (
+            self.pair is not None
+            and self.config.execute
+            and (
+                self.integrity_check_at is None
+                or datetime.now(UTC) >= self.integrity_check_at
+            )
+        ):
             self._check_integrity()
 
     def _check_integrity(self) -> None:
@@ -1359,6 +1366,12 @@ class RealtimeArbitrage:
                 self.stopped = True
                 raise StrategyError(result.reason or "Protected pair integrity diverged; runtime converged toward empty.")
             self.integrity_check_at = datetime.now(UTC) + timedelta(seconds=self.config.integrity_check_seconds)
+            _LOGGER.info(
+                "pair_integrity_verified first_ticket=%s second_ticket=%s next_check_at=%s",
+                self.pair.first_ticket,
+                self.pair.second_ticket,
+                self.integrity_check_at.isoformat(),
+            )
             return
         for name, endpoint in self.endpoints.items():
             positions = self._records(endpoint, "current_positions", "positions")
