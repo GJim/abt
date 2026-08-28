@@ -93,6 +93,8 @@ class FakeGateway:
             "volume_max": 100.0,
             "filling_mode": 3,
             "order_mode": 3,
+            "trade_stops_level": 10,
+            "trade_freeze_level": 0,
             **symbol,
         }
 
@@ -113,9 +115,11 @@ def configuration(
     execute: bool = True,
     max_exposure_usd: float | None = None,
     max_margin_ratio: float = 0.1,
+    maximum_holding_seconds: float | None = None,
 ) -> StrategyConfig:
     return StrategyConfig(
-        0.4, 100, 0.03, 0.02, max_exposure_usd, max_margin_ratio, 1, 40, 5, 180, time(16), 300, 30, execute
+        0.4, 100, 0.03, 0.02, max_exposure_usd, max_margin_ratio, 1, 40, 5, 180,
+        time(16), 300, 30, execute, maximum_holding_seconds
     )
 
 
@@ -432,6 +436,138 @@ class RealtimeArbitrageTests(unittest.TestCase):
 
         self.assertEqual(0, runtime.calls)
 
+    def test_quiet_market_data_still_advances_the_active_pair_runtime(self) -> None:
+        class Runtime:
+            calls = 0
+
+            def maintain(self, now: datetime, market: object) -> object:
+                self.calls += 1
+                return type("Result", (), {"status": "active", "state": "ACTIVE", "reason": None})()
+
+        gateway = FakeGateway()
+        strategy = RealtimeArbitrage(
+            gateway,
+            first=Endpoint("worker-a"),
+            second=Endpoint("worker-b"),
+            config=configuration(),
+        )
+        strategy.pair = Pair(
+            "EURUSD", "long_first_short_second", 1.2, 1.2, 11, 22,
+            "LONG", "SHORT", 0.1, datetime.now(UTC),
+        )
+        runtime = Runtime()
+        strategy.runtime = runtime  # type: ignore[assignment]
+        strategy.integrity_check_at = datetime.now(UTC) + timedelta(minutes=1)
+        strategy._cutoff_reached = lambda: False  # type: ignore[method-assign]
+        stop = Event()
+
+        def quiet_market_data() -> None:
+            stop.set()
+            return None
+
+        gateway.market_data = quiet_market_data  # type: ignore[method-assign]
+
+        strategy.run(stop)
+
+        self.assertEqual(1, runtime.calls)
+
+    def test_quiet_loop_continues_an_unprojected_uncertain_close_after_restart(self) -> None:
+        class Runtime:
+            state = "CLOSE_UNCERTAIN"
+            calls = 0
+
+            def maintain(self, now: datetime, market: object) -> object:
+                self.calls += 1
+                return type("Result", (), {"status": "empty", "state": "EMPTY", "reason": None})()
+
+        gateway = FakeGateway()
+        strategy = RealtimeArbitrage(
+            gateway,
+            first=Endpoint("worker-a"),
+            second=Endpoint("worker-b"),
+            config=configuration(),
+        )
+        runtime = Runtime()
+        strategy.runtime = runtime  # type: ignore[assignment]
+        strategy.runtime_close_pending = True
+        strategy._cutoff_reached = lambda: False  # type: ignore[method-assign]
+        stop = Event()
+
+        def quiet_market_data() -> None:
+            stop.set()
+            return None
+
+        gateway.market_data = quiet_market_data  # type: ignore[method-assign]
+
+        strategy.run(stop)
+
+        self.assertEqual(1, runtime.calls)
+        self.assertFalse(strategy.runtime_close_pending)
+
+    def test_runtime_market_observation_uses_each_worker_quote_and_recent_movement(self) -> None:
+        strategy = RealtimeArbitrage(
+            FakeGateway(),
+            first=Endpoint("worker-a"),
+            second=Endpoint("worker-b"),
+            config=configuration(),
+        )
+        now = datetime.now(UTC)
+        for offset in range(60, -1, -1):
+            movement = (60 - offset) * (0.0001 / 60)
+            first = (1.1000 + movement, 1.1002 + movement)
+            second = (1.1002 + movement, 1.1004 + movement)
+            observed_at = (now - timedelta(seconds=offset)).isoformat()
+            strategy._consume({
+                "worker_id": "worker-a",
+                "observed_at": observed_at,
+                "quotes": [{"symbol": "EURUSD", "bid": first[0], "ask": first[1]}],
+            })
+            strategy._consume({
+                "worker_id": "worker-b",
+                "observed_at": observed_at,
+                "quotes": [{"symbol": "EURUSD", "bid": second[0], "ask": second[1]}],
+            })
+
+        observation = strategy._runtime_market_observation(now, "EURUSD")
+
+        assert observation is not None
+        self.assertEqual(("worker-a", 1.1001, 1.1003), (
+            observation.first.worker_id,
+            round(observation.first.bid, 4),
+            round(observation.first.ask, 4),
+        ))
+        self.assertEqual(("worker-b", 1.1003, 1.1005), (
+            observation.second.worker_id,
+            round(observation.second.bid, 4),
+            round(observation.second.ask, 4),
+        ))
+        self.assertAlmostEqual(
+            0.0001 / 60, observation.first.recent_midpoint_moves[-1]
+        )
+
+    def test_quote_gap_invalidates_natural_movement_history(self) -> None:
+        strategy = RealtimeArbitrage(
+            FakeGateway(),
+            first=Endpoint("worker-a"),
+            second=Endpoint("worker-b"),
+            config=configuration(),
+        )
+        now = datetime.now(UTC)
+        for name, worker_id in (("first", "worker-a"), ("second", "worker-b")):
+            strategy._consume({
+                "worker_id": worker_id,
+                "observed_at": (now - timedelta(seconds=10)).isoformat(),
+                "quotes": [{"symbol": "EURUSD", "bid": 1.1000, "ask": 1.1002}],
+            })
+            strategy._consume({
+                "worker_id": worker_id,
+                "observed_at": now.isoformat(),
+                "quotes": [{"symbol": "EURUSD", "bid": 1.1001, "ask": 1.1003}],
+            })
+            self.assertEqual(1, len(strategy.quote_history[name]["EURUSD"]))
+
+        self.assertIsNone(strategy._runtime_market_observation(now, "EURUSD"))
+
     def test_write_rpc_disconnect_never_falls_back_to_direct_account_mutation(self) -> None:
         gateway = FakeGateway()
         strategy = RealtimeArbitrage(gateway, first=Endpoint("worker-a"), second=Endpoint("worker-b"), config=configuration())
@@ -514,6 +650,43 @@ class RealtimeArbitrageTests(unittest.TestCase):
                 for line in captured.output
             )
         )
+
+    def test_entry_snapshots_the_configured_maximum_holding_age(self) -> None:
+        class Runtime:
+            plan: object | None = None
+
+            def enter(self, plan: object) -> object:
+                self.plan = plan
+                first = type("Leg", (), {"entry_price": 1.1002, "ticket": 11})()
+                second = type("Leg", (), {"entry_price": 1.1000, "ticket": 22})()
+                return type(
+                    "Result", (),
+                    {"status": "active", "state": "ACTIVE", "first": first, "second": second},
+                )()
+
+        strategy = RealtimeArbitrage(
+            FakeGateway(),
+            first=Endpoint("worker-a"),
+            second=Endpoint("worker-b"),
+            config=configuration(maximum_holding_seconds=90),
+        )
+        now = datetime.now(UTC)
+        strategy.quotes["first"]["EURUSD"] = (now, 1.1000, 1.1002)
+        strategy.quotes["second"]["EURUSD"] = (now, 1.0998, 1.1000)
+        strategy.sizing_plans = {
+            ("EURUSD", "short_first_long_second"): SizingPlan(
+                0.1, 400, 400, now
+            )
+        }
+        runtime = Runtime()
+        strategy.runtime = runtime  # type: ignore[assignment]
+
+        strategy._open(TradeCandidate("EURUSD", "short_first_long_second", 0.0001))
+
+        assert runtime.plan is not None
+        timed_exit = runtime.plan.timed_exit  # type: ignore[attr-defined]
+        assert timed_exit is not None
+        self.assertEqual(90, timed_exit.maximum_holding_seconds)
 
     def test_skips_entry_when_margin_budget_cannot_cover_minimum_volume(self) -> None:
         gateway = FakeGateway()
@@ -690,6 +863,54 @@ class RealtimeArbitrageTests(unittest.TestCase):
         self.assertFalse(strategy._minimum_hold_elapsed())
         strategy.pair.opened_at = datetime.now(UTC) - timedelta(seconds=180)
         self.assertTrue(strategy._minimum_hold_elapsed())
+
+    def test_reverse_signal_bypasses_an_armed_timed_exit(self) -> None:
+        class Runtime:
+            state = "TIMED_EXIT_ARMED"
+            maintain_calls = 0
+            close_calls = 0
+
+            def maintain(self, now: datetime, market: object) -> object:
+                self.maintain_calls += 1
+                return type("Result", (), {"state": "TIMED_EXIT_ARMED", "reason": None})()
+
+            def desire_empty(self, reason: str) -> object:
+                self.close_calls += 1
+                return type("Result", (), {"state": "EMPTY", "reason": None})()
+
+        gateway = FakeGateway()
+        strategy = RealtimeArbitrage(
+            gateway,
+            first=Endpoint("worker-a"),
+            second=Endpoint("worker-b"),
+            config=configuration(),
+        )
+        strategy.pair = Pair(
+            "EURUSD", "long_first_short_second", 1.1, 1.1, 11, 22,
+            "LONG", "SHORT", 0.1, datetime.now(UTC) - timedelta(minutes=4),
+        )
+        now = datetime.now(UTC)
+        strategy.quotes["first"]["EURUSD"] = (now, 1.1010, 1.1011)
+        strategy.quotes["second"]["EURUSD"] = (now, 1.1000, 1.1001)
+        runtime = Runtime()
+        strategy.runtime = runtime  # type: ignore[assignment]
+        strategy._cutoff_reached = lambda: False  # type: ignore[method-assign]
+        stop = Event()
+
+        def one_message() -> dict[str, object]:
+            stop.set()
+            return {
+                "worker_id": "worker-a",
+                "observed_at": now.isoformat(),
+                "quotes": [{"symbol": "EURUSD", "bid": 1.1010, "ask": 1.1011}],
+            }
+
+        gateway.market_data = one_message  # type: ignore[method-assign]
+
+        strategy.run(stop)
+
+        self.assertEqual(1, runtime.close_calls)
+        self.assertEqual(0, runtime.maintain_calls)
 
     def test_new_york_daily_cutoff_includes_the_configured_minute(self) -> None:
         gateway = FakeGateway()
@@ -977,6 +1198,9 @@ class RealtimeArbitrageTests(unittest.TestCase):
             ["--lots", "0.1"],
             ["--max-margin-ratio", "0.51"],
             ["--max-exposure-usd", "0"],
+            ["--maximum-holding-seconds", "0"],
+            ["--maximum-holding-seconds", "nan"],
+            ["--maximum-holding-seconds", "inf"],
         ):
             with self.subTest(arguments=arguments):
                 with self.assertRaises(SystemExit):

@@ -129,6 +129,9 @@ _Avoid_: 配對的逐腿 Trader worker operation
 **生命週期時間權威**:
 策略執行體的單調時鐘裁決配對期限，帳戶工作者在 broker send 前以指令絕對期限作最後安全檢查；各主機必須同步受信任 UTC 時間來源，broker 時間只作事件證據。
 
+**限時同步配對退出**:
+已驗證受保護配對超過其持久化最大持有時間後，由策略執行體依兩個帳戶工作者的當前報價、近期自然波動及 broker stop/freeze constraints 建立的近市價退出走廊。兩腿以相同 normalized market movement 為目標，不保證相同 broker fill；若只剩一腿，策略執行體保留 15 秒 orphan grace，逾時只 market-close 剩餘 owned ticket，若兩腿在走廊 armed 後 30 秒仍存在則並行 market-close。所有期限、targets、effects 與 observation evidence 必須 durable，重啟不得重新起算。
+
 **失聯安全平倉**:
 一個帳戶工作者無法經主控台 relay 與策略執行體保持有效通訊超過心跳寬限時間後，停止新進場並依本機 broker observation 進入帳戶復原生命週期。已受 broker SL/TP 保護的曝險不因短暫失聯盲目重送或修改，重連後必須重新觀測。
 

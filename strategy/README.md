@@ -95,14 +95,13 @@ other broker's price because the brokers can quote different prices, spreads,
 precision, and contract terms. The Strategy Runtime remains non-active until Worker facts verify both legs.
 
 A broker TP remains emergency protection, not the normal pair exit: the
-strategy normally closes both legs together on its reverse signal. If either
-broker protection closes a leg, the next market-data event immediately verifies
-both expected positions; its missing ticket triggers durable close convergence for the remaining owned leg and
-stops the strategy.
+strategy normally closes both legs together on its reverse signal. Before a
+timed exit is armed, a missing protected ticket triggers durable close
+convergence for the remaining owned leg and stops the strategy.
 
 Every `--integrity-check-seconds` (default: five), it reads both accounts'
-orders and positions while idle. While a pair is active, this check runs on
-every market-data event. At startup both accounts must be empty; while a pair is active,
+orders and positions, including while the healthy market-data stream is quiet.
+At startup both accounts must be empty; while a pair is active,
 each account must contain exactly its expected ticket, symbol, direction, and
 volume, with no pending orders. Any mismatch is treated as an external account operation and moves the runtime
 toward `EMPTY` or `NEEDS_HUMAN` without mutating unrelated exposure.
@@ -122,6 +121,26 @@ Each pair must remain open for `--minimum-hold-seconds` (default: 180 seconds)
 before a normal reverse-signal exit can close it. This minimum never delays
 broker SL/TP, risk-limit, external-operation, or Ctrl+C shutdown handling.
 
+Timed synchronized exit is disabled by default. Set
+`--maximum-holding-seconds N` to snapshot a maximum holding age into each new
+pair. The age starts only after fresh Worker facts verify both entry legs.
+When it elapses, the Strategy Runtime reads current symbol stop/freeze
+constraints and combines them with current spread and the last 60 seconds of
+one-second midpoint movement. It then persists and concurrently sends a
+near-market SL/TP corridor for both owned tickets. Fresh broker snapshots must
+verify the exact protection before the corridor is considered armed.
+
+If one leg exits while the timed corridor is armed, the remaining protected
+leg receives a 15-second grace period to exit from the same market movement.
+After that deadline only the remaining owned ticket and current volume are
+market-closed. If both legs remain open for 30 seconds after arming, both are
+market-closed concurrently. Missing or stale market evidence, invalid broker
+constraints, and partially verified protection fall back to normal
+owned-ticket close convergence. All deadlines and protection targets survive
+Strategy Runtime restart. A reverse signal after the minimum hold, risk limit,
+daily cutoff, or shutdown bypasses the timed waiting periods and immediately
+converges the owned pair toward empty.
+
 At `--flatten-at-ny` (default: `16:00`), the strategy uses
 `America/New_York` to unconditionally close both selected accounts and stop.
 This daily cutoff also overrides the minimum hold time, preventing cross-day
@@ -132,6 +151,7 @@ uv run python strategy\realtime_arbitrage.py `
   --entry-edge-points 4 `
   --max-exposure-usd 5000 `
   --max-margin-ratio 0.1 `
+  --maximum-holding-seconds 900 `
   --execute
 ```
 

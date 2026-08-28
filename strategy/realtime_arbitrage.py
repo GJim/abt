@@ -25,7 +25,15 @@ from zoneinfo import ZoneInfo
 from abt.controlplane.crypto import trader_proof_payload
 from abt.trader.cli import HTTPTraderTransport
 from abt.trader.identity import load_identity
-from abt.trader.runtime import PairLegPlan, PairPlan, StrategyRuntime, StrategyRuntimeError
+from abt.trader.runtime import (
+    PairLegMarket,
+    PairLegPlan,
+    PairMarketObservation,
+    PairPlan,
+    StrategyRuntime,
+    StrategyRuntimeError,
+    TimedExitPolicy,
+)
 from abt.trader.session import open_authenticated_trader_session
 from abt.trader_protocol import WorkerEffectRequested, WorkerReadRequested
 from abt.worker.keystore import WindowsCNGKeyStore
@@ -83,6 +91,7 @@ class StrategyConfig:
     worker_disconnect_grace_seconds: float
     worker_write_disconnect_grace_seconds: float
     execute: bool
+    maximum_holding_seconds: float | None = None
 
 
 @dataclass(slots=True)
@@ -346,6 +355,24 @@ class TraderGateway:
             request_id=request_id,
             correlation=correlation,
             _include_fact=True,
+        )
+
+    def symbol_info(
+        self,
+        worker_id: str,
+        *,
+        symbol: str,
+        runtime_command_id: str,
+        request_id: str,
+        correlation: dict[str, object],
+    ) -> dict[str, object]:
+        return self.request(
+            worker_id,
+            kind="read",
+            request={"type": "symbol_info", "symbol": symbol},
+            runtime_command_id=runtime_command_id,
+            request_id=request_id,
+            correlation=correlation,
         )
 
     def order_check(
@@ -710,6 +737,9 @@ class RealtimeArbitrage:
                 exposure * self.config.max_margin_ratio * (1 - _MARGIN_HEADROOM_FRACTION),
             )
         self.quotes: dict[str, dict[str, tuple[datetime, float, float]]] = {"first": {}, "second": {}}
+        self.quote_history: dict[str, dict[str, deque[tuple[datetime, float]]]] = {
+            "first": {}, "second": {}
+        }
         self.sizing_plans: dict[tuple[str, str], SizingPlan] = {}
         self.sizing_snapshot_at: datetime | None = None
         self.integrity_check_at: datetime | None = None
@@ -726,13 +756,22 @@ class RealtimeArbitrage:
         self.awaiting_clear_symbol: str | None = None
         self.stopped = False
         self.completed_trades = 0
+        self._last_runtime_state = "ACTIVE"
+        self.runtime_close_pending = False
         self._ny_date: object | None = None
         if self.runtime is not None:
             try:
                 recovered = self.runtime.recover()
             except StrategyRuntimeError as error:
                 raise StrategyError(str(error)) from error
-            if recovered.state == "ACTIVE" and recovered.first is not None and recovered.second is not None:
+            if (
+                recovered.state in {
+                    "ACTIVE", "TIMED_EXIT_ARMED", "ORPHAN_GRACE",
+                    "CLOSING", "CLOSE_UNCERTAIN",
+                }
+                and recovered.first is not None
+                and recovered.second is not None
+            ):
                 plan = self.runtime.active_plan
                 if plan is None:
                     raise StrategyError("The runtime recovered active broker facts without a durable pair plan.")
@@ -746,13 +785,16 @@ class RealtimeArbitrage:
                     plan.first.direction,
                     plan.second.direction,
                     float(plan.first.volume),
-                    datetime.now(UTC),
+                    recovered.activated_at or datetime.now(UTC),
                     plan.pair_id,
                     plan.first.stop_loss,
                     plan.first.take_profit,
                     plan.second.stop_loss,
                     plan.second.take_profit,
                 )
+                self._last_runtime_state = recovered.state
+            elif recovered.state in {"CLOSING", "CLOSE_UNCERTAIN"}:
+                self.runtime_close_pending = True
             elif recovered.state == "NEEDS_HUMAN":
                 self.needs_human = True
                 self.stopped = True
@@ -778,21 +820,30 @@ class RealtimeArbitrage:
             except (WorkerMarketDataUnavailable, WorkerRpcUnavailable) as error:
                 self._suspend_for_worker_disconnect(error)
                 continue
-            if message is None:
-                continue
-            if self._consume(message):
+            if message is not None and self._consume(message):
                 self._recover_worker_market_data(message)
             if self.unavailable_endpoints:
                 continue
             try:
-                if self.pair is not None and self.config.execute:
+                if self.runtime_close_pending:
+                    self._maintain_unprojected_close(datetime.now(UTC))
+                    continue
+                runtime_active = (
+                    self.runtime is None or getattr(self.runtime, "state", "ACTIVE") == "ACTIVE"
+                )
+                if self.pair is not None and self.config.execute and runtime_active:
                     self._check_active_pair_integrity()
-                else:
+                elif self.pair is None:
                     self._check_integrity_if_due()
-                if self.pair is not None and self._quotes_fresh(self.pair.symbol) and self._risk_breached():
+                if (
+                    message is not None
+                    and self.pair is not None
+                    and self._quotes_fresh(self.pair.symbol)
+                    and self._risk_breached()
+                ):
                     _LOGGER.warning("risk_limit_triggered completed_trades=%d", self.completed_trades)
                     self._halt("risk limit reached")
-                if self.pair is not None:
+                if message is not None and self.pair is not None:
                     candidate = self._candidate_for_symbol(self.pair.symbol)
                     if candidate is not None and candidate.direction != self.pair.direction:
                         if not self._minimum_hold_elapsed():
@@ -803,26 +854,37 @@ class RealtimeArbitrage:
                                 candidate.direction,
                                 max(0, remaining),
                             )
-                            continue
-                        _LOGGER.info(
-                            "reverse_signal_close symbol=%s old_direction=%s new_direction=%s edge=%.10g "
-                            "first_bid/ask=%s second_bid/ask=%s",
-                            self.pair.symbol,
-                            self.pair.direction,
-                            candidate.direction,
-                            candidate.edge,
-                            self._quote_text("first", self.pair.symbol),
-                            self._quote_text("second", self.pair.symbol),
-                        )
-                        self._flatten_all()
-                        self.completed_trades += 1
-                        self.awaiting_clear_symbol = candidate.symbol
-                        if self.completed_trades >= self.config.maximum_trades:
+                        else:
                             _LOGGER.info(
-                                "maximum_trades_completed completed_trades=%d",
-                                self.completed_trades,
+                                "reverse_signal_close symbol=%s old_direction=%s new_direction=%s edge=%.10g "
+                                "first_bid/ask=%s second_bid/ask=%s",
+                                self.pair.symbol,
+                                self.pair.direction,
+                                candidate.direction,
+                                candidate.edge,
+                                self._quote_text("first", self.pair.symbol),
+                                self._quote_text("second", self.pair.symbol),
                             )
-                            return
+                            self._flatten_all()
+                            self.completed_trades += 1
+                            self.awaiting_clear_symbol = candidate.symbol
+                            if self.completed_trades >= self.config.maximum_trades:
+                                _LOGGER.info(
+                                    "maximum_trades_completed completed_trades=%d",
+                                    self.completed_trades,
+                                )
+                                return
+                            continue
+                timed_exit_active = False
+                if self.pair is not None and self.config.execute and self.runtime is not None:
+                    now = datetime.now(UTC)
+                    timed_exit_active = self._maintain_active_pair(
+                        now,
+                        self._runtime_market_observation(now, self.pair.symbol),
+                    )
+                if message is None or timed_exit_active:
+                    continue
+                if self.pair is not None:
                     continue
                 self._refresh_sizing_snapshot_if_due()
                 candidate = self._best_candidate()
@@ -838,6 +900,67 @@ class RealtimeArbitrage:
                     _LOGGER.info("entry_skipped_trade_limit completed_trades=%d maximum_trades=%d", self.completed_trades, self.config.maximum_trades)
             except WorkerRpcUnavailable as error:
                 self._suspend_for_worker_disconnect(error)
+
+    def _maintain_unprojected_close(self, now: datetime) -> None:
+        if self.runtime is None:
+            raise StrategyError(
+                "Durable Strategy Runtime is unavailable during close recovery."
+            )
+        result = self.runtime.maintain(now, None)
+        if result.state == "EMPTY":
+            self.runtime_close_pending = False
+            _LOGGER.info("unverified_entry_empty_verified")
+            return
+        if result.state in {"CLOSING", "CLOSE_UNCERTAIN"}:
+            if result.state != self._last_runtime_state:
+                _LOGGER.info(
+                    "unverified_entry_close_progress state=%s reason=%s",
+                    result.state,
+                    result.reason,
+                )
+                self._last_runtime_state = result.state
+            return
+        self.needs_human = True
+        self.stopped = True
+        raise StrategyError(
+            result.reason or "Unverified entry close recovery requires operator action."
+        )
+
+    def _maintain_active_pair(
+        self,
+        now: datetime,
+        market: PairMarketObservation | None,
+    ) -> bool:
+        assert self.runtime is not None
+        result = self.runtime.maintain(now, market)
+        if result.state == "ACTIVE":
+            self._last_runtime_state = "ACTIVE"
+            return False
+        if result.state in {
+            "TIMED_EXIT_ARMING", "TIMED_EXIT_ARMED", "ORPHAN_GRACE",
+            "CLOSING", "CLOSE_UNCERTAIN",
+        }:
+            if result.state != self._last_runtime_state:
+                _LOGGER.info(
+                    "timed_exit_progress state=%s reason=%s", result.state, result.reason
+                )
+                self._last_runtime_state = result.state
+            return True
+        if result.state == "EMPTY":
+            closed_symbol = self.pair.symbol if self.pair is not None else None
+            self.pair = None
+            self.awaiting_clear_symbol = closed_symbol
+            self.completed_trades += 1
+            _LOGGER.info("timed_exit_completed completed_trades=%d", self.completed_trades)
+            if self.completed_trades >= self.config.maximum_trades:
+                self.stopped = True
+                _LOGGER.info(
+                    "maximum_trades_completed completed_trades=%d", self.completed_trades
+                )
+            return True
+        self.needs_human = True
+        self.stopped = True
+        raise StrategyError(result.reason or "Timed exit requires operator action.")
 
     def shutdown(self) -> None:
         _LOGGER.info("strategy_shutdown_requested execute=%s", self.config.execute)
@@ -874,6 +997,7 @@ class RealtimeArbitrage:
 
     def _load_shared_symbols(self) -> dict[str, SharedSymbol]:
         catalogs = {name: self._catalog_specifications(endpoint) for name, endpoint in self.endpoints.items()}
+        self.symbol_specifications = catalogs
         shared: dict[str, SharedSymbol] = {}
         for symbol in sorted(catalogs["first"].keys() & catalogs["second"].keys()):
             first, second = catalogs["first"][symbol], catalogs["second"][symbol]
@@ -962,16 +1086,75 @@ class RealtimeArbitrage:
             except StrategyError:
                 _LOGGER.warning("quote_ignored endpoint=%s symbol=%s reason=invalid_price", name, quote["symbol"])
                 continue
+            current_quote = self.quotes[name].get(quote["symbol"])
+            if current_quote is not None and timestamp < current_quote[0]:
+                _LOGGER.debug(
+                    "quote_ignored endpoint=%s symbol=%s reason=out_of_order",
+                    name,
+                    quote["symbol"],
+                )
+                continue
             self.quotes[name][quote["symbol"]] = (timestamp, bid, ask)
+            history = self.quote_history[name].setdefault(quote["symbol"], deque())
+            midpoint = (bid + ask) / 2
+            if history and timestamp - history[-1][0] > timedelta(seconds=2):
+                history.clear()
+            if not history or timestamp - history[-1][0] >= timedelta(seconds=1):
+                history.append((timestamp, midpoint))
+            elif timestamp >= history[-1][0]:
+                history[-1] = (timestamp, midpoint)
+            cutoff = timestamp - timedelta(seconds=60)
+            while history and history[0][0] < cutoff:
+                history.popleft()
             _LOGGER.debug("quote_updated endpoint=%s symbol=%s bid=%s ask=%s observed_at=%s", name, quote["symbol"], bid, ask, observed_at)
             consumed = True
         return consumed
+
+    def _runtime_market_observation(
+        self,
+        now: datetime,
+        symbol: str,
+    ) -> PairMarketObservation | None:
+        legs: dict[str, PairLegMarket] = {}
+        for name in ("first", "second"):
+            quote = self.quotes[name].get(symbol)
+            history = self.quote_history[name].get(symbol)
+            specification = self.symbol_specifications[name].get(symbol)
+            if quote is None or history is None or len(history) < 2 or specification is None:
+                return None
+            samples = tuple(
+                sample
+                for sample in history
+                if now - timedelta(seconds=60) <= sample[0] <= now + timedelta(seconds=1)
+            )
+            if (
+                len(samples) < 2
+                or (samples[-1][0] - samples[0][0]).total_seconds() < 55
+            ):
+                return None
+            moves = tuple(
+                abs(current[1] - previous[1])
+                / (current[0] - previous[0]).total_seconds()
+                for previous, current in zip(samples, samples[1:])
+            )
+            if not moves:
+                return None
+            observed_at, bid, ask = quote
+            legs[name] = PairLegMarket(
+                worker_id=self.endpoints[name].worker_id,
+                observed_at=observed_at,
+                bid=bid,
+                ask=ask,
+                recent_midpoint_moves=moves,
+            )
+        return PairMarketObservation(first=legs["first"], second=legs["second"])
 
     def _suspend_for_worker_disconnect(self, error: WorkerMarketDataUnavailable | WorkerRpcUnavailable) -> None:
         name = next((key for key, endpoint in self.endpoints.items() if endpoint.worker_id == error.worker_id), None)
         if name is None:
             raise StrategyError(f"Controller reported market-data loss for unselected Worker {error.worker_id}.")
         self.quotes[name].clear()
+        self.quote_history[name].clear()
         self.unavailable_endpoints.add(name)
         grace_seconds = (
             self.config.worker_write_disconnect_grace_seconds
@@ -1206,6 +1389,11 @@ class RealtimeArbitrage:
                         "second", self.endpoints["second"].worker_id, symbol, second_direction,
                         _volume_text(volume, specification.volume_step), specification.filling_mode,
                         f"{plan.second_margin_limit:.2f}", second_stop_loss, second_take_profit,
+                    ),
+                    timed_exit=(
+                        TimedExitPolicy(self.config.maximum_holding_seconds)
+                        if self.config.maximum_holding_seconds is not None
+                        else None
                     ),
                 )
                 result = self.runtime.enter(pair_plan)
@@ -1661,6 +1849,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--emergency-stop-loss-usd", type=float, default=40)
     parser.add_argument("--integrity-check-seconds", type=float, default=5)
     parser.add_argument("--minimum-hold-seconds", type=float, default=180)
+    parser.add_argument(
+        "--maximum-holding-seconds",
+        type=float,
+        help="arm a synchronized timed exit after this broker-verified holding age",
+    )
     parser.add_argument("--flatten-at-ny", type=_ny_time, default=time(16, 0), metavar="HH:MM")
     parser.add_argument("--worker-disconnect-grace-seconds", type=float, default=300)
     parser.add_argument("--worker-write-disconnect-grace-seconds", type=float, default=30)
@@ -1695,11 +1888,20 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--max-margin-ratio must not exceed 0.5.")
     if args.max_exposure_usd is not None and args.max_exposure_usd <= 0:
         parser.error("--max-exposure-usd must be positive.")
+    if (
+        args.maximum_holding_seconds is not None
+        and (
+            not math.isfinite(args.maximum_holding_seconds)
+            or args.maximum_holding_seconds <= 0
+        )
+    ):
+        parser.error("--maximum-holding-seconds must be positive.")
     config = StrategyConfig(
         args.entry_edge_points, args.max_trades, args.daily_loss_percent / 100, args.trade_loss_percent / 100,
         args.max_exposure_usd, args.max_margin_ratio, args.quote_max_age_seconds, args.emergency_stop_loss_usd,
         args.integrity_check_seconds, args.minimum_hold_seconds,
-        args.flatten_at_ny, args.worker_disconnect_grace_seconds, args.worker_write_disconnect_grace_seconds, args.execute,
+        args.flatten_at_ny, args.worker_disconnect_grace_seconds, args.worker_write_disconnect_grace_seconds,
+        args.execute, args.maximum_holding_seconds,
     )
     configured_workers = (
         (args.first_worker, args.second_worker)
