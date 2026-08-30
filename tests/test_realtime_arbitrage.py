@@ -22,6 +22,7 @@ from strategy.realtime_arbitrage import (
     TraderGateway,
     WorkerMarketDataUnavailable,
     WorkerRpcUnavailable,
+    _TraderRelayInterrupted,
     main,
 )
 
@@ -40,7 +41,13 @@ class FakeGateway:
     def request(self, worker_id: str, *, kind: str, request: dict[str, object]) -> dict[str, object]:
         self.calls.append((worker_id, kind, request))
         if request["type"] == "account_info":
-            return {"account": {"balance": 5_000.0, "equity": 5_000.0}}
+            return {
+                "account": {
+                    "balance": 5_000.0,
+                    "equity": 5_000.0,
+                    "currency": "USD",
+                }
+            }
         if request["type"] == "symbols":
             if worker_id in self.unavailable_catalog_workers:
                 raise StrategyError("Worker broker read unavailable.")
@@ -275,6 +282,91 @@ class RealtimeArbitrageTests(unittest.TestCase):
                 correlation={"pair_id": "pair-1", "leg": "first", "purpose": "entry"},
             )
 
+    def test_gateway_retries_read_after_reconnect_without_retrying_writes(self) -> None:
+        gateway = TraderGateway.__new__(TraderGateway)
+        gateway.trader_id = "trader-1"
+        gateway._disconnect_generation = 0
+        gateway._read_reconnect_grace_seconds = 300
+        sent: list[dict[str, object]] = []
+        gateway._send = sent.append
+        calls = 0
+
+        def wait_for(*_args: object, generation: int | None = None, **_kwargs: object) -> dict[str, object]:
+            nonlocal calls
+            calls += 1
+            if generation == 0:
+                gateway._disconnect_generation = 1
+                raise _TraderRelayInterrupted(
+                    "Trader relay disconnected before the request outcome was received."
+                )
+            if calls == 2:
+                gateway._disconnect_generation = 2
+                raise _TraderRelayInterrupted(
+                    "Trader relay disconnected before the request outcome was received."
+                )
+            return {
+                "type": "relay",
+                "envelope": {
+                    "request_id": "read-1:retry:2",
+                    "accepted": True,
+                    "result": {"profit": 40.0},
+                },
+            }
+
+        gateway._wait_for = wait_for
+
+        self.assertEqual(
+            {"profit": 40.0},
+            gateway.request(
+                "worker-a",
+                kind="read",
+                request={
+                    "type": "calc_profit",
+                    "symbol": "EURUSD",
+                    "volume": "0.10",
+                    "direction": "LONG",
+                    "open_price": "1.10000",
+                    "close_price": "1.10010",
+                },
+                runtime_command_id="command-1",
+                request_id="read-1",
+            ),
+        )
+        self.assertEqual(3, len(sent))
+        self.assertEqual(3, calls)
+        self.assertEqual(
+            sent[0]["envelope"]["request_id"],  # type: ignore[index]
+            "read-1",
+        )
+        self.assertEqual(
+            sent[1]["envelope"]["request_id"],  # type: ignore[index]
+            "read-1:retry:1",
+        )
+        self.assertEqual(
+            sent[2]["envelope"]["request_id"],  # type: ignore[index]
+            "read-1:retry:2",
+        )
+
+        sent.clear()
+        gateway._disconnect_generation = 0
+        calls = 0
+        with self.assertRaisesRegex(StrategyError, "before the request outcome"):
+            gateway.request(
+                "worker-a",
+                kind="operation",
+                request={
+                    "type": "modify_sl_tp",
+                    "symbol": "EURUSD",
+                    "position": "123",
+                    "sl": "1.09000",
+                    "tp": "1.11000",
+                },
+                runtime_command_id="command-1",
+                request_id="write-1",
+            )
+        self.assertEqual(1, len(sent))
+        self.assertEqual(1, calls)
+
     def test_gateway_hashes_the_exact_serialized_effect_payload(self) -> None:
         gateway = TraderGateway.__new__(TraderGateway)
         gateway.trader_id = "trader-1"
@@ -313,6 +405,48 @@ class RealtimeArbitrageTests(unittest.TestCase):
         self.assertNotIn("request", payload)
         canonical = json.dumps(payload, separators=(",", ":"), sort_keys=True, ensure_ascii=False)
         self.assertEqual(sha256(canonical.encode()).hexdigest(), envelope["payload_hash"])  # type: ignore[index]
+
+    def test_gateway_claims_strategy_runtime_execution_mode(self) -> None:
+        gateway = TraderGateway.__new__(TraderGateway)
+        gateway._disconnect_generation = 0
+        sent: list[dict[str, object]] = []
+        gateway._send = sent.append
+        gateway._wait_for = lambda *_args, **_kwargs: {
+            "type": "pair_execution_mode_claim_result",
+            "request_id": "claim-1",
+            "accepted": True,
+        }
+
+        result = gateway.claim_pair_execution_mode(
+            "worker-a", "worker-b", runtime_command_id="command-1", request_id="claim-1"
+        )
+
+        self.assertEqual({"mode": "strategy_runtime"}, result)
+        self.assertEqual(
+            {
+                "type": "pair_execution_mode_claim",
+                "request_id": "claim-1",
+                "leader_worker_id": "worker-a",
+                "follower_worker_id": "worker-b",
+            },
+            sent[0],
+        )
+
+    def test_gateway_execution_mode_claim_rejection_raises(self) -> None:
+        gateway = TraderGateway.__new__(TraderGateway)
+        gateway._disconnect_generation = 0
+        gateway._send = lambda _message: None
+        gateway._wait_for = lambda *_args, **_kwargs: {
+            "type": "pair_execution_mode_claim_result",
+            "request_id": "claim-1",
+            "accepted": False,
+            "reason": "Pair Execution Cell already holds a live claim on this pair.",
+        }
+
+        with self.assertRaisesRegex(StrategyError, "Pair Execution Cell already holds"):
+            gateway.claim_pair_execution_mode(
+                "worker-a", "worker-b", runtime_command_id="command-1", request_id="claim-1"
+            )
 
     def test_fact_sink_ignores_buffered_unselected_workers_and_preserves_order(self) -> None:
         gateway = TraderGateway.__new__(TraderGateway)
@@ -698,8 +832,8 @@ class RealtimeArbitrageTests(unittest.TestCase):
         timed_exit = runtime.plan.timed_exit  # type: ignore[attr-defined]
         assert timed_exit is not None
         self.assertEqual(90, timed_exit.maximum_holding_seconds)
-        self.assertEqual("40", runtime.plan.first.protection_loss_usd)  # type: ignore[attr-defined]
-        self.assertEqual("40", runtime.plan.second.protection_loss_usd)  # type: ignore[attr-defined]
+        self.assertEqual("1.104", runtime.plan.first.stop_loss)  # type: ignore[attr-defined]
+        self.assertEqual("1.096", runtime.plan.second.stop_loss)  # type: ignore[attr-defined]
 
     def test_skips_entry_when_margin_budget_cannot_cover_minimum_volume(self) -> None:
         gateway = FakeGateway()
@@ -798,6 +932,55 @@ class RealtimeArbitrageTests(unittest.TestCase):
                 for _, kind, request in gateway.calls[calls_before_targets:]
             )
         )
+
+    def test_initial_protection_uses_profit_and_loss_tick_values_independently(self) -> None:
+        gateway = FakeGateway()
+        gateway.symbol_info_results["worker-a", "EURUSD"] = {
+            "symbol": gateway.symbol_specification({
+                "name": "EURUSD",
+                "trade_tick_value_profit": 2.0,
+                "trade_tick_value_loss": 1.0,
+            })
+        }
+        strategy = RealtimeArbitrage(
+            gateway,
+            first=Endpoint("worker-a"),
+            second=Endpoint("worker-b"),
+            config=configuration(),
+        )
+
+        sl, tp = strategy._initial_protection_targets(
+            "first", "EURUSD", "LONG", 1.2, 0.1
+        )
+
+        self.assertEqual(("1.196", "1.202"), (sl, tp))
+
+    def test_usd_risk_configuration_rejects_non_usd_account(self) -> None:
+        gateway = FakeGateway()
+        original_request = gateway.request
+
+        def request(
+            worker_id: str, *, kind: str, request: dict[str, object]
+        ) -> dict[str, object]:
+            if request["type"] == "account_info" and worker_id == "worker-a":
+                return {
+                    "account": {
+                        "balance": 5_000.0,
+                        "equity": 5_000.0,
+                        "currency": "EUR",
+                    }
+                }
+            return original_request(worker_id, kind=kind, request=request)
+
+        gateway.request = request  # type: ignore[method-assign]
+
+        with self.assertRaisesRegex(StrategyError, "account currency must be USD"):
+            RealtimeArbitrage(
+                gateway,
+                first=Endpoint("worker-a"),
+                second=Endpoint("worker-b"),
+                config=configuration(),
+            )
 
     def test_fast_emergency_stop_uses_the_full_configured_loss_limit(self) -> None:
         gateway = FakeGateway()
@@ -1017,9 +1200,6 @@ class RealtimeArbitrageTests(unittest.TestCase):
     def test_rejects_mismatched_hard_contract_terms(self) -> None:
         mismatches = {
             "trade_calc_mode": 1,
-            "digits": 4,
-            "point": 0.0001,
-            "trade_tick_size": 0.0001,
             "trade_contract_size": 10_000.0,
             "volume_min": 0.1,
             "volume_step": 0.1,
@@ -1039,6 +1219,32 @@ class RealtimeArbitrageTests(unittest.TestCase):
                         second=Endpoint("worker-b"),
                         config=configuration(execute=False),
                     )
+
+    def test_accepts_different_broker_quote_precision_for_the_same_contract(self) -> None:
+        gateway = FakeGateway()
+        gateway.symbols = {
+            "worker-a": [{
+                "name": "EURUSD",
+                "digits": 5,
+                "point": 0.00001,
+                "trade_tick_size": 0.00001,
+            }],
+            "worker-b": [{
+                "name": "EURUSD",
+                "digits": 4,
+                "point": 0.0001,
+                "trade_tick_size": 0.0001,
+            }],
+        }
+
+        strategy = RealtimeArbitrage(
+            gateway,
+            first=Endpoint("worker-a"),
+            second=Endpoint("worker-b"),
+            config=configuration(execute=False),
+        )
+
+        self.assertEqual(0.0001, strategy.shared_symbols["EURUSD"].point)
 
     def test_prefers_shared_fok_and_falls_back_to_shared_ioc(self) -> None:
         for first_filling_mode, second_filling_mode, expected in (
@@ -1116,48 +1322,51 @@ class RealtimeArbitrageTests(unittest.TestCase):
                 with self.assertRaisesRegex(StrategyError, "invalid symbol catalog"):
                     RealtimeArbitrage(gateway, first=Endpoint("worker-a"), second=Endpoint("worker-b"), config=configuration())
 
-    def test_initial_calibration_excludes_non_usd_symbols_and_refresh_logs_only_changes(self) -> None:
+    def test_initial_calibration_accepts_non_usd_profit_currency_and_asymmetric_tick_values(self) -> None:
         gateway = FakeGateway()
-        invalid = gateway.symbol_specification(
-            {"name": "EURUSD", "currency_profit": "EUR"}
+        audcad = gateway.symbol_specification(
+            {
+                "name": "EURUSD",
+                "currency_profit": "CAD",
+                "trade_tick_value": 0.7195,
+                "trade_tick_value_profit": 0.7196,
+                "trade_tick_value_loss": 0.7194,
+            }
         )
-        gateway.symbol_info_results["worker-a", "EURUSD"] = {"symbol": invalid}
+        gateway.symbol_info_results["worker-a", "EURUSD"] = {"symbol": audcad}
 
-        with self.assertLogs("strategy.realtime_arbitrage", "INFO") as captured:
-            strategy = RealtimeArbitrage(
-                gateway,
-                first=Endpoint("worker-a"),
-                second=Endpoint("worker-b"),
-                config=configuration(execute=False),
-            )
+        strategy = RealtimeArbitrage(
+            gateway,
+            first=Endpoint("worker-a"),
+            second=Endpoint("worker-b"),
+            config=configuration(execute=False),
+        )
 
-        self.assertNotIn("EURUSD", strategy.protection_calibrations)
-        self.assertTrue(any(
-            "protection_calibration_excluded symbol=EURUSD reason=first:non_usd_profit_currency"
-            in line
-            for line in captured.output
+        calibration = strategy.protection_calibrations["EURUSD"].first
+        self.assertEqual((0.7196, 0.7194), (
+            calibration.profit_tick_value,
+            calibration.loss_tick_value,
         ))
         now = datetime.now(UTC)
-        strategy.quotes["first"]["EURUSD"] = (now, 1.2, 1.2001)
+        strategy.quotes["first"]["EURUSD"] = (now, 1.2010, 1.2011)
         strategy.quotes["second"]["EURUSD"] = (now, 1.2, 1.2001)
-        self.assertIsNone(strategy._candidate_for_symbol("EURUSD"))
+        self.assertIsNotNone(strategy._candidate_for_symbol("EURUSD"))
 
         gateway.symbol_info_results["worker-a", "EURUSD"] = {
-            "symbol": gateway.symbol_specification({"name": "EURUSD"})
+            "symbol": gateway.symbol_specification(
+                {"name": "EURUSD", "trade_tick_value_loss": 0}
+            )
         }
         strategy.protection_calibration_at = datetime.now(UTC) - timedelta(hours=3)
         with self.assertLogs("strategy.realtime_arbitrage", "INFO") as refreshed:
             strategy._refresh_protection_calibration_if_due()
 
-        self.assertIn("EURUSD", strategy.protection_calibrations)
+        self.assertNotIn("EURUSD", strategy.protection_calibrations)
         self.assertTrue(any(
             "protection_calibration_changed symbol=EURUSD" in line
             for line in refreshed.output
         ))
         self.assertEqual(1, len(refreshed.output))
-        self.assertFalse(any(
-            "protection_calibration_excluded" in line for line in refreshed.output
-        ))
 
     def test_sizing_ignores_shared_symbols_without_protection_calibration(self) -> None:
         gateway = FakeGateway()
@@ -1168,7 +1377,11 @@ class RealtimeArbitrageTests(unittest.TestCase):
         for worker_id in ("worker-a", "worker-b"):
             gateway.symbol_info_results[worker_id, "AUDCAD"] = {
                 "symbol": gateway.symbol_specification(
-                    {"name": "AUDCAD", "currency_profit": "CAD"}
+                    {
+                        "name": "AUDCAD",
+                        "currency_profit": "CAD",
+                        "trade_tick_value_loss": 0,
+                    }
                 )
             }
         strategy = RealtimeArbitrage(

@@ -22,6 +22,7 @@ from .identity import (
     save_identity,
 )
 from .keystore import HardwareKeyStore, WindowsCNGKeyStore
+from .pair_cell_adapter import PairCellRuntime
 from .reconciliation import reconnect_worker_session
 from .rotation import (
     WorkerCertificateExpired,
@@ -370,6 +371,7 @@ def _reconcile_with_certificate_maintenance(
 
             try:
                 effect_journal = WorkerEffectJournal(identity_path.with_suffix(".effects.sqlite"))
+                pair_cell_db_path = identity_path.with_suffix(".paircell.sqlite")
                 reconnect_worker_session(
                     open_session=lambda: open_authenticated_worker_session(
                         controller_url=current_identity.controller_url,
@@ -384,6 +386,16 @@ def _reconcile_with_certificate_maintenance(
                     server=current_identity.server,
                     maintenance=maintain,
                     effect_journal=effect_journal,
+                    pair_cell_factory=lambda mt5_client, session, journal, login, server: PairCellRuntime(
+                        worker_id=getattr(session, "worker_id", ""),
+                        db_path=pair_cell_db_path,
+                        session=session,  # type: ignore[arg-type]
+                        mt5=mt5_client,
+                        effect_journal=journal if journal is not None else WorkerEffectJournal(pair_cell_db_path.with_suffix(".fallback-effects.sqlite")),
+                        recovery_epoch=getattr(session, "recovery_epoch", ""),
+                        login=login,
+                        server=server,
+                    ),
                 )
                 return
             except WorkerCertificateRotated:

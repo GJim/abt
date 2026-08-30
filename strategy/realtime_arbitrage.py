@@ -13,7 +13,7 @@ import sys
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
-from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
+from decimal import Decimal, ROUND_CEILING, ROUND_DOWN, ROUND_FLOOR, ROUND_HALF_UP
 from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
 from queue import Queue
@@ -49,6 +49,10 @@ _PAIR_ENTRY_EXPIRY = timedelta(seconds=5)
 
 class StrategyError(RuntimeError):
     """Raised when the strategy cannot safely retain or create exposure."""
+
+
+class _TraderRelayInterrupted(StrategyError):
+    """Raised when the Trader relay loses a request outcome during reconnect."""
 
 
 class WorkerMarketDataUnavailable(StrategyError):
@@ -100,6 +104,7 @@ class Account:
     balance: float
     equity: float
     day_start_equity: float
+    currency: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,7 +126,6 @@ class SymbolSpecification:
 @dataclass(frozen=True, slots=True)
 class SharedSymbol:
     point: float
-    trade_tick_size: float
     filling_mode: str
     volume_min: float
     volume_step: float
@@ -129,9 +133,18 @@ class SharedSymbol:
 
 
 @dataclass(frozen=True, slots=True)
+class ProtectionLegCalibration:
+    point: float
+    tick_size: float
+    profit_tick_value: float
+    loss_tick_value: float
+    minimum_stop_distance: float
+
+
+@dataclass(frozen=True, slots=True)
 class ProtectionCalibration:
-    first_usd_per_point: float
-    second_usd_per_point: float
+    first: ProtectionLegCalibration
+    second: ProtectionLegCalibration
 
 
 @dataclass(slots=True)
@@ -179,12 +192,14 @@ class TraderGateway:
         worker_ids: tuple[str, ...],
         owned_resources: tuple[object, ...] = (),
         reconnect: Callable[[], object] | None = None,
+        read_reconnect_grace_seconds: float = 300,
     ) -> None:
         self._socket = socket
         self.trader_id = trader_id
         self._worker_ids = worker_ids
         self._owned_resources = owned_resources
         self._reconnect = reconnect
+        self._read_reconnect_grace_seconds = read_reconnect_grace_seconds
         self._closing = Event()
         self._connection_ready = Event()
         self._connection_ready.set()
@@ -205,7 +220,13 @@ class TraderGateway:
         self.resume_streams()
 
     @classmethod
-    def connect(cls, config_path: Path, *, worker_ids: tuple[str, ...]) -> TraderGateway:
+    def connect(
+        cls,
+        config_path: Path,
+        *,
+        worker_ids: tuple[str, ...],
+        read_reconnect_grace_seconds: float = 300,
+    ) -> TraderGateway:
         identity = load_identity(config_path)
         transport = HTTPTraderTransport()
         key_store = WindowsCNGKeyStore(identity.key_name)
@@ -247,6 +268,7 @@ class TraderGateway:
                 worker_ids=worker_ids,
                 owned_resources=(key_store, transport),
                 reconnect=reconnect_socket,
+                read_reconnect_grace_seconds=read_reconnect_grace_seconds,
             )
         except Exception:
             key_store.close()
@@ -273,17 +295,7 @@ class TraderGateway:
         payload_hash = sha256(canonical.encode()).hexdigest()
         request_type = request.get("type", request.get("action", kind))
         _LOGGER.debug("rpc_request worker=%s kind=%s type=%s request_id=%s", worker_id, kind, request_type, request_id)
-        if kind == "read":
-            envelope = WorkerReadRequested(
-                trader_id=self.trader_id,
-                worker_id=worker_id,
-                runtime_command_id=runtime_command_id,
-                request_id=request_id,
-                payload_hash=payload_hash,
-                correlation=correlation,
-                payload=request,
-            ).model_dump(mode="json")
-        else:
+        if kind != "read":
             operation = kind if kind in {"order_check", "order_execute"} else "trader_operation"
             payload = {"operation": operation, "order": request} if operation != "trader_operation" else {
                 "operation": operation, "request": request
@@ -302,14 +314,48 @@ class TraderGateway:
                 correlation=correlation,
                 payload=payload,
             ).model_dump(mode="json", exclude_none=True)
-        generation = self._disconnect_generation
-        self._send({"type": "relay", "worker_id": worker_id, "envelope": envelope})
-        message = self._wait_for(
-            lambda candidate: candidate.get("type") == "relay"
-            and isinstance(candidate.get("envelope"), dict)
-            and candidate["envelope"].get("request_id") == request_id,
-            generation=generation,
+        retry_deadline = (
+            monotonic() + self._read_reconnect_grace_seconds
+            if kind == "read"
+            else None
         )
+        attempt = 0
+        while True:
+            relay_request_id = request_id if attempt == 0 else f"{request_id}:retry:{attempt}"
+            if kind == "read":
+                envelope = WorkerReadRequested(
+                    trader_id=self.trader_id,
+                    worker_id=worker_id,
+                    runtime_command_id=runtime_command_id,
+                    request_id=relay_request_id,
+                    payload_hash=payload_hash,
+                    correlation=correlation,
+                    payload=request,
+                ).model_dump(mode="json")
+            generation = self._disconnect_generation
+            try:
+                self._send({"type": "relay", "worker_id": worker_id, "envelope": envelope})
+                message = self._wait_for(
+                    lambda candidate: candidate.get("type") == "relay"
+                    and isinstance(candidate.get("envelope"), dict)
+                    and candidate["envelope"].get("request_id") == relay_request_id,
+                    generation=generation,
+                )
+                break
+            except _TraderRelayInterrupted:
+                if kind != "read":
+                    raise
+                assert retry_deadline is not None
+                if monotonic() >= retry_deadline:
+                    raise
+                attempt += 1
+                _LOGGER.warning(
+                    "rpc_read_retrying_after_reconnect worker=%s type=%s request_id=%s retry=%d",
+                    worker_id,
+                    request_type,
+                    relay_request_id,
+                    attempt,
+                )
         fact = message["envelope"]
         assert isinstance(fact, dict)
         if fact.get("accepted") is not True:
@@ -461,6 +507,41 @@ class TraderGateway:
             effect_id=effect_id, expires_at=expires_at, correlation=correlation,
         )
 
+    def claim_pair_execution_mode(
+        self,
+        leader_worker_id: str,
+        follower_worker_id: str,
+        *,
+        runtime_command_id: str,
+        request_id: str,
+    ) -> dict[str, object]:
+        """Claim live ``strategy_runtime`` ownership of this Worker pair.
+
+        ADR-0010 requires the legacy Strategy Runtime and a Pair Execution
+        Cell to never both run live for the same Worker pair; this is the
+        Strategy Runtime's half of that mutual exclusion, enforced by the
+        controller (``ControlLedger.claim_pair_execution_mode``) rather than
+        derived locally.
+        """
+
+        generation = self._disconnect_generation
+        self._send(
+            {
+                "type": "pair_execution_mode_claim",
+                "request_id": request_id,
+                "leader_worker_id": leader_worker_id,
+                "follower_worker_id": follower_worker_id,
+            }
+        )
+        message = self._wait_for(
+            lambda candidate: candidate.get("type") == "pair_execution_mode_claim_result"
+            and candidate.get("request_id") == request_id,
+            generation=generation,
+        )
+        if message.get("accepted") is not True:
+            raise StrategyError(str(message.get("reason") or "Controller rejected the Strategy Runtime execution-mode claim."))
+        return {"mode": "strategy_runtime"}
+
     def query(self, query: str) -> dict[str, object]:
         request_id = str(uuid4())
         _LOGGER.debug("controller_query query=%s request_id=%s", query, request_id)
@@ -581,7 +662,7 @@ class TraderGateway:
             with self._send_lock:
                 self._socket.send(json.dumps(message, separators=(",", ":"), sort_keys=True))
         except (AttributeError, OSError) as error:
-            raise StrategyError("Trader relay is not connected.") from error
+            raise _TraderRelayInterrupted("Trader relay is not connected.") from error
 
     def _receive_forever(self) -> None:
         while not self._closing.is_set():
@@ -724,13 +805,17 @@ class TraderGateway:
         with self._messages_ready:
             while True:
                 if generation is not None and generation != self._disconnect_generation:
-                    raise StrategyError("Trader relay disconnected before the request outcome was received.")
+                    raise _TraderRelayInterrupted(
+                        "Trader relay disconnected before the request outcome was received."
+                    )
                 for message in tuple(self._inbox):
                     if predicate(message):
                         self._inbox.remove(message)
                         return message
                 if self._receiver_error is not None:
-                    raise StrategyError("Trader relay disconnected or returned invalid data.") from self._receiver_error
+                    raise _TraderRelayInterrupted(
+                        "Trader relay disconnected or returned invalid data."
+                    ) from self._receiver_error
                 remaining = deadline - monotonic()
                 if remaining <= 0:
                     raise TimeoutError
@@ -1016,8 +1101,16 @@ class RealtimeArbitrage:
             raise StrategyError(f"Worker {endpoint.worker_id} returned no account.")
         equity = _positive(value.get("equity"), "equity")
         balance = _positive(value.get("balance"), "balance")
-        _LOGGER.info("account_loaded worker=%s balance=%.2f equity=%.2f", endpoint.worker_id, balance, equity)
-        return Account(balance, equity, equity)
+        currency = value.get("currency")
+        if currency != "USD":
+            raise StrategyError(
+                f"Worker {endpoint.worker_id} account currency must be USD for USD-denominated risk limits."
+            )
+        _LOGGER.info(
+            "account_loaded worker=%s balance=%.2f equity=%.2f currency=%s",
+            endpoint.worker_id, balance, equity, currency,
+        )
+        return Account(balance, equity, equity, currency)
 
     def _verify_active_workers(self) -> None:
         result = self.gateway.query("active_workers")
@@ -1058,8 +1151,7 @@ class RealtimeArbitrage:
                 _LOGGER.info("shared_symbol_excluded symbol=%s reason=no_shared_fok_or_ioc", symbol)
                 continue
             shared[symbol] = SharedSymbol(
-                point=first.point,
-                trade_tick_size=first.trade_tick_size,
+                point=max(first.point, second.point),
                 filling_mode=filling_mode,
                 volume_min=first.volume_min,
                 volume_step=first.volume_step,
@@ -1081,7 +1173,7 @@ class RealtimeArbitrage:
         calibrations: dict[str, ProtectionCalibration] = {}
         states: dict[str, str] = {}
         for symbol in sorted(self.shared_symbols):
-            endpoint_values: dict[str, float] = {}
+            endpoint_values: dict[str, ProtectionLegCalibration] = {}
             reasons: list[str] = []
             for name, endpoint in self.endpoints.items():
                 result = self.gateway.request(
@@ -1089,7 +1181,7 @@ class RealtimeArbitrage:
                     kind="read",
                     request={"type": "symbol_info", "symbol": symbol},
                 )
-                value, reason = _usd_per_point_calibration(result.get("symbol"), symbol)
+                value, reason = _protection_leg_calibration(result.get("symbol"), symbol)
                 if value is None:
                     reasons.append(f"{name}:{reason}")
                 else:
@@ -1102,8 +1194,11 @@ class RealtimeArbitrage:
                 )
                 calibrations[symbol] = calibration
                 states[symbol] = (
-                    f"eligible:first={calibration.first_usd_per_point:.12g},"
-                    f"second={calibration.second_usd_per_point:.12g}"
+                    "eligible:"
+                    f"first_profit={calibration.first.profit_tick_value:.12g},"
+                    f"first_loss={calibration.first.loss_tick_value:.12g},"
+                    f"second_profit={calibration.second.profit_tick_value:.12g},"
+                    f"second_loss={calibration.second.loss_tick_value:.12g}"
                 )
         if initial:
             for symbol in sorted(self.shared_symbols):
@@ -1497,14 +1592,12 @@ class RealtimeArbitrage:
                     first=PairLegPlan(
                         "first", self.endpoints["first"].worker_id, symbol, first_direction,
                         _volume_text(volume, specification.volume_step), specification.filling_mode,
-                        f"{plan.first_margin_limit:.2f}", first_stop_loss, first_take_profit,
-                        f"{self.config.emergency_stop_loss_usd:.10g}",
+                        first_stop_loss, first_take_profit,
                     ),
                     second=PairLegPlan(
                         "second", self.endpoints["second"].worker_id, symbol, second_direction,
                         _volume_text(volume, specification.volume_step), specification.filling_mode,
-                        f"{plan.second_margin_limit:.2f}", second_stop_loss, second_take_profit,
-                        f"{self.config.emergency_stop_loss_usd:.10g}",
+                        second_stop_loss, second_take_profit,
                     ),
                     timed_exit=(
                         TimedExitPolicy(self.config.maximum_holding_seconds)
@@ -1518,7 +1611,10 @@ class RealtimeArbitrage:
                 self.needs_human = True
                 raise HedgedEntryContained(f"Strategy Runtime could not prove safe entry: {error}") from error
             if result.status == "empty":
-                _LOGGER.info("entry_rejected_preflight symbol=%s direction=%s reason=%s", symbol, direction, result.reason)
+                _LOGGER.info(
+                    "entry_contained symbol=%s direction=%s reason=%s",
+                    symbol, direction, result.reason,
+                )
                 return
             if result.status != "active" or result.first is None or result.second is None:
                 self.stopped = True
@@ -1567,19 +1663,41 @@ class RealtimeArbitrage:
     ) -> tuple[str, str]:
         calibration = self.protection_calibrations.get(symbol)
         if calibration is None:
-            raise StrategyError(f"Cannot fast-protect {symbol}: USD per-point calibration is unavailable.")
-        usd_per_point = (
-            calibration.first_usd_per_point if name == "first"
-            else calibration.second_usd_per_point
-        )
-        price_distance = (
+            raise StrategyError(
+                f"Cannot fast-protect {symbol}: account-currency tick calibration is unavailable."
+            )
+        leg = calibration.first if name == "first" else calibration.second
+        loss_ticks = math.floor(
             self.config.emergency_stop_loss_usd
-            / (usd_per_point * volume)
-            * self.shared_symbols[symbol].point
+            / (leg.loss_tick_value * volume)
         )
-        specification = self.shared_symbols[symbol]
-        sl = _tick_price_text(entry - price_distance if direction == "LONG" else entry + price_distance, specification.trade_tick_size)
-        tp = _tick_price_text(entry + price_distance if direction == "LONG" else entry - price_distance, specification.trade_tick_size)
+        profit_ticks = math.floor(
+            self.config.emergency_stop_loss_usd
+            / (leg.profit_tick_value * volume)
+        )
+        if loss_ticks < 1 or profit_ticks < 1:
+            raise StrategyError(
+                f"Cannot fast-protect {symbol}: configured protection is smaller than one broker tick."
+            )
+        loss_distance = loss_ticks * leg.tick_size
+        profit_distance = profit_ticks * leg.tick_size
+        sl = _tick_price_text(
+            entry - loss_distance if direction == "LONG" else entry + loss_distance,
+            leg.tick_size,
+            ROUND_CEILING if direction == "LONG" else ROUND_FLOOR,
+        )
+        tp = _tick_price_text(
+            entry + profit_distance if direction == "LONG" else entry - profit_distance,
+            leg.tick_size,
+            ROUND_FLOOR if direction == "LONG" else ROUND_CEILING,
+        )
+        if (
+            abs(entry - float(sl)) + 1e-12 < leg.minimum_stop_distance
+            or abs(float(tp) - entry) + 1e-12 < leg.minimum_stop_distance
+        ):
+            raise StrategyError(
+                f"Cannot fast-protect {symbol}: configured protection is inside broker minimum stops."
+            )
         _LOGGER.info(
             "initial_protection_calculated endpoint=%s sl=%.10f tp=%.10f magnitude_usd=%.2f",
             name,
@@ -1762,9 +1880,13 @@ def _positive(value: object, field: str) -> float:
     return float(value)
 
 
-def _tick_price_text(price: float, tick_size: float) -> str:
+def _tick_price_text(
+    price: float,
+    tick_size: float,
+    rounding: str = ROUND_HALF_UP,
+) -> str:
     tick = Decimal(str(tick_size))
-    normalized = (Decimal(str(price)) / tick).to_integral_value(rounding=ROUND_HALF_UP) * tick
+    normalized = (Decimal(str(price)) / tick).to_integral_value(rounding=rounding) * tick
     return format(normalized.normalize(), "f")
 
 
@@ -1772,39 +1894,34 @@ def _positive_finite(value: object) -> bool:
     return not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(value) and value > 0
 
 
-def _usd_per_point_calibration(
+def _protection_leg_calibration(
     value: object,
     symbol: str,
-) -> tuple[float | None, str]:
+) -> tuple[ProtectionLegCalibration | None, str]:
     if not isinstance(value, dict) or value.get("name") != symbol:
         return None, "missing_symbol_info"
-    currency_profit = value.get("currency_profit")
-    if not isinstance(currency_profit, str) or not currency_profit:
-        return None, "missing_or_invalid_per_point_inputs"
-    if currency_profit != "USD":
-        return None, "non_usd_profit_currency"
     point = _calibration_number(value.get("point"))
     tick_size = _calibration_number(value.get("trade_tick_size"))
-    tick_values = tuple(
-        _calibration_number(value.get(field))
-        for field in (
-            "trade_tick_value",
-            "trade_tick_value_profit",
-            "trade_tick_value_loss",
-        )
-    )
-    if point is None or tick_size is None or any(item is None for item in tick_values):
-        return None, "missing_or_invalid_per_point_inputs"
-    tick_value, profit_tick_value, loss_tick_value = tick_values
-    assert tick_value is not None and profit_tick_value is not None and loss_tick_value is not None
-    if not math.isclose(tick_value, profit_tick_value, rel_tol=0, abs_tol=1e-12) or not math.isclose(
-        tick_value, loss_tick_value, rel_tol=0, abs_tol=1e-12
+    profit_tick_value = _calibration_number(value.get("trade_tick_value_profit"))
+    loss_tick_value = _calibration_number(value.get("trade_tick_value_loss"))
+    stops_level = value.get("trade_stops_level")
+    if (
+        point is None
+        or tick_size is None
+        or profit_tick_value is None
+        or loss_tick_value is None
+        or isinstance(stops_level, bool)
+        or not isinstance(stops_level, int)
+        or stops_level < 0
     ):
-        return None, "per_point_not_provably_constant"
-    usd_per_point = tick_value * point / tick_size
-    if not math.isfinite(usd_per_point) or usd_per_point <= 0:
-        return None, "missing_or_invalid_per_point_inputs"
-    return usd_per_point, ""
+        return None, "missing_or_invalid_tick_inputs"
+    return ProtectionLegCalibration(
+        point=point,
+        tick_size=tick_size,
+        profit_tick_value=profit_tick_value,
+        loss_tick_value=loss_tick_value,
+        minimum_stop_distance=stops_level * point,
+    ), ""
 
 
 def _calibration_number(value: object) -> float | None:
@@ -1918,9 +2035,6 @@ def _hard_specification_mismatches(
 ) -> list[str]:
     fields = (
         "trade_calc_mode",
-        "digits",
-        "point",
-        "trade_tick_size",
         "contract_size",
         "volume_min",
         "volume_step",
@@ -2037,7 +2151,11 @@ def main(argv: list[str] | None = None) -> int:
         if args.first_worker is not None
         else ("*",)
     )
-    gateway = TraderGateway.connect(Path(args.trader_config), worker_ids=configured_workers)
+    gateway = TraderGateway.connect(
+        Path(args.trader_config),
+        worker_ids=configured_workers,
+        read_reconnect_grace_seconds=config.worker_disconnect_grace_seconds,
+    )
     stop = Event()
     signal.signal(signal.SIGINT, lambda *_: (_LOGGER.info("interrupt_received"), stop.set()))
     strategy: RealtimeArbitrage | None = None

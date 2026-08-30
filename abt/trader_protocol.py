@@ -378,3 +378,60 @@ WorkerFactEnvelope = Annotated[
 
 worker_request_envelope_adapter = TypeAdapter(WorkerRequestEnvelope)
 worker_fact_envelope_adapter = TypeAdapter(WorkerFactEnvelope)
+
+
+# --------------------------------------------------------------------------- #
+# Pair Execution Cell opaque Worker-to-Worker relay (ADR-0010)
+# --------------------------------------------------------------------------- #
+#
+# The controller relays these envelopes between the two Workers of one leased
+# pair.  It validates identity, route, lease epoch/expiry, payload size, and
+# protocol version only; it never inspects ``payload`` (quotes, arm/commit,
+# leg status) and never calculates an edge or derives pair lifecycle state.
+
+MAX_PAIR_RELAY_ENVELOPE_BYTES = 65_536
+PAIR_CELL_PROTOCOL_VERSION = 1
+
+
+class PairLeaseClaim(_ProtocolModel):
+    """The identity/route/fencing fields the controller validates on every message."""
+
+    leader_worker_id: str
+    follower_worker_id: str
+    trader_id: str
+    contract_hash: str
+    lease_epoch: int
+
+
+class PairCellRelayEnvelope(_ProtocolModel):
+    """One opaque, versioned pair-cell message relayed Worker-to-Worker.
+
+    ``request_id`` uniquely identifies *this* message instance and is the
+    controller's sole replay-deduplication key: it is fresh for every
+    logically distinct message a Pair Execution Cell emits, and reused only
+    when the Worker-side transport retries delivering that exact instance.
+    ``attempt_id`` is a separate, non-unique correlation field spanning every
+    message of one attempt (arm, arm-ack, commit, leg-status, ...); several
+    distinct messages legitimately share one ``attempt_id``, so it must never
+    be used as the dedup key.
+    """
+
+    type: Literal["pair_cell_relay"] = "pair_cell_relay"
+    protocol_version: Literal[1] = PAIR_CELL_PROTOCOL_VERSION
+    lease: PairLeaseClaim
+    from_worker_id: str
+    to_worker_id: str
+    request_id: str = Field(min_length=1)
+    attempt_id: str | None = None
+    payload_hash: str
+    payload: dict[str, object]
+
+    @model_validator(mode="after")
+    def route_within_lease(self) -> PairCellRelayEnvelope:
+        pair = {self.lease.leader_worker_id, self.lease.follower_worker_id}
+        if self.from_worker_id not in pair or self.to_worker_id not in pair or self.from_worker_id == self.to_worker_id:
+            raise ValueError("The pair-cell relay route must be between the leased leader and follower.")
+        return self
+
+
+pair_cell_relay_envelope_adapter = TypeAdapter(PairCellRelayEnvelope)

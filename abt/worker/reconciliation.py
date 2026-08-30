@@ -65,6 +65,23 @@ class WorkerSafetySession(Protocol):
     def send_recovery_state(self, state: str, reason: str) -> None: ...
 
 
+class PairCellPump(Protocol):
+    """The subset of ``abt.worker.pair_cell_adapter.PairCellRuntime`` this
+    loop drives; injected via ``pair_cell_factory`` rather than imported
+    directly, since that adapter module itself depends on this one."""
+
+    def drain_relay(self) -> object: ...
+
+    def pump(self, observed_at: datetime) -> object: ...
+
+    def close(self) -> None: ...
+
+
+PairCellFactory = Callable[
+    ["ReadOnlyMT5", "AuthenticatedReconciliationSession", "WorkerEffectJournal | None", int, str], PairCellPump
+]
+
+
 class AnalysisWorkerSession(Protocol):
     def receive_trader_rpc(self) -> ScheduledTraderRpc | dict[str, object] | None: ...
 
@@ -345,6 +362,7 @@ def reconcile_authenticated_worker(
     sleep: Callable[[float], None] = _sleep,
     maintenance: Callable[[], None] | None = None,
     effect_journal: WorkerEffectJournal | None = None,
+    pair_cell_factory: PairCellFactory | None = None,
 ) -> None:
     """Use an authenticated session's memory-only password for read-only MT5 reconciliation."""
 
@@ -353,6 +371,7 @@ def reconcile_authenticated_worker(
         send_recovery_sync([] if effect_journal is None else effect_journal.unresolved())
     password = session.request_password()
     initialized = False
+    pair_cell: PairCellPump | None = None
     try:
         initialize = getattr(mt5, "initialize", None)
         login_mt5 = getattr(mt5, "login", None)
@@ -376,6 +395,8 @@ def reconcile_authenticated_worker(
             live_state = LiveWorkerMarketStateAdapter(
                 mt5, watched_symbols=_visible_symbols(mt5), emit=send_live_state
             )
+        if pair_cell_factory is not None:
+            pair_cell = pair_cell_factory(mt5, session, effect_journal, login, server)
         _run_reconciliation_with_relay(
             reconciliation,
             mt5=mt5,
@@ -385,8 +406,11 @@ def reconcile_authenticated_worker(
             maintenance=maintenance,
             live_state=live_state,
             effect_journal=effect_journal,
+            pair_cell=pair_cell,
         )
     finally:
+        if pair_cell is not None:
+            pair_cell.close()
         password = ""
         if initialized:
             shutdown = getattr(mt5, "shutdown", None)
@@ -404,13 +428,14 @@ def reconcile_with_safety(
     sleep: Callable[[float], None] = _sleep,
     maintenance: Callable[[], None] | None = None,
     effect_journal: WorkerEffectJournal | None = None,
+    pair_cell_factory: PairCellFactory | None = None,
 ) -> None:
     """Run reconciliation with bounded terminal/API recovery and human escalation."""
 
     WorkerSafetyAdapter(session).run_with_retries(
         lambda: reconcile_authenticated_worker(
             mt5=mt5, session=session, login=login, server=server, now=now, sleep=sleep, maintenance=maintenance,
-            effect_journal=effect_journal,
+            effect_journal=effect_journal, pair_cell_factory=pair_cell_factory,
         ),
         sleep=sleep,
     )
@@ -427,6 +452,7 @@ def reconnect_worker_session(
     maintenance: Callable[[AuthenticatedReconciliationSession], None] | None = None,
     effect_journal: WorkerEffectJournal | None = None,
     monotonic_clock: Callable[[], float] = monotonic,
+    pair_cell_factory: PairCellFactory | None = None,
 ) -> None:
     """Reconnect an interrupted proved WSS session with a bounded exponential backoff."""
 
@@ -444,6 +470,7 @@ def reconnect_worker_session(
                     sleep=sleep,
                     maintenance=None if maintenance is None else lambda: maintenance(session),
                     effect_journal=effect_journal,
+                    pair_cell_factory=pair_cell_factory,
                 )
             return
         except WorkerSessionDisconnected as error:
@@ -472,6 +499,7 @@ def _run_reconciliation_with_relay(
     maintenance: Callable[[], None] | None,
     live_state: LiveWorkerMarketStateAdapter | None,
     effect_journal: WorkerEffectJournal | None,
+    pair_cell: PairCellPump | None = None,
 ) -> None:
     next_maintenance = now()
     next_reconciliation = next_maintenance
@@ -488,9 +516,16 @@ def _run_reconciliation_with_relay(
             live_state.poll(observed_at)
         for _ in range(2):
             session.receive_worker_relay(timeout=0.25 if live_state is not None else 30.0)
+            if pair_cell is not None:
+                # Arm/commit relay turnaround is this feature's latency
+                # -critical path, so it is drained every inner iteration
+                # rather than gated behind the outer polling cadence below.
+                pair_cell.drain_relay()
             _serve_pending_trader_rpc(mt5, session, live_state, effect_journal)
             if safety is not None:
                 safety.heartbeat(now())
+        if pair_cell is not None:
+            pair_cell.pump(observed_at)
 
 
 def _serve_pending_trader_rpc(
@@ -506,14 +541,34 @@ def _serve_pending_trader_rpc(
     if trader_rpc is None:
         return
     if isinstance(trader_rpc, ScheduledTraderRpc):
-        request_type = trader_rpc.request.get("worker_request_type")
-        worker_request = trader_rpc.request.get("worker_request")
-        if request_type in {"order_check_request", "order_execute_request"} and isinstance(worker_request, dict):
-            _serve_scheduled_hedge_request(mt5, session, trader_rpc, request_type, worker_request, effect_journal)
-            return
-        _serve_scheduled_trader_rpc(mt5, session, trader_rpc, live_state=live_state, effect_journal=effect_journal)
+        _dispatch_scheduled_trader_rpc(mt5, session, trader_rpc, live_state, effect_journal)
         return
     _serve_trader_rpc(mt5, session, trader_rpc, live_state=live_state)
+
+
+def _dispatch_scheduled_trader_rpc(
+    mt5: ReadOnlyMT5,
+    session: AnalysisWorkerSession,
+    scheduled: ScheduledTraderRpc,
+    live_state: LiveWorkerMarketStateAdapter | None,
+    effect_journal: WorkerEffectJournal | None,
+) -> None:
+    """Route one already-dequeued :class:`ScheduledTraderRpc` to its handler and complete it.
+
+    Shared by the ordinary ``receive_trader_rpc`` pump above and by
+    ``abt.worker.pair_cell_adapter``'s foreign-scheduler-item callback: the
+    Pair Execution Cell shares this Worker's single scheduler (see
+    ``abt.pair_cell.PairExecutionCell``'s constructor), so a foreign item its
+    own broker write drains ahead of must be served through this exact same
+    routing -- never a second, divergent dispatch path.
+    """
+
+    request_type = scheduled.request.get("worker_request_type")
+    worker_request = scheduled.request.get("worker_request")
+    if request_type in {"order_check_request", "order_execute_request"} and isinstance(worker_request, dict):
+        _serve_scheduled_hedge_request(mt5, session, scheduled, request_type, worker_request, effect_journal)
+        return
+    _serve_scheduled_trader_rpc(mt5, session, scheduled, live_state=live_state, effect_journal=effect_journal)
 
 
 def _serve_scheduled_hedge_request(
@@ -1050,32 +1105,10 @@ def _trader_operation(
     if operation == "close" and set(payload) == {"type", "ticket", "volume"}:
         ticket = int(_request_text(payload, "ticket"))
         volume = float(_request_text(payload, "volume"))
-        if volume <= 0:
-            raise ValueError
-        position = next(
-            (item for item in _records(mt5.positions_get(), "position").values() if str(item.get("ticket")) == str(ticket)),
-            None,
-        )
-        if position is None or not isinstance(position.get("symbol"), str) or position.get("type") is None:
-            raise WorkerEnrollmentError("The position is no longer observable.")
-        close_type = getattr(mt5, "ORDER_TYPE_SELL") if position["type"] == getattr(mt5, "POSITION_TYPE_BUY") else getattr(mt5, "ORDER_TYPE_BUY")
-        tick = _evidence(mt5.symbol_info_tick(position["symbol"]), "position close tick")
-        price_key = "bid" if close_type == getattr(mt5, "ORDER_TYPE_SELL") else "ask"
-        price = tick.get(price_key)
-        if isinstance(price, bool) or not isinstance(price, (int, float)) or price <= 0:
-            raise WorkerEnrollmentError("The position close price is unavailable.")
         result = _broker_receipt(
             _journaled_order_send(
                 mt5,
-                {
-                    "action": getattr(mt5, "TRADE_ACTION_DEAL"),
-                    "position": ticket,
-                    "symbol": position["symbol"],
-                    "volume": volume,
-                    "type": close_type,
-                    "price": price,
-                    "type_filling": getattr(mt5, "ORDER_FILLING_IOC"),
-                },
+                _broker_close_request(mt5, ticket, volume),
                 journal_payload=payload,
                 effect_journal=effect_journal,
                 effect_id=effect_id,
@@ -1171,7 +1204,7 @@ def _trader_utc(value: str) -> datetime:
 
 def _record_values(value: object, kind: str) -> list[object]:
     if value is None:
-        return []
+        raise WorkerEnrollmentError(f"The local MT5 terminal returned no {kind}.")
     if not isinstance(value, (list, tuple)):
         raise WorkerEnrollmentError(f"The local MT5 terminal returned invalid {kind} records.")
     return list(value)
@@ -1280,6 +1313,40 @@ def _broker_order_request(mt5: object, order: dict[str, object]) -> dict[str, ob
         except (TypeError, ValueError, AttributeError) as error:
             raise WorkerEnrollmentError("The controller requested an invalid protection update.") from error
     return _broker_limit_request(mt5, order)
+
+
+def _broker_close_request(mt5: object, ticket: int, volume: float) -> dict[str, object]:
+    """Build a genuine MT5 ``TRADE_ACTION_DEAL`` close request for one owned ticket.
+
+    Shared by the ordinary Trader-relay ``close`` operation and the Pair
+    Execution Cell's containment adapter (``abt.worker.pair_cell_adapter``),
+    so both broker-write paths translate an abstract close request into the
+    exact MT5 request shape identically.
+    """
+
+    if volume <= 0:
+        raise ValueError
+    position = next(
+        (item for item in _records(mt5.positions_get(), "position").values() if str(item.get("ticket")) == str(ticket)),
+        None,
+    )
+    if position is None or not isinstance(position.get("symbol"), str) or position.get("type") is None:
+        raise WorkerEnrollmentError("The position is no longer observable.")
+    close_type = getattr(mt5, "ORDER_TYPE_SELL") if position["type"] == getattr(mt5, "POSITION_TYPE_BUY") else getattr(mt5, "ORDER_TYPE_BUY")
+    tick = _evidence(mt5.symbol_info_tick(position["symbol"]), "position close tick")
+    price_key = "bid" if close_type == getattr(mt5, "ORDER_TYPE_SELL") else "ask"
+    price = tick.get(price_key)
+    if isinstance(price, bool) or not isinstance(price, (int, float)) or price <= 0:
+        raise WorkerEnrollmentError("The position close price is unavailable.")
+    return {
+        "action": getattr(mt5, "TRADE_ACTION_DEAL"),
+        "position": ticket,
+        "symbol": position["symbol"],
+        "volume": volume,
+        "type": close_type,
+        "price": price,
+        "type_filling": getattr(mt5, "ORDER_FILLING_IOC"),
+    }
 
 
 def _require_terminal_trading_permission(mt5: object) -> None:
@@ -1444,7 +1511,7 @@ def _live_quote(mt5: ReadOnlyMT5, symbol: str) -> dict[str, object]:
 
 def _records(value: object, kind: str) -> dict[str, dict[str, object]]:
     if value is None:
-        return {}
+        raise WorkerEnrollmentError(f"The local MT5 terminal returned no {kind} records.")
     if not isinstance(value, (list, tuple)):
         raise WorkerEnrollmentError(f"The local MT5 terminal returned invalid {kind} records.")
     records: dict[str, dict[str, object]] = {}

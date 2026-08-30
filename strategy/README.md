@@ -9,12 +9,13 @@ both specified Workers to be connected, then reads each selected
 Worker's complete `symbols` catalog once. It fails startup if either catalog is
 invalid or unavailable, and keeps only exact-name symbols that are tradable
 (trade mode 4), bidirectional, and have matching hard contract terms: trade
-calculation mode, digits, point, tick size, contract size, minimum volume,
-volume step, and allowed directions. The endpoints must also share an
-executable filling mode; the strategy uses FOK when both support it, otherwise
-IOC. Live decisions use only this cached shared catalog and fresh exact-name
-Market Watch quotes; they never make per-event broker symbol-specification
-calls.
+calculation mode, contract size, minimum volume, volume step, and allowed
+directions. Broker-specific digits, point, and tick size may differ; the larger
+point defines the entry-edge threshold, while each leg uses its own protection
+calibration. The endpoints must also share an executable filling mode; the
+strategy uses FOK when both support it, otherwise IOC. Live decisions use only
+this cached shared catalog and fresh exact-name Market Watch quotes; they never
+make per-event broker symbol-specification calls.
 
 Immediately after that intersection, the strategy configures each selected
 Worker's live quote set once with every shared symbol name in lexical order
@@ -36,8 +37,8 @@ The strategy sizes every entry dynamically. `--max-exposure-usd` is the
 per-leg capital allocation; when omitted, each endpoint uses its startup
 equity. `--max-margin-ratio` defaults to `0.1` and cannot exceed `0.5`, so
 each leg's broker-native margin budget is 10% of that endpoint's allocation.
-It reserves a fixed internal 20% headroom from that budget: a cached plan and
-its controller hard limit therefore use at most 80% of the configured amount
+It reserves a fixed internal 20% headroom from that budget: each cached plan
+therefore targets at most 80% of the configured amount
 (8% of allocation at the default). This deliberate buffer protects against
 quote, margin, and free-margin movement during the cache lifetime.
 
@@ -62,12 +63,14 @@ fact cursors. The controller authenticates and routes versioned envelopes but
 does not interpret orders, positions, pairs, or lifecycle state.
 
 Each signal has one five-second expiry shared by both legs. The Strategy
-Runtime sends the two exact broker `order_check` requests concurrently and
-dispatches only after both checks and the shared deadline succeed. Checks do
-not reserve liquidity. Each market effect has a deterministic ID; the Worker
-journal persists `send_started` immediately before MT5 submission and never
-blindly resends an effect that crossed it. FOK is selected whenever both
-Workers support it; a failed FOK is rejected and never silently retried as IOC.
+Runtime reads both admission snapshots concurrently, then dispatches both
+protected market orders concurrently without a separate `order_check`
+round trip. MT5 validates each submitted order, and an asymmetric rejection is
+contained by converging the surviving leg to empty. Each market effect has a
+deterministic ID; the Worker journal persists `send_started` immediately before
+MT5 submission and never blindly resends an effect that crossed it. FOK is
+selected whenever both Workers support it; a failed FOK is rejected and never
+silently retried as IOC.
 
 Receipts alone never make a pair active. Fresh Worker snapshots must prove the
 ticket, symbol, side, volume, SL, TP, and absence of pending orders on both
@@ -84,18 +87,24 @@ the stream until a fresh snapshot arrives. Ctrl+C, the daily cutoff, risk
 limits, and integrity failures use the same durable close convergence rather
 than a controller command or direct fallback.
 
+An idempotent Worker read interrupted by a Trader relay reconnect is retried
+with a new request ID until `--worker-disconnect-grace-seconds` elapses, after
+the gateway resumes its Worker streams. Broker effects are never reissued by
+this path because their delivery may already have reached MT5.
+
 At initialization, and every three hours afterwards, the strategy reads each
-shared symbol's current broker specification. It only admits symbols whose
-profit currency is USD and whose positive tick value is equal for ordinary,
-profit, and loss calculations; excluded symbols and later eligibility or value
-changes are logged. At a signal, it converts the full
-`--emergency-stop-loss-usd` (default: US$40) directly from this cached USD
-per-point calibration, so no `calc_profit` reads delay the concurrent entry
-orders. After fresh Worker facts verify both entries, the Strategy Runtime
-uses broker `calc_profit` authority to calculate final targets and durably
-refines both owned tickets with concurrent journaled `modify_sl_tp` effects.
-The controller remains an opaque relay; the realtime strategy never writes
-individual final protection.
+shared symbol's current broker specification. Profit currency does not need to
+be USD: MT5 reports profit and loss tick values in the account currency. Both
+selected accounts must be USD accounts because the risk configuration is
+USD-denominated. Each leg independently caches its positive profit tick value,
+loss tick value, tick size, point, and broker minimum stop distance; excluded
+symbols and later eligibility or value changes are logged. At a signal, it
+converts the full `--emergency-stop-loss-usd` (default: US$40) into whole ticks,
+using the loss value for SL and profit value for TP. The protected orders are
+therefore ready locally before dispatch: no signal-time `symbol_info`,
+`calc_profit`, or post-entry protection-modification RPC is required. Fresh
+Worker facts must still verify both exact protected positions. The controller
+remains an opaque relay.
 
 A broker TP remains emergency protection, not the normal pair exit: the
 strategy normally closes both legs together on its reverse signal. Before a
@@ -165,9 +174,9 @@ pass `--first-worker` and `--second-worker` together.
 
 Pass `--execute` only after the dry-run output and worker connectivity have
 been verified. The ten-minute sizing cache is intentionally approximate and
-conservative; final parallel broker preflight remains authoritative. If no
-cached common minimum volume fits, or either final preflight rejects, the
-strategy skips that entry signal without sending an order.
+conservative; MT5 remains authoritative when each protected market order is
+submitted. If no cached common minimum volume fits, the strategy skips that
+entry signal without sending an order.
 While a pair is open it evaluates only that pair's symbol for reversal and
 exit; it cannot open another trade. After closing, the closed symbol must
 clear its qualifying signal before re-entry on that symbol, but a different

@@ -35,7 +35,7 @@ The Strategy Runtime owns the complete cross-Worker pair lifecycle:
 
 - market-data consumption and signal decisions;
 - sizing and risk policy;
-- paired preflight and dispatch coordination;
+- protected paired dispatch coordination;
 - requested and broker-observed leg facts;
 - entry, active, close, containment, and terminal state;
 - reconnect, replay, restart recovery, and idempotency;
@@ -139,17 +139,16 @@ and are not controller states, but the implementation must distinguish at
 least:
 
 1. `EMPTY` - current Worker facts prove no owned pair exposure.
-2. `PREFLIGHTING` - both exact broker checks are outstanding.
-3. `DISPATCHING` - at least one entry command may reach a Worker.
-4. `ENTRY_UNCERTAIN` - one or more broker outcomes require fresh observation.
-5. `VERIFYING` - both entry receipts exist; current Worker facts must bind the
+2. `DISPATCHING` - at least one entry command may reach a Worker.
+3. `ENTRY_UNCERTAIN` - one or more broker outcomes require fresh observation.
+4. `VERIFYING` - both entry receipts exist; current Worker facts must bind the
    actual tickets, fills, orders, positions, and protection.
-6. `ACTIVE` - both current Worker facts prove the expected protected pair.
-7. `CLOSING` - desired state is empty; pending orders are cancelled and
+5. `ACTIVE` - both current Worker facts prove the expected protected pair.
+6. `CLOSING` - desired state is empty; pending orders are cancelled and
    positions are closed from current evidence.
-8. `CLOSE_UNCERTAIN` - a close effect crossed `send_started` without conclusive
+7. `CLOSE_UNCERTAIN` - a close effect crossed `send_started` without conclusive
    receipt.
-9. `NEEDS_HUMAN` - identity, journal integrity, or persistently unobservable
+8. `NEEDS_HUMAN` - identity, journal integrity, or persistently unobservable
    broker state prevents automatic recovery.
 
 The runtime may refine these states internally. Callers and tests should
@@ -175,10 +174,11 @@ state name.
 
 - One durable local command ID identifies the complete pair entry.
 - The runtime records the planned pair and both deterministic Worker effect IDs
-  before preflight.
-- Both exact Worker `order_check` calls use one absolute expiry.
-- Dispatch begins only after both preflights accept and the shared expiry still
-  permits both commands.
+  before dispatch.
+- Both account snapshots are fetched concurrently before admission.
+- Cached symbol and margin facts prepare exact protected orders before the
+  signal; MT5 validates each order when it is submitted.
+- Dispatch begins only while the shared expiry still permits both commands.
 - Both Worker sends are issued concurrently.
 - A failed or unknown leg never triggers a blind resend.
 - Any uncertain or asymmetric outcome immediately changes desired state to

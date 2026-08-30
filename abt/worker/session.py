@@ -8,7 +8,7 @@ from statistics import median
 from collections.abc import Callable
 from datetime import UTC, datetime
 from dataclasses import dataclass, field
-from typing import Protocol, Self
+from typing import Protocol, Self, cast
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
@@ -68,6 +68,8 @@ class AuthenticatedWorkerSession:
     _relay_requests: dict[str, WorkerReadRequested | WorkerEffectRequested] = field(
         default_factory=dict, init=False, repr=False
     )
+    _pair_relay_inbox: list[dict[str, object]] = field(default_factory=list, init=False, repr=False)
+    _pair_cell_activation_inbox: list[dict[str, object]] = field(default_factory=list, init=False, repr=False)
 
     def __enter__(self) -> Self:
         return self
@@ -164,9 +166,18 @@ class AuthenticatedWorkerSession:
     def _response(self) -> dict[str, object]:
         while True:
             response = _message(self.socket)
-            if response.get("type") == "worker_relay":
+            response_type = response.get("type")
+            if response_type == "worker_relay":
                 self._queue_worker_relay(response)
                 continue
+            if response_type == "pair_relay_deliver":
+                self._queue_pair_relay_envelope(response)
+                continue
+            if response_type == "pair_cell_activate":
+                self._queue_pair_cell_activation(response)
+                continue
+            if response_type == "pair_relay_ack":
+                continue  # fire-and-forget sends do not correlate this synchronously
             return response
 
     def _parse_order_check(self, response: dict[str, object]) -> dict[str, object]:
@@ -337,33 +348,133 @@ class AuthenticatedWorkerSession:
     def receive_trader_rpc(self) -> ScheduledTraderRpc | None:
         scheduled = self._trader_rpc_scheduler.next()
         if isinstance(scheduled, TraderRpcOutcome):
-            if scheduled.worker_request_type is not None and scheduled.worker_request is not None:
-                self._send_hedge_scheduler_outcome(
-                    scheduled.worker_request_type,
-                    scheduled.worker_request,
-                    scheduled,
-                )
-                return None
-            self.send_trader_rpc(
-                request_id=scheduled.request_id,
-                kind=scheduled.kind,
-                accepted=False,
-                reason=f"{scheduled.category}: {scheduled.reason}",
-            )
+            self.dispatch_scheduler_outcome(scheduled)
             return None
         return scheduled
 
+    def dispatch_scheduler_outcome(self, outcome: TraderRpcOutcome) -> None:
+        """Deliver one scheduler-produced terminal outcome to its original requester.
+
+        Used both by ``receive_trader_rpc`` for this session's own admitted
+        work and by adapters (e.g. the Pair Execution Cell, via
+        ``abt.worker.pair_cell_adapter``) that must fully serve any other
+        scheduler item their own broker write happens to drain past, since
+        both sides share this session's single
+        :class:`~abt.worker.scheduler.DeadlineAwareTraderRpcScheduler`.
+        """
+
+        if outcome.worker_request_type is not None and outcome.worker_request is not None:
+            self._send_hedge_scheduler_outcome(outcome.worker_request_type, outcome.worker_request, outcome)
+            return
+        self.send_trader_rpc(
+            request_id=outcome.request_id,
+            kind=outcome.kind,
+            accepted=False,
+            reason=f"{outcome.category}: {outcome.reason}",
+        )
+
     def receive_worker_relay(self, timeout: float | None = None) -> bool:
+        """Pull one pending controller-pushed message and route it by type.
+
+        This single receive seam serves every push the controller may send on
+        this connection: ordinary Trader-relay ``worker_relay`` requests, and
+        the Pair Execution Cell's own opaque ``pair_relay_deliver``/
+        ``pair_cell_activate`` pushes and ``pair_relay_ack`` receipts. Each is
+        queued for its own consumer so this method never confuses one kind of
+        push for another, and interleaved traffic on the same socket is
+        handled one message at a time in arrival order.
+        """
+
         try:
             response = _message(self.socket, timeout=timeout)
         except TimeoutError:
             return False
         except Exception as error:
             _raise_closed_connection(error, "Worker relay request")
-        if response.get("type") != "worker_relay":
-            raise WorkerEnrollmentError("The controller returned an invalid Worker relay request.")
-        self._queue_worker_relay(response)
-        return True
+        response_type = response.get("type")
+        if response_type == "worker_relay":
+            self._queue_worker_relay(response)
+            return True
+        if response_type == "pair_relay_deliver":
+            self._queue_pair_relay_envelope(response)
+            return True
+        if response_type == "pair_cell_activate":
+            self._queue_pair_cell_activation(response)
+            return True
+        if response_type == "pair_relay_ack":
+            return True  # fire-and-forget sends do not correlate this synchronously
+        raise WorkerEnrollmentError("The controller returned an invalid Worker relay request.")
+
+    def _queue_pair_relay_envelope(self, response: dict[str, object]) -> None:
+        if set(response) != {"type", "envelope"} or not isinstance(response.get("envelope"), dict):
+            raise WorkerEnrollmentError("The controller returned an invalid Pair Execution Cell relay push.")
+        self._pair_relay_inbox.append(cast(dict[str, object], response["envelope"]))
+
+    def _queue_pair_cell_activation(self, response: dict[str, object]) -> None:
+        if (
+            set(response) != {"type", "contract", "lease"}
+            or not isinstance(response.get("contract"), dict)
+            or not isinstance(response.get("lease"), dict)
+        ):
+            raise WorkerEnrollmentError("The controller returned an invalid Pair Execution Cell activation push.")
+        self._pair_cell_activation_inbox.append(
+            {"contract": cast(dict[str, object], response["contract"]), "lease": cast(dict[str, object], response["lease"])}
+        )
+
+    def drain_pair_relay_envelopes(self) -> list[dict[str, object]]:
+        """Pop every opaque Pair Execution Cell envelope queued since the last drain."""
+
+        envelopes, self._pair_relay_inbox = self._pair_relay_inbox, []
+        return envelopes
+
+    def drain_pair_cell_activations(self) -> list[dict[str, object]]:
+        """Pop every controller-pushed ``{contract, lease}`` activation queued since the last drain."""
+
+        activations, self._pair_cell_activation_inbox = self._pair_cell_activation_inbox, []
+        return activations
+
+    def send_pair_relay(self, envelope: dict[str, object], *, request_id: str) -> None:
+        """Send one opaque Pair Execution Cell envelope; fire-and-forget.
+
+        The Pair Execution Cell's relay adapter never blocks on an
+        acknowledgement (``PairRelayAdapter.send`` returns ``None``); a
+        ``pair_relay_ack`` arriving later is tolerated (and ignored) by
+        ``receive_worker_relay``/``_response`` wherever it happens to
+        interleave with other traffic on this connection.
+        """
+
+        try:
+            _send(self.socket, {"type": "pair_relay", "request_id": request_id, "envelope": envelope})
+        except Exception as error:
+            _raise_closed_connection(error, "Pair Execution Cell relay")
+
+    def request_pair_cell_activation(self) -> dict[str, object] | None:
+        """Synchronously ask the controller for this Worker's current pair
+        lease and contract, used once at Worker startup (or reconnect) before
+        entering the low-latency event loop -- not on any hot path."""
+
+        try:
+            _send(self.socket, {"type": "pair_cell_sync_request"})
+            response = self._response()
+            if response.get("type") != "pair_cell_sync" or set(response) != {"type", "contract", "lease"}:
+                raise WorkerEnrollmentError("The controller returned an invalid Pair Execution Cell sync response.")
+            contract = response["contract"]
+            if contract is None:
+                return None
+            lease = response["lease"]
+            if not isinstance(contract, dict) or not isinstance(lease, dict):
+                raise WorkerEnrollmentError("The controller returned an invalid Pair Execution Cell sync response.")
+            return {"contract": contract, "lease": lease}
+        except Exception as error:
+            _raise_closed_connection(error, "Pair Execution Cell activation sync")
+
+    @property
+    def trader_rpc_scheduler(self) -> DeadlineAwareTraderRpcScheduler:
+        """The single scheduler this Worker uses for every source of broker
+        writes. Adapters (e.g. the Pair Execution Cell) must share this exact
+        instance to preserve serialized MT5 access and priority ordering."""
+
+        return self._trader_rpc_scheduler
 
     def _queue_trader_rpc(self, response: dict[str, object]) -> None:
         envelope_fields = {

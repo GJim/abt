@@ -6,6 +6,7 @@ from pydantic import ValidationError
 
 from abt.trader_protocol import (
     MAX_LIVE_SYMBOLS,
+    pair_cell_relay_envelope_adapter,
     trader_rpc_request_adapter,
     trader_rpc_response_adapter,
     worker_request_envelope_adapter,
@@ -231,3 +232,58 @@ class TraderProtocolTests(unittest.TestCase):
         )
 
         self.assertEqual("worker-a", request.worker_id)
+
+
+class PairCellRelayEnvelopeTests(unittest.TestCase):
+    def _envelope(self, **overrides: object) -> dict[str, object]:
+        envelope: dict[str, object] = {
+            "type": "pair_cell_relay",
+            "protocol_version": 1,
+            "lease": {
+                "leader_worker_id": "worker-a",
+                "follower_worker_id": "worker-b",
+                "trader_id": "trader-1",
+                "contract_hash": "hash-1",
+                "lease_epoch": 1,
+            },
+            "from_worker_id": "worker-a",
+            "to_worker_id": "worker-b",
+            "request_id": "message-1",
+            "attempt_id": "attempt-1",
+            "payload_hash": "abc",
+            "payload": {"kind": "quote", "symbol": "EURUSD"},
+        }
+        envelope.update(overrides)
+        return envelope
+
+    def test_rejects_a_missing_message_id(self) -> None:
+        envelope = self._envelope()
+        del envelope["request_id"]
+        with self.assertRaises(ValidationError):
+            pair_cell_relay_envelope_adapter.validate_python(envelope)
+
+    def test_accepts_a_well_formed_opaque_envelope(self) -> None:
+        envelope = pair_cell_relay_envelope_adapter.validate_python(self._envelope())
+
+        self.assertEqual("worker-a", envelope.from_worker_id)
+        self.assertEqual({"kind": "quote", "symbol": "EURUSD"}, envelope.payload)
+
+    def test_rejects_a_route_outside_the_leased_pair(self) -> None:
+        with self.assertRaises(ValidationError):
+            pair_cell_relay_envelope_adapter.validate_python(
+                self._envelope(to_worker_id="worker-c")
+            )
+
+    def test_rejects_a_route_to_self(self) -> None:
+        with self.assertRaises(ValidationError):
+            pair_cell_relay_envelope_adapter.validate_python(
+                self._envelope(from_worker_id="worker-a", to_worker_id="worker-a")
+            )
+
+    def test_rejects_an_unknown_protocol_version(self) -> None:
+        with self.assertRaises(ValidationError):
+            pair_cell_relay_envelope_adapter.validate_python(self._envelope(protocol_version=2))
+
+    def test_rejects_extra_fields(self) -> None:
+        with self.assertRaises(ValidationError):
+            pair_cell_relay_envelope_adapter.validate_python(self._envelope(unexpected="value"))

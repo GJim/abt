@@ -52,31 +52,6 @@ class RuntimeRelay(Protocol):
         correlation: dict[str, object],
     ) -> dict[str, object]: ...
 
-    def calc_profit(
-        self,
-        worker_id: str,
-        *,
-        symbol: str,
-        volume: str,
-        direction: str,
-        open_price: float,
-        close_price: float,
-        runtime_command_id: str,
-        request_id: str,
-        correlation: dict[str, object],
-    ) -> dict[str, object]: ...
-
-    def order_check(
-        self,
-        worker_id: str,
-        *,
-        order: dict[str, object],
-        runtime_command_id: str,
-        request_id: str,
-        expires_at: datetime,
-        correlation: dict[str, object],
-    ) -> dict[str, object]: ...
-
     def order_execute(
         self,
         worker_id: str,
@@ -101,6 +76,27 @@ class RuntimeRelay(Protocol):
         correlation: dict[str, object],
     ) -> dict[str, object]: ...
 
+    def claim_pair_execution_mode(
+        self,
+        leader_worker_id: str,
+        follower_worker_id: str,
+        *,
+        runtime_command_id: str,
+        request_id: str,
+    ) -> dict[str, object]:
+        """Claim (or refresh) this Worker pair's live ``strategy_runtime``
+        lifecycle-owner mode with the controller before dispatching any new
+        entry effect.
+
+        Raises if the controller rejects the claim (for example, because a
+        Pair Execution Cell already holds a live claim on this pair): ADR-0010
+        requires ``strategy_runtime`` and ``pair_execution_cell`` never both
+        run live for the same Worker pair, so this call is the Strategy
+        Runtime's half of that mutual exclusion and must never be skipped or
+        made optional.
+        """
+        ...
+
 
 @dataclass(frozen=True, slots=True)
 class PairLegPlan:
@@ -110,10 +106,8 @@ class PairLegPlan:
     direction: str
     volume: str
     filling_mode: str
-    margin_limit: str
     stop_loss: str
     take_profit: str
-    protection_loss_usd: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,7 +156,6 @@ class PairPlan:
     first: PairLegPlan
     second: PairLegPlan
     timed_exit: TimedExitPolicy | None = None
-    protection_revision: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -197,7 +190,7 @@ class StrategyRuntime:
     ) -> None:
         missing = [
             name for name in (
-                "snapshot", "symbol_info", "calc_profit", "order_check", "order_execute", "operate"
+                "snapshot", "symbol_info", "order_execute", "operate", "claim_pair_execution_mode"
             )
             if not callable(getattr(relay, name, None))
         ]
@@ -486,13 +479,14 @@ class StrategyRuntime:
         )
 
     def worker_cursor(self, worker_id: str) -> tuple[str | None, int, bool]:
-        row = self._connection.execute(
-            "SELECT recovery_epoch, event_id, fresh_snapshot FROM worker_cursors WHERE worker_id = ?",
-            (worker_id,),
-        ).fetchone()
-        if row is None:
-            raise StrategyRuntimeError("Worker is not part of this Strategy Runtime.")
-        return row[0], int(row[1]), bool(row[2])
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT recovery_epoch, event_id, fresh_snapshot FROM worker_cursors WHERE worker_id = ?",
+                (worker_id,),
+            ).fetchone()
+            if row is None:
+                raise StrategyRuntimeError("Worker is not part of this Strategy Runtime.")
+            return row[0], int(row[1]), bool(row[2])
 
     def ingest_fact(self, envelope: dict[str, object]) -> str:
         """Durably deduplicate Worker facts and force snapshots after gaps or epoch changes."""
@@ -562,10 +556,10 @@ class StrategyRuntime:
         with self._lock:
             if self.state != "EMPTY":
                 raise StrategyRuntimeError("A new pair cannot start until broker-verified empty.")
-            admission_facts = {
-                worker_id: self._snapshot(worker_id, f"{plan.command_id}:entry-admission")
-                for worker_id in self.worker_ids
-            }
+            self._claim_execution_mode(plan)
+            admission_facts = self._snapshots(
+                self.worker_ids, f"{plan.command_id}:entry-admission"
+            )
             if any(fact["orders"] or fact["positions"] for fact in admission_facts.values()):
                 raise StrategyRuntimeError("A new pair cannot start while current Worker facts show exposure.")
             self._record_command(plan.command_id, _plan_json(plan))
@@ -575,20 +569,18 @@ class StrategyRuntime:
             }
             for leg in (plan.first, plan.second):
                 self._prepare_effect(effects[leg.name], plan.command_id, leg.worker_id, _order(leg))
-            self._set_state(plan, "PREFLIGHTING", "ACTIVE", "Both exact broker checks are outstanding.")
+            if datetime.now(UTC) >= plan.expires_at:
+                self._set_state(plan, "CLOSING", "EMPTY", "Entry expired before dispatch.")
+                return self.converge_empty("entry-expired-before-dispatch")
+            self._set_state(
+                plan, "DISPATCHING", "ACTIVE",
+                "Both protected entry effects may reach their Workers.",
+            )
 
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            futures = {
-                leg.name: executor.submit(self._safe_preflight, plan, leg)
-                for leg in (plan.first, plan.second)
-            }
-            checks = {name: future.result() for name, future in futures.items()}
-        rejected = [name for name, result in checks.items() if not _preflight_accepted(result, getattr(plan, name))]
-        if rejected or datetime.now(UTC) >= plan.expires_at:
-            self._set_state(plan, "CLOSING", "EMPTY", f"Entry preflight rejected: {', '.join(rejected) or 'expired'}.")
-            return self.converge_empty("entry-preflight-rejected")
+        if datetime.now(UTC) >= plan.expires_at:
+            self._set_state(plan, "CLOSING", "EMPTY", "Entry expired before dispatch.")
+            return self.converge_empty("entry-expired-before-dispatch")
 
-        self._set_state(plan, "DISPATCHING", "ACTIVE", "Both entry effects may reach their Workers.")
         with ThreadPoolExecutor(max_workers=2) as executor:
             futures = {
                 leg.name: executor.submit(self._safe_execute, plan, leg, effects[leg.name])
@@ -603,166 +595,17 @@ class StrategyRuntime:
 
         self._record_activation(plan, datetime.now(UTC))
         self._set_state(plan, "VERIFYING", "ACTIVE", "Receipts exist; fresh Worker facts must prove the pair.")
-        facts = {
-            plan.first.worker_id: self._snapshot(plan.first.worker_id, plan.command_id),
-            plan.second.worker_id: self._snapshot(plan.second.worker_id, plan.command_id),
-        }
+        facts = self._snapshots(
+            (plan.first.worker_id, plan.second.worker_id), plan.command_id
+        )
         verified = self._verify(plan, facts, outcomes)
         if verified is None:
             self._set_state(plan, "ENTRY_UNCERTAIN", "EMPTY", "Broker facts do not prove the requested protected pair.")
             return self.converge_empty("entry-verification-failed")
         activated_at = self._record_activation(plan, datetime.now(UTC))
         self._record_verified(plan, verified)
-        plan, verified = self._refine_entry_protection(plan, verified)
         self._set_state(plan, "ACTIVE", "ACTIVE", "Current Worker facts prove the protected pair.")
         return PairExecutionResult("active", "ACTIVE", *verified, activated_at=activated_at)
-
-    def _refine_entry_protection(
-        self,
-        plan: PairPlan,
-        verified: tuple[VerifiedLeg, VerifiedLeg],
-    ) -> tuple[PairPlan, tuple[VerifiedLeg, VerifiedLeg]]:
-        """Replace provisional entry protection with broker-calculated pair protection."""
-
-        if plan.first.protection_loss_usd is None and plan.second.protection_loss_usd is None:
-            return plan, verified
-        try:
-            targets = self._exact_protection_targets(plan, verified)
-        except Exception as error:
-            self._set_state(
-                plan, "CLOSING", "EMPTY",
-                f"Exact entry protection could not be calculated: {error}",
-            )
-            self.converge_empty("entry-protection-calculation-failed")
-            raise StrategyRuntimeError("Exact entry protection calculation failed.") from error
-        refined = replace(
-            plan,
-            first=replace(
-                plan.first, stop_loss=targets["first"]["sl"], take_profit=targets["first"]["tp"]
-            ),
-            second=replace(
-                plan.second, stop_loss=targets["second"]["sl"], take_profit=targets["second"]["tp"]
-            ),
-            protection_revision=plan.protection_revision + 1,
-        )
-        self._set_state(
-            refined, "REFINING_PROTECTION", "ACTIVE",
-            "Broker-verified entry is receiving exact pair-owned protection.",
-        )
-        prepared: dict[str, tuple[PairLegPlan, str, dict[str, object]]] = {}
-        for name, leg in (("first", refined.first), ("second", refined.second)):
-            effect_id = self._next_effect_id(
-                refined.command_id, leg.worker_id, "entry-protection-refinement"
-            )
-            operation = {
-                "type": "modify_sl_tp",
-                "symbol": leg.symbol,
-                "position": str(self._verified_ticket(refined, leg.worker_id)),
-                "sl": leg.stop_loss,
-                "tp": leg.take_profit,
-            }
-            self._prepare_effect(effect_id, refined.command_id, leg.worker_id, operation)
-            prepared[name] = (leg, effect_id, operation)
-        self._connection.executemany(
-            """UPDATE runtime_effects SET delivery_state = 'dispatching', updated_at = ?
-               WHERE effect_id = ? AND delivery_state = 'prepared'""",
-            [(_now(), effect_id) for _leg, effect_id, _operation in prepared.values()],
-        )
-        self._connection.commit()
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            futures = {
-                name: executor.submit(
-                    self._safe_operate, refined, leg, effect_id, operation,
-                    "entry-protection-refinement",
-                )
-                for name, (leg, effect_id, operation) in prepared.items()
-            }
-            outcomes = {name: future.result() for name, future in futures.items()}
-        for name, outcome in outcomes.items():
-            self._record_effect_outcome(prepared[name][1], outcome)
-        facts = {
-            refined.first.worker_id: self._snapshot(
-                refined.first.worker_id, f"{refined.command_id}:entry-protection-verify"
-            ),
-            refined.second.worker_id: self._snapshot(
-                refined.second.worker_id, f"{refined.command_id}:entry-protection-verify"
-            ),
-        }
-        final = self._verify(refined, facts, receipts={})
-        if final is None:
-            self._set_state(
-                refined, "CLOSING", "EMPTY",
-                "Exact entry protection was not broker-verified on both owned legs.",
-            )
-            self.converge_empty("entry-protection-refinement-failed")
-            raise StrategyRuntimeError("Exact entry protection could not be broker-verified.")
-        self._record_verified(refined, final)
-        return refined, final
-
-    def _exact_protection_targets(
-        self,
-        plan: PairPlan,
-        verified: tuple[VerifiedLeg, VerifiedLeg],
-    ) -> dict[str, dict[str, str]]:
-        verified_by_worker = {leg.worker_id: leg for leg in verified}
-        constraints = self._current_symbol_constraints(plan)
-        if constraints is None:
-            raise StrategyRuntimeError("Current symbol constraints are unavailable.")
-        targets: dict[str, dict[str, str]] = {}
-        for name, leg in (("first", plan.first), ("second", plan.second)):
-            loss_limit = _positive_finite(leg.protection_loss_usd)
-            if loss_limit is None:
-                raise StrategyRuntimeError("Entry protection loss limit is invalid.")
-            entry = verified_by_worker[leg.worker_id].entry_price
-            tick_size = float(constraints[name]["tick_size"])
-            digits = int(constraints[name]["digits"])
-            stop_loss = self._broker_profit_target_price(
-                plan, leg, entry, -loss_limit
-            )
-            take_profit = self._broker_profit_target_price(
-                plan, leg, entry, loss_limit
-            )
-            targets[name] = {
-                "sl": _round_price(stop_loss, tick_size, digits, ROUND_CEILING if leg.direction == "LONG" else ROUND_FLOOR),
-                "tp": _round_price(take_profit, tick_size, digits, ROUND_FLOOR if leg.direction == "LONG" else ROUND_CEILING),
-            }
-        return targets
-
-    def _broker_profit_target_price(
-        self,
-        plan: PairPlan,
-        leg: PairLegPlan,
-        entry: float,
-        target_profit: float,
-    ) -> float:
-        lower, upper = entry * 0.5, entry * 1.5
-        for iteration in range(32):
-            candidate = (lower + upper) / 2
-            result = self.relay.calc_profit(
-                leg.worker_id,
-                symbol=leg.symbol,
-                volume=leg.volume,
-                direction=leg.direction,
-                open_price=entry,
-                close_price=candidate,
-                runtime_command_id=plan.command_id,
-                request_id=(
-                    f"{plan.command_id}:{leg.name}:entry-protection-profit:{iteration}"
-                ),
-                correlation={
-                    "pair_id": plan.pair_id,
-                    "leg": leg.name,
-                    "purpose": "entry-protection-refinement",
-                },
-            )
-            profit = _finite_float(result.get("profit"))
-            if profit is None:
-                raise StrategyRuntimeError("Worker returned invalid calculated profit.")
-            if (profit < target_profit) == (leg.direction == "LONG"):
-                lower = candidate
-            else:
-                upper = candidate
-        return (lower + upper) / 2
 
     def maintain(
         self,
@@ -1793,22 +1636,6 @@ class StrategyRuntime:
         )
         self._connection.commit()
 
-    def _preflight(self, plan: PairPlan, leg: PairLegPlan) -> dict[str, object]:
-        return self.relay.order_check(
-            leg.worker_id,
-            order=_order(leg),
-            runtime_command_id=plan.command_id,
-            request_id=f"{plan.command_id}:{leg.name}:check",
-            expires_at=plan.expires_at,
-            correlation={"pair_id": plan.pair_id, "leg": leg.name, "purpose": "entry-preflight"},
-        )
-
-    def _safe_preflight(self, plan: PairPlan, leg: PairLegPlan) -> dict[str, object]:
-        try:
-            return self._preflight(plan, leg)
-        except Exception as error:
-            return {"accepted": False, "execution_state": "not_started", "reason": str(error)}
-
     def _execute(self, plan: PairPlan, leg: PairLegPlan, effect_id: str) -> dict[str, object]:
         with self._lock:
             self._connection.execute(
@@ -1937,13 +1764,67 @@ class StrategyRuntime:
             command_id, worker_id, suffix
         )
 
+    def _claim_execution_mode(self, plan: PairPlan) -> None:
+        """Claim live ``strategy_runtime`` ownership of this Worker pair before
+        admitting any entry effect (ADR-0010 execution-mode exclusivity).
+
+        A rejection (for example, a Pair Execution Cell already holds a live
+        claim) stops the entry here, before any admission read or broker
+        effect is prepared, so the legacy Strategy Runtime never issues a
+        broker entry effect for a pair currently opted into the cell.
+        """
+
+        try:
+            self.relay.claim_pair_execution_mode(
+                self.worker_ids[0],
+                self.worker_ids[1],
+                runtime_command_id=plan.command_id,
+                request_id=f"{plan.command_id}:execution-mode-claim",
+            )
+        except Exception as error:
+            raise StrategyRuntimeError(
+                f"This Worker pair is not available to the Strategy Runtime: {error}"
+            ) from error
+
     def _snapshot(self, worker_id: str, command_id: str) -> dict[str, list[dict[str, object]]]:
-        snapshot = self.relay.snapshot(
+        return self._record_snapshot(
+            worker_id, self._request_snapshot(worker_id, command_id)
+        )
+
+    def _snapshots(
+        self,
+        worker_ids: tuple[str, ...],
+        command_id: str,
+    ) -> dict[str, dict[str, list[dict[str, object]]]]:
+        with ThreadPoolExecutor(max_workers=len(worker_ids)) as executor:
+            futures = {
+                worker_id: executor.submit(
+                    self._request_snapshot, worker_id, command_id
+                )
+                for worker_id in worker_ids
+            }
+            snapshots = {
+                worker_id: future.result()
+                for worker_id, future in futures.items()
+            }
+        return {
+            worker_id: self._record_snapshot(worker_id, snapshots[worker_id])
+            for worker_id in worker_ids
+        }
+
+    def _request_snapshot(self, worker_id: str, command_id: str) -> dict[str, object]:
+        return self.relay.snapshot(
             worker_id,
             runtime_command_id=command_id,
             request_id=f"{command_id}:{worker_id}:snapshot:{uuid4()}",
             correlation={"purpose": "fresh-snapshot"},
         )
+
+    def _record_snapshot(
+        self,
+        worker_id: str,
+        snapshot: dict[str, object],
+    ) -> dict[str, list[dict[str, object]]]:
         orders = snapshot.get("orders")
         positions = snapshot.get("positions")
         if not isinstance(orders, list) or not all(isinstance(value, dict) for value in orders):
@@ -2147,17 +2028,6 @@ def _order(leg: PairLegPlan) -> dict[str, object]:
     }
 
 
-def _preflight_accepted(result: dict[str, object], leg: PairLegPlan) -> bool:
-    if result.get("accepted") is not True:
-        return False
-    diagnostics = result.get("diagnostics")
-    margin = diagnostics.get("margin") if isinstance(diagnostics, dict) else None
-    try:
-        return margin is not None and float(str(margin)) <= float(leg.margin_limit)
-    except (TypeError, ValueError):
-        return False
-
-
 def _effect_accepted(result: dict[str, object]) -> bool:
     return result.get("accepted") is True and result.get("execution_state") not in {"sent", "not_started"}
 
@@ -2215,7 +2085,6 @@ def _plan_json(plan: PairPlan) -> dict[str, object]:
         "first": asdict(plan.first),
         "second": asdict(plan.second),
         "timed_exit": asdict(plan.timed_exit) if plan.timed_exit is not None else None,
-        "protection_revision": plan.protection_revision,
     }
 
 
@@ -2225,15 +2094,26 @@ def _plan(value: dict[str, object]) -> PairPlan:
         command_id=str(value["command_id"]),
         direction=str(value["direction"]),
         expires_at=datetime.fromisoformat(str(value["expires_at"])),
-        first=PairLegPlan(**value["first"]),  # type: ignore[arg-type]
-        second=PairLegPlan(**value["second"]),  # type: ignore[arg-type]
+        first=_leg_plan(value["first"]),
+        second=_leg_plan(value["second"]),
         timed_exit=(
             TimedExitPolicy(**value["timed_exit"])  # type: ignore[arg-type]
             if isinstance(value.get("timed_exit"), dict)
             else None
         ),
-        protection_revision=int(value.get("protection_revision", 0)),
     )
+
+
+def _leg_plan(value: object) -> PairLegPlan:
+    if not isinstance(value, dict):
+        raise StrategyRuntimeError("Persisted pair leg is invalid.")
+    return PairLegPlan(**{
+        field: value[field]
+        for field in (
+            "name", "worker_id", "symbol", "direction", "volume",
+            "filling_mode", "stop_loss", "take_profit",
+        )
+    })  # type: ignore[arg-type]
 
 
 def _canonical(value: dict[str, object]) -> str:

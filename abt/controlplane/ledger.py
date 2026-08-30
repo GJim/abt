@@ -787,6 +787,326 @@ class ControlLedger:
                 {"worker_id": worker_id, "source": source, "reason": reason},
             )
 
+    # -- Pair Execution Cell: execution-mode exclusivity, lease, and relay -- #
+
+    def claim_pair_execution_mode(
+        self, leader_worker_id: str, follower_worker_id: str, mode: str, trader_id: str
+    ) -> None:
+        """Enforce that a Worker pair has exactly one live lifecycle owner.
+
+        ``live`` modes (``strategy_runtime`` and ``pair_execution_cell``) are
+        mutually exclusive for the same pair; ``shadow`` may run alongside
+        either so old and new edge decisions can be compared before cutover.
+        """
+
+        with self._transaction():
+            self._claim_pair_execution_mode_locked(leader_worker_id, follower_worker_id, mode, trader_id)
+
+    def _claim_pair_execution_mode_locked(
+        self, leader_worker_id: str, follower_worker_id: str, mode: str, trader_id: str
+    ) -> None:
+        if mode not in ("strategy_runtime", "pair_execution_cell", "shadow"):
+            raise LedgerError("Invalid Pair Execution Cell execution mode.")
+        pair_key = _pair_key(leader_worker_id, follower_worker_id)
+        self.active_worker(leader_worker_id)
+        self.active_worker(follower_worker_id)
+        if mode != "shadow":
+            existing = self._connection.execute(
+                "SELECT mode, trader_id FROM pair_execution_owners WHERE pair_key = ? AND mode != 'shadow'",
+                [pair_key],
+            ).fetchone()
+            if existing is not None and (existing[0] != mode or existing[1] != trader_id):
+                raise LedgerError(
+                    "This Worker pair already has a different live execution owner; "
+                    "the legacy Strategy Runtime and a Pair Execution Cell cannot both run for the same pair."
+                )
+        self._connection.execute(
+            """INSERT INTO pair_execution_owners (pair_key, mode, trader_id, claimed_at)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT (pair_key, mode) DO UPDATE SET
+                 trader_id = excluded.trader_id, claimed_at = excluded.claimed_at""",
+            [pair_key, mode, trader_id, _utc_now()],
+        )
+        self._event(
+            "pair_execution_mode_claimed",
+            {"leader_worker_id": leader_worker_id, "follower_worker_id": follower_worker_id, "mode": mode, "trader_id": trader_id},
+        )
+
+    def release_pair_execution_mode(self, leader_worker_id: str, follower_worker_id: str, mode: str) -> None:
+        pair_key = _pair_key(leader_worker_id, follower_worker_id)
+        with self._transaction():
+            self._connection.execute(
+                "DELETE FROM pair_execution_owners WHERE pair_key = ? AND mode = ?", [pair_key, mode]
+            )
+            self._event(
+                "pair_execution_mode_released",
+                {"leader_worker_id": leader_worker_id, "follower_worker_id": follower_worker_id, "mode": mode},
+            )
+
+    def issue_pair_lease(
+        self,
+        *,
+        leader_worker_id: str,
+        follower_worker_id: str,
+        trader_id: str,
+        contract_hash: str,
+        ttl_seconds: float,
+        mode: str = "pair_execution_cell",
+    ) -> dict[str, Any]:
+        """Issue a strictly increasing, epoch-fenced lease for one Worker pair."""
+
+        with self._transaction():
+            return self._issue_pair_lease_locked(
+                leader_worker_id=leader_worker_id,
+                follower_worker_id=follower_worker_id,
+                trader_id=trader_id,
+                contract_hash=contract_hash,
+                ttl_seconds=ttl_seconds,
+                mode=mode,
+            )
+
+    def _issue_pair_lease_locked(
+        self,
+        *,
+        leader_worker_id: str,
+        follower_worker_id: str,
+        trader_id: str,
+        contract_hash: str,
+        ttl_seconds: float,
+        mode: str = "pair_execution_cell",
+    ) -> dict[str, Any]:
+        pair_key = _pair_key(leader_worker_id, follower_worker_id)
+        self._claim_pair_execution_mode_locked(leader_worker_id, follower_worker_id, mode, trader_id)
+        row = self._connection.execute(
+            "SELECT epoch FROM pair_leases WHERE pair_key = ? ORDER BY epoch DESC LIMIT 1", [pair_key]
+        ).fetchone()
+        epoch = 1 if row is None else int(row[0]) + 1
+        issued_at = _utc_now()
+        expires_at = issued_at + timedelta(seconds=ttl_seconds)
+        self._connection.execute(
+            """INSERT INTO pair_leases
+               (pair_key, epoch, leader_worker_id, follower_worker_id, trader_id, contract_hash, issued_at, expires_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            [pair_key, epoch, leader_worker_id, follower_worker_id, trader_id, contract_hash, issued_at, expires_at],
+        )
+        self._event(
+            "pair_lease_issued",
+            {
+                "leader_worker_id": leader_worker_id,
+                "follower_worker_id": follower_worker_id,
+                "trader_id": trader_id,
+                "contract_hash": contract_hash,
+                "epoch": epoch,
+            },
+        )
+        return {
+            "leader_worker_id": leader_worker_id,
+            "follower_worker_id": follower_worker_id,
+            "trader_id": trader_id,
+            "contract_hash": contract_hash,
+            "epoch": epoch,
+            "issued_at": issued_at,
+            "expires_at": expires_at,
+        }
+
+    def activate_pair_contract(
+        self,
+        *,
+        contract: dict[str, Any],
+        contract_hash: str,
+        trader_id: str,
+        ttl_seconds: float,
+    ) -> dict[str, Any]:
+        """Durably store one immutable Pair Execution Cell contract and issue its lease.
+
+        This is the controller surface that creates and distributes the
+        complete contract (not only a lease bound to an opaque hash).
+        Validation here is limited to identity (both Workers exist and are
+        active), route (the two Workers are distinct), and lease/mode
+        concerns; strategy values inside ``contract`` (edge threshold, risk
+        budget, volumes, quote policy, ...) are stored and relayed opaquely
+        and never interpreted.
+        """
+
+        leader_worker_id = contract.get("leader_worker_id")
+        follower_worker_id = contract.get("follower_worker_id")
+        if not isinstance(leader_worker_id, str) or not isinstance(follower_worker_id, str):
+            raise LedgerError("Pair Execution Cell contract identity is invalid.")
+        if leader_worker_id == follower_worker_id:
+            raise LedgerError("A Pair Execution Cell contract must use two distinct Workers.")
+        if contract.get("trader_id") != trader_id:
+            raise LedgerError("Pair Execution Cell contract trader identity does not match the requester.")
+        canonical = json.dumps(contract, separators=(",", ":"), sort_keys=True, allow_nan=False)
+        with self._transaction():
+            self.active_worker(leader_worker_id)
+            self.active_worker(follower_worker_id)
+            existing = self._connection.execute(
+                "SELECT payload FROM pair_contracts WHERE contract_hash = ?", [contract_hash]
+            ).fetchone()
+            if existing is not None and existing[0] != canonical:
+                raise LedgerError("Pair Execution Cell contract hash was reused with different content.")
+            if existing is None:
+                self._connection.execute(
+                    """INSERT INTO pair_contracts
+                       (contract_hash, trader_id, leader_worker_id, follower_worker_id, payload, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    [contract_hash, trader_id, leader_worker_id, follower_worker_id, canonical, _utc_now()],
+                )
+                self._event(
+                    "pair_contract_activated",
+                    {
+                        "contract_hash": contract_hash,
+                        "leader_worker_id": leader_worker_id,
+                        "follower_worker_id": follower_worker_id,
+                        "trader_id": trader_id,
+                    },
+                )
+            lease = self._issue_pair_lease_locked(
+                leader_worker_id=leader_worker_id,
+                follower_worker_id=follower_worker_id,
+                trader_id=trader_id,
+                contract_hash=contract_hash,
+                ttl_seconds=ttl_seconds,
+                mode="pair_execution_cell",
+            )
+            return {"contract": json.loads(canonical), "lease": lease}
+
+    def pair_cell_activation_for_worker(self, worker_id: str) -> dict[str, Any] | None:
+        """The current active lease and contract for a pair this Worker belongs to, if any.
+
+        Used to (re)deliver activation to a Worker that connects after the
+        operator activated the pair (first connection, or reconnect after a
+        push was missed) so delivery does not depend on the Worker having
+        been online at the moment of activation.
+        """
+
+        row = self._connection.execute(
+            """SELECT epoch, leader_worker_id, follower_worker_id, trader_id, contract_hash, issued_at, expires_at
+               FROM pair_leases
+               WHERE (leader_worker_id = ? OR follower_worker_id = ?) AND expires_at > ?
+               ORDER BY epoch DESC LIMIT 1""",
+            [worker_id, worker_id, _utc_now()],
+        ).fetchone()
+        if row is None:
+            return None
+        contract_row = self._connection.execute(
+            "SELECT payload FROM pair_contracts WHERE contract_hash = ?", [row[4]]
+        ).fetchone()
+        if contract_row is None:
+            return None
+        return {
+            "contract": json.loads(contract_row[0]),
+            "lease": {
+                "epoch": int(row[0]),
+                "leader_worker_id": row[1],
+                "follower_worker_id": row[2],
+                "trader_id": row[3],
+                "contract_hash": row[4],
+                "issued_at": row[5],
+                "expires_at": row[6],
+            },
+        }
+
+    def current_pair_lease_epoch(self, leader_worker_id: str, follower_worker_id: str) -> dict[str, Any] | None:
+        pair_key = _pair_key(leader_worker_id, follower_worker_id)
+        row = self._connection.execute(
+            """SELECT epoch, leader_worker_id, follower_worker_id, trader_id, contract_hash, expires_at
+               FROM pair_leases WHERE pair_key = ? ORDER BY epoch DESC LIMIT 1""",
+            [pair_key],
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "epoch": int(row[0]),
+            "leader_worker_id": row[1],
+            "follower_worker_id": row[2],
+            "trader_id": row[3],
+            "contract_hash": row[4],
+            "expires_at": row[5],
+        }
+
+    def record_pair_relay(self, envelope: dict[str, Any]) -> dict[str, Any]:
+        """Authorize and durably record one opaque Worker-to-Worker envelope.
+
+        Only identity, route, lease epoch/expiry, and size are validated; the
+        opaque ``payload`` (quotes, arm/commit, leg status) is never inspected
+        or used to derive an edge or pair-lifecycle state.  Only attempt
+        -scoped kinds (anything carrying ``attempt_id``) are durably audited
+        with delivery deduplication; unscoped high-frequency messages (quote
+        and readiness relay) are authorized and forwarded without a durable
+        audit row.
+
+        Delivery dedup keys on ``request_id`` (fresh per distinct message
+        instance) rather than ``attempt_id``.  ``attempt_id`` correlates every
+        message of one attempt -- arm, arm-ack, commit, and leg-status all
+        legitimately share it -- so it cannot double as an idempotency key
+        without rejecting that same legitimate sequence as "reused content".
+        """
+
+        lease = envelope.get("lease")
+        if not isinstance(lease, dict):
+            raise LedgerError("Pair relay envelope lease claim is invalid.")
+        leader_worker_id = lease.get("leader_worker_id")
+        follower_worker_id = lease.get("follower_worker_id")
+        trader_id = lease.get("trader_id")
+        contract_hash = lease.get("contract_hash")
+        lease_epoch = lease.get("lease_epoch")
+        from_worker_id, to_worker_id = envelope.get("from_worker_id"), envelope.get("to_worker_id")
+        request_id = envelope.get("request_id")
+        if (
+            not isinstance(leader_worker_id, str)
+            or not isinstance(follower_worker_id, str)
+            or not isinstance(trader_id, str)
+            or not isinstance(contract_hash, str)
+            or isinstance(lease_epoch, bool)
+            or not isinstance(lease_epoch, int)
+            or from_worker_id not in (leader_worker_id, follower_worker_id)
+            or to_worker_id not in (leader_worker_id, follower_worker_id)
+            or from_worker_id == to_worker_id
+            or not isinstance(request_id, str)
+            or not request_id
+        ):
+            raise LedgerError("Pair relay envelope identity or route is invalid.")
+        if len(json.dumps(envelope, separators=(",", ":"), ensure_ascii=False).encode("utf-8")) > 65_536:
+            raise LedgerError("Pair relay envelope exceeds the size limit.")
+        current = self.current_pair_lease_epoch(leader_worker_id, follower_worker_id)
+        if (
+            current is None
+            or current["trader_id"] != trader_id
+            or current["contract_hash"] != contract_hash
+            or current["epoch"] != lease_epoch
+            or current["expires_at"] <= _utc_now()
+        ):
+            raise LedgerError("Pair relay envelope does not match an active lease epoch.")
+        with self._transaction():
+            self.active_worker(from_worker_id)
+            self.active_worker(to_worker_id)
+            attempt_id = envelope.get("attempt_id")
+            if not isinstance(attempt_id, str) or not attempt_id:
+                return {"delivered": True, "audited": False}
+            canonical = json.dumps(envelope, separators=(",", ":"), sort_keys=True, allow_nan=False)
+            envelope_hash = _hash(canonical)
+            existing = self._connection.execute(
+                """SELECT envelope_hash FROM pair_relay
+                   WHERE from_worker_id = ? AND to_worker_id = ? AND message_id = ?""",
+                [from_worker_id, to_worker_id, request_id],
+            ).fetchone()
+            if existing is not None:
+                if existing[0] != envelope_hash:
+                    raise LedgerError("Pair relay message ID was reused with different content.")
+                return {"delivered": True, "audited": True, "replay": True}
+            self._event(
+                "pair_relay_recorded",
+                {"from_worker_id": from_worker_id, "to_worker_id": to_worker_id, "attempt_id": attempt_id, "envelope": envelope},
+            )
+            self._connection.execute(
+                """INSERT INTO pair_relay
+                   (from_worker_id, to_worker_id, message_id, attempt_id, lease_epoch, envelope_hash, envelope, recorded_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                [from_worker_id, to_worker_id, request_id, attempt_id, lease_epoch, envelope_hash, canonical, _utc_now()],
+            )
+            return {"delivered": True, "audited": True, "replay": False}
+
     def acknowledge_trader_events(
         self, trader_id: str, cursor: int, connection_cursor: int, delivered_event_ids: set[int]
     ) -> None:
@@ -1456,6 +1776,43 @@ class ControlLedger:
                     reason VARCHAR NOT NULL,
                     occurred_at TIMESTAMPTZ NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS pair_execution_owners (
+                    pair_key VARCHAR NOT NULL,
+                    mode VARCHAR NOT NULL,
+                    trader_id VARCHAR NOT NULL,
+                    claimed_at TIMESTAMPTZ NOT NULL,
+                    PRIMARY KEY (pair_key, mode)
+                );
+                CREATE TABLE IF NOT EXISTS pair_leases (
+                    pair_key VARCHAR NOT NULL,
+                    epoch BIGINT NOT NULL,
+                    leader_worker_id VARCHAR NOT NULL,
+                    follower_worker_id VARCHAR NOT NULL,
+                    trader_id VARCHAR NOT NULL,
+                    contract_hash VARCHAR NOT NULL,
+                    issued_at TIMESTAMPTZ NOT NULL,
+                    expires_at TIMESTAMPTZ NOT NULL,
+                    PRIMARY KEY (pair_key, epoch)
+                );
+                CREATE TABLE IF NOT EXISTS pair_relay (
+                    from_worker_id VARCHAR NOT NULL,
+                    to_worker_id VARCHAR NOT NULL,
+                    message_id VARCHAR NOT NULL,
+                    attempt_id VARCHAR NOT NULL,
+                    lease_epoch BIGINT NOT NULL,
+                    envelope_hash VARCHAR NOT NULL,
+                    envelope JSON NOT NULL,
+                    recorded_at TIMESTAMPTZ NOT NULL,
+                    PRIMARY KEY (from_worker_id, to_worker_id, message_id)
+                );
+                CREATE TABLE IF NOT EXISTS pair_contracts (
+                    contract_hash VARCHAR PRIMARY KEY,
+                    trader_id VARCHAR NOT NULL,
+                    leader_worker_id VARCHAR NOT NULL,
+                    follower_worker_id VARCHAR NOT NULL,
+                    payload JSON NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL
+                );
                 """
             )
             self._connection.execute("ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS registration_invite_hash VARCHAR")
@@ -1609,6 +1966,12 @@ def _summary_boolean(value: object) -> bool | None:
 
 def _hash(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _pair_key(leader_worker_id: str, follower_worker_id: str) -> str:
+    """A canonical, order-independent key identifying one Worker pair."""
+
+    return "|".join(sorted((leader_worker_id, follower_worker_id)))
 
 
 def _utc_now() -> datetime:

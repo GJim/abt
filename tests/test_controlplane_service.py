@@ -1087,6 +1087,128 @@ class ControlPlaneServiceTests(unittest.TestCase):
         self.assertTrue(_is_authoritative_worker_session(connections, worker_id, authoritative))
         self.assertFalse(_is_authoritative_worker_session(connections, worker_id, superseded))
 
+    def test_pair_relay_forwards_an_opaque_envelope_between_leased_workers(self) -> None:
+        leader_key, leader_id, leader_certificate = self._approved_worker(111111, "Broker-A")
+        follower_key, follower_id, follower_certificate = self._approved_worker(222222, "Broker-B")
+        trader_enrollment = self.app.state.ledger.create_trader_enrollment(
+            strategy_name="pair-execution-cell", claimed_public_ip="203.0.113.4", public_key_pem="trader-public-key"
+        )
+        trader_id = self.app.state.ledger.approve_trader_enrollment(
+            trader_enrollment["registration_id"], "ABCDEF", lambda value, *_: f"certificate:{value}"
+        )
+        lease = self.app.state.ledger.issue_pair_lease(
+            leader_worker_id=leader_id, follower_worker_id=follower_id,
+            trader_id=trader_id, contract_hash="contract-hash-1", ttl_seconds=300,
+        )
+        envelope = {
+            "lease": {
+                "leader_worker_id": leader_id, "follower_worker_id": follower_id,
+                "trader_id": trader_id, "contract_hash": "contract-hash-1", "lease_epoch": lease["epoch"],
+            },
+            "from_worker_id": leader_id, "to_worker_id": follower_id,
+            "request_id": "message-1",
+            "attempt_id": "attempt-1",
+            "payload_hash": "unused-by-controller",
+            "payload": {"kind": "arm_request", "opaque_to_controller": True},
+        }
+
+        with self.client.websocket_connect("/api/worker/session") as leader_socket:
+            self._authenticate_worker_socket(leader_socket, leader_key, leader_id, leader_certificate)
+            with self.client.websocket_connect("/api/worker/session") as follower_socket:
+                self._authenticate_worker_socket(follower_socket, follower_key, follower_id, follower_certificate)
+
+                leader_socket.send_json({"type": "pair_relay", "request_id": "relay-1", "envelope": envelope})
+
+                delivered = follower_socket.receive_json()
+                ack = leader_socket.receive_json()
+
+        self.assertEqual({"type": "pair_relay_deliver", "envelope": envelope}, delivered)
+        self.assertEqual({"type": "pair_relay_ack", "request_id": "relay-1", "accepted": True, "result": {"delivered": True, "audited": True, "replay": False}}, ack)
+
+    def test_pair_relay_rejects_a_route_outside_the_leased_pair(self) -> None:
+        leader_key, leader_id, leader_certificate = self._approved_worker(333333, "Broker-A")
+        _outsider_key, outsider_id, _outsider_certificate = self._approved_worker(444444, "Broker-C")
+        _follower_key, follower_id, _follower_certificate = self._approved_worker(555555, "Broker-B")
+        trader_enrollment = self.app.state.ledger.create_trader_enrollment(
+            strategy_name="pair-execution-cell", claimed_public_ip="203.0.113.4", public_key_pem="trader-public-key-2"
+        )
+        trader_id = self.app.state.ledger.approve_trader_enrollment(
+            trader_enrollment["registration_id"], "ABCDEF", lambda value, *_: f"certificate:{value}"
+        )
+        lease = self.app.state.ledger.issue_pair_lease(
+            leader_worker_id=leader_id, follower_worker_id=follower_id,
+            trader_id=trader_id, contract_hash="contract-hash-2", ttl_seconds=300,
+        )
+        envelope = {
+            "lease": {
+                "leader_worker_id": leader_id, "follower_worker_id": follower_id,
+                "trader_id": trader_id, "contract_hash": "contract-hash-2", "lease_epoch": lease["epoch"],
+            },
+            "from_worker_id": leader_id, "to_worker_id": outsider_id,
+            "request_id": "message-1",
+            "attempt_id": "attempt-1",
+            "payload_hash": "unused-by-controller",
+            "payload": {"kind": "arm_request"},
+        }
+
+        with self.client.websocket_connect("/api/worker/session") as leader_socket:
+            self._authenticate_worker_socket(leader_socket, leader_key, leader_id, leader_certificate)
+            leader_socket.send_json({"type": "pair_relay", "request_id": "relay-1", "envelope": envelope})
+            ack = leader_socket.receive_json()
+
+        self.assertFalse(ack["accepted"])
+
+    def test_admin_pair_execution_mode_switch_is_mutually_exclusive_and_explicit(self) -> None:
+        _leader_key, leader_id, _leader_certificate = self._approved_worker(666666, "Broker-A")
+        _follower_key, follower_id, _follower_certificate = self._approved_worker(777777, "Broker-B")
+        trader_enrollment = self.app.state.ledger.create_trader_enrollment(
+            strategy_name="pair-execution-cell", claimed_public_ip="203.0.113.4", public_key_pem="trader-public-key-3"
+        )
+        trader_id = self.app.state.ledger.approve_trader_enrollment(
+            trader_enrollment["registration_id"], "ABCDEF", lambda value, *_: f"certificate:{value}"
+        )
+        login = self.client.post(
+            "/api/admin/login", json={"username": "ABCDEF", "password": "A-secure-admin-password!"}
+        )
+        headers = {"X-CSRF-Token": login.json()["csrf_token"]}
+
+        claim = self.client.post(
+            "/api/admin/pairs/execution-mode",
+            headers=headers,
+            json={
+                "leader_worker_id": leader_id, "follower_worker_id": follower_id,
+                "trader_id": trader_id, "mode": "strategy_runtime",
+            },
+        )
+        self.assertEqual(200, claim.status_code)
+
+        conflict = self.client.post(
+            "/api/admin/pairs/execution-mode",
+            headers=headers,
+            json={
+                "leader_worker_id": leader_id, "follower_worker_id": follower_id,
+                "trader_id": trader_id, "mode": "pair_execution_cell",
+            },
+        )
+        self.assertEqual(409, conflict.status_code)
+
+        release = self.client.post(
+            "/api/admin/pairs/execution-mode/release",
+            headers=headers,
+            json={"leader_worker_id": leader_id, "follower_worker_id": follower_id, "mode": "strategy_runtime"},
+        )
+        self.assertEqual(204, release.status_code)
+
+        after_release = self.client.post(
+            "/api/admin/pairs/execution-mode",
+            headers=headers,
+            json={
+                "leader_worker_id": leader_id, "follower_worker_id": follower_id,
+                "trader_id": trader_id, "mode": "pair_execution_cell",
+            },
+        )
+        self.assertEqual(200, after_release.status_code)
+
     def _create_pending_enrollment(self) -> str:
         private_key = ec.generate_private_key(ec.SECP256R1())
         public_key_pem = private_key.public_key().public_bytes(

@@ -3,7 +3,8 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from threading import Barrier
+import sqlite3
+from threading import Barrier, Event, Thread
 import unittest
 
 from abt.trader.runtime import (
@@ -49,6 +50,22 @@ class ScriptedRelay:
         self.close_barrier: Barrier | None = None
         self.corrupt_entry_worker: str | None = None
         self.reappear_on_orphan_close: tuple[str, dict[str, object]] | None = None
+        self.entry_admission_barrier: Barrier | None = None
+        self.reject_execution_mode_claim = False
+        self.execution_mode_claims: list[tuple[str, str]] = []
+
+    def claim_pair_execution_mode(
+        self,
+        leader_worker_id: str,
+        follower_worker_id: str,
+        *,
+        runtime_command_id: str,
+        request_id: str,
+    ) -> dict[str, object]:
+        self.execution_mode_claims.append((leader_worker_id, follower_worker_id))
+        if self.reject_execution_mode_claim:
+            raise RuntimeError("Pair Execution Cell already holds a live claim on this pair.")
+        return {"mode": "strategy_runtime"}
 
     def snapshot(
         self,
@@ -58,6 +75,11 @@ class ScriptedRelay:
         request_id: str,
         correlation: dict[str, object],
     ) -> dict[str, object]:
+        if (
+            self.entry_admission_barrier is not None
+            and "entry-admission" in runtime_command_id
+        ):
+            self.entry_admission_barrier.wait(timeout=2)
         if (
             self.reappear_on_orphan_close is not None
             and "orphan-close-observe" in runtime_command_id
@@ -251,10 +273,10 @@ def pair_plan(policy: TimedExitPolicy | None = None) -> PairPlan:
         direction="long_first_short_second",
         expires_at=datetime.now(UTC) + timedelta(seconds=30),
         first=PairLegPlan(
-            "first", "worker-a", "EURUSD", "LONG", "0.10", "FOK", "100.00", "1.09", "1.12"
+            "first", "worker-a", "EURUSD", "LONG", "0.10", "FOK", "1.09", "1.12"
         ),
         second=PairLegPlan(
-            "second", "worker-b", "EURUSD", "SHORT", "0.10", "FOK", "100.00", "1.12", "1.09"
+            "second", "worker-b", "EURUSD", "SHORT", "0.10", "FOK", "1.12", "1.09"
         ),
         timed_exit=policy,
     )
@@ -307,36 +329,35 @@ class StrategyRuntimeTests(unittest.TestCase):
             effect_id for _, _, effect_id in relay.effects
         })
 
-    def test_entry_refines_fast_protection_after_broker_verified_entry(self) -> None:
+    def test_entry_keeps_cached_protection_without_profit_reads_or_modification(self) -> None:
         relay = ScriptedRelay()
         runtime = StrategyRuntime(":memory:", relay, worker_ids=("worker-a", "worker-b"))
         self.addCleanup(runtime.close)
-        plan = replace(
-            pair_plan(),
-            first=replace(pair_plan().first, protection_loss_usd="40.00"),
-            second=replace(pair_plan().second, protection_loss_usd="40.00"),
-        )
 
-        result = runtime.enter(plan)
+        result = runtime.enter(pair_plan())
 
         self.assertEqual(("active", "ACTIVE"), (result.status, result.state))
         self.assertEqual(["entry", "entry"], relay.events[:2])
-        self.assertEqual(128, relay.events.count("calc_profit"))
-        self.assertEqual(2, relay.events.count("modify_sl_tp"))
+        self.assertNotIn("calc_profit", relay.events)
+        self.assertNotIn("modify_sl_tp", relay.events)
         active_plan = runtime.active_plan
         assert active_plan is not None
-        self.assertEqual(1, active_plan.protection_revision)
-        self.assertEqual(("1.09601", "1.10399"), (
+        self.assertEqual(("1.09", "1.12"), (
             active_plan.first.stop_loss, active_plan.first.take_profit,
         ))
-        self.assertEqual(("1.10399", "1.09601"), (
+        self.assertEqual(("1.12", "1.09"), (
             active_plan.second.stop_loss, active_plan.second.take_profit,
         ))
-        self.assertTrue(all(
-            effect_id is not None and "entry-protection-refinement" in effect_id
-            for _worker_id, kind, effect_id in relay.effects
-            if kind == "modify_sl_tp"
-        ))
+
+    def test_entry_fetches_both_admission_snapshots_concurrently(self) -> None:
+        relay = ScriptedRelay()
+        relay.entry_admission_barrier = Barrier(2)
+        runtime = StrategyRuntime(":memory:", relay, worker_ids=("worker-a", "worker-b"))
+        self.addCleanup(runtime.close)
+
+        result = runtime.enter(pair_plan())
+
+        self.assertEqual(("active", "ACTIVE"), (result.status, result.state))
 
     def test_maximum_holding_age_arms_a_verified_synchronized_exit_corridor(self) -> None:
         relay = ScriptedRelay()
@@ -868,7 +889,7 @@ class StrategyRuntimeTests(unittest.TestCase):
         self.assertEqual(2, len(entry_effects))
         self.assertEqual(2, len({effect_id for _, _, effect_id in entry_effects}))
 
-    def test_rejected_preflight_emits_no_entry_effect(self) -> None:
+    def test_rejected_direct_entry_contains_the_other_leg(self) -> None:
         relay = ScriptedRelay()
         relay.reject_worker = "worker-b"
         runtime = StrategyRuntime(":memory:", relay, worker_ids=("worker-a", "worker-b"))
@@ -877,7 +898,11 @@ class StrategyRuntimeTests(unittest.TestCase):
         result = runtime.enter(pair_plan())
 
         self.assertEqual(("empty", "EMPTY"), (result.status, result.state))
-        self.assertEqual([], relay.effects)
+        self.assertEqual(2, len([
+            effect for effect in relay.effects if effect[1] == "order_execute"
+        ]))
+        self.assertEqual([], relay.positions["worker-a"])
+        self.assertEqual([], relay.positions["worker-b"])
 
     def test_desired_empty_cancels_then_closes_and_requires_final_empty_snapshot(self) -> None:
         relay = ScriptedRelay()
@@ -938,6 +963,58 @@ class StrategyRuntimeTests(unittest.TestCase):
             runtime.ingest_fact({**delta, "recovery_epoch": "epoch-2", "event_id": 1}),
         )
 
+    def test_worker_cursor_serializes_with_worker_fact_delivery(self) -> None:
+        runtime = StrategyRuntime(":memory:", ScriptedRelay(), worker_ids=("worker-a", "worker-b"))
+        self.addCleanup(runtime.close)
+        delivery_entered, allow_delivery = Event(), Event()
+        cursor_started, concurrent_query = Event(), Event()
+        errors: list[BaseException] = []
+
+        def blocked_delivery(_: dict[str, object]) -> str:
+            delivery_entered.set()
+            self.assertTrue(allow_delivery.wait(2))
+            return "applied"
+
+        class Connection:
+            def execute(self, *_: object) -> object:
+                if not allow_delivery.is_set():
+                    concurrent_query.set()
+                    raise sqlite3.InterfaceError("bad parameter or other API misuse")
+                return type("Cursor", (), {"fetchone": lambda _: ("epoch-a", 1, 1)})()
+
+            def close(self) -> None:
+                pass
+
+        runtime._ingest_fact = blocked_delivery  # type: ignore[method-assign]
+        runtime._connection = Connection()  # type: ignore[assignment]
+
+        def deliver() -> None:
+            try:
+                runtime.ingest_fact({})
+            except BaseException as error:
+                errors.append(error)
+
+        def read_cursor() -> None:
+            cursor_started.set()
+            try:
+                runtime.worker_cursor("worker-a")
+            except BaseException as error:
+                errors.append(error)
+
+        delivery = Thread(target=deliver)
+        delivery.start()
+        self.assertTrue(delivery_entered.wait(1))
+        cursor = Thread(target=read_cursor)
+        cursor.start()
+        self.assertTrue(cursor_started.wait(1))
+        self.assertFalse(concurrent_query.wait(1))
+        allow_delivery.set()
+        delivery.join(1)
+        cursor.join(1)
+        self.assertFalse(delivery.is_alive())
+        self.assertFalse(cursor.is_alive())
+        self.assertEqual([], errors)
+
     def test_changed_ticket_or_protection_requires_human_without_mutating_unknown_exposure(self) -> None:
         relay = ScriptedRelay()
         runtime = StrategyRuntime(":memory:", relay, worker_ids=("worker-a", "worker-b"))
@@ -982,7 +1059,6 @@ class StrategyRuntimeTests(unittest.TestCase):
             pass
 
         for crash_state, expected in (
-            ("PREFLIGHTING", "EMPTY"),
             ("DISPATCHING", "EMPTY"),
             ("VERIFYING", "ACTIVE"),
             ("ACTIVE", "ACTIVE"),
@@ -995,7 +1071,12 @@ class StrategyRuntimeTests(unittest.TestCase):
                 if crash_state == "ENTRY_UNCERTAIN":
                     relay.lose_receipt_worker = "worker-a"
                 if crash_state == "CLOSING":
-                    relay.reject_worker = "worker-b"
+                    plan = replace(
+                        pair_plan(),
+                        expires_at=datetime.now(UTC) - timedelta(seconds=1),
+                    )
+                else:
+                    plan = pair_plan()
 
                 def crash_after(state: str) -> None:
                     if state == crash_state:
@@ -1008,7 +1089,7 @@ class StrategyRuntimeTests(unittest.TestCase):
                     after_transition=crash_after,
                 )
                 with self.assertRaises(Crash):
-                    runtime.enter(pair_plan())
+                    runtime.enter(plan)
                 runtime.close()
                 recovered = StrategyRuntime(
                     self.runtime_path, relay, worker_ids=("worker-a", "worker-b")
@@ -1145,4 +1226,48 @@ class StrategyRuntimeTests(unittest.TestCase):
         with self.assertRaisesRegex(StrategyRuntimeError, "typed interface"):
             StrategyRuntime(
                 ":memory:", LegacyRelay(), worker_ids=("worker-a", "worker-b")  # type: ignore[arg-type]
+            )
+
+    def test_enter_claims_strategy_runtime_execution_mode_before_admission(self) -> None:
+        relay = ScriptedRelay()
+        runtime = StrategyRuntime(":memory:", relay, worker_ids=("worker-a", "worker-b"))
+        self.addCleanup(runtime.close)
+
+        runtime.enter(pair_plan())
+
+        self.assertEqual([("worker-a", "worker-b")], relay.execution_mode_claims)
+
+    def test_enter_refuses_when_a_pair_execution_cell_already_owns_the_pair(self) -> None:
+        """ADR-0010: strategy_runtime and pair_execution_cell are mutually
+        exclusive live owners of one Worker pair; a Strategy Runtime whose
+        claim is rejected must not issue any broker entry effect."""
+
+        relay = ScriptedRelay()
+        relay.reject_execution_mode_claim = True
+        runtime = StrategyRuntime(":memory:", relay, worker_ids=("worker-a", "worker-b"))
+        self.addCleanup(runtime.close)
+
+        with self.assertRaisesRegex(StrategyRuntimeError, "not available to the Strategy Runtime"):
+            runtime.enter(pair_plan())
+
+        self.assertEqual([], relay.effects)
+        self.assertEqual("EMPTY", runtime.state)
+
+    def test_relay_missing_execution_mode_claim_is_not_accepted(self) -> None:
+        class IncompleteRelay:
+            def snapshot(self, *_: object, **__: object) -> dict[str, object]:
+                raise AssertionError
+
+            def symbol_info(self, *_: object, **__: object) -> dict[str, object]:
+                raise AssertionError
+
+            def order_execute(self, *_: object, **__: object) -> dict[str, object]:
+                raise AssertionError
+
+            def operate(self, *_: object, **__: object) -> dict[str, object]:
+                raise AssertionError
+
+        with self.assertRaisesRegex(StrategyRuntimeError, "typed interface"):
+            StrategyRuntime(
+                ":memory:", IncompleteRelay(), worker_ids=("worker-a", "worker-b")  # type: ignore[arg-type]
             )

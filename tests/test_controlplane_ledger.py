@@ -267,3 +267,228 @@ class ControlLedgerTests(unittest.TestCase):
         self.ledger.revoke_registration_invite(invite, "ABCDEF")
         with self.assertRaisesRegex(LedgerError, "no longer active"):
             self.ledger.consume_registration_invite(invite, "worker")
+
+
+class PairExecutionCellLedgerTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._directory = tempfile.TemporaryDirectory()
+        self.ledger = ControlLedger(Path(self._directory.name) / "ledger.duckdb")
+        self.trader_id = self._active_trader()
+        self.worker_a = self._active_worker(111111, "Broker-A")
+        self.worker_b = self._active_worker(222222, "Broker-B")
+
+    def tearDown(self) -> None:
+        self.ledger.close()
+        self._directory.cleanup()
+
+    def _active_trader(self) -> str:
+        enrollment = self.ledger.create_trader_enrollment(
+            strategy_name="pair-execution-cell",
+            claimed_public_ip="203.0.113.4",
+            public_key_pem="public-key",
+        )
+        return self.ledger.approve_trader_enrollment(
+            enrollment["registration_id"], "ABCDEF", lambda value, *_: f"certificate:{value}"
+        )
+
+    def _active_worker(self, login: int, server: str) -> str:
+        challenge, _ = self.ledger.issue_enrollment_challenge()
+        enrollment = self.ledger.create_enrollment(
+            login=login,
+            server=server,
+            public_key_pem=f"worker-key-{login}",
+            account_info={"login": login},
+            terminal_info={"name": "MetaTrader 5"},
+            password_secret_ref=f"abt/data/mt5/pending/{login}",
+            enrollment_challenge=challenge,
+        )
+        return self.ledger.approve_enrollment(
+            enrollment.enrollment_id, "ABCDEF", lambda value, *_: f"certificate:{value}"
+        )
+
+    def test_pair_execution_cell_mode_is_mutually_exclusive_with_strategy_runtime(self) -> None:
+        self.ledger.claim_pair_execution_mode(self.worker_a, self.worker_b, "strategy_runtime", self.trader_id)
+
+        with self.assertRaises(LedgerError):
+            self.ledger.claim_pair_execution_mode(self.worker_a, self.worker_b, "pair_execution_cell", self.trader_id)
+
+        # An explicit release allows the operator to then opt the pair in.
+        self.ledger.release_pair_execution_mode(self.worker_a, self.worker_b, "strategy_runtime")
+        self.ledger.claim_pair_execution_mode(self.worker_a, self.worker_b, "pair_execution_cell", self.trader_id)
+
+    def test_shadow_mode_may_run_alongside_a_live_owner(self) -> None:
+        self.ledger.claim_pair_execution_mode(self.worker_a, self.worker_b, "strategy_runtime", self.trader_id)
+
+        self.ledger.claim_pair_execution_mode(self.worker_a, self.worker_b, "shadow", self.trader_id)  # does not raise
+
+    def test_issue_pair_lease_strictly_increases_epoch_and_requires_claim(self) -> None:
+        first = self.ledger.issue_pair_lease(
+            leader_worker_id=self.worker_a, follower_worker_id=self.worker_b,
+            trader_id=self.trader_id, contract_hash="hash-1", ttl_seconds=60,
+        )
+        second = self.ledger.issue_pair_lease(
+            leader_worker_id=self.worker_a, follower_worker_id=self.worker_b,
+            trader_id=self.trader_id, contract_hash="hash-1", ttl_seconds=60,
+        )
+
+        self.assertEqual(1, first["epoch"])
+        self.assertEqual(2, second["epoch"])
+
+    def test_lease_issuance_blocked_while_legacy_runtime_owns_the_pair(self) -> None:
+        self.ledger.claim_pair_execution_mode(self.worker_a, self.worker_b, "strategy_runtime", self.trader_id)
+
+        with self.assertRaises(LedgerError):
+            self.ledger.issue_pair_lease(
+                leader_worker_id=self.worker_a, follower_worker_id=self.worker_b,
+                trader_id=self.trader_id, contract_hash="hash-1", ttl_seconds=60,
+            )
+
+    def test_activate_pair_contract_creates_and_distributes_the_full_contract_and_lease(self) -> None:
+        contract = {
+            "contract_id": "contract-1", "leader_worker_id": self.worker_a, "follower_worker_id": self.worker_b,
+            "trader_id": self.trader_id, "symbol": "EURUSD", "edge_threshold": "0.0005",
+        }
+
+        activation = self.ledger.activate_pair_contract(
+            contract=contract, contract_hash="hash-1", trader_id=self.trader_id, ttl_seconds=300,
+        )
+
+        self.assertEqual(contract, activation["contract"])
+        self.assertEqual(1, activation["lease"]["epoch"])
+        self.assertEqual(
+            activation, self.ledger.pair_cell_activation_for_worker(self.worker_a)
+        )
+        self.assertEqual(
+            activation, self.ledger.pair_cell_activation_for_worker(self.worker_b)
+        )
+
+    def test_activate_pair_contract_is_blocked_while_a_legacy_strategy_runtime_owns_the_pair(self) -> None:
+        self.ledger.claim_pair_execution_mode(self.worker_a, self.worker_b, "strategy_runtime", self.trader_id)
+        contract = {
+            "contract_id": "contract-1", "leader_worker_id": self.worker_a, "follower_worker_id": self.worker_b,
+            "trader_id": self.trader_id, "symbol": "EURUSD",
+        }
+
+        with self.assertRaises(LedgerError):
+            self.ledger.activate_pair_contract(
+                contract=contract, contract_hash="hash-1", trader_id=self.trader_id, ttl_seconds=300,
+            )
+
+    def test_pair_relay_authorizes_and_audits_attempt_scoped_envelopes_without_interpreting_payload(self) -> None:
+        lease = self.ledger.issue_pair_lease(
+            leader_worker_id=self.worker_a, follower_worker_id=self.worker_b,
+            trader_id=self.trader_id, contract_hash="hash-1", ttl_seconds=60,
+        )
+        envelope = {
+            "lease": {
+                "leader_worker_id": self.worker_a, "follower_worker_id": self.worker_b,
+                "trader_id": self.trader_id, "contract_hash": "hash-1", "lease_epoch": lease["epoch"],
+            },
+            "from_worker_id": self.worker_a, "to_worker_id": self.worker_b,
+            "request_id": "message-1",
+            "attempt_id": "attempt-1",
+            "payload": {"kind": "arm_request", "opaque_to_controller": True},
+        }
+
+        first = self.ledger.record_pair_relay(envelope)
+        replay = self.ledger.record_pair_relay(envelope)
+        changed = dict(envelope, payload={"kind": "arm_request", "opaque_to_controller": False})
+        with self.assertRaises(LedgerError):
+            self.ledger.record_pair_relay(changed)
+
+        self.assertTrue(first["audited"])
+        self.assertFalse(first.get("replay", False))
+        self.assertTrue(replay["replay"])
+
+    def test_pair_relay_permits_distinct_messages_sharing_one_attempt_id(self) -> None:
+        """arm, arm-ack, commit, and leg-status all legitimately share one
+        attempt_id; dedup must key on the per-message request_id instead, or
+        this ordinary sequence would be rejected as reused content."""
+
+        lease = self.ledger.issue_pair_lease(
+            leader_worker_id=self.worker_a, follower_worker_id=self.worker_b,
+            trader_id=self.trader_id, contract_hash="hash-1", ttl_seconds=60,
+        )
+        base = {
+            "lease": {
+                "leader_worker_id": self.worker_a, "follower_worker_id": self.worker_b,
+                "trader_id": self.trader_id, "contract_hash": "hash-1", "lease_epoch": lease["epoch"],
+            },
+            "from_worker_id": self.worker_a, "to_worker_id": self.worker_b,
+            "attempt_id": "attempt-1",
+        }
+        arm = self.ledger.record_pair_relay(
+            {**base, "request_id": "message-arm", "payload": {"kind": "arm_request"}}
+        )
+        commit = self.ledger.record_pair_relay(
+            {**base, "request_id": "message-commit", "payload": {"kind": "commit"}}
+        )
+        leg_status = self.ledger.record_pair_relay(
+            {**base, "request_id": "message-leg-status", "payload": {"kind": "leg_status"}}
+        )
+
+        self.assertTrue(arm["audited"] and commit["audited"] and leg_status["audited"])
+        self.assertFalse(arm.get("replay", False))
+        self.assertFalse(commit.get("replay", False))
+        self.assertFalse(leg_status.get("replay", False))
+
+    def test_pair_relay_rejects_a_route_outside_the_leased_pair(self) -> None:
+        lease = self.ledger.issue_pair_lease(
+            leader_worker_id=self.worker_a, follower_worker_id=self.worker_b,
+            trader_id=self.trader_id, contract_hash="hash-1", ttl_seconds=60,
+        )
+        envelope = {
+            "lease": {
+                "leader_worker_id": self.worker_a, "follower_worker_id": self.worker_b,
+                "trader_id": self.trader_id, "contract_hash": "hash-1", "lease_epoch": lease["epoch"],
+            },
+            "from_worker_id": self.worker_a, "to_worker_id": "not-in-this-pair",
+            "request_id": "message-1",
+            "attempt_id": "attempt-1",
+            "payload": {"kind": "quote"},
+        }
+
+        with self.assertRaises(LedgerError):
+            self.ledger.record_pair_relay(envelope)
+
+    def test_pair_relay_rejects_a_stale_lease_epoch(self) -> None:
+        lease = self.ledger.issue_pair_lease(
+            leader_worker_id=self.worker_a, follower_worker_id=self.worker_b,
+            trader_id=self.trader_id, contract_hash="hash-1", ttl_seconds=60,
+        )
+        self.ledger.issue_pair_lease(  # bumps the epoch again
+            leader_worker_id=self.worker_a, follower_worker_id=self.worker_b,
+            trader_id=self.trader_id, contract_hash="hash-1", ttl_seconds=60,
+        )
+        envelope = {
+            "lease": {
+                "leader_worker_id": self.worker_a, "follower_worker_id": self.worker_b,
+                "trader_id": self.trader_id, "contract_hash": "hash-1", "lease_epoch": lease["epoch"],
+            },
+            "from_worker_id": self.worker_a, "to_worker_id": self.worker_b,
+            "request_id": "message-1",
+            "payload": {"kind": "quote"},
+        }
+
+        with self.assertRaises(LedgerError):
+            self.ledger.record_pair_relay(envelope)
+
+    def test_pair_relay_does_not_durably_audit_unscoped_quote_messages(self) -> None:
+        lease = self.ledger.issue_pair_lease(
+            leader_worker_id=self.worker_a, follower_worker_id=self.worker_b,
+            trader_id=self.trader_id, contract_hash="hash-1", ttl_seconds=60,
+        )
+        envelope = {
+            "lease": {
+                "leader_worker_id": self.worker_a, "follower_worker_id": self.worker_b,
+                "trader_id": self.trader_id, "contract_hash": "hash-1", "lease_epoch": lease["epoch"],
+            },
+            "from_worker_id": self.worker_a, "to_worker_id": self.worker_b,
+            "request_id": "message-1",
+            "payload": {"kind": "quote", "bid": "1.1000"},
+        }
+
+        result = self.ledger.record_pair_relay(envelope)
+
+        self.assertTrue(result["delivered"])
+        self.assertFalse(result["audited"])

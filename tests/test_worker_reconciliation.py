@@ -386,6 +386,25 @@ class WorkerReconciliationTests(unittest.TestCase):
         with self.assertRaisesRegex(WorkerEnrollmentError, "invalid symbol catalog"):
             _trader_read(mt5, {"type": "symbols"})
 
+    def test_broker_snapshot_rejects_unavailable_exposure_records(self) -> None:
+        for field in ("orders", "positions"):
+            with self.subTest(field=field):
+                mt5 = ReadOnlyMT5()
+                setattr(mt5, field, None)
+
+                with self.assertRaisesRegex(WorkerEnrollmentError, f"no {field}"):
+                    _trader_read(mt5, {"type": "broker_snapshot"})
+
+    def test_reconciliation_rejects_unavailable_exposure_records(self) -> None:
+        for field in ("orders", "positions"):
+            with self.subTest(field=field):
+                mt5 = ReadOnlyMT5()
+                setattr(mt5, field, None)
+                adapter = MT5ReconciliationAdapter(mt5, emit=lambda _: None)
+
+                with self.assertRaisesRegex(WorkerEnrollmentError, f"no {field[:-1]} records"):
+                    adapter.poll(datetime(2026, 8, 16, tzinfo=UTC))
+
     def test_margin_batch_reads_each_requested_calculation_without_broker_writes(self) -> None:
         class MarginMT5(ReadOnlyMT5):
             ORDER_TYPE_BUY = 0
@@ -969,6 +988,67 @@ class WorkerReconciliationTests(unittest.TestCase):
         )
         self.assertEqual("snapshot", emitted[0]["type"])
         self.assertEqual(0, mt5.broker_write_calls)
+
+    def test_pair_cell_factory_is_constructed_pumped_and_closed(self) -> None:
+        """Wiring test for gap #1/#2: a supplied ``pair_cell_factory`` must be
+        constructed once MT5 login succeeds, pumped every loop iteration, and
+        closed on shutdown -- this must fail if that wiring is removed."""
+
+        mt5 = ReadOnlyMT5()
+        mt5.initialize = lambda: True  # type: ignore[attr-defined]
+        mt5.login = lambda login, *, password, server: True  # type: ignore[attr-defined]
+        mt5.shutdown = lambda: None  # type: ignore[attr-defined]
+
+        class OneShotSession(MemoryOnlySession):
+            def __init__(self, emitted: list[dict[str, object]]) -> None:
+                super().__init__(emitted)
+                self._relay_calls = 0
+
+            def receive_worker_relay(self, timeout: float | None = None) -> bool:
+                self._relay_calls += 1
+                if self._relay_calls > 2:
+                    raise StopIteration
+                return False
+
+        class FakePairCell:
+            def __init__(self) -> None:
+                self.drain_calls = 0
+                self.pump_calls: list[object] = []
+                self.closed = False
+
+            def drain_relay(self) -> object:
+                self.drain_calls += 1
+                return None
+
+            def pump(self, observed_at: object) -> object:
+                self.pump_calls.append(observed_at)
+                return None
+
+            def close(self) -> None:
+                self.closed = True
+
+        fake_pair_cell = FakePairCell()
+        factory_calls: list[tuple[object, object, object, int, str]] = []
+
+        def factory(mt5_client: object, session: object, journal: object, login: int, server: str) -> FakePairCell:
+            factory_calls.append((mt5_client, session, journal, login, server))
+            return fake_pair_cell
+
+        with self.assertRaises(StopIteration):
+            reconcile_authenticated_worker(
+                mt5=mt5,
+                session=OneShotSession([]),
+                login=123456,
+                server="Broker-Demo",
+                now=lambda: datetime(2026, 8, 16, tzinfo=UTC),
+                pair_cell_factory=factory,
+            )
+
+        self.assertEqual(1, len(factory_calls))
+        self.assertEqual((123456, "Broker-Demo"), factory_calls[0][3:])
+        self.assertGreater(fake_pair_cell.drain_calls, 0)
+        self.assertGreater(len(fake_pair_cell.pump_calls), 0)
+        self.assertTrue(fake_pair_cell.closed)
 
     def _serve_market_data_analysis(self, stage: str, timeframe: str) -> dict[str, object]:
         mt5 = AnalysisMT5()
