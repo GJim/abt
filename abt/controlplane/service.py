@@ -115,6 +115,12 @@ class PairContractActivationRequest(BaseModel):
     commit_lead_seconds: float = Field(gt=0)
     execution_expiry_seconds: float = Field(gt=0)
     mode: Literal["live", "shadow"] = "live"
+    maximum_holding_seconds: float | None = Field(
+        gt=0, le=7 * 24 * 60 * 60, allow_inf_nan=False, default=None
+    )
+    flatten_at_ny: str | None = Field(
+        pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$", default=None
+    )
     ttl_seconds: float = Field(gt=0, default=3600.0)
 
 

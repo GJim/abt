@@ -97,6 +97,7 @@ class FakeMT5:
         # Worker never learns the outcome conclusively.
         self.raise_after_fill = False
         self.receipt_none_after_fill = False
+        self.close_leaves_position_visible = False
 
     def account_info(self) -> object:
         return {"login": 1, "server": "demo"}
@@ -148,7 +149,8 @@ class FakeMT5:
                     return {"retcode": _DONE}
             return {"retcode": _REJECTED, "comment": "unknown ticket"}
         if kind == "close":
-            self.positions = [p for p in self.positions if str(p["ticket"]) != str(request["ticket"])]
+            if not self.close_leaves_position_visible:
+                self.positions = [p for p in self.positions if str(p["ticket"]) != str(request["ticket"])]
             return {"retcode": _DONE}
         if kind == "cancel":
             self.orders = [o for o in self.orders if str(o["ticket"]) != str(request["ticket"])]
@@ -161,8 +163,15 @@ class FaultyJournal(WorkerEffectJournal):
 
     def __init__(self, path: Path) -> None:
         super().__init__(path)
+        self.fail_prepare = 0
         self.fail_send_started = 0
         self.fail_receipt = 0
+
+    def prepare(self, effect_id: str, payload: dict[str, object]) -> None:
+        if self.fail_prepare > 0:
+            self.fail_prepare -= 1
+            raise EffectJournalError("simulated durable prepare failure")
+        super().prepare(effect_id, payload)
 
     def mark_send_started(self, effect_id: str) -> None:
         if self.fail_send_started > 0:
@@ -185,6 +194,8 @@ def _contract(
     arm_timeout_seconds: float = 2.0,
     commit_lead_seconds: float = 0.05,
     execution_expiry_seconds: float = 1.0,
+    maximum_holding_seconds: float | None = None,
+    flatten_at_ny: str | None = None,
 ) -> PairContract:
     return PairContract(
         contract_id="contract-1",
@@ -205,6 +216,8 @@ def _contract(
         commit_lead_seconds=commit_lead_seconds,
         execution_expiry_seconds=execution_expiry_seconds,
         mode=mode,  # type: ignore[arg-type]
+        maximum_holding_seconds=maximum_holding_seconds,
+        flatten_at_ny=flatten_at_ny,
     )
 
 
@@ -422,6 +435,137 @@ class PairExecutionCellHappyPathTests(unittest.TestCase):
             self.assertEqual("ACTIVE", leader_result.state)
             self.assertEqual([], harness.leader_mt5.positions)
             self.assertEqual([], harness.follower_mt5.positions)
+
+
+class PairExecutionCellExitPolicyTests(unittest.TestCase):
+    def test_maximum_holding_age_closes_both_legs_and_verifies_empty(self) -> None:
+        with _tmp_dir() as tmp_path:
+            harness = _Harness(tmp_path, contract=_contract(maximum_holding_seconds=210))
+            harness.advance_to_active()
+
+            harness.tick(209.9)
+            self.assertEqual(1, len(harness.leader_mt5.positions))
+            self.assertEqual(1, len(harness.follower_mt5.positions))
+
+            harness.tick(0.2)
+            self.assertEqual([], harness.leader_mt5.positions)
+            self.assertEqual([], harness.follower_mt5.positions)
+            self.assertTrue(
+                any(
+                    transition["event"] == "close_requested"
+                    and transition["detail"] == "maximum_holding_seconds"
+                    for transition in harness.leader.transition_history()
+                )
+            )
+
+    def test_maximum_holding_age_survives_worker_restart(self) -> None:
+        with _tmp_dir() as tmp_path:
+            harness = _Harness(tmp_path, contract=_contract(maximum_holding_seconds=210))
+            harness.advance_to_active()
+            harness.tick(180)
+            harness.restart_leader()
+
+            harness.tick(30.1)
+
+            self.assertEqual([], harness.leader_mt5.positions)
+            self.assertEqual([], harness.follower_mt5.positions)
+
+    def test_recovery_reestablishes_missing_active_timestamp_before_timed_exit(self) -> None:
+        with _tmp_dir() as tmp_path:
+            harness = _Harness(tmp_path, contract=_contract(maximum_holding_seconds=210))
+            harness.advance_to_active()
+            harness.leader._db.execute("DELETE FROM cell_active_state")  # noqa: SLF001 - simulate crash boundary
+            harness.leader._db.commit()  # noqa: SLF001
+
+            restarted = harness.restart_leader()
+            recovered = restarted.handle_event(ClockTickEvent(harness.now))
+            self.assertEqual("ACTIVE", recovered.state)
+
+            harness.tick(210.1)
+
+            self.assertEqual([], harness.leader_mt5.positions)
+            self.assertEqual([], harness.follower_mt5.positions)
+
+    def test_new_york_flatten_closes_active_pair_and_blocks_new_entry(self) -> None:
+        with _tmp_dir() as tmp_path:
+            # 2026-01-01 00:00 UTC is 2025-12-31 19:00 America/New_York.
+            harness = _Harness(tmp_path, contract=_contract(flatten_at_ny="19:01"))
+            harness.advance_to_active()
+
+            harness.tick(61)
+
+            self.assertEqual([], harness.leader_mt5.positions)
+            self.assertEqual([], harness.follower_mt5.positions)
+            harness.make_ready()
+            harness.feed_quotes(sequence=2)
+            harness.tick(0.2)
+            self.assertIsNone(harness.leader.handle_event(ClockTickEvent(harness.now)).attempt_id)
+
+    def test_close_waits_for_a_later_snapshot_when_mt5_still_reports_the_position(self) -> None:
+        with _tmp_dir() as tmp_path:
+            harness = _Harness(tmp_path, contract=_contract(maximum_holding_seconds=1))
+            harness.advance_to_active()
+            harness.leader_mt5.close_leaves_position_visible = True
+
+            result = harness.leader.handle_event(ClockTickEvent(harness.now + timedelta(seconds=1.1)))
+
+            self.assertEqual("CONVERGING_EMPTY", result.state)
+            close_requests = [request for request in harness.leader_mt5.requests if request["type"] == "close"]
+            self.assertEqual(1, len(close_requests))
+
+    def test_dst_fall_back_does_not_reopen_entry_after_the_first_cutoff_occurrence(self) -> None:
+        with _tmp_dir() as tmp_path:
+            harness = _Harness(tmp_path, contract=_contract(flatten_at_ny="01:30"))
+            harness.now = datetime(2026, 11, 1, 5, 31, tzinfo=UTC)  # 01:31 EDT, after the first cutoff
+            harness.lease = _lease(harness.contract, now=harness.now, ttl_seconds=7200)
+            harness.activate_both()
+            harness.make_ready()
+            harness.feed_quotes()
+            self.assertIsNone(harness.leader.handle_event(ClockTickEvent(harness.now)).attempt_id)
+
+            harness.now = datetime(2026, 11, 1, 6, 1, tzinfo=UTC)  # 01:01 EST after clocks roll back
+            harness.make_ready()
+            harness.feed_quotes(sequence=2)
+            harness.tick(0.2)
+
+            self.assertIsNone(harness.leader.handle_event(ClockTickEvent(harness.now)).attempt_id)
+
+    def test_close_journal_failure_stops_for_human_without_an_unjournaled_send(self) -> None:
+        with _tmp_dir() as tmp_path:
+            journal = FaultyJournal(tmp_path / "leader_journal.sqlite3")
+            harness = _Harness(tmp_path, leader_journal=journal)
+            harness.advance_to_active()
+            journal.fail_prepare = 1
+
+            result = harness.leader.request_close("test close")
+
+            self.assertEqual("NEEDS_HUMAN", result.state)
+            self.assertEqual(1, len(harness.leader_mt5.positions))
+            self.assertEqual([], [request for request in harness.leader_mt5.requests if request["type"] == "close"])
+
+            restarted = harness.restart_leader()
+            recovered = restarted.handle_event(ClockTickEvent(harness.now))
+            self.assertEqual("NEEDS_HUMAN", recovered.state)
+            self.assertEqual([], [request for request in harness.leader_mt5.requests if request["type"] == "close"])
+
+    def test_restart_waits_for_broker_evidence_after_a_receipted_close(self) -> None:
+        with _tmp_dir() as tmp_path:
+            harness = _Harness(tmp_path)
+            harness.advance_to_active()
+            harness.leader_mt5.close_leaves_position_visible = True
+            harness.leader.request_close("test close")
+            self.assertEqual(1, len([r for r in harness.leader_mt5.requests if r["type"] == "close"]))
+
+            restarted = harness.restart_leader()
+            recovered = restarted.handle_event(ClockTickEvent(harness.now))
+            self.assertEqual("CONVERGING_EMPTY", recovered.state)
+            self.assertFalse(recovered.needs_human)
+            self.assertEqual(1, len([r for r in harness.leader_mt5.requests if r["type"] == "close"]))
+
+            harness.leader_mt5.positions.clear()
+            restarted.handle_event(ClockTickEvent(harness.now))
+            harness.follower.handle_event(ClockTickEvent(harness.now))
+            self.assertIsNone(restarted.handle_event(ClockTickEvent(harness.now)).attempt_id)
 
 
 class PairExecutionCellDecisionTests(unittest.TestCase):
@@ -759,6 +903,13 @@ class PairExecutionCellRecoveryTests(unittest.TestCase):
 
 
 class PairExecutionCellLeaseTests(unittest.TestCase):
+    def test_oversized_maximum_holding_period_is_rejected_at_activation(self) -> None:
+        with _tmp_dir() as tmp_path:
+            harness = _Harness(tmp_path, contract=_contract(maximum_holding_seconds=604801))
+
+            with self.assertRaises(PairExecutionCellError):
+                harness.leader.activate(harness.contract, harness.lease)
+
     def test_stale_epoch_activation_is_rejected(self) -> None:
         with _tmp_dir() as tmp_path:
             harness = _Harness(tmp_path)
@@ -1256,6 +1407,9 @@ class PairExecutionCellAbandonedAttemptTests(unittest.TestCase):
             harness.now += timedelta(seconds=0.05)
             harness.follower.handle_event(ClockTickEvent(harness.now))
             harness.leader.handle_event(ClockTickEvent(harness.now))
+            # Close completion is established by a later broker observation,
+            # never by recursively re-reading from the close call stack.
+            harness.follower.handle_event(ClockTickEvent(harness.now))
 
             self.assertEqual([], harness.follower_mt5.positions)
             self.assertIsNone(harness.leader.handle_event(ClockTickEvent(harness.now)).attempt_id)

@@ -34,7 +34,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR
 from hashlib import sha256
 import json
@@ -43,6 +43,7 @@ import sqlite3
 from pathlib import Path
 from typing import Literal, Protocol, cast
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 from .worker.effect_journal import EffectJournalError, WorkerEffectJournal
 from .worker.scheduler import (
@@ -61,6 +62,7 @@ class PairExecutionCellError(RuntimeError):
 Role = Literal["leader", "follower"]
 ExecutionMode = Literal["live", "shadow"]
 Direction = Literal["LONG", "SHORT"]
+_MAXIMUM_HOLDING_SECONDS = 7 * 24 * 60 * 60
 PairState = Literal[
     "IDLE",
     "ARMING",
@@ -103,9 +105,11 @@ class PairContract:
     commit_lead_seconds: float
     execution_expiry_seconds: float
     mode: ExecutionMode = "live"
+    maximum_holding_seconds: float | None = None
+    flatten_at_ny: str | None = None
 
     def canonical(self) -> dict[str, object]:
-        return {
+        value: dict[str, object] = {
             "contract_id": self.contract_id,
             "leader_worker_id": self.leader_worker_id,
             "follower_worker_id": self.follower_worker_id,
@@ -125,6 +129,11 @@ class PairContract:
             "execution_expiry_seconds": self.execution_expiry_seconds,
             "mode": self.mode,
         }
+        if self.maximum_holding_seconds is not None:
+            value["maximum_holding_seconds"] = self.maximum_holding_seconds
+        if self.flatten_at_ny is not None:
+            value["flatten_at_ny"] = self.flatten_at_ny
+        return value
 
     @property
     def hash(self) -> str:
@@ -606,6 +615,7 @@ class PairExecutionCell:
         self._attempt: Attempt | None = None
         self._leg: LegState | None = None
         self._peer_leg: PeerLegView = PeerLegView()
+        self._active_since: datetime | None = None
         self._state: PairState = "IDLE"
         self._desired: DesiredState = "NONE"
         self._needs_human: str | None = None
@@ -660,6 +670,15 @@ class PairExecutionCell:
                 attempt_id TEXT,
                 updated_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS cell_active_state (
+                attempt_id TEXT PRIMARY KEY,
+                active_since TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS cell_operator_stop (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                reason TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS cell_transitions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 attempt_id TEXT,
@@ -672,6 +691,16 @@ class PairExecutionCell:
         self._db.commit()
 
     def _load_persisted_state(self) -> None:
+        transition_row = self._db.execute(
+            "SELECT at FROM cell_transitions ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        if transition_row is not None:
+            self._now = max(self._now, _parse_utc(transition_row[0]))
+        operator_stop_row = self._db.execute(
+            "SELECT reason FROM cell_operator_stop WHERE id = 1"
+        ).fetchone()
+        if operator_stop_row is not None:
+            self._needs_human = operator_stop_row[0]
         lease_row = self._db.execute(
             "SELECT leader_worker_id, follower_worker_id, trader_id, contract_hash, epoch, issued_at, expires_at, revoked "
             "FROM cell_lease WHERE id = 1"
@@ -716,6 +745,11 @@ class PairExecutionCell:
             ).fetchone()
             self._desired = cast(DesiredState, desired_row[0]) if desired_row is not None else "NONE"
             if self._leg is not None:
+                active_row = self._db.execute(
+                    "SELECT active_since FROM cell_active_state WHERE attempt_id = ?", (attempt_row[0],)
+                ).fetchone()
+                if active_row is not None:
+                    self._active_since = _parse_utc(active_row[0])
                 self._recovering = True
                 self._state = self._recovered_state()
 
@@ -725,7 +759,7 @@ class PairExecutionCell:
             return "ENTRY_UNCERTAIN"
         if self._desired == "EMPTY":
             return "CONVERGING_EMPTY"
-        if self._leg.protection_status == "refined":
+        if self._leg.protection_status == "refined" and self._active_since is not None:
             return "ACTIVE"
         if self._leg.entry_status == "filled":
             return "VERIFYING_PROTECTION"
@@ -844,6 +878,26 @@ class PairExecutionCell:
         )
         self._db.commit()
 
+    def _persist_active_since(self) -> None:
+        if self._attempt is None or self._active_since is None:
+            return
+        self._db.execute(
+            "INSERT INTO cell_active_state (attempt_id, active_since) VALUES (?, ?)"
+            " ON CONFLICT(attempt_id) DO UPDATE SET active_since = excluded.active_since",
+            (self._attempt.attempt_id, _iso(self._active_since)),
+        )
+        self._db.commit()
+
+    def _set_needs_human(self, reason: str, detail: str) -> None:
+        self._needs_human = reason
+        self._db.execute(
+            "INSERT INTO cell_operator_stop (id, reason, updated_at) VALUES (1, ?, ?)"
+            " ON CONFLICT(id) DO UPDATE SET reason = excluded.reason, updated_at = excluded.updated_at",
+            (reason, _iso(self._now)),
+        )
+        self._transition("close_needs_human", detail)
+        self._db.commit()
+
     def _transition(self, event: str, detail: str = "") -> None:
         self._db.execute(
             "INSERT INTO cell_transitions (attempt_id, event, detail, at) VALUES (?, ?, ?, ?)",
@@ -887,6 +941,20 @@ class PairExecutionCell:
 
         if self._worker_id not in (contract.leader_worker_id, contract.follower_worker_id):
             raise PairExecutionCellError("This Worker is not part of the pair contract.")
+        if (
+            contract.maximum_holding_seconds is not None
+            and (
+                not math.isfinite(contract.maximum_holding_seconds)
+                or contract.maximum_holding_seconds <= 0
+                or contract.maximum_holding_seconds > _MAXIMUM_HOLDING_SECONDS
+            )
+        ):
+            raise PairExecutionCellError("Maximum holding seconds must be positive and no greater than seven days.")
+        if contract.flatten_at_ny is not None:
+            try:
+                time.fromisoformat(contract.flatten_at_ny)
+            except ValueError as error:
+                raise PairExecutionCellError("New York flatten time must use HH:MM format.") from error
         if lease.contract_hash != contract.hash:
             raise PairExecutionCellError("The lease contract hash does not match the pair contract.")
         if (
@@ -974,6 +1042,8 @@ class PairExecutionCell:
         the attempt itself is legitimately in flight.
         """
 
+        if self._flatten_reached():
+            return False, "New York flatten cutoff has passed"
         facts = self._local_facts
         if facts is None:
             return False, "no local readiness facts observed yet"
@@ -1181,6 +1251,7 @@ class PairExecutionCell:
         if self._needs_human is not None:
             self._state = "NEEDS_HUMAN"
             return
+        self._enforce_exit_policy()
         self._maybe_publish_readiness()
         self._enforce_attempt_authority()
         self._expire_stale_attempt()
@@ -1189,6 +1260,34 @@ class PairExecutionCell:
         self._maybe_send_commit()
         self._maybe_progress_convergence()
         self._maybe_declare_active()
+
+    def _enforce_exit_policy(self) -> None:
+        contract = self._contract
+        if contract is None:
+            return
+        if self._attempt is not None and self._desired != "EMPTY" and self._flatten_reached():
+            self._begin_close("flatten_at_ny")
+            return
+        if (
+            self._attempt is not None
+            and self._desired != "EMPTY"
+            and self._active_since is not None
+            and contract.maximum_holding_seconds is not None
+            and self._now >= self._active_since + timedelta(seconds=contract.maximum_holding_seconds)
+        ):
+            self._begin_close("maximum_holding_seconds")
+
+    def _flatten_reached(self) -> bool:
+        if self._contract is None or self._contract.flatten_at_ny is None:
+            return False
+        try:
+            cutoff = time.fromisoformat(self._contract.flatten_at_ny)
+        except ValueError:
+            return True
+        ny_zone = ZoneInfo("America/New_York")
+        ny_now = self._now.astimezone(ny_zone)
+        cutoff_at = datetime.combine(ny_now.date(), cutoff, tzinfo=ny_zone)
+        return self._now >= cutoff_at.astimezone(UTC)
 
     def _enforce_attempt_authority(self) -> None:
         """Lease loss before this leg's send abandons the attempt safely.
@@ -1249,6 +1348,7 @@ class PairExecutionCell:
         self._attempt = None
         self._leg = None
         self._peer_leg = PeerLegView()
+        self._active_since = None
         self._desired = "NONE"
         self._persist_desired()
         self._recovering = False
@@ -1848,9 +1948,13 @@ class PairExecutionCell:
             return
         if self._peer_leg.status != "protection_refined":
             return
-        if self._desired != "EMPTY" and self._state != "ACTIVE":
+        if self._desired != "EMPTY" and (self._state != "ACTIVE" or self._active_since is None):
             self._state = "ACTIVE"
-            self._record_timing("terminal_time")
+            if self._active_since is None:
+                self._active_since = self._now
+                self._persist_active_since()
+                self._transition("active_verified", _iso(self._active_since))
+                self._record_timing("terminal_time")
 
     def _report_leg_status(
         self,
@@ -1937,13 +2041,18 @@ class PairExecutionCell:
         """Any exit policy (risk, cutoff, timed exit, shutdown, integrity, break
         -glass) converges through this single owned desired-empty path."""
 
+        self._begin_close(reason)
         if self._attempt is not None:
-            self._desired = "EMPTY"
-            self._persist_desired()
-            self._transition("close_requested", reason)
             self._request_broker_read()
             self._progress()
         return self._result()
+
+    def _begin_close(self, reason: str) -> None:
+        if self._attempt is None or self._desired == "EMPTY":
+            return
+        self._desired = "EMPTY"
+        self._persist_desired()
+        self._transition("close_requested", reason)
 
     def _maybe_progress_convergence(self) -> None:
         if self._desired != "EMPTY" or self._attempt is None or self._leg is None:
@@ -1995,6 +2104,8 @@ class PairExecutionCell:
         if leg.ticket is not None:
             owned_positions = [p for p in event.positions if str(p.get("ticket")) == leg.ticket]
             if owned_positions:
+                if self._needs_human is not None:
+                    return
                 self._close_owned(owned_positions[0])
                 return
         if not event.orders and not event.positions and not leg.empty_verified:
@@ -2016,11 +2127,40 @@ class PairExecutionCell:
             self._request_broker_read()
             return
         try:
-            self._journal.prepare(effect_id, payload)
-        except EffectJournalError:
+            effect_state = self._journal.prepare(effect_id, payload)
+        except EffectJournalError as error:
+            self._set_needs_human(
+                f"close effect {effect_id} could not be prepared: {error}",
+                "effect journal prepare failed",
+            )
             return
-        self._run_broker_write(effect_id, payload, priority="emergency")
-        self._request_broker_read()
+        if effect_state in ("receipt", "observed"):
+            try:
+                evidence = self._journal.evidence(effect_id)
+            except EffectJournalError as error:
+                self._set_needs_human(
+                    f"close effect {effect_id} has invalid replay evidence: {error}",
+                    "invalid close replay evidence",
+                )
+                return
+            if evidence.get("retcode") in (10008, 10009):
+                self._transition("close_receipt_recovered", effect_id)
+                self._db.commit()
+                return
+            self._set_needs_human(
+                f"close effect {effect_id} has non-success replay evidence",
+                "close replay evidence was not successful",
+            )
+            return
+        if effect_state == "send_started":
+            self._set_needs_human(
+                f"close effect {effect_id} has no conclusive broker receipt",
+                "close remained uncertain after send_started",
+            )
+            return
+        outcome = self._run_broker_write(effect_id, payload, priority="emergency")
+        if outcome != "completed":
+            self._set_needs_human(f"close effect {effect_id} ended {outcome}", outcome)
 
     # -- observable result --------------------------------------------------- #
 
@@ -2080,6 +2220,8 @@ def _contract_from_canonical(value: dict[str, object]) -> PairContract:
         commit_lead_seconds=cast(float, value["commit_lead_seconds"]),
         execution_expiry_seconds=cast(float, value["execution_expiry_seconds"]),
         mode=cast(ExecutionMode, value.get("mode", "live")),
+        maximum_holding_seconds=cast(float | None, value.get("maximum_holding_seconds")),
+        flatten_at_ny=cast(str | None, value.get("flatten_at_ny")),
     )
 
 
