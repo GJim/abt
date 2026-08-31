@@ -29,6 +29,10 @@ module runs on both paired Workers; an immutable, epoch-fenced lease
 (`abt.pair_cell.PairLease`) selects leader or follower behavior. Only the
 leader creates entry attempts; the follower validates and executes an
 assigned leg but never derives an independent edge or terminal pair state.
+Operator activation authorizes the Worker pair and its strategy/risk policy,
+not an individual symbol. The leader continuously evaluates the common
+eligible product universe and freezes the selected product and mirror
+direction into each immutable attempt.
 
 The controller keeps ADR-0009's opaque-relay-plane role. It issues and
 fences pair leases (`ControlLedger.issue_pair_lease`), and it relays
@@ -83,6 +87,10 @@ are never simultaneously enabled for the same pair.
 - Quote evidence carries broker tick time, recovery epoch, and a monotonic
   sequence; edge decisions use only broker-time freshness and cross-Worker
   skew bounds, never transport-observed time.
+- Per-symbol point, tick-size, account-currency tick values, volume,
+  filling-mode and protection plans are refreshed and exchanged before
+  signals. The leader can therefore rank all qualifying products by a
+  conservative expected edge value in USD without a signal-time RPC.
 - Entry uses a local arm/commit protocol between exactly two Workers instead
   of controller-mediated dispatch: the follower arms from local checks only,
   and the leader commits with one common execution time and a short
@@ -103,6 +111,12 @@ are never simultaneously enabled for the same pair.
   scheduler is terminalized exactly once, including durable-journal failures,
   MT5 exceptions, and missing receipts, so emergency containment and ordinary
   Worker RPC work stay runnable after any abnormal broker write.
+- A confirmed entry retcode `10021` (`TRADE_RETCODE_PRICE_OFF`) durably
+  quarantines that canonical product for the Worker pair before ordinary
+  asymmetric containment continues. Quarantine survives process restart and
+  lease renewal, does not block unrelated eligible products, and can only be
+  released by an explicit authenticated, audited operator action while no
+  attempt is unresolved.
 
 ## Consequences
 

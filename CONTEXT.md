@@ -149,11 +149,26 @@ _Avoid_: 獨立 Trader Execution 服務、無狀態策略腳本
 在配對的兩台帳戶工作者上執行相同模組、以租約角色（leader/follower）決定行為的深模組；已選擇加入的配對由其取代策略執行體成為配對反向避險生命週期擁有者，僅 leader 可建立進場嘗試。它保留 ADR-0009 的單一擁有者、durable state 與主控台不推導配對狀態等不變量，只搬移擁有者位置。
 _Avoid_: 配對執行器（與主控台角色混淆）
 
+**工作者配對啟用（Worker Pair Activation）**:
+操作員授權一組 leader/follower 帳戶工作者在不可變策略與風控政策下運行配對執行單元的動作；授權範圍是工作者配對及其可交易商品宇宙，不是逐一批准單一商品。啟用建立配對合約與配對租約，但不預先選定下一筆交易商品或方向。
+_Avoid_: 商品啟用、交易核准
+
+**可交易商品宇宙（Eligible Product Universe）**:
+兩個帳戶工作者共同支援、未遭隔離，且雙方報價、point/tick size、帳戶幣別 tick value、volume、填單模式與保護校準皆新鮮完整的配對商品集合。任一商品資料缺失或過期只移除該商品資格，不觸發 signal-time RPC，也不使其他商品失去資格。
+
+**最佳進場候選（Best Entry Candidate）**:
+leader 對可交易商品宇宙內每個商品的兩個鏡像方向套用 edge-points 門檻後，以雙方預先快取之每 point USD 價值計算保守預期 edge USD 並選出的唯一候選；同值時依 normalized edge points、canonical product identity、direction 決定固定順序。選定後商品、方向、量與排名證據凍結於該次嘗試。
+_Avoid_: 最大 raw price edge
+
+**配對商品隔離（Pair Product Quarantine）**:
+任一進場腿收到 MT5 `10021 TRADE_RETCODE_PRICE_OFF`／`No prices` 後，配對執行單元針對該工作者配對與 canonical product 持久建立的禁止進場狀態。隔離保存 offending Worker、attempt 與 broker receipt 證據，跨重啟及租約更新有效；顯示或恢復 bid/ask 不會自動解除，只能在沒有 unresolved attempt 時由已驗證操作員明確解除並留下稽核事件。
+_Avoid_: 暫時沒有報價、報價過期
+
 **配對租約**:
 主控台核發、帶嚴格遞增 fencing epoch 的短期授權，綁定 leader 帳戶工作者、follower 帳戶工作者、交易者身分與配對合約雜湊；兩台帳戶工作者只接受較高或相等 epoch 的租約，過期租約移除建立或提交新進場嘗試的權限，但不取消已跨越 `send_started` 的 broker effect。
 
 **配對合約**:
-配對執行單元租約內不可變的政策快照，包含角色對應方向、量規劃、填單模式、edge 門檻、報價新鮮度與 skew 上限、arm 逾時、commit 前置時間、執行到期與生命週期退出政策；合約變更需要新租約 epoch 及兩台帳戶工作者的 broker 驗證空倉事實。
+配對執行單元租約內不可變的工作者配對政策快照，包含可交易商品宇宙與篩選條件、逐商品量規劃、填單模式、edge-points 門檻、最佳候選排名、報價新鮮度與 skew 上限、arm 逾時、commit 前置時間、執行到期與生命週期退出政策；它不預先選定單一商品或方向。合約變更需要新租約 epoch 及兩台帳戶工作者的 broker 驗證空倉事實。
 
 **進場提交授權**:
 每台帳戶工作者對單一嘗試持久保存的送單授權；leader 於發出 commit 時、follower 於驗證該 commit 時各自寫入，arm 本身不構成授權。缺少該嘗試的授權即不得 `order_send`，因此遺失的 arm_ack 或 commit 不會產生單邊進場。leader 未曾授權的嘗試在結構上證明 follower 不可能送單。

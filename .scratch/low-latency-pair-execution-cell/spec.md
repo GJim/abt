@@ -43,9 +43,11 @@ both paired account Workers while preserving exactly one protected-pair
 lifecycle owner.
 
 The controller issues a short-lived, epoch-based pair lease that assigns one
-Worker as leader and the other as follower. Both Workers receive the same
-immutable pair contract, including role assignment, eligible symbols,
-directions, volume plans, risk limits, quote freshness policy, execution
+Worker as leader and the other as follower. Activation authorizes the Worker
+pair and one immutable strategy/risk policy; it never requires an operator to
+approve each symbol separately. Both Workers receive the same immutable pair
+contract, including role assignment, the eligible product universe, per-symbol
+volume and execution plans, risk limits, quote freshness policy, execution
 deadlines, and conservative emergency protection. The leader alone may create
 a pair entry attempt. The follower validates and executes a leader-created
 attempt but never independently creates a competing attempt.
@@ -58,14 +60,24 @@ account-local broker facts, margin headroom, terminal health, effect-journal
 health, and lease state. A Worker is `PAIR_READY` only while all entry
 invariants remain continuously true.
 
-When the leader detects an edge from a coherent pair of fresh quote revisions,
-it durably creates one immutable attempt and asks the follower to arm it. The
-follower performs only local, memory-resident and journal-backed admission
-checks. After both sides are armed, the leader emits one commit carrying a
-near-future common execution time and a short absolute expiry. Each Worker
-checks its lease, attempt, readiness, quote age, and deadline immediately
-before its local MT5 call. A late or invalid commit is rejected without broker
-send.
+Both Workers continuously maintain and exchange quotes plus cached symbol
+economics for every eligible product. The cached plan includes point,
+tick-size, account-currency tick values, volume constraints, selected volume,
+filling mode, and protection calibration, and is refreshed before a signal
+rather than by a signal-time RPC. The leader evaluates every coherent eligible
+symbol in both mirror directions. Candidates must first clear the configured
+edge-points threshold; when several qualify, the leader deterministically
+chooses the greatest conservative expected edge value in USD, then normalized
+edge points, canonical symbol, and direction.
+
+When the leader selects the best candidate, it durably creates one immutable
+attempt containing that symbol, direction and cached plan and asks the follower
+to arm it. The follower performs only local, memory-resident and journal-backed
+admission checks. After both sides are armed, the leader emits one commit
+carrying a near-future common execution time and a short absolute expiry. Each
+Worker checks its lease, attempt, readiness, quote age, symbol plan and deadline
+immediately before its local MT5 call. A late or invalid commit is rejected
+without broker send.
 
 The initial market order includes conservative emergency SL/TP derived before
 the signal from current symbol constraints and risk policy. A position is
@@ -81,6 +93,16 @@ refinement, or cannot be observed, the leader changes desired state to
 `EMPTY` and performs evidence-driven convergence. Owned orders are cancelled,
 owned positions are closed, and both Workers must produce fresh authoritative
 empty facts before the attempt is terminal.
+
+MT5 retcode `10021` (`TRADE_RETCODE_PRICE_OFF`, normally reported as `No
+prices`) is also product-health evidence. The first confirmed `10021` from
+either leg immediately places that canonical product in a durable quarantine
+for the Worker pair, records the offending Worker and broker receipt, and
+triggers the ordinary asymmetric-entry containment path. After the current
+attempt reaches broker-verified terminal `EMPTY`, the pair may continue
+evaluating other eligible products, but the quarantined product cannot be
+selected across process restarts or lease renewals. Quarantine has no automatic
+expiry and requires an explicit audited operator release.
 
 The Pair Execution Cell replaces the Strategy Runtime as the deployment
 location of realtime entry and protected-pair orchestration for opted-in
@@ -175,6 +197,20 @@ for Pair Execution Cell pairs.
 81. As a strategy operator, I want shadow mode to compare old and new edge decisions without broker writes, so that quote coherence and readiness can be validated first.
 82. As a strategy operator, I want a controlled test-account rollout with small exposure, so that latency and asymmetric-entry behavior are measured before broad activation.
 83. As a strategy operator, I want the legacy path removed after successful cutover, so that two production lifecycle owners cannot remain enabled indefinitely.
+84. As a strategy operator, I want one activation to authorize a Worker pair and strategy policy, so that I do not approve every product individually.
+85. As a strategy operator, I want both Workers to discover their common eligible product universe before trading, so that opportunities are selected automatically.
+86. As a strategy operator, I want both mirror directions evaluated for every eligible product, so that the contract does not preselect the direction of a future opportunity.
+87. As a strategy operator, I want the points threshold applied independently to every candidate, so that differently quoted products use comparable admission semantics.
+88. As a strategy operator, I want per-symbol point and account-currency tick values cached before a signal, so that cross-product ranking adds no signal-time RPC.
+89. As a strategy operator, I want a product excluded while either Worker's symbol economics are missing or stale, so that speed never relies on an unpriced plan.
+90. As a strategy operator, I want simultaneous candidates ranked by conservative expected edge USD, so that products with different digits and tick values can be compared economically.
+91. As a strategy operator, I want candidate ties broken by normalized edge points, canonical symbol and direction, so that replaying identical evidence selects the same attempt.
+92. As a strategy operator, I want the selected symbol, direction, plans and ranking evidence frozen into the attempt, so that later catalog refreshes cannot mutate an armed trade.
+93. As a strategy operator, I want a first confirmed MT5 `10021 No prices` result to quarantine that product for the Worker pair, so that repeated broker-side quote outages do not repeatedly create asymmetric entries.
+94. As a strategy operator, I want product quarantine persisted across Worker restarts and lease renewals, so that a process restart cannot accidentally re-enable a known unsafe product.
+95. As a strategy operator, I want quarantine to retain the offending Worker, receipt and attempt evidence, so that I can diagnose which broker rejected executable pricing.
+96. As a strategy operator, I want quarantined products skipped while other eligible products continue to compete, so that one broker-specific product failure does not stop the entire account pair.
+97. As a strategy operator, I want only an explicit audited operator action to release quarantine, so that a transient displayed bid/ask cannot automatically override broker execution evidence.
 
 ## Implementation Decisions
 
@@ -198,10 +234,16 @@ for Pair Execution Cell pairs.
 - Exactly one Worker holds the lifecycle-owner role for a lease epoch. The
   follower owns only its account-local leg facts and effects; it does not
   calculate an independent edge or terminal pair state.
-- The controller owns pair lease issuance, renewal, revocation, fencing epoch,
+- The controller owns Worker-pair policy activation, pair lease issuance,
+  renewal, revocation, fencing epoch,
   route authorization, message delivery, replay, and immutable audit copies.
   It does not inspect quote values, calculate edges, assign directions after
   activation, or choose compensation.
+- Activation applies to one Worker pair and its complete strategy/risk policy,
+  not to one symbol. The operator may constrain the eligible universe with
+  policy filters, but individual common products are discovered, calibrated,
+  evaluated, selected, and quarantined by the Pair Execution Cell without
+  separate activation.
 - Pair leases bind leader Worker, follower Worker, trader identity, pair
   contract hash, issue time, expiry, and strictly increasing fencing epoch.
   Both Workers persist the highest accepted epoch and reject older envelopes.
@@ -212,8 +254,9 @@ for Pair Execution Cell pairs.
   attempt or active pair. Initial delivery may require the existing leader to
   recover; automatic distributed consensus or mid-attempt failover is not
   introduced.
-- The pair contract snapshots eligible symbols, role-to-direction mapping,
-  volume plans, filling modes, edge threshold, risk budget, emergency
+- The pair contract snapshots the eligible product universe and filters,
+  per-symbol volume plans, filling modes, edge-points threshold, ranking
+  policy, risk budget, emergency
   protection policy, refined protection policy, quote-age and skew limits,
   arm timeout, commit lead time, execution expiry, and lifecycle exit policy.
 - Contract changes require a new lease epoch and broker-verified empty facts
@@ -230,15 +273,25 @@ for Pair Execution Cell pairs.
 - A genuinely empty MT5 query is represented only by an empty tuple/list.
   `None`, malformed records, and read exceptions are unavailable facts and
   cannot establish `PAIR_READY`, `ACTIVE`, or `EMPTY`.
-- Margin sizing and protection calibration run before a signal and refresh on
-  bounded schedules. A stale plan removes readiness rather than triggering a
-  signal-time refresh.
+- Margin sizing, point/tick-size discovery, account-currency profit/loss tick
+  values, filling-mode selection, and protection calibration run per eligible
+  symbol before a signal and refresh on bounded schedules. Both Workers
+  exchange versioned cached plans beside readiness and quote evidence. A
+  missing or stale plan removes only that product's eligibility rather than
+  triggering a signal-time RPC.
 - Worker quote evidence contains Worker identity, symbol, bid, ask, last,
   broker tick time, local receive time, recovery epoch, and monotonic quote
   sequence. Broker tick time is preserved end to end.
-- The leader evaluates an edge only from its latest local quote and one peer
-  quote satisfying configured age, skew, epoch, sequence, and symbol checks.
+- The leader evaluates both mirror directions for every non-quarantined common
+  product using only the latest local quote, peer quote, and per-Worker cached
+  plans satisfying configured age, skew, epoch, sequence, and symbol checks.
   Transport `observed_at` is not a substitute for broker quote freshness.
+- Candidate admission uses normalized edge points. Cross-product ranking uses
+  conservative expected edge USD calculated from executable bid/ask
+  differential and the lower of the two cached USD-per-point values at each
+  leg's planned volume. This deliberately avoids overstating value when broker
+  tick economics differ. Equal USD values are ordered by normalized edge
+  points, canonical product identity, then direction.
 - Quotes are relayed through authenticated controller Worker streams. The
   controller may fan out and replay opaque envelopes but does not normalize or
   merge quote values.
@@ -281,6 +334,15 @@ for Pair Execution Cell pairs.
 - Any reject, expiry, unknown-after-send outcome, inconsistent observation,
   protection failure, or contradictory peer evidence changes desired state to
   `EMPTY`. No new attempt is admitted during convergence.
+- A confirmed MT5 `10021`/`TRADE_RETCODE_PRICE_OFF` receipt from either entry
+  leg additionally creates a durable Worker-pair product quarantine before
+  convergence proceeds. Quarantine is keyed by canonical paired product,
+  records offending Worker/attempt/receipt evidence, survives restart and
+  lease renewal, and has no time-based automatic release.
+- Quarantine release is an explicit authenticated operator action, is allowed
+  only while the account pair has no unresolved attempt, and emits immutable
+  audit evidence. Displayed or newly arriving bid/ask data never releases a
+  product automatically.
 - Empty convergence observes both Workers, cancels attempt-owned pending
   orders, observes again, closes exact attempt-owned positions at current
   volume, and requires final fresh empty facts from both Workers.
@@ -358,6 +420,15 @@ for Pair Execution Cell pairs.
   delayed replay.
 - Decision tests prove that only the leader creates attempts and that leader
   and follower running identical code cannot both originate one.
+- Universe tests cover common-product intersection, aliases, missing/stale
+  per-symbol plans, simultaneous candidates, both mirror directions,
+  point-normalized admission, conservative USD ranking, and deterministic
+  tie-breaking without signal-time RPC.
+- Quarantine tests inject `10021` on either leg and prove immediate
+  containment, durable pair-wide exclusion, continued selection of other
+  products, restart and lease-renewal persistence, displayed-quote
+  non-release, authenticated manual release, unresolved-attempt release
+  rejection, and immutable audit evidence.
 - Readiness tests cover every revocation cause and prove that restored
   readiness requires fresh authoritative evidence rather than elapsed time.
 - Arm/commit tests cover follower rejection, leader readiness loss, late arm
