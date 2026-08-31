@@ -343,6 +343,95 @@ class PairExecutionCellLedgerTests(unittest.TestCase):
                 trader_id=self.trader_id, contract_hash="hash-1", ttl_seconds=60,
             )
 
+    def test_release_pair_quarantine_records_an_audit_event_and_returns_the_push_payload(self) -> None:
+        release = self.ledger.release_pair_quarantine(
+            leader_worker_id=self.worker_a,
+            follower_worker_id=self.worker_b,
+            symbol="EURUSD",
+            actor="alice",
+            reason="broker confirmed the symbol is tradable again",
+        )
+
+        self.assertEqual("EURUSD", release["symbol"])
+        self.assertEqual("alice", release["actor"])
+        self.assertEqual("broker confirmed the symbol is tradable again", release["reason"])
+        self.assertIn("observed_at", release)
+        self.assertTrue(any(
+            event["event_type"] == "pair_quarantine_release_requested"
+            and event["payload"]["symbol"] == "EURUSD"
+            and event["payload"]["actor"] == "alice"
+            and event["payload"]["reason"] == "broker confirmed the symbol is tradable again"
+            and event["payload"]["leader_worker_id"] == self.worker_a
+            and event["payload"]["follower_worker_id"] == self.worker_b
+            for event in self.ledger.events()
+        ))
+
+    def test_release_pair_quarantine_rejects_the_same_worker_as_leader_and_follower(self) -> None:
+        with self.assertRaises(LedgerError):
+            self.ledger.release_pair_quarantine(
+                leader_worker_id=self.worker_a,
+                follower_worker_id=self.worker_a,
+                symbol="EURUSD",
+                actor="alice",
+                reason="operator review",
+            )
+
+    def test_release_pair_quarantine_rejects_an_unknown_worker(self) -> None:
+        with self.assertRaises(LedgerError):
+            self.ledger.release_pair_quarantine(
+                leader_worker_id=self.worker_a,
+                follower_worker_id="no-such-worker",
+                symbol="EURUSD",
+                actor="alice",
+                reason="operator review",
+            )
+
+    def test_record_pair_quarantine_release_outcome_audits_the_per_worker_result_unconditionally(self) -> None:
+        self.ledger.record_pair_quarantine_release_outcome(
+            leader_worker_id=self.worker_a,
+            follower_worker_id=self.worker_b,
+            symbol="EURUSD",
+            actor="alice",
+            leader_outcome="applied",
+            follower_outcome="rejected",
+            applied=False,
+        )
+
+        self.assertTrue(any(
+            event["event_type"] == "pair_quarantine_release_outcome"
+            and event["payload"]["symbol"] == "EURUSD"
+            and event["payload"]["actor"] == "alice"
+            and event["payload"]["leader_worker_id"] == self.worker_a
+            and event["payload"]["follower_worker_id"] == self.worker_b
+            and event["payload"]["leader_outcome"] == "applied"
+            and event["payload"]["follower_outcome"] == "rejected"
+            and event["payload"]["applied"] is False
+            for event in self.ledger.events()
+        ))
+
+    def test_record_pair_quarantine_release_outcome_records_a_genuine_success_too(self) -> None:
+        """The audit trail is unconditional: a fully-applied release must be
+        recorded, not just failures, so operators can trust it as the single
+        source of truth for what happened."""
+
+        self.ledger.record_pair_quarantine_release_outcome(
+            leader_worker_id=self.worker_a,
+            follower_worker_id=self.worker_b,
+            symbol="EURUSD",
+            actor="alice",
+            leader_outcome="applied",
+            follower_outcome="applied",
+            applied=True,
+        )
+
+        self.assertTrue(any(
+            event["event_type"] == "pair_quarantine_release_outcome"
+            and event["payload"]["leader_outcome"] == "applied"
+            and event["payload"]["follower_outcome"] == "applied"
+            and event["payload"]["applied"] is True
+            for event in self.ledger.events()
+        ))
+
     def test_activate_pair_contract_creates_and_distributes_the_full_contract_and_lease(self) -> None:
         contract = {
             "contract_id": "contract-1", "leader_worker_id": self.worker_a, "follower_worker_id": self.worker_b,
@@ -373,6 +462,27 @@ class PairExecutionCellLedgerTests(unittest.TestCase):
             self.ledger.activate_pair_contract(
                 contract=contract, contract_hash="hash-1", trader_id=self.trader_id, ttl_seconds=300,
             )
+
+    def test_activate_pair_contract_stores_an_automatic_entry_edge_points_contract_opaquely(self) -> None:
+        """Requirement: an automatic (``entry_edge_points``/``eligible_symbols``)
+        policy contract is stored and distributed exactly like a legacy one --
+        the ledger never interprets or requires a fixed symbol/direction."""
+
+        contract = {
+            "contract_id": "contract-2", "leader_worker_id": self.worker_a, "follower_worker_id": self.worker_b,
+            "trader_id": self.trader_id, "entry_edge_points": "1.5",
+            "eligible_symbols": ["EURUSD", "GBPUSD", "XAUUSD"],
+        }
+
+        activation = self.ledger.activate_pair_contract(
+            contract=contract, contract_hash="hash-2", trader_id=self.trader_id, ttl_seconds=300,
+        )
+
+        self.assertEqual(contract, activation["contract"])
+        self.assertEqual(["EURUSD", "GBPUSD", "XAUUSD"], activation["contract"]["eligible_symbols"])
+        self.assertEqual(
+            activation, self.ledger.pair_cell_activation_for_worker(self.worker_a)
+        )
 
     def test_pair_relay_authorizes_and_audits_attempt_scoped_envelopes_without_interpreting_payload(self) -> None:
         lease = self.ledger.issue_pair_lease(

@@ -70,6 +70,7 @@ class AuthenticatedWorkerSession:
     )
     _pair_relay_inbox: list[dict[str, object]] = field(default_factory=list, init=False, repr=False)
     _pair_cell_activation_inbox: list[dict[str, object]] = field(default_factory=list, init=False, repr=False)
+    _pair_cell_quarantine_release_inbox: list[dict[str, object]] = field(default_factory=list, init=False, repr=False)
 
     def __enter__(self) -> Self:
         return self
@@ -175,6 +176,9 @@ class AuthenticatedWorkerSession:
                 continue
             if response_type == "pair_cell_activate":
                 self._queue_pair_cell_activation(response)
+                continue
+            if response_type == "pair_cell_quarantine_release_request":
+                self._queue_pair_cell_quarantine_release(response)
                 continue
             if response_type == "pair_relay_ack":
                 continue  # fire-and-forget sends do not correlate this synchronously
@@ -379,10 +383,11 @@ class AuthenticatedWorkerSession:
         This single receive seam serves every push the controller may send on
         this connection: ordinary Trader-relay ``worker_relay`` requests, and
         the Pair Execution Cell's own opaque ``pair_relay_deliver``/
-        ``pair_cell_activate`` pushes and ``pair_relay_ack`` receipts. Each is
-        queued for its own consumer so this method never confuses one kind of
-        push for another, and interleaved traffic on the same socket is
-        handled one message at a time in arrival order.
+        ``pair_cell_activate``/``pair_cell_quarantine_release_request`` pushes
+        and ``pair_relay_ack`` receipts. Each is queued for its own consumer
+        so this method never confuses one kind of push for another, and
+        interleaved traffic on the same socket is handled one message at a
+        time in arrival order.
         """
 
         try:
@@ -400,6 +405,9 @@ class AuthenticatedWorkerSession:
             return True
         if response_type == "pair_cell_activate":
             self._queue_pair_cell_activation(response)
+            return True
+        if response_type == "pair_cell_quarantine_release_request":
+            self._queue_pair_cell_quarantine_release(response)
             return True
         if response_type == "pair_relay_ack":
             return True  # fire-and-forget sends do not correlate this synchronously
@@ -421,6 +429,33 @@ class AuthenticatedWorkerSession:
             {"contract": cast(dict[str, object], response["contract"]), "lease": cast(dict[str, object], response["lease"])}
         )
 
+    def _queue_pair_cell_quarantine_release(self, response: dict[str, object]) -> None:
+        if (
+            set(response) != {"type", "request_id", "symbol", "actor", "reason", "observed_at"}
+            or not isinstance(response.get("request_id"), str)
+            or not response["request_id"]
+            or not isinstance(response.get("symbol"), str)
+            or not response["symbol"]
+            or not isinstance(response.get("actor"), str)
+            or not response["actor"]
+            or not isinstance(response.get("reason"), str)
+            or not response["reason"]
+            or not isinstance(response.get("observed_at"), str)
+            or not response["observed_at"]
+        ):
+            raise WorkerEnrollmentError(
+                "The controller returned an invalid Pair Execution Cell quarantine-release request."
+            )
+        self._pair_cell_quarantine_release_inbox.append(
+            {
+                "request_id": cast(str, response["request_id"]),
+                "symbol": cast(str, response["symbol"]),
+                "actor": cast(str, response["actor"]),
+                "reason": cast(str, response["reason"]),
+                "observed_at": cast(str, response["observed_at"]),
+            }
+        )
+
     def drain_pair_relay_envelopes(self) -> list[dict[str, object]]:
         """Pop every opaque Pair Execution Cell envelope queued since the last drain."""
 
@@ -432,6 +467,13 @@ class AuthenticatedWorkerSession:
 
         activations, self._pair_cell_activation_inbox = self._pair_cell_activation_inbox, []
         return activations
+
+    def drain_pair_cell_quarantine_releases(self) -> list[dict[str, object]]:
+        """Pop every controller-pushed ``{request_id, symbol, actor, reason, observed_at}``
+        quarantine-release request queued since the last drain."""
+
+        releases, self._pair_cell_quarantine_release_inbox = self._pair_cell_quarantine_release_inbox, []
+        return releases
 
     def send_pair_relay(self, envelope: dict[str, object], *, request_id: str) -> None:
         """Send one opaque Pair Execution Cell envelope; fire-and-forget.
@@ -447,6 +489,32 @@ class AuthenticatedWorkerSession:
             _send(self.socket, {"type": "pair_relay", "request_id": request_id, "envelope": envelope})
         except Exception as error:
             _raise_closed_connection(error, "Pair Execution Cell relay")
+
+    def send_pair_cell_quarantine_release_result(self, *, request_id: str, symbol: str, outcome: str) -> None:
+        """Reply to one controller-pushed quarantine-release request with
+        this Worker's own actual applied/rejected outcome.
+
+        The controller correlates this by ``request_id`` against the pending
+        ``pair_cell_quarantine_release_request`` it is awaiting, so the
+        admin route never reports success unless every Worker's own cell
+        genuinely applied (or trivially satisfied, i.e. the product was
+        never quarantined here) the release -- it cannot be inferred from
+        the push alone, since ``PairExecutionCell`` silently rejects a
+        release while an attempt is unresolved.
+        """
+
+        try:
+            _send(
+                self.socket,
+                {
+                    "type": "pair_cell_quarantine_release_result",
+                    "request_id": request_id,
+                    "symbol": symbol,
+                    "outcome": outcome,
+                },
+            )
+        except Exception as error:
+            _raise_closed_connection(error, "Pair Execution Cell quarantine-release result")
 
     def request_pair_cell_activation(self) -> dict[str, object] | None:
         """Synchronously ask the controller for this Worker's current pair

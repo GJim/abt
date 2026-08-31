@@ -22,7 +22,7 @@ from fastapi import Cookie, FastAPI, Header, HTTPException, Query, Response, Web
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from ..pair_cell import PairContract
 from ..trader_protocol import pair_cell_relay_envelope_adapter, trader_rpc_response_adapter
@@ -91,9 +91,21 @@ class PairContractActivationRequest(BaseModel):
     """The complete, structurally-validated Pair Execution Cell contract.
 
     Only structural/identity/route/lease concerns are validated here (field
-    types, presence, distinct Workers); strategy values -- ``edge_threshold``,
-    ``risk_budget_usd``, volumes, quote/timing policy -- are opaque to the
-    controller and stored/relayed as-is.
+    types, presence, distinct Workers); strategy values -- ``edge_threshold``
+    /``entry_edge_points``, ``risk_budget_usd``, volumes, quote/timing policy
+    -- are opaque to the controller and stored/relayed as-is.
+
+    A pair contract activates one of two mutually exclusive policy shapes,
+    matching ``abt.pair_cell.PairContract``'s own activation-time rule:
+
+    * an *automatic* policy (``entry_edge_points`` plus ``eligible_symbols``)
+      that authorizes the Worker pair and lets the leader evaluate every
+      coherent eligible product itself, never requiring a per-symbol
+      operator approval; or
+    * a *legacy* one-symbol/one-direction-pair activation (``symbol``,
+      ``leader_direction``, ``follower_direction``, ``edge_threshold``),
+      preserved so existing operator tooling and older activation payloads
+      keep working unchanged.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -101,13 +113,15 @@ class PairContractActivationRequest(BaseModel):
     leader_worker_id: str = Field(min_length=1)
     follower_worker_id: str = Field(min_length=1)
     trader_id: str = Field(min_length=1)
-    symbol: str = Field(min_length=1)
-    leader_direction: Literal["LONG", "SHORT"]
-    follower_direction: Literal["LONG", "SHORT"]
+    symbol: str | None = Field(min_length=1, default=None)
+    leader_direction: Literal["LONG", "SHORT"] | None = None
+    follower_direction: Literal["LONG", "SHORT"] | None = None
+    edge_threshold: str | None = Field(min_length=1, default=None)
+    entry_edge_points: str | None = Field(min_length=1, default=None)
+    eligible_symbols: list[str] = Field(default_factory=list)
     leader_volume: str = Field(min_length=1)
     follower_volume: str = Field(min_length=1)
     filling_mode: Literal["FOK", "IOC"]
-    edge_threshold: str = Field(min_length=1)
     risk_budget_usd: str = Field(min_length=1)
     quote_max_age_seconds: float = Field(gt=0)
     quote_max_skew_seconds: float = Field(gt=0)
@@ -123,6 +137,28 @@ class PairContractActivationRequest(BaseModel):
     )
     ttl_seconds: float = Field(gt=0, default=3600.0)
 
+    @model_validator(mode="after")
+    def _validate_policy_shape(self) -> "PairContractActivationRequest":
+        automatic = self.entry_edge_points is not None
+        legacy_fields = (
+            self.symbol, self.leader_direction, self.follower_direction, self.edge_threshold
+        )
+        legacy = all(
+            value is not None
+            for value in legacy_fields
+        )
+        if automatic and any(value is not None for value in legacy_fields):
+            raise ValueError("Automatic pair activation cannot include legacy product or direction fields.")
+        if automatic == legacy:
+            raise ValueError(
+                "A pair contract activation must define either an automatic entry_edge_points policy "
+                "or one complete legacy symbol/direction/edge_threshold product, "
+                "not both or neither."
+            )
+        if any(not symbol.strip() for symbol in self.eligible_symbols):
+            raise ValueError("Eligible symbols must be non-empty canonical product names.")
+        return self
+
 
 class PairExecutionModeReleaseRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -130,6 +166,22 @@ class PairExecutionModeReleaseRequest(BaseModel):
     leader_worker_id: str = Field(min_length=1)
     follower_worker_id: str = Field(min_length=1)
     mode: Literal["strategy_runtime", "pair_execution_cell", "shadow"]
+
+
+class PairQuarantineReleaseRequest(BaseModel):
+    """One operator's explicit, audited release of one quarantined product.
+
+    ``actor`` is intentionally not a client-supplied field: it is always the
+    authenticated admin session's own username, so the audit trail cannot be
+    forged by the request body.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    leader_worker_id: str = Field(min_length=1)
+    follower_worker_id: str = Field(min_length=1)
+    symbol: str = Field(min_length=1)
+    reason: str = Field(min_length=1)
 
 
 class EnrollmentRequest(BaseModel):
@@ -860,6 +912,7 @@ def create_app(
 
         _require_admin(ledger, abt_admin_session, x_csrf_token, require_csrf=True)
         fields = payload.model_dump(exclude={"ttl_seconds"})
+        fields["eligible_symbols"] = tuple(fields["eligible_symbols"])
         contract = PairContract(contract_id=str(uuid4()), **fields)
         try:
             activation = ledger.activate_pair_contract(
@@ -889,6 +942,79 @@ def create_app(
         _require_admin(ledger, abt_admin_session, x_csrf_token, require_csrf=True)
         ledger.release_pair_execution_mode(payload.leader_worker_id, payload.follower_worker_id, payload.mode)
         return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    @app.post("/api/admin/pairs/quarantine/release")
+    async def release_pair_quarantine_route(
+        payload: PairQuarantineReleaseRequest,
+        abt_admin_session: Annotated[str | None, Cookie()] = None,
+        x_csrf_token: Annotated[str | None, Header()] = None,
+    ) -> dict[str, object]:
+        """Explicitly, audibly release one quarantined product for a Worker pair.
+
+        Quarantine is per-Worker durable state with no controller-side
+        mirror, and ``PairExecutionCell`` silently rejects a release while an
+        attempt is unresolved -- it never raises and never reports whether a
+        release actually took effect. So this route never claims success on
+        a fire-and-forget push alone: it sends a correlated request to both
+        the leader and follower Worker session and awaits each one's own
+        genuine applied/rejected outcome (a Worker that never had the symbol
+        quarantined counts as applied -- there is nothing to release there),
+        and only reports success if *both* applied. A rejection, a timeout,
+        or either Worker being disconnected is reported as a failure with
+        whatever per-worker outcome is known, and the request may always be
+        safely retried once the blocking condition (unresolved attempt,
+        disconnected Worker) is resolved -- releasing an already-released (or
+        never-quarantined) product is itself always a safe, applied no-op.
+        """
+
+        username = _require_admin(ledger, abt_admin_session, x_csrf_token, require_csrf=True)
+        try:
+            release = ledger.release_pair_quarantine(
+                leader_worker_id=payload.leader_worker_id,
+                follower_worker_id=payload.follower_worker_id,
+                symbol=payload.symbol,
+                actor=username,
+                reason=payload.reason,
+            )
+            leader_connection = _connected_worker_session(
+                worker_connections,
+                payload.leader_worker_id,
+                reason="The leader Worker must be connected to receive the quarantine release.",
+            )
+            follower_connection = _connected_worker_session(
+                worker_connections,
+                payload.follower_worker_id,
+                reason="The follower Worker must be connected to receive the quarantine release.",
+            )
+        except LedgerError as error:
+            raise HTTPException(status_code=_ledger_error_status(error), detail=str(error)) from error
+
+        release = jsonable_encoder(release)
+        leader_outcome, follower_outcome = await asyncio.gather(
+            _request_pair_cell_quarantine_release(leader_connection, release, request_id=str(uuid4())),
+            _request_pair_cell_quarantine_release(follower_connection, release, request_id=str(uuid4())),
+        )
+        applied = leader_outcome == "applied" and follower_outcome == "applied"
+        ledger.record_pair_quarantine_release_outcome(
+            leader_worker_id=payload.leader_worker_id,
+            follower_worker_id=payload.follower_worker_id,
+            symbol=payload.symbol,
+            actor=username,
+            leader_outcome=leader_outcome,
+            follower_outcome=follower_outcome,
+            applied=applied,
+        )
+        body = {
+            "status": "released" if applied else "rejected",
+            "symbol": release["symbol"],
+            "actor": release["actor"],
+            "reason": release["reason"],
+            "leader_outcome": leader_outcome,
+            "follower_outcome": follower_outcome,
+        }
+        if not applied:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=body)
+        return body
 
     @app.post("/api/admin/logout", status_code=status.HTTP_204_NO_CONTENT)
     def logout(
@@ -1433,6 +1559,16 @@ def create_app(
                                 "reason": str(error),
                             }
                         )
+                elif (
+                    message_type == "pair_cell_quarantine_release_result"
+                    and set(request) == {"type", "request_id", "symbol", "outcome"}
+                    and isinstance(request.get("request_id"), str)
+                    and request["request_id"]
+                    and isinstance(request.get("symbol"), str)
+                    and request["symbol"]
+                    and request.get("outcome") in ("applied", "rejected")
+                ):
+                    _record_pair_cell_quarantine_release_result(connection, request)
                 else:
                     raise ValueError("Invalid protocol message.")
         except WebSocketDisconnect as error:
@@ -1603,6 +1739,34 @@ async def _request_worker_relay(
         connection.pending.pop(request.request_id, None)
 
 
+async def _request_pair_cell_quarantine_release(
+    connection: _WorkerSessionConnection,
+    release: dict[str, object],
+    *,
+    request_id: str,
+) -> str:
+    """Ask one Worker to apply this quarantine release and await its own
+    genuine applied/rejected outcome; a timeout or mid-flight disconnect
+    never counts as applied -- it is reported as ``"unknown"`` so the
+    caller never mistakes "we don't know" for success.
+    """
+
+    message = {
+        "type": "pair_cell_quarantine_release_request",
+        "request_id": request_id,
+        "symbol": release["symbol"],
+        "actor": release["actor"],
+        "reason": release["reason"],
+        "observed_at": release["observed_at"],
+    }
+    try:
+        response = await _request_worker_relay(connection, timeout=15, message=message)
+    except (asyncio.TimeoutError, LedgerError):
+        return "unknown"
+    outcome = response.get("outcome")
+    return cast(str, outcome) if outcome in ("applied", "rejected") else "unknown"
+
+
 def _push_worker_relay(connection: _WorkerSessionConnection, message: dict[str, object]) -> None:
     """Enqueue one fire-and-forget push through the connection's single writer."""
 
@@ -1703,6 +1867,26 @@ def _record_worker_relay_response(
         raise ValueError("Worker relay response identity does not match its session.")
     ledger.complete_trader_relay(trader_id, request_id, cast(dict[str, Any], envelope))
     pending = connection.pending.pop(request_id, None)
+    if pending is None:
+        return
+    if not pending.future.done():
+        pending.future.set_result(request)
+
+
+def _record_pair_cell_quarantine_release_result(
+    connection: _WorkerSessionConnection,
+    request: dict[str, object],
+) -> None:
+    """Resolve the pending admin quarantine-release request this Worker's
+    reply correlates to, by ``request_id``.
+
+    A reply with no matching pending request (already timed out, or a
+    stray/duplicate resend) is safely ignored: whichever side is still
+    waiting on the admin route either already gave up (timeout) or was
+    already satisfied.
+    """
+
+    pending = connection.pending.pop(cast(str, request["request_id"]), None)
     if pending is None:
         return
     if not pending.future.done():

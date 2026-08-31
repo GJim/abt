@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from dataclasses import replace
 from pathlib import Path
 import unittest
 
@@ -29,6 +30,7 @@ from abt.pair_cell import (
     PairExecutionCellError,
     PairLease,
     ProtectionCalibration,
+    QuarantineReleaseEvent,
     ReadinessFactsEvent,
     RelayEnvelopeReceived,
 )
@@ -98,6 +100,7 @@ class FakeMT5:
         self.raise_after_fill = False
         self.receipt_none_after_fill = False
         self.close_leaves_position_visible = False
+        self.reject_next_entry_retcode: int | None = None
 
     def account_info(self) -> object:
         return {"login": 1, "server": "demo"}
@@ -121,6 +124,10 @@ class FakeMT5:
             raise RuntimeError("simulated MT5 exception after send_started")
         kind = request["type"]
         if kind == "market":
+            if self.reject_next_entry_retcode is not None:
+                retcode = self.reject_next_entry_retcode
+                self.reject_next_entry_retcode = None
+                return {"retcode": retcode, "comment": "No prices", "bid": 0.0, "ask": 0.0}
             if self.reject:
                 return {"retcode": _REJECTED, "comment": "no money"}
             ticket = self._next_ticket
@@ -221,6 +228,27 @@ def _contract(
     )
 
 
+def _automatic_contract(*, entry_edge_points: str = "1", mode: str = "live") -> PairContract:
+    return PairContract(
+        contract_id="automatic-contract-1",
+        leader_worker_id=LEADER,
+        follower_worker_id=FOLLOWER,
+        trader_id=TRADER,
+        leader_volume="0.10",
+        follower_volume="0.10",
+        filling_mode="FOK",
+        risk_budget_usd="50",
+        quote_max_age_seconds=2.0,
+        quote_max_skew_seconds=1.0,
+        arm_timeout_seconds=2.0,
+        commit_lead_seconds=0.05,
+        execution_expiry_seconds=1.0,
+        entry_edge_points=entry_edge_points,
+        eligible_symbols=(),
+        mode=mode,  # type: ignore[arg-type]
+    )
+
+
 def _lease(contract: PairContract, *, epoch: int = 1, now: datetime, ttl_seconds: float = 300) -> PairLease:
     return PairLease(
         leader_worker_id=LEADER,
@@ -241,8 +269,22 @@ _CALIBRATION = ProtectionCalibration(
     loss_tick_value="1",
 )
 
+_JPY_CALIBRATION = ProtectionCalibration(
+    tick_size="0.001",
+    point="0.001",
+    minimum_stop_distance="0.005",
+    profit_tick_value="0.70",
+    loss_tick_value="0.72",
+)
 
-def _readiness(now: datetime, *, orders: list | None = None, positions: list | None = None) -> ReadinessFactsEvent:
+
+def _readiness(
+    now: datetime,
+    *,
+    orders: list | None = None,
+    positions: list | None = None,
+    symbol_calibrations: dict[str, ProtectionCalibration] | None = None,
+) -> ReadinessFactsEvent:
     return ReadinessFactsEvent(
         account_login="1",
         account_server="demo",
@@ -253,6 +295,7 @@ def _readiness(now: datetime, *, orders: list | None = None, positions: list | N
         symbol_constraints_fresh=True,
         protection_calibration=_CALIBRATION,
         observed_at=now,
+        symbol_calibrations={} if symbol_calibrations is None else symbol_calibrations,
     )
 
 
@@ -334,8 +377,13 @@ class _Harness:
         self.follower.activate(self.contract, self.lease)
 
     def make_ready(self) -> None:
-        self.leader.handle_event(_readiness(self.now))
-        self.follower.handle_event(_readiness(self.now))
+        calibrations = (
+            {SYMBOL: _CALIBRATION, "USDJPY": _JPY_CALIBRATION}
+            if self.contract.entry_edge_points is not None
+            else None
+        )
+        self.leader.handle_event(_readiness(self.now, symbol_calibrations=calibrations))
+        self.follower.handle_event(_readiness(self.now, symbol_calibrations=calibrations))
 
     def feed_quotes(
         self,
@@ -379,6 +427,31 @@ class _Harness:
                 local_receive_time=self.now,
                 recovery_epoch="epoch-restarted",
                 sequence=sequence,
+            )
+        )
+
+    def feed_symbol_quotes(
+        self,
+        symbol: str,
+        *,
+        leader_bid: str,
+        leader_ask: str,
+        follower_bid: str,
+        follower_ask: str,
+        sequence: int,
+    ) -> None:
+        self.leader.handle_event(
+            LocalQuoteEvent(
+                symbol=symbol, bid=Decimal(leader_bid), ask=Decimal(leader_ask),
+                broker_time=self.now, local_receive_time=self.now,
+                recovery_epoch="epoch-a", sequence=sequence,
+            )
+        )
+        self.follower.handle_event(
+            LocalQuoteEvent(
+                symbol=symbol, bid=Decimal(follower_bid), ask=Decimal(follower_ask),
+                broker_time=self.now, local_receive_time=self.now,
+                recovery_epoch="epoch-b", sequence=sequence,
             )
         )
 
@@ -569,6 +642,214 @@ class PairExecutionCellExitPolicyTests(unittest.TestCase):
 
 
 class PairExecutionCellDecisionTests(unittest.TestCase):
+    def test_automatic_contract_rejects_any_stray_legacy_product_field(self) -> None:
+        with _tmp_dir() as tmp_path:
+            harness = _Harness(tmp_path, contract=_automatic_contract())
+            malformed = replace(harness.contract, symbol=SYMBOL)
+
+            with self.assertRaises(PairExecutionCellError):
+                harness.leader.activate(malformed, _lease(malformed, now=harness.now))
+
+    def test_released_quarantine_cannot_be_resurrected_by_stale_peer_gossip(self) -> None:
+        with _tmp_dir() as tmp_path:
+            harness = _Harness(tmp_path, contract=_automatic_contract())
+            harness.activate_both()
+            harness.follower._quarantine_product(  # noqa: SLF001 - construct durable broker evidence
+                "USDJPY",
+                offending_worker_id=FOLLOWER,
+                attempt_id="failed-attempt",
+                receipt={"retcode": 10021, "comment": "No prices"},
+            )
+            stale_gossip = harness.follower._product_quarantine_records()  # noqa: SLF001
+            harness.leader._accept_peer_product_quarantines(stale_gossip, FOLLOWER)  # noqa: SLF001
+            harness.leader.handle_event(
+                QuarantineReleaseEvent(
+                    symbol="USDJPY",
+                    actor="operator-1",
+                    reason="broker restored pricing",
+                    observed_at=harness.now,
+                )
+            )
+
+            harness.leader._accept_peer_product_quarantines(stale_gossip, FOLLOWER)  # noqa: SLF001
+
+            self.assertNotIn("USDJPY", harness.leader.quarantined_products())
+
+    def test_control_plane_release_timestamp_does_not_advance_the_trading_clock(self) -> None:
+        with _tmp_dir() as tmp_path:
+            harness = _Harness(tmp_path, contract=_automatic_contract())
+            harness.activate_both()
+            worker_now = harness.leader._now  # noqa: SLF001
+
+            harness.leader.handle_event(
+                QuarantineReleaseEvent(
+                    symbol="USDJPY",
+                    actor="operator-1",
+                    reason="manual release",
+                    observed_at=worker_now + timedelta(days=1),
+                )
+            )
+
+            self.assertEqual(worker_now, harness.leader._now)  # noqa: SLF001
+
+    def test_commit_does_not_split_legs_when_workers_observe_different_post_decision_prices(self) -> None:
+        with _tmp_dir() as tmp_path:
+            harness = _Harness(tmp_path, contract=_automatic_contract())
+            harness.activate_both()
+            harness.feed_symbol_quotes(
+                SYMBOL,
+                leader_bid="1.10000", leader_ask="1.10010",
+                follower_bid="1.10012", follower_ask="1.10022",
+                sequence=1,
+            )
+            harness.make_ready()
+            harness.network.drop_kinds.add("quote")
+            harness.leader.handle_event(
+                LocalQuoteEvent(
+                    symbol=SYMBOL,
+                    bid=Decimal("1.09970"),
+                    ask=Decimal("1.09980"),
+                    broker_time=harness.now,
+                    local_receive_time=harness.now,
+                    recovery_epoch="leader-epoch",
+                    sequence=2,
+                )
+            )
+
+            harness.tick(0.10)
+
+            self.assertEqual(1, len([request for request in harness.leader_mt5.requests if request["type"] == "market"]))
+            self.assertEqual(1, len([request for request in harness.follower_mt5.requests if request["type"] == "market"]))
+
+    def test_follower_refuses_to_arm_a_product_held_only_in_its_local_quarantine(self) -> None:
+        with _tmp_dir() as tmp_path:
+            harness = _Harness(tmp_path, contract=_automatic_contract())
+            harness.activate_both()
+            harness.feed_symbol_quotes(
+                "USDJPY",
+                leader_bid="150.03", leader_ask="150.04",
+                follower_bid="150.00", follower_ask="150.01",
+                sequence=1,
+            )
+            harness.follower._quarantine_product(  # noqa: SLF001 - construct durable broker evidence
+                "USDJPY",
+                offending_worker_id=FOLLOWER,
+                attempt_id="prior-attempt",
+                receipt={"retcode": 10021, "comment": "No prices"},
+            )
+            harness.network.drop_kinds.add("quote")
+            harness.make_ready()
+            harness.tick(0.10)
+
+            self.assertEqual([], [request for request in harness.leader_mt5.requests if request["type"] == "market"])
+            self.assertEqual([], [request for request in harness.follower_mt5.requests if request["type"] == "market"])
+
+    def test_quote_relay_repairs_a_missed_pair_wide_quarantine_notification(self) -> None:
+        with _tmp_dir() as tmp_path:
+            harness = _Harness(tmp_path, contract=_automatic_contract())
+            harness.activate_both()
+            harness.follower._quarantine_product(  # noqa: SLF001 - construct durable broker evidence
+                "USDJPY",
+                offending_worker_id=FOLLOWER,
+                attempt_id="prior-attempt",
+                receipt={"retcode": 10021, "comment": "No prices"},
+            )
+
+            harness.follower.handle_event(
+                LocalQuoteEvent(
+                    symbol="USDJPY",
+                    bid=Decimal("150.00"),
+                    ask=Decimal("150.01"),
+                    broker_time=harness.now,
+                    local_receive_time=harness.now,
+                    recovery_epoch="follower-epoch",
+                    sequence=1,
+                )
+            )
+
+            self.assertIn("USDJPY", harness.leader.quarantined_products())
+
+    def test_manual_release_removes_a_durable_product_quarantine(self) -> None:
+        with _tmp_dir() as tmp_path:
+            harness = _Harness(tmp_path, contract=_automatic_contract())
+            harness.leader_mt5.reject_next_entry_retcode = 10021
+            harness.activate_both()
+            harness.feed_symbol_quotes(
+                "USDJPY",
+                leader_bid="150.03", leader_ask="150.04",
+                follower_bid="150.00", follower_ask="150.01",
+                sequence=1,
+            )
+            harness.make_ready()
+            harness.tick(0.10)
+            harness.restart_leader()
+
+            harness.leader.handle_event(
+                QuarantineReleaseEvent(
+                    symbol="USDJPY",
+                    actor="operator-1",
+                    reason="broker confirmed executable pricing",
+                    observed_at=harness.now,
+                )
+            )
+
+            self.assertNotIn("USDJPY", harness.leader.quarantined_products())
+
+    def test_no_prices_quarantines_the_product_on_both_workers_and_survives_restart(self) -> None:
+        with _tmp_dir() as tmp_path:
+            harness = _Harness(tmp_path, contract=_automatic_contract())
+            harness.leader_mt5.reject_next_entry_retcode = 10021
+            harness.activate_both()
+            harness.feed_symbol_quotes(
+                "USDJPY",
+                leader_bid="150.03", leader_ask="150.04",
+                follower_bid="150.00", follower_ask="150.01",
+                sequence=1,
+            )
+            harness.make_ready()
+            harness.tick(0.10)
+
+            self.assertIn("USDJPY", harness.leader.quarantined_products())
+            self.assertIn("USDJPY", harness.follower.quarantined_products())
+
+            restarted = harness.restart_leader()
+            self.assertIn("USDJPY", restarted.quarantined_products())
+            harness.restart_follower()
+            harness.make_ready()
+            harness.feed_symbol_quotes(
+                SYMBOL,
+                leader_bid="1.10000", leader_ask="1.10010",
+                follower_bid="1.10012", follower_ask="1.10022",
+                sequence=2,
+            )
+            harness.tick(0.10)
+            self.assertEqual(SYMBOL, harness.leader._attempt.symbol)  # noqa: SLF001
+
+    def test_leader_selects_the_highest_conservative_usd_candidate_without_a_fixed_symbol(self) -> None:
+        with _tmp_dir() as tmp_path:
+            harness = _Harness(tmp_path, contract=_automatic_contract())
+            harness.activate_both()
+            harness.feed_symbol_quotes(
+                SYMBOL,
+                leader_bid="1.10000", leader_ask="1.10010",
+                follower_bid="1.10012", follower_ask="1.10022",
+                sequence=1,
+            )
+            harness.feed_symbol_quotes(
+                "USDJPY",
+                leader_bid="150.03", leader_ask="150.04",
+                follower_bid="150.00", follower_ask="150.01",
+                sequence=1,
+            )
+            harness.make_ready()
+
+            result = harness.leader.handle_event(ClockTickEvent(harness.now))
+
+            self.assertIsNotNone(result.attempt_id)
+            self.assertEqual("USDJPY", harness.leader._attempt.symbol)  # noqa: SLF001
+            self.assertEqual("SHORT", harness.leader._attempt.leader_direction)  # noqa: SLF001
+            self.assertEqual("LONG", harness.leader._attempt.follower_direction)  # noqa: SLF001
+
     def test_only_leader_creates_an_attempt_from_identical_code(self) -> None:
         with _tmp_dir() as tmp_path:
             harness = _Harness(tmp_path)

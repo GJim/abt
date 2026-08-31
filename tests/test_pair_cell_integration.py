@@ -21,6 +21,7 @@ import socket
 import tempfile
 import threading
 import time
+from typing import cast
 import unittest
 from uuid import uuid4
 
@@ -128,6 +129,9 @@ class FakeMT5:
 
     def symbol_info(self, symbol: str) -> object:
         return dict(self.symbol)
+
+    def symbol_select(self, symbol: str, enable: bool) -> bool:
+        return True
 
     def symbol_info_tick(self, symbol: str) -> object:
         with self.lock:
@@ -311,6 +315,25 @@ class _LiveServer:
             timeout=5,
         )
 
+    def release_pair_quarantine(
+        self, *, leader_worker_id: str, follower_worker_id: str, symbol: str, reason: str
+    ) -> httpx.Response:
+        cookie, csrf = self.admin_session()
+        return httpx.post(
+            f"{self.base_url}/api/admin/pairs/quarantine/release",
+            headers={"Cookie": cookie, "X-CSRF-Token": csrf},
+            json={
+                "leader_worker_id": leader_worker_id, "follower_worker_id": follower_worker_id,
+                "symbol": symbol, "reason": reason,
+            },
+            # Release is now correlated/acknowledged: the server awaits a
+            # ``pair_cell_quarantine_release_result`` from each connected
+            # Worker (up to 15s per Worker, run concurrently) before
+            # replying, so the client-side timeout must comfortably exceed
+            # that.
+            timeout=20,
+        )
+
 
 def _drive(
     *,
@@ -489,6 +512,121 @@ class PairExecutionCellEndToEndTests(unittest.TestCase):
 
         assert activation is not None
         self.assertEqual(leader_id, activation["contract"]["leader_worker_id"])
+
+    def test_quarantine_release_is_pushed_to_both_connected_worker_sessions_with_actor_and_reason(self) -> None:
+        leader_key, leader_id, leader_cert = self.server.approved_worker(910301, "Broker-A")
+        follower_key, follower_id, follower_cert = self.server.approved_worker(910302, "Broker-B")
+
+        leader_session = self.server.connect_worker_session(leader_key, leader_id, leader_cert)
+        self.addCleanup(leader_session.socket.__exit__, None, None, None)
+        follower_session = self.server.connect_worker_session(follower_key, follower_id, follower_cert)
+        self.addCleanup(follower_session.socket.__exit__, None, None, None)
+
+        responses: list[httpx.Response] = []
+
+        def _call() -> None:
+            responses.append(
+                self.server.release_pair_quarantine(
+                    leader_worker_id=leader_id,
+                    follower_worker_id=follower_id,
+                    symbol="EURUSD",
+                    reason="broker confirmed the symbol is tradable again",
+                )
+            )
+
+        caller = threading.Thread(target=_call, daemon=True)
+        caller.start()
+
+        # The route now awaits a genuine per-Worker outcome before replying,
+        # so this test must play the Worker side of the correlated
+        # request/response protocol on the main thread for both connections
+        # before the background HTTP call can return.
+        for session in (leader_session, follower_session):
+            self.assertTrue(session.receive_worker_relay(timeout=5))
+            releases = session.drain_pair_cell_quarantine_releases()
+            self.assertEqual(1, len(releases))
+            self.assertEqual("EURUSD", releases[0]["symbol"])
+            self.assertEqual("ABCDEF", releases[0]["actor"])
+            self.assertEqual("broker confirmed the symbol is tradable again", releases[0]["reason"])
+            session.send_pair_cell_quarantine_release_result(
+                request_id=cast(str, releases[0]["request_id"]), symbol="EURUSD", outcome="applied"
+            )
+
+        caller.join(timeout=10)
+        self.assertFalse(caller.is_alive())
+        response = responses[0]
+        self.assertEqual(200, response.status_code, response.text)
+        body = response.json()
+        self.assertEqual("EURUSD", body["symbol"])
+        self.assertEqual("ABCDEF", body["actor"])
+        self.assertEqual("broker confirmed the symbol is tradable again", body["reason"])
+        self.assertEqual("applied", body["leader_outcome"])
+        self.assertEqual("applied", body["follower_outcome"])
+
+    def test_quarantine_release_reports_409_and_never_a_false_success_when_a_worker_rejects_it(self) -> None:
+        """Live-safety requirement: if either Worker genuinely rejects the
+        release (e.g. an unresolved attempt still holds the quarantine),
+        the route must never report overall success -- and it must say so
+        per-Worker, so an operator can tell which side still needs a retry."""
+
+        leader_key, leader_id, leader_cert = self.server.approved_worker(910303, "Broker-A")
+        follower_key, follower_id, follower_cert = self.server.approved_worker(910304, "Broker-B")
+
+        leader_session = self.server.connect_worker_session(leader_key, leader_id, leader_cert)
+        self.addCleanup(leader_session.socket.__exit__, None, None, None)
+        follower_session = self.server.connect_worker_session(follower_key, follower_id, follower_cert)
+        self.addCleanup(follower_session.socket.__exit__, None, None, None)
+
+        responses: list[httpx.Response] = []
+
+        def _call() -> None:
+            responses.append(
+                self.server.release_pair_quarantine(
+                    leader_worker_id=leader_id,
+                    follower_worker_id=follower_id,
+                    symbol="EURUSD",
+                    reason="operator review",
+                )
+            )
+
+        caller = threading.Thread(target=_call, daemon=True)
+        caller.start()
+
+        outcomes = [(leader_session, "applied"), (follower_session, "rejected")]
+        for session, outcome in outcomes:
+            self.assertTrue(session.receive_worker_relay(timeout=5))
+            releases = session.drain_pair_cell_quarantine_releases()
+            self.assertEqual(1, len(releases))
+            session.send_pair_cell_quarantine_release_result(
+                request_id=cast(str, releases[0]["request_id"]), symbol="EURUSD", outcome=outcome
+            )
+
+        caller.join(timeout=10)
+        self.assertFalse(caller.is_alive())
+        response = responses[0]
+        self.assertEqual(409, response.status_code)
+        body = response.json()["detail"]
+        self.assertEqual("applied", body["leader_outcome"])
+        self.assertEqual("rejected", body["follower_outcome"])
+
+    def test_quarantine_release_is_rejected_while_either_worker_is_disconnected(self) -> None:
+        leader_key, leader_id, leader_cert = self.server.approved_worker(910401, "Broker-A")
+        _follower_key, follower_id, _follower_cert = self.server.approved_worker(910402, "Broker-B")
+
+        # Only the leader is connected; the follower is offline, and unlike
+        # contract activation (idempotent latest-state a Worker can fetch via
+        # pair_cell_sync_request on reconnect), a quarantine release is a
+        # one-time action, so it must never be silently queued/dropped for a
+        # Worker that happens to be offline right now.
+        leader_session = self.server.connect_worker_session(leader_key, leader_id, leader_cert)
+        self.addCleanup(leader_session.socket.__exit__, None, None, None)
+
+        response = self.server.release_pair_quarantine(
+            leader_worker_id=leader_id, follower_worker_id=follower_id, symbol="EURUSD", reason="operator review",
+        )
+
+        self.assertEqual(409, response.status_code)
+        self.assertFalse(leader_session.receive_worker_relay(timeout=0.2))
 
 
 if __name__ == "__main__":

@@ -843,6 +843,83 @@ class ControlLedger:
                 {"leader_worker_id": leader_worker_id, "follower_worker_id": follower_worker_id, "mode": mode},
             )
 
+    def release_pair_quarantine(
+        self,
+        *,
+        leader_worker_id: str,
+        follower_worker_id: str,
+        symbol: str,
+        actor: str,
+        reason: str,
+    ) -> dict[str, Any]:
+        """Durably audit-log one operator's explicit product quarantine release
+        and return the payload the caller must push live to both Workers.
+
+        A product quarantine is Worker-local durable state (each Worker's own
+        ``cell_product_quarantine`` table), not mirrored here, and a release
+        is a one-time action rather than idempotent latest-state the way
+        contract activation is: replaying an old release to a Worker that
+        reconnects later could incorrectly release a *newer* quarantine of
+        the same symbol. So the controller never persists a release for
+        later replay -- it only records the immutable audit event and
+        returns the payload; the caller is responsible for delivering it to
+        both currently-connected Worker sessions now.
+        """
+
+        if leader_worker_id == follower_worker_id:
+            raise LedgerError("A Pair Execution Cell quarantine release must name two distinct Workers.")
+        with self._transaction():
+            self.active_worker(leader_worker_id)
+            self.active_worker(follower_worker_id)
+            observed_at = _utc_now()
+            self._event(
+                "pair_quarantine_release_requested",
+                {
+                    "leader_worker_id": leader_worker_id,
+                    "follower_worker_id": follower_worker_id,
+                    "symbol": symbol,
+                    "actor": actor,
+                    "reason": reason,
+                },
+            )
+        return {"symbol": symbol, "actor": actor, "reason": reason, "observed_at": observed_at}
+
+    def record_pair_quarantine_release_outcome(
+        self,
+        *,
+        leader_worker_id: str,
+        follower_worker_id: str,
+        symbol: str,
+        actor: str,
+        leader_outcome: str,
+        follower_outcome: str,
+        applied: bool,
+    ) -> int:
+        """Durably audit-log the delivered per-Worker outcome of one
+        quarantine release request, alongside its overall applied/rejected
+        result.
+
+        Recorded unconditionally -- whether both Workers genuinely applied
+        the release, one or both rejected it (an unresolved attempt), or a
+        Worker's outcome could not be confirmed (disconnect/timeout) -- so
+        the audit trail always reflects what actually happened rather than
+        only ever recording success.
+        """
+
+        with self._transaction():
+            return self._event(
+                "pair_quarantine_release_outcome",
+                {
+                    "leader_worker_id": leader_worker_id,
+                    "follower_worker_id": follower_worker_id,
+                    "symbol": symbol,
+                    "actor": actor,
+                    "leader_outcome": leader_outcome,
+                    "follower_outcome": follower_outcome,
+                    "applied": applied,
+                },
+            )
+
     def issue_pair_lease(
         self,
         *,

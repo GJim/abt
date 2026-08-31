@@ -43,6 +43,7 @@ from abt.controlplane.service import (
     _broadcast_trader_worker_stream,
     _delete_expired_pending_secrets,
     _is_authoritative_worker_session,
+    _request_pair_cell_quarantine_release,
     _TraderSessionConnection,
     _WorkerSessionConnection,
     _trader_market_subscription,
@@ -134,6 +135,76 @@ class TraderMarketSubscriptionTests(unittest.TestCase):
         for value in ([], ["*", "worker-1"], [""]):
             with self.assertRaises(ValueError):
                 _trader_market_subscription(value)
+
+
+class PairCellQuarantineReleaseRequestHelperTests(unittest.TestCase):
+    """Focused, non-websocket coverage of the correlated request/response
+    helper itself: it must return exactly what the Worker reports, and it
+    must never turn "we don't know" (a timeout or a disconnect) into a false
+    "applied"."""
+
+    @staticmethod
+    def _release() -> dict[str, object]:
+        return {
+            "symbol": "EURUSD",
+            "actor": "alice",
+            "reason": "broker confirmed the symbol is tradable again",
+            "observed_at": "2024-01-01T00:00:00+00:00",
+        }
+
+    def test_returns_the_workers_own_reported_outcome(self) -> None:
+        connection = _WorkerSessionConnection(websocket=None)  # type: ignore[arg-type]
+
+        async def _drive() -> str:
+            task = asyncio.ensure_future(
+                _request_pair_cell_quarantine_release(connection, self._release(), request_id="req-1")
+            )
+            await asyncio.sleep(0)  # allow the request to be enqueued
+            queued = connection.outbound.get_nowait()
+            self.assertEqual("req-1", queued.request_id)
+            queued.future.set_result(
+                {"type": "pair_cell_quarantine_release_result", "request_id": "req-1", "symbol": "EURUSD", "outcome": "rejected"}
+            )
+            return await task
+
+        self.assertEqual("rejected", asyncio.run(_drive()))
+
+    def test_a_timeout_is_reported_as_unknown_never_applied(self) -> None:
+        connection = _WorkerSessionConnection(websocket=None)  # type: ignore[arg-type]
+        with patch.object(
+            controlplane_service, "_request_worker_relay", side_effect=asyncio.TimeoutError()
+        ):
+            outcome = asyncio.run(
+                _request_pair_cell_quarantine_release(connection, self._release(), request_id="req-1")
+            )
+
+        self.assertEqual("unknown", outcome)
+
+    def test_a_mid_flight_disconnect_is_reported_as_unknown_never_applied(self) -> None:
+        connection = _WorkerSessionConnection(websocket=None)  # type: ignore[arg-type]
+        with patch.object(
+            controlplane_service, "_request_worker_relay", side_effect=LedgerError("Worker disconnected.")
+        ):
+            outcome = asyncio.run(
+                _request_pair_cell_quarantine_release(connection, self._release(), request_id="req-1")
+            )
+
+        self.assertEqual("unknown", outcome)
+
+    def test_a_malformed_or_unexpected_reply_is_reported_as_unknown(self) -> None:
+        connection = _WorkerSessionConnection(websocket=None)  # type: ignore[arg-type]
+
+        async def _drive() -> str:
+            task = asyncio.ensure_future(
+                _request_pair_cell_quarantine_release(connection, self._release(), request_id="req-1")
+            )
+            await asyncio.sleep(0)
+            queued = connection.outbound.get_nowait()
+            queued.future.set_result({"type": "pair_cell_quarantine_release_result", "request_id": "req-1", "symbol": "EURUSD"})
+            return await task
+
+        self.assertEqual("unknown", asyncio.run(_drive()))
+
 
 
 class MemoryCertificateIssuer:
@@ -1208,6 +1279,222 @@ class ControlPlaneServiceTests(unittest.TestCase):
             },
         )
         self.assertEqual(200, after_release.status_code)
+
+    def _base_pair_contract_activation_fields(self, leader_id: str, follower_id: str, trader_id: str) -> dict[str, object]:
+        return {
+            "leader_worker_id": leader_id, "follower_worker_id": follower_id, "trader_id": trader_id,
+            "leader_volume": "0.10", "follower_volume": "0.10", "filling_mode": "FOK",
+            "risk_budget_usd": "50", "quote_max_age_seconds": 5.0, "quote_max_skew_seconds": 5.0,
+            "arm_timeout_seconds": 5.0, "commit_lead_seconds": 0.2, "execution_expiry_seconds": 5.0,
+            "mode": "live", "ttl_seconds": 300,
+        }
+
+    def test_admin_activates_an_automatic_entry_edge_points_pair_contract(self) -> None:
+        """Requirement: activation accepts a policy-level ``entry_edge_points``
+        plus ``eligible_symbols`` instead of one fixed symbol/directions."""
+
+        _leader_key, leader_id, _leader_certificate = self._approved_worker(101010, "Broker-A")
+        _follower_key, follower_id, _follower_certificate = self._approved_worker(202020, "Broker-B")
+        trader_enrollment = self.app.state.ledger.create_trader_enrollment(
+            strategy_name="pair-execution-cell", claimed_public_ip="203.0.113.4", public_key_pem="trader-public-key-4"
+        )
+        trader_id = self.app.state.ledger.approve_trader_enrollment(
+            trader_enrollment["registration_id"], "ABCDEF", lambda value, *_: f"certificate:{value}"
+        )
+        login = self.client.post(
+            "/api/admin/login", json={"username": "ABCDEF", "password": "A-secure-admin-password!"}
+        )
+        headers = {"X-CSRF-Token": login.json()["csrf_token"]}
+
+        response = self.client.post(
+            "/api/admin/pairs/activate",
+            headers=headers,
+            json={
+                **self._base_pair_contract_activation_fields(leader_id, follower_id, trader_id),
+                "entry_edge_points": "1.5",
+                "eligible_symbols": ["EURUSD", "GBPUSD", "XAUUSD"],
+            },
+        )
+
+        self.assertEqual(200, response.status_code, response.text)
+        contract = response.json()["contract"]
+        self.assertEqual("1.5", contract["entry_edge_points"])
+        self.assertEqual(["EURUSD", "GBPUSD", "XAUUSD"], contract["eligible_symbols"])
+        self.assertNotIn("symbol", contract)
+
+    def test_automatic_activation_allows_an_empty_filter_for_full_catalog_discovery(self) -> None:
+        activation = controlplane_service.PairContractActivationRequest(
+            **self._base_pair_contract_activation_fields("leader-1", "follower-1", "trader-1"),
+            entry_edge_points="1",
+        )
+
+        self.assertEqual([], activation.eligible_symbols)
+
+    def test_admin_activates_a_legacy_symbol_and_direction_pair_contract(self) -> None:
+        """Requirement: old fixed symbol/directions activation payloads keep working."""
+
+        _leader_key, leader_id, _leader_certificate = self._approved_worker(303030, "Broker-A")
+        _follower_key, follower_id, _follower_certificate = self._approved_worker(404040, "Broker-B")
+        trader_enrollment = self.app.state.ledger.create_trader_enrollment(
+            strategy_name="pair-execution-cell", claimed_public_ip="203.0.113.4", public_key_pem="trader-public-key-5"
+        )
+        trader_id = self.app.state.ledger.approve_trader_enrollment(
+            trader_enrollment["registration_id"], "ABCDEF", lambda value, *_: f"certificate:{value}"
+        )
+        login = self.client.post(
+            "/api/admin/login", json={"username": "ABCDEF", "password": "A-secure-admin-password!"}
+        )
+        headers = {"X-CSRF-Token": login.json()["csrf_token"]}
+
+        response = self.client.post(
+            "/api/admin/pairs/activate",
+            headers=headers,
+            json={
+                **self._base_pair_contract_activation_fields(leader_id, follower_id, trader_id),
+                "symbol": "EURUSD", "leader_direction": "LONG", "follower_direction": "SHORT",
+                "edge_threshold": "0.0005",
+            },
+        )
+
+        self.assertEqual(200, response.status_code, response.text)
+        contract = response.json()["contract"]
+        self.assertEqual("EURUSD", contract["symbol"])
+        self.assertNotIn("entry_edge_points", contract)
+
+    def test_admin_activation_rejects_both_automatic_and_legacy_fields_together(self) -> None:
+        _leader_key, leader_id, _leader_certificate = self._approved_worker(505050, "Broker-A")
+        _follower_key, follower_id, _follower_certificate = self._approved_worker(606060, "Broker-B")
+        trader_enrollment = self.app.state.ledger.create_trader_enrollment(
+            strategy_name="pair-execution-cell", claimed_public_ip="203.0.113.4", public_key_pem="trader-public-key-6"
+        )
+        trader_id = self.app.state.ledger.approve_trader_enrollment(
+            trader_enrollment["registration_id"], "ABCDEF", lambda value, *_: f"certificate:{value}"
+        )
+        login = self.client.post(
+            "/api/admin/login", json={"username": "ABCDEF", "password": "A-secure-admin-password!"}
+        )
+        headers = {"X-CSRF-Token": login.json()["csrf_token"]}
+
+        response = self.client.post(
+            "/api/admin/pairs/activate",
+            headers=headers,
+            json={
+                **self._base_pair_contract_activation_fields(leader_id, follower_id, trader_id),
+                "entry_edge_points": "1.5", "eligible_symbols": ["EURUSD"],
+                "symbol": "EURUSD", "leader_direction": "LONG", "follower_direction": "SHORT",
+                "edge_threshold": "0.0005",
+            },
+        )
+
+        self.assertEqual(422, response.status_code)
+
+    def test_admin_activation_rejects_neither_automatic_nor_legacy_fields(self) -> None:
+        _leader_key, leader_id, _leader_certificate = self._approved_worker(707070, "Broker-A")
+        _follower_key, follower_id, _follower_certificate = self._approved_worker(808080, "Broker-B")
+        trader_enrollment = self.app.state.ledger.create_trader_enrollment(
+            strategy_name="pair-execution-cell", claimed_public_ip="203.0.113.4", public_key_pem="trader-public-key-7"
+        )
+        trader_id = self.app.state.ledger.approve_trader_enrollment(
+            trader_enrollment["registration_id"], "ABCDEF", lambda value, *_: f"certificate:{value}"
+        )
+        login = self.client.post(
+            "/api/admin/login", json={"username": "ABCDEF", "password": "A-secure-admin-password!"}
+        )
+        headers = {"X-CSRF-Token": login.json()["csrf_token"]}
+
+        response = self.client.post(
+            "/api/admin/pairs/activate",
+            headers=headers,
+            json=self._base_pair_contract_activation_fields(leader_id, follower_id, trader_id),
+        )
+
+        self.assertEqual(422, response.status_code)
+
+    def test_admin_release_of_pair_quarantine_requires_admin_auth(self) -> None:
+        response = self.client.post(
+            "/api/admin/pairs/quarantine/release",
+            json={
+                "leader_worker_id": "worker-a", "follower_worker_id": "worker-b",
+                "symbol": "EURUSD", "reason": "operator review",
+            },
+        )
+
+        self.assertEqual(401, response.status_code)
+
+    def test_admin_release_of_pair_quarantine_request_requires_a_non_empty_reason(self) -> None:
+        login = self.client.post(
+            "/api/admin/login", json={"username": "ABCDEF", "password": "A-secure-admin-password!"}
+        )
+        headers = {"X-CSRF-Token": login.json()["csrf_token"]}
+
+        response = self.client.post(
+            "/api/admin/pairs/quarantine/release",
+            headers=headers,
+            json={"leader_worker_id": "worker-a", "follower_worker_id": "worker-b", "symbol": "EURUSD", "reason": ""},
+        )
+
+        self.assertEqual(422, response.status_code)
+
+    def test_admin_release_of_pair_quarantine_rejects_the_same_worker_as_leader_and_follower(self) -> None:
+        _leader_key, leader_id, _leader_certificate = self._approved_worker(909090, "Broker-A")
+        login = self.client.post(
+            "/api/admin/login", json={"username": "ABCDEF", "password": "A-secure-admin-password!"}
+        )
+        headers = {"X-CSRF-Token": login.json()["csrf_token"]}
+
+        response = self.client.post(
+            "/api/admin/pairs/quarantine/release",
+            headers=headers,
+            json={
+                "leader_worker_id": leader_id, "follower_worker_id": leader_id,
+                "symbol": "EURUSD", "reason": "operator review",
+            },
+        )
+
+        self.assertEqual(409, response.status_code)
+
+    def test_admin_release_of_pair_quarantine_rejects_an_unknown_worker(self) -> None:
+        _leader_key, leader_id, _leader_certificate = self._approved_worker(919191, "Broker-A")
+        login = self.client.post(
+            "/api/admin/login", json={"username": "ABCDEF", "password": "A-secure-admin-password!"}
+        )
+        headers = {"X-CSRF-Token": login.json()["csrf_token"]}
+
+        response = self.client.post(
+            "/api/admin/pairs/quarantine/release",
+            headers=headers,
+            json={
+                "leader_worker_id": leader_id, "follower_worker_id": "no-such-worker",
+                "symbol": "EURUSD", "reason": "operator review",
+            },
+        )
+
+        self.assertEqual(409, response.status_code)
+
+    def test_admin_release_of_pair_quarantine_requires_both_workers_to_be_connected(self) -> None:
+        """Requirement: unlike contract activation (idempotent latest-state a
+        Worker can fetch on reconnect), a quarantine release is a one-time
+        action, so it must never be silently accepted for delivery "later" --
+        both the leader and follower Worker session must be connected now."""
+
+        _leader_key, leader_id, _leader_certificate = self._approved_worker(929292, "Broker-A")
+        _follower_key, follower_id, _follower_certificate = self._approved_worker(939393, "Broker-B")
+        login = self.client.post(
+            "/api/admin/login", json={"username": "ABCDEF", "password": "A-secure-admin-password!"}
+        )
+        headers = {"X-CSRF-Token": login.json()["csrf_token"]}
+
+        response = self.client.post(
+            "/api/admin/pairs/quarantine/release",
+            headers=headers,
+            json={
+                "leader_worker_id": leader_id, "follower_worker_id": follower_id,
+                "symbol": "EURUSD", "reason": "operator review",
+            },
+        )
+
+        self.assertEqual(409, response.status_code)
+        self.assertIn("connected", response.json()["detail"])
 
     def _create_pending_enrollment(self) -> str:
         private_key = ec.generate_private_key(ec.SECP256R1())

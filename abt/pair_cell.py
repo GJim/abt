@@ -91,13 +91,9 @@ class PairContract:
     leader_worker_id: str
     follower_worker_id: str
     trader_id: str
-    symbol: str
-    leader_direction: Direction
-    follower_direction: Direction
     leader_volume: str
     follower_volume: str
     filling_mode: Literal["FOK", "IOC"]
-    edge_threshold: str
     risk_budget_usd: str
     quote_max_age_seconds: float
     quote_max_skew_seconds: float
@@ -107,6 +103,12 @@ class PairContract:
     mode: ExecutionMode = "live"
     maximum_holding_seconds: float | None = None
     flatten_at_ny: str | None = None
+    entry_edge_points: str | None = None
+    eligible_symbols: tuple[str, ...] = ()
+    symbol: str | None = None
+    leader_direction: Direction | None = None
+    follower_direction: Direction | None = None
+    edge_threshold: str | None = None
 
     def canonical(self) -> dict[str, object]:
         value: dict[str, object] = {
@@ -114,13 +116,9 @@ class PairContract:
             "leader_worker_id": self.leader_worker_id,
             "follower_worker_id": self.follower_worker_id,
             "trader_id": self.trader_id,
-            "symbol": self.symbol,
-            "leader_direction": self.leader_direction,
-            "follower_direction": self.follower_direction,
             "leader_volume": self.leader_volume,
             "follower_volume": self.follower_volume,
             "filling_mode": self.filling_mode,
-            "edge_threshold": self.edge_threshold,
             "risk_budget_usd": self.risk_budget_usd,
             "quote_max_age_seconds": self.quote_max_age_seconds,
             "quote_max_skew_seconds": self.quote_max_skew_seconds,
@@ -133,6 +131,17 @@ class PairContract:
             value["maximum_holding_seconds"] = self.maximum_holding_seconds
         if self.flatten_at_ny is not None:
             value["flatten_at_ny"] = self.flatten_at_ny
+        if self.entry_edge_points is not None:
+            value["entry_edge_points"] = self.entry_edge_points
+            value["eligible_symbols"] = list(self.eligible_symbols)
+        if self.symbol is not None:
+            value["symbol"] = self.symbol
+        if self.leader_direction is not None:
+            value["leader_direction"] = self.leader_direction
+        if self.follower_direction is not None:
+            value["follower_direction"] = self.follower_direction
+        if self.edge_threshold is not None:
+            value["edge_threshold"] = self.edge_threshold
         return value
 
     @property
@@ -154,7 +163,10 @@ class PairContract:
         raise PairExecutionCellError("Worker ID is not part of this pair contract.")
 
     def direction_of(self, worker_id: str) -> Direction:
-        return self.leader_direction if self.role_of(worker_id) == "leader" else self.follower_direction
+        direction = self.leader_direction if self.role_of(worker_id) == "leader" else self.follower_direction
+        if direction is None:
+            raise PairExecutionCellError("Automatic pair contracts choose direction per attempt.")
+        return direction
 
     def volume_of(self, worker_id: str) -> str:
         return self.leader_volume if self.role_of(worker_id) == "leader" else self.follower_volume
@@ -221,6 +233,11 @@ class LocalQuoteEvent:
 
 
 @dataclass(frozen=True, slots=True)
+class LocalQuoteBatchEvent:
+    quotes: tuple[LocalQuoteEvent, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class ProtectionCalibration:
     """Symbol constraints refreshed on a bounded schedule, off the critical path."""
 
@@ -244,6 +261,7 @@ class ReadinessFactsEvent:
     symbol_constraints_fresh: bool
     protection_calibration: ProtectionCalibration | None
     observed_at: datetime
+    symbol_calibrations: dict[str, ProtectionCalibration] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -264,6 +282,14 @@ class ClockTickEvent:
 
 
 @dataclass(frozen=True, slots=True)
+class QuarantineReleaseEvent:
+    symbol: str
+    actor: str
+    reason: str
+    observed_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class RelayEnvelopeReceived:
     """An authenticated, already identity/route/lease-validated opaque envelope."""
 
@@ -272,10 +298,12 @@ class RelayEnvelopeReceived:
 
 PairCellEvent = (
     LocalQuoteEvent
+    | LocalQuoteBatchEvent
     | ReadinessFactsEvent
     | LeaseEvent
     | BrokerSnapshotEvent
     | ClockTickEvent
+    | QuarantineReleaseEvent
     | RelayEnvelopeReceived
 )
 
@@ -321,6 +349,12 @@ class PairResult:
     needs_human_reason: str | None
     recovering: bool
     timing: dict[str, object] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class BrokerWriteResult:
+    category: Literal["completed", "rejected", "expired_not_started", "unknown_after_send"]
+    receipt: dict[str, object] | None = None
 
 
 # --------------------------------------------------------------------------- #
@@ -609,6 +643,14 @@ class PairExecutionCell:
         self._lease_revoked = False
         self._local_quote: QuoteSnapshot | None = None
         self._peer_quote: QuoteSnapshot | None = None
+        self._local_quotes: dict[str, QuoteSnapshot] = {}
+        self._peer_quotes: dict[str, QuoteSnapshot] = {}
+        self._local_calibrations: dict[str, ProtectionCalibration] = {}
+        self._peer_calibrations: dict[str, ProtectionCalibration] = {}
+        self._peer_plan_batches: dict[str, dict[int, dict[str, object]]] = {}
+        self._peer_plan_hash: str | None = None
+        self._local_plan_payload: dict[str, dict[str, object]] = {}
+        self._local_plan_hash = _hash(_canonical_json({}))
         self._local_facts: ReadinessFactsEvent | None = None
         self._peer_ready = False
         self._peer_ready_reason = "no peer readiness observed yet"
@@ -624,6 +666,7 @@ class PairExecutionCell:
         self._last_timing: dict[str, object] = {}
         self._last_published_ready: bool | None = None
         self._last_published_reason: str | None = None
+        self._last_published_plan_hash: str | None = None
         self._load_persisted_state()
 
     # -- schema -------------------------------------------------------- #
@@ -678,6 +721,24 @@ class PairExecutionCell:
                 id INTEGER PRIMARY KEY CHECK (id = 1),
                 reason TEXT NOT NULL,
                 updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS cell_product_quarantine (
+                symbol TEXT PRIMARY KEY,
+                offending_worker_id TEXT NOT NULL,
+                attempt_id TEXT NOT NULL,
+                receipt TEXT NOT NULL,
+                quarantined_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS cell_product_quarantine_release (
+                symbol TEXT NOT NULL,
+                offending_worker_id TEXT NOT NULL,
+                attempt_id TEXT NOT NULL,
+                released_at TEXT NOT NULL,
+                PRIMARY KEY (symbol, offending_worker_id, attempt_id)
+            );
+            CREATE TABLE IF NOT EXISTS cell_product_release_marker (
+                symbol TEXT PRIMARY KEY,
+                marker TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS cell_transitions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -941,6 +1002,29 @@ class PairExecutionCell:
 
         if self._worker_id not in (contract.leader_worker_id, contract.follower_worker_id):
             raise PairExecutionCellError("This Worker is not part of the pair contract.")
+        automatic = contract.entry_edge_points is not None
+        legacy_fields = (
+            contract.symbol,
+            contract.leader_direction,
+            contract.follower_direction,
+            contract.edge_threshold,
+        )
+        legacy = all(
+            value is not None
+            for value in legacy_fields
+        )
+        if automatic and any(value is not None for value in legacy_fields):
+            raise PairExecutionCellError("Automatic pair contracts cannot include legacy product or direction fields.")
+        if automatic == legacy:
+            raise PairExecutionCellError(
+                "A pair contract must define either automatic entry_edge_points policy or one complete legacy product."
+            )
+        if automatic:
+            threshold = _to_decimal(contract.entry_edge_points)
+            if threshold is None or threshold <= 0:
+                raise PairExecutionCellError("Entry edge points must be a positive finite decimal.")
+            if any(not symbol.strip() for symbol in contract.eligible_symbols):
+                raise PairExecutionCellError("Eligible symbols must be non-empty canonical product names.")
         if (
             contract.maximum_holding_seconds is not None
             and (
@@ -1006,14 +1090,39 @@ class PairExecutionCell:
         elif isinstance(event, LocalQuoteEvent):
             self._now = max(self._now, _as_utc(event.local_receive_time))
             self._accept_local_quote(event)
+        elif isinstance(event, LocalQuoteBatchEvent):
+            accepted: list[QuoteSnapshot] = []
+            for quote in event.quotes:
+                self._now = max(self._now, _as_utc(quote.local_receive_time))
+                if self._accept_local_quote(quote, publish=False):
+                    accepted.append(self._local_quotes[quote.symbol])
+            if accepted:
+                self._publish_quote_batch(tuple(accepted))
+            else:
+                self._publish_quarantine_batches()
         elif isinstance(event, ReadinessFactsEvent):
             self._now = max(self._now, _as_utc(event.observed_at))
             self._local_facts = event
+            self._local_calibrations = dict(event.symbol_calibrations)
+            if (
+                not self._local_calibrations
+                and self._contract is not None
+                and self._contract.symbol is not None
+                and event.protection_calibration is not None
+            ):
+                self._local_calibrations[self._contract.symbol] = event.protection_calibration
+            self._local_plan_payload = {
+                symbol: asdict(plan) for symbol, plan in sorted(self._local_calibrations.items())
+            }
+            self._local_plan_hash = _hash(_canonical_json(self._local_plan_payload))
         elif isinstance(event, LeaseEvent):
             self._apply_lease_event(event.lease)
         elif isinstance(event, BrokerSnapshotEvent):
             self._now = max(self._now, _as_utc(event.observed_at))
             self._apply_broker_snapshot(event)
+        elif isinstance(event, QuarantineReleaseEvent):
+            _as_utc(event.observed_at)
+            self._release_product_quarantine(event)
         elif isinstance(event, RelayEnvelopeReceived):
             self._accept_relay_envelope(event.envelope)
         else:
@@ -1058,7 +1167,10 @@ class PairExecutionCell:
             return False, "insufficient margin headroom"
         if not facts.symbol_constraints_fresh:
             return False, "symbol constraints are stale"
-        if facts.protection_calibration is None:
+        if self._contract is not None and self._contract.entry_edge_points is not None:
+            if not self._local_calibrations:
+                return False, "no eligible symbol calibration is available"
+        elif facts.protection_calibration is None:
             return False, "protection calibration is unavailable"
         try:
             unresolved = self._journal.unresolved()
@@ -1106,35 +1218,57 @@ class PairExecutionCell:
 
     # -- quotes ------------------------------------------------------------ #
 
-    def _accept_local_quote(self, event: LocalQuoteEvent) -> None:
-        if self._contract is not None and event.symbol != self._contract.symbol:
-            return
-        existing = self._local_quote
+    def _accept_local_quote(self, event: LocalQuoteEvent, *, publish: bool = True) -> bool:
+        if self._contract is not None:
+            if self._contract.symbol is not None and event.symbol != self._contract.symbol:
+                return False
+            if self._contract.eligible_symbols and event.symbol not in self._contract.eligible_symbols:
+                return False
+        existing = self._local_quotes.get(event.symbol)
         if (
             existing is not None
             and existing.recovery_epoch == event.recovery_epoch
             and event.sequence <= existing.sequence
         ):
-            return
-        self._local_quote = QuoteSnapshot(
+            return False
+        broker_time = _as_utc(event.broker_time)
+        if (
+            existing is not None
+            and existing.recovery_epoch == event.recovery_epoch
+            and existing.bid == event.bid
+            and existing.ask == event.ask
+            and existing.broker_time == broker_time
+        ):
+            return False
+        quote = QuoteSnapshot(
             worker_id=self._worker_id,
             symbol=event.symbol,
             bid=event.bid,
             ask=event.ask,
-            broker_time=_as_utc(event.broker_time),
+            broker_time=broker_time,
             local_receive_time=_as_utc(event.local_receive_time),
             recovery_epoch=event.recovery_epoch,
             sequence=event.sequence,
         )
-        self._publish_quote(self._local_quote)
+        self._local_quotes[event.symbol] = quote
+        self._local_quote = quote
+        if publish:
+            self._publish_quote(quote)
         self._record_timing("local_quote_observed")
+        return True
 
     def _accept_peer_quote(self, payload: Mapping[str, object]) -> None:
         if self._contract is None:
             return
         peer_id = self._contract.peer_of(self._worker_id)
-        if payload.get("worker_id") != peer_id or payload.get("symbol") != self._contract.symbol:
+        symbol = payload.get("symbol")
+        if payload.get("worker_id") != peer_id or not isinstance(symbol, str):
             return
+        if self._contract.symbol is not None and symbol != self._contract.symbol:
+            return
+        if self._contract.eligible_symbols and symbol not in self._contract.eligible_symbols:
+            return
+        self._accept_peer_product_quarantines(payload.get("product_quarantines"), peer_id)
         bid, ask = _to_decimal(payload.get("bid")), _to_decimal(payload.get("ask"))
         broker_time_raw, sequence = payload.get("broker_time"), payload.get("sequence")
         epoch = payload.get("recovery_epoch")
@@ -1152,12 +1286,12 @@ class PairExecutionCell:
             broker_time = _parse_utc(broker_time_raw)
         except (ValueError, PairExecutionCellError):
             return
-        existing = self._peer_quote
+        existing = self._peer_quotes.get(symbol)
         if existing is not None and existing.recovery_epoch == epoch and sequence <= existing.sequence:
             return  # duplicate or out-of-order within the same recovery epoch
-        self._peer_quote = QuoteSnapshot(
+        quote = QuoteSnapshot(
             worker_id=peer_id,
-            symbol=self._contract.symbol,
+            symbol=symbol,
             bid=bid,
             ask=ask,
             broker_time=broker_time,
@@ -1165,41 +1299,146 @@ class PairExecutionCell:
             recovery_epoch=epoch,
             sequence=sequence,
         )
+        self._peer_quotes[symbol] = quote
+        self._peer_quote = quote
         self._record_timing("peer_quote_observed")
 
     def _publish_quote(self, quote: QuoteSnapshot) -> None:
         if self._contract is None or self._lease is None:
             return
+        payload = quote.canonical()
+        self._publish_quarantine_batches()
         self._relay.send(
             {
                 "kind": "quote",
                 "from_worker_id": self._worker_id,
                 "to_worker_id": self._contract.peer_of(self._worker_id),
                 "lease_epoch": self._lease.epoch,
-                "payload": quote.canonical(),
+                "payload": payload,
             }
         )
+
+    def _publish_quote_batch(self, quotes: tuple[QuoteSnapshot, ...]) -> None:
+        if self._contract is None or self._lease is None:
+            return
+        canonical_quotes = {str(index): quote.canonical() for index, quote in enumerate(quotes)}
+        self._publish_quarantine_batches()
+        for batch in self._bounded_mapping_batches(canonical_quotes):
+            self._relay.send(
+                {
+                    "kind": "quote_batch",
+                    "from_worker_id": self._worker_id,
+                    "to_worker_id": self._contract.peer_of(self._worker_id),
+                    "lease_epoch": self._lease.epoch,
+                    "payload": {
+                        "quotes": list(batch.values()),
+                    },
+                }
+            )
 
     def _maybe_publish_readiness(self) -> None:
         if self._contract is None or self._lease is None:
             return
         ready, reason = self._local_ready()
-        if (ready, reason) == (self._last_published_ready, self._last_published_reason):
+        plans_changed = self._local_plan_hash != self._last_published_plan_hash
+        first_publication = self._last_published_plan_hash is None
+        if (ready, reason, self._local_plan_hash) == (
+            self._last_published_ready,
+            self._last_published_reason,
+            self._last_published_plan_hash,
+        ):
             return
         self._last_published_ready, self._last_published_reason = ready, reason
+        self._last_published_plan_hash = self._local_plan_hash
+        if plans_changed:
+            self._publish_calibration_batches()
         self._relay.send(
             {
                 "kind": "readiness",
                 "from_worker_id": self._worker_id,
                 "to_worker_id": self._contract.peer_of(self._worker_id),
                 "lease_epoch": self._lease.epoch,
-                "payload": {"ready": ready, "reason": reason},
+                "payload": {
+                    "ready": ready,
+                    "reason": reason,
+                    "plan_hash": self._local_plan_hash,
+                },
             }
         )
+        if first_publication:
+            self._relay.send(
+                {
+                    "kind": "calibration_request",
+                    "from_worker_id": self._worker_id,
+                    "to_worker_id": self._contract.peer_of(self._worker_id),
+                    "lease_epoch": self._lease.epoch,
+                    "payload": {},
+                }
+            )
 
-    def _coherent_quotes(self) -> tuple[QuoteSnapshot, QuoteSnapshot] | None:
+    def _publish_calibration_batches(self) -> None:
+        if self._contract is None or self._lease is None:
+            return
+        batches = self._bounded_mapping_batches(self._local_plan_payload)
+        for index, batch in enumerate(batches):
+            self._relay.send(
+                {
+                    "kind": "calibration_batch",
+                    "from_worker_id": self._worker_id,
+                    "to_worker_id": self._contract.peer_of(self._worker_id),
+                    "lease_epoch": self._lease.epoch,
+                    "payload": {
+                        "plan_hash": self._local_plan_hash,
+                        "batch_index": index,
+                        "batch_count": len(batches),
+                        "symbol_calibrations": batch,
+                    },
+                }
+            )
+
+    def _publish_quarantine_batches(self) -> None:
+        if self._contract is None or self._lease is None:
+            return
+        records = {str(index): record for index, record in enumerate(self._product_quarantine_records())}
+        if not records:
+            return
+        for batch in self._bounded_mapping_batches(records):
+            self._relay.send(
+                {
+                    "kind": "quarantine_batch",
+                    "from_worker_id": self._worker_id,
+                    "to_worker_id": self._contract.peer_of(self._worker_id),
+                    "lease_epoch": self._lease.epoch,
+                    "payload": {"product_quarantines": list(batch.values())},
+                }
+            )
+
+    @staticmethod
+    def _bounded_mapping_batches(
+        payload: Mapping[str, dict[str, object]], *, max_bytes: int = 32_768
+    ) -> list[dict[str, dict[str, object]]]:
+        batches: list[dict[str, dict[str, object]]] = []
+        current: dict[str, dict[str, object]] = {}
+        current_size = 2
+        for symbol, value in payload.items():
+            entry_size = len(_canonical_json({symbol: value}).encode("utf-8")) - 2
+            separator_size = 1 if current else 0
+            if current and current_size + separator_size + entry_size > max_bytes:
+                batches.append(current)
+                current = {symbol: value}
+                current_size = 2 + entry_size
+            else:
+                current[symbol] = value
+                current_size += separator_size + entry_size
+        batches.append(current)
+        return batches
+
+    def _coherent_quotes(self, symbol: str | None = None) -> tuple[QuoteSnapshot, QuoteSnapshot] | None:
         assert self._contract is not None
-        local, peer = self._local_quote, self._peer_quote
+        selected = symbol if symbol is not None else self._contract.symbol
+        if selected is None:
+            return None
+        local, peer = self._local_quotes.get(selected), self._peer_quotes.get(selected)
         if local is None or peer is None:
             return None
         if not local.fresh(self._now, self._contract.quote_max_age_seconds):
@@ -1223,11 +1462,47 @@ class PairExecutionCell:
             return  # never trust a message that does not originate from the bound peer
         if kind == "quote":
             self._accept_peer_quote(payload)
+        elif kind == "quote_batch":
+            raw_quotes = payload.get("quotes")
+            if isinstance(raw_quotes, list):
+                for quote in raw_quotes:
+                    if isinstance(quote, dict):
+                        self._accept_peer_quote(quote)
+        elif kind == "calibration_batch":
+            self._accept_peer_calibration_batch(payload)
+        elif kind == "calibration_request":
+            self._publish_calibration_batches()
+        elif kind == "quarantine_batch":
+            if self._contract is not None:
+                self._accept_peer_product_quarantines(
+                    payload.get("product_quarantines"),
+                    self._contract.peer_of(self._worker_id),
+                )
         elif kind == "readiness":
             ready = payload.get("ready")
             reason = payload.get("reason")
             if isinstance(ready, bool) and isinstance(reason, str):
                 self._peer_ready, self._peer_ready_reason = ready, reason
+                raw_plans = payload.get("symbol_calibrations")
+                if isinstance(raw_plans, dict):
+                    self._peer_calibrations = self._parse_calibrations(raw_plans)
+                    self._peer_plan_hash = _hash(_canonical_json(raw_plans))
+                peer_plan_hash = payload.get("plan_hash")
+                if (
+                    isinstance(peer_plan_hash, str)
+                    and peer_plan_hash != self._peer_plan_hash
+                    and self._contract is not None
+                    and self._lease is not None
+                ):
+                    self._relay.send(
+                        {
+                            "kind": "calibration_request",
+                            "from_worker_id": self._worker_id,
+                            "to_worker_id": self._contract.peer_of(self._worker_id),
+                            "lease_epoch": self._lease.epoch,
+                            "payload": {},
+                        }
+                    )
         elif kind == "arm_request":
             self._handle_arm_request(payload)
         elif kind == "arm_ack":
@@ -1236,6 +1511,54 @@ class PairExecutionCell:
             self._handle_commit(payload)
         elif kind == "leg_status":
             self._handle_peer_leg_status(payload)
+
+    @staticmethod
+    def _parse_calibrations(raw_plans: Mapping[object, object]) -> dict[str, ProtectionCalibration]:
+        parsed: dict[str, ProtectionCalibration] = {}
+        for symbol, raw in raw_plans.items():
+            if isinstance(symbol, str) and isinstance(raw, dict):
+                try:
+                    parsed[symbol] = ProtectionCalibration(
+                        tick_size=str(raw["tick_size"]),
+                        point=str(raw["point"]),
+                        minimum_stop_distance=str(raw["minimum_stop_distance"]),
+                        profit_tick_value=str(raw["profit_tick_value"]),
+                        loss_tick_value=str(raw["loss_tick_value"]),
+                    )
+                except KeyError:
+                    continue
+        return parsed
+
+    def _accept_peer_calibration_batch(self, payload: Mapping[str, object]) -> None:
+        plan_hash = payload.get("plan_hash")
+        batch_index = payload.get("batch_index")
+        batch_count = payload.get("batch_count")
+        raw_plans = payload.get("symbol_calibrations")
+        if (
+            not isinstance(plan_hash, str)
+            or isinstance(batch_index, bool)
+            or not isinstance(batch_index, int)
+            or isinstance(batch_count, bool)
+            or not isinstance(batch_count, int)
+            or batch_count <= 0
+            or batch_index < 0
+            or batch_index >= batch_count
+            or not isinstance(raw_plans, dict)
+        ):
+            return
+        batches = self._peer_plan_batches.setdefault(plan_hash, {})
+        batches[batch_index] = dict(raw_plans)
+        if len(batches) != batch_count:
+            return
+        combined: dict[object, object] = {}
+        for index in range(batch_count):
+            combined.update(batches[index])
+        if _hash(_canonical_json(combined)) != plan_hash:
+            self._peer_plan_batches.pop(plan_hash, None)
+            return
+        self._peer_calibrations = self._parse_calibrations(combined)
+        self._peer_plan_hash = plan_hash
+        self._peer_plan_batches = {plan_hash: batches}
 
     # -- leader: attempt creation and arming -------------------------------- #
 
@@ -1354,6 +1677,121 @@ class PairExecutionCell:
         self._recovering = False
         self._state = "IDLE"
 
+    def _best_entry_candidate(
+        self,
+    ) -> tuple[str, Direction, Direction, QuoteSnapshot, QuoteSnapshot, ProtectionCalibration] | None:
+        contract = self._contract
+        if contract is None:
+            return None
+        if contract.entry_edge_points is None:
+            coherent = self._coherent_quotes()
+            if (
+                coherent is None
+                or contract.symbol is None
+                or contract.leader_direction is None
+                or contract.follower_direction is None
+                or contract.edge_threshold is None
+                or contract.symbol in self.quarantined_products()
+            ):
+                return None
+            leader_quote, follower_quote = coherent
+            threshold = _to_decimal(contract.edge_threshold)
+            calibration = self._local_calibrations.get(contract.symbol)
+            if (
+                threshold is None
+                or edge_value(leader_quote, follower_quote, contract.leader_direction) < threshold
+                or calibration is None
+            ):
+                return None
+            return (
+                contract.symbol,
+                contract.leader_direction,
+                contract.follower_direction,
+                leader_quote,
+                follower_quote,
+                calibration,
+            )
+
+        threshold_points = _to_decimal(contract.entry_edge_points)
+        leader_volume = _to_decimal(contract.leader_volume)
+        follower_volume = _to_decimal(contract.follower_volume)
+        if threshold_points is None or leader_volume is None or follower_volume is None:
+            return None
+        symbols = set(self._local_quotes) & set(self._peer_quotes) & set(self._local_calibrations) & set(
+            self._peer_calibrations
+        )
+        symbols -= set(self.quarantined_products())
+        if contract.eligible_symbols:
+            symbols &= set(contract.eligible_symbols)
+        ranked: list[
+            tuple[
+                Decimal,
+                Decimal,
+                str,
+                Direction,
+                Direction,
+                QuoteSnapshot,
+                QuoteSnapshot,
+                ProtectionCalibration,
+            ]
+        ] = []
+        for symbol in symbols:
+            coherent = self._coherent_quotes(symbol)
+            if coherent is None:
+                continue
+            leader_quote, follower_quote = coherent
+            leader_calibration = self._local_calibrations[symbol]
+            follower_calibration = self._peer_calibrations[symbol]
+            point = _to_decimal(leader_calibration.point)
+            peer_point = _to_decimal(follower_calibration.point)
+            if point is None or peer_point is None or point <= 0 or peer_point != point:
+                continue
+            for leader_direction, follower_direction in (("LONG", "SHORT"), ("SHORT", "LONG")):
+                direction = cast(Direction, leader_direction)
+                edge_points = edge_value(leader_quote, follower_quote, direction) / point
+                if edge_points < threshold_points:
+                    continue
+                leader_usd = self._usd_per_point(leader_calibration, leader_volume)
+                follower_usd = self._usd_per_point(follower_calibration, follower_volume)
+                if leader_usd is None or follower_usd is None:
+                    continue
+                ranked.append(
+                    (
+                        edge_points * min(leader_usd, follower_usd),
+                        edge_points,
+                        symbol,
+                        direction,
+                        cast(Direction, follower_direction),
+                        leader_quote,
+                        follower_quote,
+                        leader_calibration,
+                    )
+                )
+        if not ranked:
+            return None
+        ranked.sort(key=lambda item: (-item[0], -item[1], item[2], item[3]))
+        _, _, symbol, leader_direction, follower_direction, leader_quote, follower_quote, calibration = ranked[0]
+        return symbol, leader_direction, follower_direction, leader_quote, follower_quote, calibration
+
+    @staticmethod
+    def _usd_per_point(calibration: ProtectionCalibration, volume: Decimal) -> Decimal | None:
+        point = _to_decimal(calibration.point)
+        tick_size = _to_decimal(calibration.tick_size)
+        profit_value = _to_decimal(calibration.profit_tick_value)
+        loss_value = _to_decimal(calibration.loss_tick_value)
+        if (
+            point is None
+            or tick_size is None
+            or profit_value is None
+            or loss_value is None
+            or point <= 0
+            or tick_size <= 0
+            or profit_value <= 0
+            or loss_value <= 0
+        ):
+            return None
+        return point / tick_size * min(profit_value, loss_value) * volume
+
     def _maybe_create_attempt(self) -> None:
         contract, lease = self._contract, self._lease_authority()
         if contract is None or lease is None:
@@ -1362,18 +1800,13 @@ class PairExecutionCell:
         peer_ready, _ = self._peer_ready_now()
         if not ready or not peer_ready:
             return
-        coherent = self._coherent_quotes()
-        if coherent is None:
+        candidate = self._best_entry_candidate()
+        if candidate is None:
             return
-        leader_quote, follower_quote = coherent
-        edge = edge_value(leader_quote, follower_quote, contract.leader_direction)
-        threshold = _to_decimal(contract.edge_threshold)
-        if threshold is None or edge < threshold:
-            return
+        symbol, leader_direction, follower_direction, leader_quote, follower_quote, calibration = candidate
         self._record_timing("edge_decision")
-        leader_entry = leader_quote.ask if contract.leader_direction == "LONG" else leader_quote.bid
+        leader_entry = leader_quote.ask if leader_direction == "LONG" else leader_quote.bid
         leader_volume = _to_decimal(contract.leader_volume)
-        calibration = self._local_facts.protection_calibration if self._local_facts else None
         if leader_volume is None or calibration is None:
             return
         risk_budget = _to_decimal(contract.risk_budget_usd)
@@ -1381,7 +1814,7 @@ class PairExecutionCell:
             return
         protection = compute_protection(
             entry=leader_entry,
-            direction=contract.leader_direction,
+            direction=leader_direction,
             volume=leader_volume,
             calibration=calibration,
             risk_budget_usd=risk_budget,
@@ -1393,9 +1826,9 @@ class PairExecutionCell:
             attempt_id=str(uuid4()),
             lease_epoch=lease.epoch,
             contract_hash=contract.hash,
-            symbol=contract.symbol,
-            leader_direction=contract.leader_direction,
-            follower_direction=contract.follower_direction,
+            symbol=symbol,
+            leader_direction=leader_direction,
+            follower_direction=follower_direction,
             leader_volume=contract.leader_volume,
             follower_volume=contract.follower_volume,
             leader_quote=leader_quote,
@@ -1450,6 +1883,14 @@ class PairExecutionCell:
             # already-created exposure.
             self._send_arm_ack(attempt.attempt_id, False, "an earlier attempt is still unresolved")
             return
+        if attempt.symbol in self.quarantined_products():
+            self._send_arm_ack(
+                attempt.attempt_id,
+                False,
+                "product is quarantined on the follower",
+                symbol=attempt.symbol,
+            )
+            return
         if lease is None:
             self._send_arm_ack(attempt.attempt_id, False, "follower not ready: lease is missing or expired")
             return
@@ -1462,7 +1903,7 @@ class PairExecutionCell:
             return
         follower_entry = attempt.follower_quote.ask if attempt.follower_direction == "LONG" else attempt.follower_quote.bid
         follower_volume = _to_decimal(attempt.follower_volume)
-        calibration = self._local_facts.protection_calibration if self._local_facts else None
+        calibration = self._local_calibrations.get(attempt.symbol)
         risk_budget = _to_decimal(contract.risk_budget_usd)
         protection = None
         if follower_volume is not None and calibration is not None and risk_budget is not None:
@@ -1489,7 +1930,7 @@ class PairExecutionCell:
         self._record_timing("arm_receive")
         self._send_arm_ack(attempt.attempt_id, True, "armed")
 
-    def _send_arm_ack(self, attempt_id: str, armed: bool, reason: str) -> None:
+    def _send_arm_ack(self, attempt_id: str, armed: bool, reason: str, *, symbol: str | None = None) -> None:
         if self._contract is None or self._lease is None:
             return
         self._relay.send(
@@ -1498,7 +1939,13 @@ class PairExecutionCell:
                 "from_worker_id": self._worker_id,
                 "to_worker_id": self._contract.peer_of(self._worker_id),
                 "lease_epoch": self._lease.epoch,
-                "payload": {"attempt_id": attempt_id, "armed": armed, "reason": reason},
+                "payload": {
+                    "attempt_id": attempt_id,
+                    "armed": armed,
+                    "reason": reason,
+                    "symbol": symbol,
+                    "release_marker": None if symbol is None else self._release_marker(symbol),
+                },
             }
         )
 
@@ -1508,6 +1955,20 @@ class PairExecutionCell:
         if payload.get("attempt_id") != self._attempt.attempt_id:
             return
         if payload.get("armed") is not True:
+            if payload.get("reason") == "product is quarantined on the follower":
+                symbol = payload.get("symbol")
+                if isinstance(symbol, str) and self._contract is not None:
+                    self._quarantine_product(
+                        symbol,
+                        offending_worker_id=self._contract.peer_of(self._worker_id),
+                        attempt_id=self._attempt.attempt_id,
+                        receipt={
+                            "retcode": 10021,
+                            "source": "follower_arm_rejection",
+                            "release_marker": payload.get("release_marker"),
+                        },
+                        local_evidence=True,
+                    )
             self._abandon_attempt(f"follower_arm_rejected: {payload.get('reason')}")
             return
         if self._state != "ARMING" or self._leg.arm_state != "armed":
@@ -1631,7 +2092,7 @@ class PairExecutionCell:
             return
         role = self._role()
         assert role is not None
-        quote = self._local_quote
+        quote = self._local_quotes.get(attempt.symbol)
         if quote is None or not quote.fresh(self._now, contract.quote_max_age_seconds):
             self._abandon_attempt("quote_stale_at_commit")
             return
@@ -1680,21 +2141,30 @@ class PairExecutionCell:
             self._persist_desired()
             return
         outcome = self._run_broker_write(effect_id, payload, priority="execution")
-        if outcome == "rejected":
+        if outcome.category == "rejected":
             leg.entry_status = "rejected"
             self._persist_leg()
             self._transition("entry_rejected", attempt.attempt_id)
-            self._report_leg_status("rejected")
+            receipt_retcode = outcome.receipt.get("retcode") if outcome.receipt is not None else None
+            if receipt_retcode == 10021:
+                self._quarantine_product(
+                    attempt.symbol,
+                    offending_worker_id=self._worker_id,
+                    attempt_id=attempt.attempt_id,
+                    receipt=outcome.receipt,
+                    local_evidence=True,
+                )
+            self._report_leg_status("rejected", receipt_retcode=receipt_retcode)
             self._desired = "EMPTY"
             self._persist_desired()
-        elif outcome == "expired_not_started":
+        elif outcome.category == "expired_not_started":
             leg.entry_status = "expired_not_started"
             self._persist_leg()
             self._transition("entry_expired_not_started", attempt.attempt_id)
             self._report_leg_status("expired_not_started")
             self._desired = "EMPTY"
             self._persist_desired()
-        elif outcome == "unknown_after_send":
+        elif outcome.category == "unknown_after_send":
             leg.entry_status = "unknown_after_send"
             self._persist_leg()
             self._state = "ENTRY_UNCERTAIN"
@@ -1709,7 +2179,7 @@ class PairExecutionCell:
 
     def _run_broker_write(
         self, effect_id: str, payload: dict[str, object], *, priority: Literal["execution", "protection", "emergency"]
-    ) -> Literal["completed", "rejected", "expired_not_started", "unknown_after_send"]:
+    ) -> BrokerWriteResult:
         request = {
             "request_id": effect_id,
             "command_id": effect_id,
@@ -1720,19 +2190,19 @@ class PairExecutionCell:
         }
         admitted = self._scheduler.admit(request)
         if isinstance(admitted, TraderRpcOutcome):
-            return _map_scheduler_category(admitted.category)
+            return BrokerWriteResult(_map_scheduler_category(admitted.category))
         scheduled = self._dequeue_own_item(effect_id)
         if isinstance(scheduled, TraderRpcOutcome):
-            return _map_scheduler_category(scheduled.category)
+            return BrokerWriteResult(_map_scheduler_category(scheduled.category))
         if scheduled is None:
-            return "unknown_after_send"
+            return BrokerWriteResult("unknown_after_send")
         self._record_timing("scheduler_dequeue")
         try:
             scheduled.before_broker_send()
         except BrokerActionNotStarted as error:
             # The scheduler already recorded this item's terminal outcome and
             # released its single serialization slot.
-            return _map_scheduler_category(error.outcome.category)
+            return BrokerWriteResult(_map_scheduler_category(error.outcome.category))
         # From here the item owns the Worker's one MT5 serialization slot.  It
         # must be completed exactly once on *every* path -- including journal
         # errors, MT5 exceptions, and missing receipts -- or emergency
@@ -1745,30 +2215,30 @@ class PairExecutionCell:
             except EffectJournalError as error:
                 reason = f"the effect journal refused the send_started boundary: {error}"
                 self._transition("effect_journal_refused_send_started", str(error))
-                return "unknown_after_send"
+                return BrokerWriteResult("unknown_after_send")
             self._record_timing("mt5_send_started")
             try:
                 raw = self._mt5.order_send(payload)
             except Exception as error:  # the irreversible boundary was crossed; never resend
                 self._transition("mt5_call_raised", str(error))
                 reason = f"the MT5 call raised after send_started: {error}"
-                return "unknown_after_send"
+                return BrokerWriteResult("unknown_after_send")
             receipt = _receipt(raw)
             if receipt is None:
                 self._transition("mt5_returned_no_receipt", effect_id)
                 reason = "MT5 returned no usable receipt after send_started"
-                return "unknown_after_send"
+                return BrokerWriteResult("unknown_after_send")
             try:
                 self._journal.record_receipt(effect_id, receipt)
             except EffectJournalError as error:
                 self._transition("effect_journal_refused_receipt", str(error))
                 reason = f"the effect journal refused the broker receipt: {error}"
-                return "unknown_after_send"
+                return BrokerWriteResult("unknown_after_send")
             self._record_timing("broker_response")
             category, reason = "completed", "broker receipt observed"
             if receipt.get("retcode") not in (10008, 10009):  # TRADE_RETCODE_PLACED / DONE
-                return "rejected"
-            return "completed"
+                return BrokerWriteResult("rejected", receipt)
+            return BrokerWriteResult("completed", receipt)
         finally:
             scheduled.complete(category, reason)
 
@@ -1895,7 +2365,7 @@ class PairExecutionCell:
         role = leg.role
         direction = attempt.direction_of(role)
         volume = _to_decimal(attempt.volume_of(role))
-        calibration = self._local_facts.protection_calibration if self._local_facts else None
+        calibration = self._local_calibrations.get(attempt.symbol)
         risk_budget = _to_decimal(contract.risk_budget_usd)
         fill_price = _to_decimal(leg.fill_price)
         protection = None
@@ -1929,7 +2399,7 @@ class PairExecutionCell:
             self._persist_desired()
             return
         outcome = self._run_broker_write(effect_id, payload, priority="protection")
-        if outcome == "completed":
+        if outcome.category == "completed":
             leg.refined_sl, leg.refined_tp, leg.protection_status = sl, tp, "refined"
             self._persist_leg()
             self._transition("protection_refined", attempt.attempt_id)
@@ -1938,8 +2408,8 @@ class PairExecutionCell:
         else:
             leg.protection_status = "failed"
             self._persist_leg()
-            self._transition("protection_refinement_failed", outcome)
-            self._report_leg_status("protection_failed", reason=outcome)
+            self._transition("protection_refinement_failed", outcome.category)
+            self._report_leg_status("protection_failed", reason=outcome.category)
             self._desired = "EMPTY"
             self._persist_desired()
 
@@ -1965,6 +2435,7 @@ class PairExecutionCell:
         sl: str | None = None,
         tp: str | None = None,
         reason: str = "",
+        receipt_retcode: object = None,
     ) -> None:
         if self._contract is None or self._lease is None or self._attempt is None:
             return
@@ -1982,6 +2453,9 @@ class PairExecutionCell:
                     "sl": sl,
                     "tp": tp,
                     "reason": reason,
+                    "symbol": self._attempt.symbol,
+                    "receipt_retcode": receipt_retcode,
+                    "release_marker": self._release_marker(self._attempt.symbol),
                 },
             }
         )
@@ -1991,6 +2465,18 @@ class PairExecutionCell:
         attempt_id = payload.get("attempt_id")
         if not isinstance(status, str) or not isinstance(attempt_id, str):
             return
+        symbol = payload.get("symbol")
+        if payload.get("receipt_retcode") == 10021 and isinstance(symbol, str) and self._contract is not None:
+            self._quarantine_product(
+                symbol,
+                offending_worker_id=self._contract.peer_of(self._worker_id),
+                attempt_id=attempt_id,
+                receipt={
+                    "retcode": 10021,
+                    "source": "peer_leg_status",
+                    "release_marker": payload.get("release_marker"),
+                },
+            )
         if self._attempt is None or attempt_id != self._attempt.attempt_id:
             # A status for an attempt this Worker already terminalized (both
             # sides proven safe) or never saw is still recorded durably so an
@@ -2022,6 +2508,141 @@ class PairExecutionCell:
             self._desired = "EMPTY"
             self._persist_desired()
             self._maybe_finalize_empty()
+
+    def _quarantine_product(
+        self,
+        symbol: str,
+        *,
+        offending_worker_id: str,
+        attempt_id: str,
+        receipt: Mapping[str, object],
+        local_evidence: bool = False,
+        commit: bool = True,
+    ) -> bool:
+        marker = self._release_marker(symbol)
+        evidence = dict(receipt)
+        if local_evidence:
+            evidence["release_marker"] = marker
+        elif evidence.get("release_marker") != marker:
+            return False
+        existing = self._db.execute(
+            "SELECT 1 FROM cell_product_quarantine WHERE symbol = ?",
+            (symbol,),
+        ).fetchone()
+        if existing is not None:
+            return False
+        released = self._db.execute(
+            """
+            SELECT 1 FROM cell_product_quarantine_release
+            WHERE symbol = ? AND offending_worker_id = ? AND attempt_id = ?
+            """,
+            (symbol, offending_worker_id, attempt_id),
+        ).fetchone()
+        if released is not None:
+            return False
+        inserted = self._db.execute(
+            """
+            INSERT INTO cell_product_quarantine (
+                symbol, offending_worker_id, attempt_id, receipt, quarantined_at
+            ) VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(symbol) DO NOTHING
+            """,
+            (symbol, offending_worker_id, attempt_id, _canonical_json(evidence), _iso(self._now)),
+        ).rowcount
+        if inserted:
+            self._transition("product_quarantined", f"{symbol}: MT5 retcode 10021")
+        if commit and inserted:
+            self._db.commit()
+        return bool(inserted)
+
+    def _product_quarantine_records(self) -> list[dict[str, object]]:
+        rows = self._db.execute(
+            """
+            SELECT symbol, offending_worker_id, attempt_id, receipt, quarantined_at
+            FROM cell_product_quarantine
+            ORDER BY symbol
+            """
+        ).fetchall()
+        return [
+            {
+                "symbol": str(row[0]),
+                "offending_worker_id": str(row[1]),
+                "attempt_id": str(row[2]),
+                "receipt": json.loads(str(row[3])),
+                "quarantined_at": str(row[4]),
+            }
+            for row in rows
+        ]
+
+    def _accept_peer_product_quarantines(self, raw: object, peer_id: str) -> None:
+        if not isinstance(raw, list):
+            return
+        changed = False
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            symbol = item.get("symbol")
+            attempt_id = item.get("attempt_id")
+            offending_worker_id = item.get("offending_worker_id")
+            receipt = item.get("receipt")
+            if (
+                not isinstance(symbol, str)
+                or not isinstance(attempt_id, str)
+                or offending_worker_id != peer_id
+                or not isinstance(receipt, dict)
+                or receipt.get("retcode") != 10021
+            ):
+                continue
+            changed = self._quarantine_product(
+                symbol,
+                offending_worker_id=peer_id,
+                attempt_id=attempt_id,
+                receipt=receipt,
+                commit=False,
+            ) or changed
+        if changed:
+            self._db.commit()
+
+    def _release_product_quarantine(self, event: QuarantineReleaseEvent) -> None:
+        if self._attempt is not None and not self._attempt_terminal():
+            self._transition("product_quarantine_release_rejected", f"{event.symbol}: unresolved attempt")
+            self._db.commit()
+            return
+        self._db.execute(
+            """
+            INSERT INTO cell_product_release_marker (symbol, marker) VALUES (?, ?)
+            ON CONFLICT(symbol) DO UPDATE SET marker = excluded.marker
+            """,
+            (event.symbol, _iso(event.observed_at)),
+        )
+        self._db.execute(
+            """
+            INSERT OR IGNORE INTO cell_product_quarantine_release (
+                symbol, offending_worker_id, attempt_id, released_at
+            )
+            SELECT symbol, offending_worker_id, attempt_id, ?
+            FROM cell_product_quarantine
+            WHERE symbol = ?
+            """,
+            (_iso(self._now), event.symbol),
+        )
+        deleted = self._db.execute(
+            "DELETE FROM cell_product_quarantine WHERE symbol = ?",
+            (event.symbol,),
+        ).rowcount
+        if deleted:
+            self._transition(
+                "product_quarantine_released",
+                f"{event.symbol}: actor={event.actor}; reason={event.reason}",
+            )
+        self._db.commit()
+
+    def _release_marker(self, symbol: str) -> str | None:
+        row = self._db.execute(
+            "SELECT marker FROM cell_product_release_marker WHERE symbol = ?",
+            (symbol,),
+        ).fetchone()
+        return None if row is None else str(row[0])
 
     def _record_late_peer_leg_status(self, attempt_id: str, status: str, payload: Mapping[str, object]) -> None:
         self._db.execute(
@@ -2159,8 +2780,8 @@ class PairExecutionCell:
             )
             return
         outcome = self._run_broker_write(effect_id, payload, priority="emergency")
-        if outcome != "completed":
-            self._set_needs_human(f"close effect {effect_id} ended {outcome}", outcome)
+        if outcome.category != "completed":
+            self._set_needs_human(f"close effect {effect_id} ended {outcome.category}", outcome.category)
 
     # -- observable result --------------------------------------------------- #
 
@@ -2184,6 +2805,13 @@ class PairExecutionCell:
     def close(self) -> None:
         self._db.close()
 
+    def quarantined_products(self) -> tuple[str, ...]:
+        rows = self._db.execute("SELECT symbol FROM cell_product_quarantine ORDER BY symbol").fetchall()
+        return tuple(str(row[0]) for row in rows)
+
+    def quarantine_release_marker(self, symbol: str) -> str | None:
+        return self._release_marker(symbol)
+
 
 # --------------------------------------------------------------------------- #
 # Small module-level converters
@@ -2206,13 +2834,13 @@ def _contract_from_canonical(value: dict[str, object]) -> PairContract:
         leader_worker_id=cast(str, value["leader_worker_id"]),
         follower_worker_id=cast(str, value["follower_worker_id"]),
         trader_id=cast(str, value["trader_id"]),
-        symbol=cast(str, value["symbol"]),
-        leader_direction=cast(Direction, value["leader_direction"]),
-        follower_direction=cast(Direction, value["follower_direction"]),
+        symbol=cast(str | None, value.get("symbol")),
+        leader_direction=cast(Direction | None, value.get("leader_direction")),
+        follower_direction=cast(Direction | None, value.get("follower_direction")),
         leader_volume=cast(str, value["leader_volume"]),
         follower_volume=cast(str, value["follower_volume"]),
         filling_mode=cast(Literal["FOK", "IOC"], value["filling_mode"]),
-        edge_threshold=cast(str, value["edge_threshold"]),
+        edge_threshold=cast(str | None, value.get("edge_threshold")),
         risk_budget_usd=cast(str, value["risk_budget_usd"]),
         quote_max_age_seconds=cast(float, value["quote_max_age_seconds"]),
         quote_max_skew_seconds=cast(float, value["quote_max_skew_seconds"]),
@@ -2222,6 +2850,8 @@ def _contract_from_canonical(value: dict[str, object]) -> PairContract:
         mode=cast(ExecutionMode, value.get("mode", "live")),
         maximum_holding_seconds=cast(float | None, value.get("maximum_holding_seconds")),
         flatten_at_ny=cast(str | None, value.get("flatten_at_ny")),
+        entry_edge_points=cast(str | None, value.get("entry_edge_points")),
+        eligible_symbols=tuple(cast(list[str], value.get("eligible_symbols", []))),
     )
 
 

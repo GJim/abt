@@ -18,7 +18,11 @@ is the seam that:
   internal envelope shape to and from the full, controller-validated
   :class:`~abt.trader_protocol.PairCellRelayEnvelope` wire format;
 * reads local quote evidence and continuously-maintained readiness facts from
-  the same serialized MT5 handle reconciliation already uses; and
+  the same serialized MT5 handle reconciliation already uses -- enumerating,
+  preloading (``symbol_select``), and polling every symbol in the active
+  contract's eligible product universe (not only one fixed symbol), and
+  relaying a per-symbol :class:`~abt.pair_cell.ProtectionCalibration` map
+  with distinct profit/loss tick values where MT5 exposes them; and
 * owns one :class:`~abt.pair_cell.PairExecutionCell`'s activation, restart
   recovery, per-loop event pumping, and clean shutdown for
   ``abt.worker.reconciliation``/``abt.worker.cli``.
@@ -40,6 +44,7 @@ from uuid import uuid4
 from ..pair_cell import (
     BrokerSnapshotEvent,
     ClockTickEvent,
+    LocalQuoteBatchEvent,
     LocalQuoteEvent,
     PairContract,
     PairExecutionCell,
@@ -47,6 +52,7 @@ from ..pair_cell import (
     PairLease,
     PairResult,
     ProtectionCalibration,
+    QuarantineReleaseEvent,
     ReadinessFactsEvent,
     RelayEnvelopeReceived,
     _contract_from_canonical,
@@ -81,6 +87,10 @@ class PairCellWorkerSession(Protocol):
     def drain_pair_relay_envelopes(self) -> list[dict[str, object]]: ...
 
     def drain_pair_cell_activations(self) -> list[dict[str, object]]: ...
+
+    def drain_pair_cell_quarantine_releases(self) -> list[dict[str, object]]: ...
+
+    def send_pair_cell_quarantine_release_result(self, *, request_id: str, symbol: str, outcome: str) -> None: ...
 
     def request_pair_cell_activation(self) -> dict[str, object] | None: ...
 
@@ -292,6 +302,13 @@ def refresh_protection_calibration(mt5: object, symbol: str) -> ProtectionCalibr
     Never called at signal time (see ``PairCellRuntime``'s bounded refresh
     interval): a stale plan simply removes readiness rather than triggering a
     signal-time recalculation.
+
+    MT5 reports a single symmetric ``trade_tick_value`` for most products,
+    but for some (notably futures-style and certain CFD products) it also
+    exposes distinct ``trade_tick_value_profit``/``trade_tick_value_loss``
+    fields whose values differ. When present and positive those distinct
+    values are used; otherwise both sides fall back to ``trade_tick_value``
+    so behavior is unchanged for ordinary symmetric-value products.
     """
 
     try:
@@ -303,12 +320,19 @@ def refresh_protection_calibration(mt5: object, symbol: str) -> ProtectionCalibr
     stops_level = evidence.get("trade_stops_level")
     freeze_level = evidence.get("trade_freeze_level")
     tick_value = evidence.get("trade_tick_value")
+    profit_tick_value = evidence.get("trade_tick_value_profit")
+    if not _positive_number(profit_tick_value):
+        profit_tick_value = tick_value
+    loss_tick_value = evidence.get("trade_tick_value_loss")
+    if not _positive_number(loss_tick_value):
+        loss_tick_value = tick_value
     if (
         not _positive_number(tick_size)
         or not _positive_number(point)
         or not _nonnegative_number(stops_level)
         or not _nonnegative_number(freeze_level)
-        or not _positive_number(tick_value)
+        or not _positive_number(profit_tick_value)
+        or not _positive_number(loss_tick_value)
     ):
         return None
     minimum_stop_distance = max(float(stops_level), float(freeze_level)) * float(point)
@@ -316,9 +340,74 @@ def refresh_protection_calibration(mt5: object, symbol: str) -> ProtectionCalibr
         tick_size=str(Decimal(str(tick_size))),
         point=str(Decimal(str(point))),
         minimum_stop_distance=str(Decimal(str(minimum_stop_distance))),
-        profit_tick_value=str(Decimal(str(tick_value))),
-        loss_tick_value=str(Decimal(str(tick_value))),
+        profit_tick_value=str(Decimal(str(profit_tick_value))),
+        loss_tick_value=str(Decimal(str(loss_tick_value))),
     )
+
+
+def eligible_symbols_of(contract: PairContract) -> tuple[str, ...]:
+    """The full eligible product universe this contract authorizes.
+
+    An empty automatic-policy tuple intentionally means the broker's entire
+    executable catalog; :func:`preload_eligible_symbols` resolves it locally.
+    A legacy contract instead names exactly one fixed ``symbol``.
+    """
+
+    if contract.entry_edge_points is not None:
+        return contract.eligible_symbols
+    if contract.symbol is not None:
+        return (contract.symbol,)
+    return ()
+
+
+def preload_eligible_symbols(mt5: object, symbols: tuple[str, ...]) -> tuple[str, ...]:
+    """Best-effort enumerate and preload every eligible symbol this broker exposes.
+
+    Adds each symbol to MT5 Market Watch (``symbol_select``) so its quotes
+    and calibration are available off the critical path, then returns only
+    the subset genuinely visible in this terminal. A symbol this broker does
+    not carry (or cannot make visible) is skipped with a warning rather than
+    failing the whole pair -- the leader simply never selects it.
+    """
+
+    candidates = symbols
+    if not candidates:
+        try:
+            raw_symbols = mt5.symbols_get()
+        except Exception:
+            _LOGGER.warning("Could not enumerate the MT5 product catalog.", exc_info=True)
+            return ()
+        if raw_symbols is None:
+            _LOGGER.warning("MT5 returned no product catalog.")
+            return ()
+        discovered: list[str] = []
+        for raw_symbol in raw_symbols:
+            try:
+                evidence = _evidence(raw_symbol, "symbol")
+            except WorkerEnrollmentError:
+                continue
+            name = evidence.get("name")
+            trade_mode = evidence.get("trade_mode")
+            if isinstance(name, str) and name and trade_mode == 4:
+                discovered.append(name)
+        candidates = tuple(sorted(set(discovered)))
+
+    visible: list[str] = []
+    for symbol in candidates:
+        try:
+            mt5.symbol_select(symbol, True)
+        except Exception:
+            _LOGGER.warning("Could not select eligible symbol %s in MT5 Market Watch.", symbol)
+        try:
+            evidence = _evidence(mt5.symbol_info(symbol), "symbol")
+        except WorkerEnrollmentError:
+            _LOGGER.warning("Eligible symbol %s is not available in this MT5 terminal.", symbol)
+            continue
+        if evidence.get("visible") is False:
+            _LOGGER.warning("Eligible symbol %s could not be made visible in MT5 Market Watch.", symbol)
+            continue
+        visible.append(symbol)
+    return tuple(visible)
 
 
 def _positive_number(value: object) -> bool:
@@ -334,7 +423,7 @@ def read_readiness_facts(
     *,
     login: int,
     server: str,
-    calibration: ProtectionCalibration | None,
+    calibrations: Mapping[str, ProtectionCalibration],
     calibration_fresh: bool,
     now: datetime,
     minimum_margin_headroom_usd: Decimal = Decimal("0"),
@@ -344,6 +433,14 @@ def read_readiness_facts(
     Mirrors the same broker-evidence rules ``reconciliation``/``pair_cell``
     already enforce everywhere else: MT5 ``None``/malformed/unavailable
     records are read failures, never an empty or ready fact.
+
+    ``calibrations`` carries one refreshed :class:`ProtectionCalibration` per
+    currently visible eligible symbol (see ``PairCellRuntime``); the cell
+    relays this map to the peer Worker as ``symbol_calibrations`` and uses it
+    to evaluate every coherent eligible symbol, not only one fixed product.
+    ``protection_calibration`` (the legacy single-symbol field the cell's
+    readiness gate still reads for a fixed-symbol contract) is populated
+    whenever exactly one symbol is currently calibrated.
     """
 
     try:
@@ -362,6 +459,7 @@ def read_readiness_facts(
                 margin_ok = Decimal(str(margin_free)) >= minimum_margin_headroom_usd
     except WorkerEnrollmentError:
         margin_ok = False
+    single_calibration = next(iter(calibrations.values())) if len(calibrations) == 1 else None
     return ReadinessFactsEvent(
         account_login=str(login),
         account_server=server,
@@ -370,8 +468,9 @@ def read_readiness_facts(
         positions=positions,
         margin_headroom_ok=margin_ok,
         symbol_constraints_fresh=calibration_fresh,
-        protection_calibration=calibration,
+        protection_calibration=single_calibration,
         observed_at=now,
+        symbol_calibrations=dict(calibrations),
     )
 
 
@@ -436,7 +535,9 @@ class PairCellRuntime:
         self._now = now
         self._sequence = 0
         self._contract: PairContract | None = None
-        self._calibration: ProtectionCalibration | None = None
+        self._eligible_symbols: tuple[str, ...] = ()
+        self._visible_symbols: tuple[str, ...] = ()
+        self._calibrations: dict[str, ProtectionCalibration] = {}
         epoch = now()
         self._next_quote_at = epoch
         self._next_readiness_at = epoch
@@ -507,6 +608,16 @@ class PairCellRuntime:
         except (KeyError, ValueError, PairExecutionCellError):
             _LOGGER.warning("Received an invalid Pair Execution Cell activation push.", exc_info=True)
             return
+        # Enumerate and preload this contract's full eligible product universe
+        # immediately: readiness/quote polling must never wait on a later,
+        # signal-adjacent calibration cycle to discover which symbols exist.
+        self._eligible_symbols = eligible_symbols_of(contract)
+        self._visible_symbols = preload_eligible_symbols(self._raw_mt5, self._eligible_symbols)
+        self._calibrations = {
+            symbol: calibration
+            for symbol, calibration in self._calibrations.items()
+            if symbol in self._visible_symbols
+        }
         if persist:
             try:
                 self._activation_path.write_text(
@@ -516,24 +627,77 @@ class PairCellRuntime:
                 _LOGGER.warning("Could not persist the Pair Execution Cell activation sidecar file.", exc_info=True)
 
     def drain_relay(self) -> PairResult | None:
-        """Process every already-queued activation and relay envelope now.
+        """Process every already-queued activation, quarantine release, and
+        relay envelope now.
 
         Called every iteration of the Worker's receive loop (not gated by a
         polling interval): arm/commit turnaround is this feature's latency
-        -critical path.
+        -critical path. A pushed quarantine release is delivered to this
+        Worker's own cell regardless of whether a contract is currently
+        activated -- quarantine is durable, Worker-local product state, not
+        contract-scoped -- so an admin release always reaches
+        ``PairExecutionCell.handle_event`` even between activations. Every
+        release request is answered with this Worker's own actual
+        applied/rejected outcome (correlated by ``request_id``), so the
+        controller's admin route never has to guess and never reports
+        success unless every Worker genuinely applied it.
         """
 
         result: PairResult | None = None
         for activation in self._session.drain_pair_cell_activations():
             self._apply_activation(activation)
+        for release in self._session.drain_pair_cell_quarantine_releases():
+            try:
+                request_id = cast(str, release["request_id"])
+                symbol = cast(str, release["symbol"])
+            except KeyError:
+                _LOGGER.warning(
+                    "Received a malformed Pair Execution Cell quarantine-release request.", exc_info=True
+                )
+                continue
+            try:
+                observed_at = _parse_utc(cast(str, release["observed_at"]))
+                result = self._cell.handle_event(
+                    QuarantineReleaseEvent(
+                        symbol=symbol,
+                        actor=cast(str, release["actor"]),
+                        reason=cast(str, release["reason"]),
+                        observed_at=observed_at,
+                    )
+                )
+                outcome = (
+                    "applied"
+                    if self._cell.quarantine_release_marker(symbol) == observed_at.isoformat()
+                    else "rejected"
+                )
+            except (KeyError, ValueError, PairExecutionCellError):
+                _LOGGER.warning(
+                    "Received an invalid Pair Execution Cell quarantine-release request.", exc_info=True
+                )
+                outcome = "rejected"
+            self._session.send_pair_cell_quarantine_release_result(
+                request_id=request_id, symbol=symbol, outcome=outcome
+            )
         for envelope in self._session.drain_pair_relay_envelopes():
             inner = unwrap_pair_relay_envelope(envelope)
             if inner is not None and self._contract is not None:
                 result = self._cell.handle_event(RelayEnvelopeReceived(inner))
         return result
 
+    def quarantined_products(self) -> tuple[str, ...]:
+        """This Worker's own currently quarantined products, passed through
+        for observability (e.g. admin tooling or health surfaces)."""
+
+        return self._cell.quarantined_products()
+
     def pump(self, observed_at: datetime) -> PairResult | None:
-        """Drain relay traffic, then advance time-gated local evidence."""
+        """Drain relay traffic, then advance time-gated local evidence.
+
+        Every symbol in the contract's eligible product universe is
+        preloaded, calibrated, and quoted -- not only one fixed symbol -- so
+        the leader can evaluate every coherent eligible product without a
+        signal-time RPC.
+        """
 
         result = self.drain_relay()
         if self._contract is None:
@@ -541,16 +705,24 @@ class PairCellRuntime:
         result = self._cell.handle_event(ClockTickEvent(observed_at))
         if observed_at >= self._next_calibration_at:
             self._next_calibration_at = observed_at + self._polling.calibration_interval
-            self._calibration = refresh_protection_calibration(self._raw_mt5, self._contract.symbol)
+            self._visible_symbols = preload_eligible_symbols(self._raw_mt5, self._eligible_symbols)
+            for symbol in self._visible_symbols:
+                calibration = refresh_protection_calibration(self._raw_mt5, symbol)
+                if calibration is not None:
+                    self._calibrations[symbol] = calibration
+                else:
+                    self._calibrations.pop(symbol, None)
+            for stale_symbol in set(self._calibrations) - set(self._visible_symbols):
+                self._calibrations.pop(stale_symbol, None)
         if observed_at >= self._next_readiness_at:
             self._next_readiness_at = observed_at + self._polling.readiness_interval
-            calibration_fresh = self._calibration is not None
+            calibration_fresh = bool(self._calibrations)
             try:
                 facts = read_readiness_facts(
                     cast(ReadOnlyMT5, self._raw_mt5),
                     login=self._login,
                     server=self._server,
-                    calibration=self._calibration,
+                    calibrations=self._calibrations,
                     calibration_fresh=calibration_fresh,
                     now=observed_at,
                     minimum_margin_headroom_usd=self._polling.minimum_margin_headroom_usd,
@@ -560,18 +732,22 @@ class PairCellRuntime:
                 _LOGGER.warning("Pair Execution Cell readiness read failed.", exc_info=True)
         if observed_at >= self._next_quote_at:
             self._next_quote_at = observed_at + self._polling.quote_interval
-            try:
-                self._sequence += 1
-                quote = read_local_quote(
-                    self._raw_mt5,
-                    symbol=self._contract.symbol,
-                    recovery_epoch=self._recovery_epoch,
-                    sequence=self._sequence,
-                    now=self._now,
-                )
-                result = self._cell.handle_event(quote)
-            except WorkerEnrollmentError:
-                pass
+            quotes: list[LocalQuoteEvent] = []
+            for symbol in self._visible_symbols:
+                try:
+                    self._sequence += 1
+                    quote = read_local_quote(
+                        self._raw_mt5,
+                        symbol=symbol,
+                        recovery_epoch=self._recovery_epoch,
+                        sequence=self._sequence,
+                        now=self._now,
+                    )
+                    quotes.append(quote)
+                except WorkerEnrollmentError:
+                    continue
+            if quotes:
+                result = self._cell.handle_event(LocalQuoteBatchEvent(tuple(quotes)))
         if observed_at >= self._next_snapshot_at:
             self._next_snapshot_at = observed_at + self._polling.broker_snapshot_interval
             try:
