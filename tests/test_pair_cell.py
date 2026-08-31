@@ -895,6 +895,32 @@ class PairExecutionCellDecisionTests(unittest.TestCase):
 
 
 class PairExecutionCellQuoteTests(unittest.TestCase):
+    def test_recent_quotes_with_broker_server_timezone_offset_can_enter(self) -> None:
+        with _tmp_dir() as tmp_path:
+            harness = _Harness(tmp_path)
+            harness.activate_both()
+            harness.make_ready()
+            broker_time = harness.now + timedelta(hours=3)
+            harness.leader.handle_event(
+                LocalQuoteEvent(
+                    symbol=SYMBOL, bid=Decimal("1.10000"), ask=Decimal("1.10010"),
+                    broker_time=broker_time, local_receive_time=harness.now,
+                    recovery_epoch="epoch-a", sequence=1,
+                )
+            )
+            harness.follower.handle_event(
+                LocalQuoteEvent(
+                    symbol=SYMBOL, bid=Decimal("1.10050"), ask=Decimal("1.10060"),
+                    broker_time=broker_time, local_receive_time=harness.now,
+                    recovery_epoch="epoch-b", sequence=1,
+                )
+            )
+            harness.tick(0.01)
+
+            result = harness.leader.handle_event(ClockTickEvent(harness.now))
+
+            self.assertIsNotNone(result.attempt_id)
+
     def test_stale_local_quote_blocks_entry(self) -> None:
         with _tmp_dir() as tmp_path:
             harness = _Harness(tmp_path)

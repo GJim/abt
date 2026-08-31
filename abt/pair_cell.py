@@ -200,9 +200,7 @@ class QuoteSnapshot:
     sequence: int
 
     def fresh(self, now: datetime, max_age_seconds: float) -> bool:
-        if self.broker_time > now + timedelta(seconds=1):
-            return False  # a broker time ahead of calibrated now is not trustworthy evidence
-        return (now - self.broker_time).total_seconds() <= max_age_seconds
+        return 0 <= (now - self.local_receive_time).total_seconds() <= max_age_seconds
 
     def canonical(self) -> dict[str, object]:
         return {
