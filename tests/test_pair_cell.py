@@ -642,6 +642,22 @@ class PairExecutionCellExitPolicyTests(unittest.TestCase):
 
 
 class PairExecutionCellDecisionTests(unittest.TestCase):
+    def test_restarted_leader_recovers_unchanged_peer_readiness_via_calibration_resync(self) -> None:
+        with _tmp_dir() as tmp_path:
+            harness = _Harness(tmp_path, contract=_automatic_contract(entry_edge_points="1000"))
+            harness.activate_both()
+            harness.make_ready()
+            harness.restart_leader()
+
+            harness.leader.handle_event(
+                _readiness(
+                    harness.now,
+                    symbol_calibrations={SYMBOL: _CALIBRATION, "USDJPY": _JPY_CALIBRATION},
+                )
+            )
+
+            self.assertTrue(harness.leader._peer_ready)  # noqa: SLF001
+
     def test_automatic_contract_rejects_any_stray_legacy_product_field(self) -> None:
         with _tmp_dir() as tmp_path:
             harness = _Harness(tmp_path, contract=_automatic_contract())

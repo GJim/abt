@@ -1472,6 +1472,8 @@ class PairExecutionCell:
             self._accept_peer_calibration_batch(payload)
         elif kind == "calibration_request":
             self._publish_calibration_batches()
+            self._last_published_ready = None
+            self._last_published_reason = None
         elif kind == "quarantine_batch":
             if self._contract is not None:
                 self._accept_peer_product_quarantines(
