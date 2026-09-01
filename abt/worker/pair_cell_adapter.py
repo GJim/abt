@@ -2947,7 +2947,7 @@ class PairCellRuntime:
                         kind,
                         inner.get("from_worker_id"),
                     )
-                result = self._cell.handle_event(RelayEnvelopeReceived(inner, received_at=self._now()))
+                result = self._cell.handle_event(RelayEnvelopeReceived(inner))
         if self._cell is not None:
             result = self._maybe_publish_policy() or result
             self._sync_route_control()

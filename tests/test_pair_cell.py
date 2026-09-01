@@ -2611,7 +2611,6 @@ class ImmediateEntryTests(PairCellTestCase):
             self.net.pump()
 
         output = "\n".join(logs.output)
-        self.assertIn("[DEBUG-quote-latency] follower quote batch delivered:", output)
         self.assertIn("Pair Execution Cell entry signal selected: attempt_id=", output)
         self.assertIn("phase=mt5_send_started elapsed_ms=", output)
         self.assertIn("phase=position_observed elapsed_ms=", output)
