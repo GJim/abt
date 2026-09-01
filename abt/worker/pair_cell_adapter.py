@@ -3033,7 +3033,7 @@ class PairCellRuntime:
         _LOGGER.debug(
             "Pair Execution Cell state: route_id=%s route_state=%s universe_generation=%s "
             "state=%s desired=%s attempt_id=%s ready=%s reason=%s policy_accepted=%s "
-            "plan_set_version=%s pair_confirmed=%s needs_human=%s admission=%s.",
+            "plan_set_version=%s pair_confirmed=%s needs_human=%s needs_human_reason=%s admission=%s.",
             status.route_id,
             status.route_state,
             status.universe_generation,
@@ -3046,6 +3046,7 @@ class PairCellRuntime:
             status.plan_set_version or "-",
             status.pair_confirmed,
             status.needs_human,
+            status.needs_human_reason or "-",
             diagnostic,
         )
 

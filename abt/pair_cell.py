@@ -4595,6 +4595,10 @@ class PairExecutionCell:
     def _progress(self) -> None:
         if self._needs_human is not None:
             self._state = "NEEDS_HUMAN"
+            # A stopped cell may not trade or advance an attempt, but peers
+            # still need its current fail-closed readiness to avoid waiting
+            # indefinitely for a state snapshot after reconnect or restart.
+            self._maybe_publish_state()
             return
         if self._role == "follower":
             self._maybe_install_pending_universe()

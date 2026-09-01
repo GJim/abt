@@ -4239,7 +4239,7 @@ class ForeignRouteAttemptTests(PairCellTestCase):
         self.assertIn("route-0001", cast(str, result.needs_human_reason))
         self.assertFalse(result.ready)
 
-    def test_a_foreign_route_attempt_never_relays_containment_on_the_new_route(self) -> None:
+    def test_a_foreign_route_attempt_publishes_fail_closed_readiness_on_the_new_route(self) -> None:
         self.prime()
         self.net.drop_kinds.add("leg_status")
         self.feed_quotes()
@@ -4257,11 +4257,20 @@ class ForeignRouteAttemptTests(PairCellTestCase):
             len(self.leader.close_requests()), closes_before, "foreign exposure is not guessed at"
         )
         self.assertEqual(len(self.leader.mt5.positions), 1)
+        relayed = [
+            envelope
+            for envelope in self.net.sent[marker:]
+            if envelope["from_worker_id"] == LEADER
+        ]
         self.assertEqual(
-            self.net.kinds_since(marker, LEADER),
+            [message["kind"] for message in relayed if message["kind"] in {"attempt", "leg_status"}],
             [],
-            "no leg status or containment is relayed onto the new route",
+            "no old-route attempt or containment is relayed onto the new route",
         )
+        readiness = [message for message in relayed if message["kind"] == "readiness"]
+        self.assertEqual(len(readiness), 1)
+        self.assertFalse(readiness[0]["payload"]["ready"])
+        self.assertEqual(readiness[0]["payload"]["reason"], "operator intervention is required")
 
     def test_the_new_route_never_inherits_the_old_desired_or_active_state(self) -> None:
         self.run_entry()
