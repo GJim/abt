@@ -2603,6 +2603,19 @@ class ImmediateEntryTests(PairCellTestCase):
         )
         self.assertEqual(self.leader.close_requests(), [])
 
+    def test_verbose_entry_trace_correlates_signal_and_position_timing(self) -> None:
+        self.prime()
+
+        with self.assertLogs("abt.pair_cell", level="DEBUG") as logs:
+            self.feed_quotes()
+            self.net.pump()
+
+        output = "\n".join(logs.output)
+        self.assertIn("Pair Execution Cell entry signal selected: attempt_id=", output)
+        self.assertIn("phase=mt5_send_started elapsed_ms=", output)
+        self.assertIn("phase=position_observed elapsed_ms=", output)
+        self.assertIn("Pair Execution Cell entry position observed: attempt_id=", output)
+
     def test_one_tick_rough_protection_mismatch_still_contains(self) -> None:
         self.prime()
         self.leader.mt5.observed_tp_override = 1.10084

@@ -800,6 +800,14 @@ rough emergency protection, decision time, and confirmation-timeout duration.
 Decision time is evidence for audit and recovery, not a cross-machine
 admission deadline. Its relay envelope carries `route_id`.
 
+With verbose Worker logging enabled, each created attempt emits a correlated
+entry trace: selected product/direction/volume and quote age/skew; monotonic
+elapsed time for durable attempt creation, relay dispatch, broker send and
+response, position observation, pair confirmation, precise protection, and
+activation; and the broker position's reported entry-time fields with the
+local observation timestamp. The trace is diagnostic only: it neither
+changes broker effects nor uses wall-clock comparison across Workers.
+
 The follower rejects an attempt without broker send when:
 
 - it did not come from the authenticated leader on its durable route;

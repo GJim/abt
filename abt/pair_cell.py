@@ -2196,6 +2196,7 @@ class PairExecutionCell:
         self._peer_leg = PeerLegView()
         self._pair_confirmed = False
         self._timer_deadline: float | None = None
+        self._attempt_timing_origin: float | None = None
         self._peer_proof_wait_started: float | None = None
         self._peer_proof_last_probe: float | None = None
         self._peer_proof_probes_sent = 0
@@ -2561,6 +2562,17 @@ class PairExecutionCell:
     def _record_timing(self, key: str) -> None:
         self._last_timing[key] = _iso(self._now)
         self._transition(f"timing:{key}")
+        if key == "attempt_persisted":
+            self._attempt_timing_origin = self._monotonic()
+        origin = self._attempt_timing_origin
+        elapsed = "-" if origin is None else f"{(self._monotonic() - origin) * 1000:.1f}"
+        _LOGGER.debug(
+            "Pair Execution Cell attempt timing: attempt_id=%s phase=%s elapsed_ms=%s observed_at=%s.",
+            None if self._attempt is None else self._attempt.attempt_id,
+            key,
+            elapsed,
+            _iso(self._now),
+        )
 
     def transition_history(self) -> list[dict[str, object]]:
         rows = self._db.execute(
@@ -4922,6 +4934,21 @@ class PairExecutionCell:
             decision_time=self._now,
             confirmation_timeout_seconds=policy.follower_confirmation_timeout_seconds,
         )
+        _LOGGER.debug(
+            "Pair Execution Cell entry signal selected: attempt_id=%s product_id=%s symbol=%s "
+            "direction=%s lots=%s edge_points=%s local_quote_age_ms=%.1f peer_quote_age_ms=%.1f "
+            "quote_skew_ms=%.1f decision_at=%s.",
+            attempt.attempt_id,
+            product_id,
+            attempt.symbol,
+            leader_direction,
+            lots,
+            candidates[0][1],
+            leader_quote.age_seconds(self._now) * 1000,
+            follower_quote.age_seconds(self._now) * 1000,
+            calibrated_skew_seconds(leader_quote, follower_quote) * 1000,
+            _iso(self._now),
+        )
         # 1. durably persist the immutable attempt and the prepared local effect
         self._attempt = attempt
         self._persist_attempt(attempt)
@@ -5462,6 +5489,20 @@ class PairExecutionCell:
             self._state = "AWAITING_PAIR_CONFIRMATION"
             self._transition("entry_filled_observed", leg.ticket)
             self._record_timing("position_observed")
+            _LOGGER.debug(
+                "Pair Execution Cell entry position observed: attempt_id=%s ticket=%s symbol=%s "
+                "side=%s volume=%s fill_price=%s broker_entry_time=%s broker_entry_time_msc=%s "
+                "observation_at=%s.",
+                attempt.attempt_id,
+                leg.ticket,
+                symbol,
+                direction,
+                leg.observed_volume,
+                leg.fill_price,
+                position.get("time", "-"),
+                position.get("time_msc", "-"),
+                _iso(event.observed_at),
+            )
             inconsistent = self._own_evidence_inconsistency()
             if inconsistent is not None:
                 self._transition("inconsistent_exact_evidence", inconsistent)
