@@ -153,6 +153,10 @@ _Avoid_: 配對執行器（與主控台角色混淆）、配對租約、交易�
 同一配對嘗試中，一台 Worker 對另一台 Worker 所持鏡像 leg 已 terminal 的 authenticated、durable 狀態證據；它不是 relay acknowledgement、broker receipt 或沉默。只有本機 broker-verified `EMPTY` 與同一 attempt 的 peer terminal proof 都存在時，因缺少該 proof 而產生的停機保護才可自動解除。
 _Avoid_: relay 成功確認、推定 peer 空倉
 
+**Executable Protection Equality**:
+將嘗試綁定 sizing plan 的 tick grid 視為 SL/TP broker evidence 的價格身分。MT5 binary-float 對同一已請求 tick 的微小序列化誤差等價；不同 executable tick、off-grid 預期價格或缺少該 attempt plan 則是不一致 evidence，必須 fail-closed。
+_Avoid_: 浮點文字完全相等、以寬鬆價格容差接受不同 tick
+
 **工作者主導配對（Worker-Initiated Pairing）**:
 兩台帳戶工作者自行建立配對路由的程序；沒有管理員建立的配對路由。工作者於首次未配對連線時宣告期望角色，未宣告即為可用 follower；leader 向主控台查詢當前已連線、可用且未配對的 follower 並選定其一（互動選擇，或以明確 follower worker ID 非互動選定），再經已驗證主控台提出配對提議。非 TTY 且未指定 follower worker ID 的 leader 不得阻塞等待輸入，維持已驗證且未配對並輸出可行動診斷；互動模式取得空清單時亦同。被選中的 follower 只在自身 broker 驗證空倉、沒有任何未結嘗試或效果、具備配對所需就緒條件、可讀取 USD 帳戶且餘額為正、且仍未配對時自動接受，否則明確拒絕。配對以兩階段控制流程完成，不是單一 compare-and-swap。
 _Avoid_: 管理員核准配對、配對合約核發、人工接受步驟、保留與建路由合併為單一 CAS

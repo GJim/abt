@@ -239,6 +239,7 @@ class FakeMT5:
         self.margin_per_lot: dict[str, str] = {}
         self.default_margin = "1000"
         self.symbol_facts: dict[str, dict[str, object]] = {}
+        self.observed_tp_override: float | None = None
         self.symbol_unavailable: set[str] = set()
         self.margin_unavailable: set[str] = set()
         self.reject = False
@@ -303,7 +304,11 @@ class FakeMT5:
                     "volume": float(self.partial_volume or request["volume"]),
                     "price_open": self.fill_price,
                     "sl": float(request["sl"]),
-                    "tp": float(request["tp"]),
+                    "tp": (
+                        self.observed_tp_override
+                        if self.observed_tp_override is not None
+                        else float(request["tp"])
+                    ),
                 }
             )
             if self.raise_after_fill:
@@ -2582,6 +2587,36 @@ class ImmediateEntryTests(PairCellTestCase):
         # The follower filled at 1.10040 with an 80 USD allowance (40 ticks).
         self.assertEqual(Decimal(str(follower_modify["sl"])), Decimal("1.10080"))
         self.assertEqual(Decimal(str(follower_modify["tp"])), Decimal("1.10000"))
+
+    def test_float_representation_of_rough_protection_is_not_inconsistent_evidence(self) -> None:
+        self.prime()
+        self.leader.mt5.observed_tp_override = 1.1008499999999999
+
+        self.feed_quotes()
+        self.net.pump()
+
+        result = self.leader.cell.handle_event(ClockTickEvent(self.now))
+        self.assertEqual(result.state, "ACTIVE")
+        self.assertNotIn(
+            "inconsistent_exact_evidence",
+            [row["event"] for row in self.leader.cell.transition_history()],
+        )
+        self.assertEqual(self.leader.close_requests(), [])
+
+    def test_one_tick_rough_protection_mismatch_still_contains(self) -> None:
+        self.prime()
+        self.leader.mt5.observed_tp_override = 1.10084
+
+        self.feed_quotes()
+        self.net.pump()
+
+        self.assertIn(
+            "inconsistent_exact_evidence",
+            [row["event"] for row in self.leader.cell.transition_history()],
+        )
+        self.assertEqual(
+            self.leader.cell.handle_event(ClockTickEvent(self.now)).state, "EMPTY"
+        )
 
     def test_precise_protection_is_applied_only_after_pair_confirmation(self) -> None:
         self.prime()

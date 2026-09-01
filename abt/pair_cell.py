@@ -61,7 +61,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, date, datetime, time, timedelta
-from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR
+from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_EVEN
 from hashlib import sha256
 import json
 import logging
@@ -1449,6 +1449,36 @@ class LocalProductFacts:
 
 def _round_to_tick(price: Decimal, tick: Decimal, rounding: str) -> Decimal:
     return (price / tick).to_integral_value(rounding=rounding) * tick
+
+
+def _same_protection_price(
+    expected: object, observed: object, tick_size: object
+) -> bool:
+    """Whether broker evidence preserves one requested executable protection price."""
+
+    expected_price = _to_decimal(expected)
+    observed_price = _to_decimal(observed)
+    tick = _to_decimal(tick_size)
+    if (
+        expected_price is None
+        or observed_price is None
+        or tick is None
+        or tick <= 0
+        or expected_price != _round_to_tick(expected_price, tick, ROUND_HALF_EVEN)
+    ):
+        return False
+    if observed_price == expected_price:
+        return True
+    # MT5 returns binary floats. Accept only their tiny decimal rendering error,
+    # never a broker-side movement to another executable price.
+    serialization_error = min(
+        tick / Decimal("1000000"),
+        max(Decimal("1e-12"), max(abs(expected_price), abs(observed_price)) * Decimal("1e-12")),
+    )
+    return (
+        abs(observed_price - expected_price) <= serialization_error
+        and _round_to_tick(observed_price, tick, ROUND_HALF_EVEN) == expected_price
+    )
 
 
 def edge_value(
@@ -5489,7 +5519,12 @@ class PairExecutionCell:
             elif owned is not None and precise_already:
                 observed_sl, observed_tp = _to_decimal(owned.get("sl")), _to_decimal(owned.get("tp"))
                 expected_sl, expected_tp = _to_decimal(leg.precise_sl), _to_decimal(leg.precise_tp)
-                if observed_sl != expected_sl or observed_tp != expected_tp:
+                plan = self._attempt_plan_for_role(attempt, leg.role)
+                if (
+                    plan is None
+                    or not _same_protection_price(expected_sl, observed_sl, plan.tick_size)
+                    or not _same_protection_price(expected_tp, observed_tp, plan.tick_size)
+                ):
                     self._transition("integrity_divergence", "protection mismatch")
                     self._begin_close("integrity_divergence")
                 else:
@@ -5498,6 +5533,19 @@ class PairExecutionCell:
                     self._persist_leg()
         if self._desired == "EMPTY":
             self._advance_convergence(event)
+
+    def _attempt_plan_for_role(self, attempt: Attempt, role: Role) -> SizingPlan | None:
+        """The attempt-bound local or peer plan used to validate executable prices."""
+
+        plans = self._plan_index if role == self._role else self._peer_plan_index
+        plan = plans.get(attempt.plan_version_of(role))
+        if (
+            plan is None
+            or plan.product_id != attempt.product_id
+            or plan.direction != attempt.direction_of(role)
+        ):
+            return None
+        return plan
 
     def _own_evidence_inconsistency(self) -> str | None:
         """Exact evidence is ticket, symbol, side, volume, fill price, and SL/TP."""
@@ -5513,10 +5561,13 @@ class PairExecutionCell:
         if observed_volume is None or observed_volume != _to_decimal(attempt.lots):
             return "the observed volume does not match the immutable attempt volume"
         rough_sl, rough_tp = attempt.rough_of(leg.role)
+        plan = self._attempt_plan_for_role(attempt, leg.role)
+        if plan is None:
+            return "no sizing plan exists for the immutable attempt version"
         if leg.protection_status == "rough":
-            if _to_decimal(leg.observed_sl) != _to_decimal(rough_sl):
+            if not _same_protection_price(rough_sl, leg.observed_sl, plan.tick_size):
                 return "the observed stop loss does not match the attached rough protection"
-            if _to_decimal(leg.observed_tp) != _to_decimal(rough_tp):
+            if not _same_protection_price(rough_tp, leg.observed_tp, plan.tick_size):
                 return "the observed take profit does not match the attached rough protection"
         return None
 
@@ -5541,7 +5592,13 @@ class PairExecutionCell:
         if _to_decimal(peer.volume) != _to_decimal(attempt.lots):
             return False, "the peer position volume does not match the immutable attempt volume"
         rough_sl, rough_tp = attempt.rough_of(peer_role)
-        if _to_decimal(peer.sl) != _to_decimal(rough_sl) or _to_decimal(peer.tp) != _to_decimal(rough_tp):
+        plan = self._attempt_plan_for_role(attempt, peer_role)
+        if plan is None:
+            return False, "no sizing plan exists for the peer immutable attempt version"
+        if (
+            not _same_protection_price(rough_sl, peer.sl, plan.tick_size)
+            or not _same_protection_price(rough_tp, peer.tp, plan.tick_size)
+        ):
             return False, "the peer position is missing its attached rough protection"
         return True, None
 

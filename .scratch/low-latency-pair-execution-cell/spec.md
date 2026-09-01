@@ -847,7 +847,11 @@ position proof.
 Before its local five-second timer expires, the leader must obtain exact
 broker-position evidence for both its own leg and the follower leg. Exact
 evidence includes attempt ID, ticket, symbol, side, volume, fill price, and
-attached rough SL/TP. An order receipt alone is insufficient for either leg.
+attached rough SL/TP. Protection equality is equality at the immutable
+attempt plan's executable tick: MT5 binary-float serialization of that same
+requested tick is equivalent, but a different tick, an off-grid expected
+price, or unavailable attempt-bound plan is inconsistent. An order receipt
+alone is insufficient for either leg.
 
 If both exact positions are confirmed in time, the leader emits
 `pair_entry_confirmed`. Only then does each Worker compute precise SL/TP from:
