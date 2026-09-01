@@ -77,6 +77,11 @@ class PairCellPump(Protocol):
     @property
     def should_exit(self) -> bool: ...
 
+    @property
+    def shutdown_complete(self) -> bool: ...
+
+    def request_close(self, reason: str) -> object: ...
+
     def close(self) -> None: ...
 
 
@@ -506,31 +511,48 @@ def _run_reconciliation_with_relay(
 ) -> None:
     next_maintenance = now()
     next_reconciliation = next_maintenance
+    shutdown_requested = False
     while True:
-        observed_at = now()
-        if maintenance is not None and observed_at >= next_maintenance:
-            maintenance()
-            next_maintenance = observed_at + timedelta(days=1)
-        if observed_at >= next_reconciliation:
-            reconciliation.poll(observed_at)
-            next_reconciliation = observed_at + timedelta(minutes=1)
-        _serve_pending_trader_rpc(mt5, session, live_state, effect_journal)
-        if live_state is not None:
-            live_state.poll(observed_at)
-        for _ in range(2):
-            session.receive_worker_relay(timeout=0.25 if live_state is not None else 30.0)
-            if pair_cell is not None:
-                # Arm/commit relay turnaround is this feature's latency
-                # -critical path, so it is drained every inner iteration
-                # rather than gated behind the outer polling cadence below.
-                pair_cell.drain_relay()
-            _serve_pending_trader_rpc(mt5, session, live_state, effect_journal)
-            if safety is not None:
-                safety.heartbeat(now())
-        if pair_cell is not None:
-            pair_cell.pump(observed_at)
-            if bool(getattr(pair_cell, "should_exit", False)):
+        try:
+            if shutdown_requested and pair_cell is not None and pair_cell.shutdown_complete:
+                _LOGGER.info("Pair Execution Cell graceful shutdown completed.")
                 return
+            observed_at = now()
+            if maintenance is not None and observed_at >= next_maintenance:
+                maintenance()
+                next_maintenance = observed_at + timedelta(days=1)
+            if observed_at >= next_reconciliation:
+                reconciliation.poll(observed_at)
+                next_reconciliation = observed_at + timedelta(minutes=1)
+            _serve_pending_trader_rpc(mt5, session, live_state, effect_journal)
+            if live_state is not None:
+                live_state.poll(observed_at)
+            for _ in range(2):
+                session.receive_worker_relay(timeout=0.25 if live_state is not None else 30.0)
+                if pair_cell is not None:
+                    # Arm/commit relay turnaround is this feature's latency
+                    # -critical path, so it is drained every inner iteration
+                    # rather than gated behind the outer polling cadence below.
+                    pair_cell.drain_relay()
+                _serve_pending_trader_rpc(mt5, session, live_state, effect_journal)
+                if safety is not None:
+                    safety.heartbeat(now())
+            if pair_cell is not None:
+                pair_cell.pump(observed_at)
+                if bool(getattr(pair_cell, "should_exit", False)):
+                    return
+                if shutdown_requested and pair_cell.shutdown_complete:
+                    _LOGGER.info("Pair Execution Cell graceful shutdown completed.")
+                    return
+        except KeyboardInterrupt:
+            if shutdown_requested or pair_cell is None:
+                raise
+            shutdown_requested = True
+            pair_cell.request_close("operator interrupt")
+            _LOGGER.info(
+                "Pair Execution Cell graceful shutdown requested; waiting for both legs to become terminal. "
+                "Press Ctrl+C again to force exit."
+            )
 
 
 def _serve_pending_trader_rpc(

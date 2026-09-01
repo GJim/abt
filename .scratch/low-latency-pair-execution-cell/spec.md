@@ -923,6 +923,15 @@ Timed exit, New York cutoff, risk breach, shutdown, integrity divergence,
 entry failure, and protection failure all use the same desired-`EMPTY`
 convergence path.
 
+An interactive Worker interrupt requests this same shutdown convergence rather
+than immediately terminating the process. The Worker keeps its authenticated
+relay, broker observation, and Pair Execution Cell pump active until its
+locally owned leg and the peer's terminal proof make the attempt terminal;
+only then does it close the session and MT5 connection. A second interrupt may
+force immediate process exit. This shutdown path acts only on the attempt's
+durably owned orders and positions, never account exposure it cannot
+attribute.
+
 ## User Stories
 
 1. As a strategy operator, I want only the leader to detect edges and originate attempts, so that two Workers cannot create competing trades.

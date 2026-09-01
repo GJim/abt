@@ -1089,6 +1089,65 @@ class WorkerReconciliationTests(unittest.TestCase):
 
         self.assertTrue(cell.closed)
 
+    def test_first_ctrl_c_closes_pair_cell_before_reconciliation_exits(self) -> None:
+        mt5 = ReadOnlyMT5()
+        mt5.initialize = lambda: True  # type: ignore[attr-defined]
+        mt5.login = lambda login, *, password, server: True  # type: ignore[attr-defined]
+        mt5.shutdown = lambda: None  # type: ignore[attr-defined]
+
+        class Session(MemoryOnlySession):
+            def __init__(self) -> None:
+                super().__init__([])
+                self.calls = 0
+
+            def receive_worker_relay(self, timeout: float | None = None) -> bool:
+                self.calls += 1
+                if self.calls == 1:
+                    raise KeyboardInterrupt
+                return False
+
+        class ClosingPairCell:
+            def __init__(self) -> None:
+                self.close_reasons: list[str] = []
+                self.pump_calls = 0
+                self.closed = False
+
+            def drain_relay(self) -> object:
+                return None
+
+            def request_close(self, reason: str) -> object:
+                self.close_reasons.append(reason)
+                return None
+
+            def pump(self, observed_at: object) -> object:
+                self.pump_calls += 1
+                return None
+
+            @property
+            def shutdown_complete(self) -> bool:
+                return self.pump_calls > 0
+
+            @property
+            def should_exit(self) -> bool:
+                return False
+
+            def close(self) -> None:
+                self.closed = True
+
+        cell = ClosingPairCell()
+        reconcile_authenticated_worker(
+            mt5=mt5,
+            session=Session(),
+            login=123456,
+            server="Broker-Demo",
+            now=lambda: datetime(2026, 8, 16, tzinfo=UTC),
+            pair_cell_factory=lambda *_: cell,
+        )
+
+        self.assertEqual(["operator interrupt"], cell.close_reasons)
+        self.assertGreater(cell.pump_calls, 0)
+        self.assertTrue(cell.closed)
+
     def _serve_market_data_analysis(self, stage: str, timeframe: str) -> dict[str, object]:
         mt5 = AnalysisMT5()
         session = AnalysisSession(

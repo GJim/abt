@@ -1615,6 +1615,16 @@ class PairCellRuntime:
         return self._exit_after_safe_unpair
 
     @property
+    def shutdown_complete(self) -> bool:
+        """Whether no locally owned attempt remains after a requested shutdown."""
+
+        cell = self._cell
+        if cell is None:
+            return True
+        status = cell.status()
+        return status.attempt_id is None and status.desired_state == "NONE"
+
+    @property
     def pairing_diagnostic(self) -> str:
         """The actionable reason this Worker is authenticated but not trading."""
 
