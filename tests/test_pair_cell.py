@@ -3545,6 +3545,11 @@ class PeerTerminalProofTests(PairCellTestCase):
                     self.now.isoformat(),
                 ),
             )
+            connection.execute("DELETE FROM cell_attempts WHERE attempt_id = ?", (attempt_id,))
+            connection.execute(
+                "INSERT INTO cell_transitions (attempt_id, event, detail, at) VALUES (?, ?, ?, ?)",
+                (attempt_id, "both_empty_verified", "", self.now.isoformat()),
+            )
 
         recovered = self.leader.restart().recover()
 

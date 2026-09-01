@@ -2845,6 +2845,11 @@ class PairExecutionCell:
             (attempt_id, self._route.route_id),
         ).fetchone()
         if row is None:
+            row = self._db.execute(
+                "SELECT 1 FROM cell_transitions WHERE attempt_id = ? AND event = 'both_empty_verified'",
+                (attempt_id,),
+            ).fetchone()
+        if row is None:
             return
         self._needs_human = None
         self._state = "EMPTY"
