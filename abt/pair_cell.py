@@ -2829,6 +2829,29 @@ class PairExecutionCell:
         if row is not None:
             self._clear_resolved_peer_terminal_proof_stop(attempt_id)
 
+    def _recover_terminalized_containment_stop(self) -> None:
+        """Clear a rejected containment action only after both-leg terminal proof."""
+
+        reason = self._needs_human
+        prefix, suffix = "containment effect ", " ended rejected"
+        if not isinstance(reason, str) or not reason.startswith(prefix) or not reason.endswith(suffix):
+            return
+        effect_id = reason.removeprefix(prefix).removesuffix(suffix)
+        attempt_id = effect_id.partition(":")[0]
+        if not attempt_id:
+            return
+        row = self._db.execute(
+            "SELECT 1 FROM cell_attempts WHERE attempt_id = ? AND route_id = ?"
+            " AND terminal = 1 AND terminal_reason = 'both_empty_verified'",
+            (attempt_id, self._route.route_id),
+        ).fetchone()
+        if row is None:
+            return
+        self._needs_human = None
+        self._state = "EMPTY"
+        self._db.execute("DELETE FROM cell_operator_stop WHERE id = 1")
+        self._transition("terminal_containment_recovered", attempt_id)
+
     # -- pairing acceptance ------------------------------------------------ #
 
     def freeze_pairing_acceptance(
@@ -2959,6 +2982,7 @@ class PairExecutionCell:
         self._transition("recovered", self._state)
         self._recovering = False
         self._recover_terminal_proof_stop()
+        self._recover_terminalized_containment_stop()
         # A running peer may have published an unchanged readiness snapshot
         # while this Worker was offline. Explicitly request its state instead
         # of relying on a later epoch change or market event to trigger it.

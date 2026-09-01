@@ -931,6 +931,10 @@ peer terminal proof; it then terminalizes the attempt as `EMPTY`. No other
 `NEEDS_HUMAN` reason is automatically cleared, and neither silence nor a
 successful relay acknowledgement is terminal proof.
 
+A rejected containment-effect stop is cleared only when the same route and
+attempt have durable `both_empty_verified` proof. The proof is stronger than
+the rejected broker action; no other operator stop is cleared automatically.
+
 Timed exit, New York cutoff, risk breach, shutdown, integrity divergence,
 entry failure, and protection failure all use the same desired-`EMPTY`
 convergence path.

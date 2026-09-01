@@ -3520,6 +3520,42 @@ class PeerTerminalProofTests(PairCellTestCase):
             [row["event"] for row in self.leader.cell.transition_history()],
         )
 
+    def test_terminal_evidence_resolves_a_rejected_containment_cancel_stop(self) -> None:
+        self._enter_and_strand_leader()
+        result = self.leader.cell.handle_event(ClockTickEvent(self.now))
+        for _ in range(9):
+            self.clock.advance(5.1)
+            result = self.leader.cell.handle_event(ClockTickEvent(self.now))
+            self.net.queue.clear()
+            if result.needs_human:
+                break
+        self.assertTrue(result.needs_human)
+        attempt_id = result.attempt_id
+        self.assertIsNotNone(attempt_id)
+
+        with sqlite3.connect(self.tmp / f"{LEADER}-cell.db") as connection:
+            connection.execute(
+                "UPDATE cell_attempts SET terminal = 1, terminal_reason = 'both_empty_verified'"
+                " WHERE attempt_id = ?",
+                (attempt_id,),
+            )
+            connection.execute(
+                "INSERT OR REPLACE INTO cell_operator_stop (id, reason, updated_at) VALUES (1, ?, ?)",
+                (
+                    f"containment effect {attempt_id}:{LEADER}:cancel:123 ended rejected",
+                    self.now.isoformat(),
+                ),
+            )
+
+        recovered = self.leader.restart().recover()
+
+        self.assertFalse(recovered.needs_human)
+        self.assertEqual(recovered.state, "EMPTY")
+        self.assertIn(
+            "terminal_containment_recovered",
+            [row["event"] for row in self.leader.cell.transition_history()],
+        )
+
     def test_the_bounded_probe_retransmits_this_workers_terminal_status(self) -> None:
         self._enter_and_strand_leader()
         self.net.drop_kinds.discard("leg_status")
