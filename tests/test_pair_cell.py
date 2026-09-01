@@ -3421,6 +3421,27 @@ class PeerTerminalProofTests(PairCellTestCase):
         self.assertIn("peer terminal proof", str(result.needs_human_reason))
         self.assertNotEqual(result.state, "EMPTY", "EMPTY is never inferred from silence")
 
+    def test_a_peer_terminal_proof_resolves_the_bounded_recovery_stop(self) -> None:
+        self._enter_and_strand_leader()
+        result = self.leader.cell.handle_event(ClockTickEvent(self.now))
+        for _ in range(9):
+            self.clock.advance(5.1)
+            result = self.leader.cell.handle_event(ClockTickEvent(self.now))
+            self.net.queue.clear()
+            if result.needs_human:
+                break
+        self.assertTrue(result.needs_human)
+
+        self.net.drop_kinds.discard("leg_status")
+        self.clock.advance(5.1)
+        self.leader.cell.handle_event(ClockTickEvent(self.now))
+        self.net.pump()
+        result = self.leader.cell.handle_event(ClockTickEvent(self.now))
+
+        self.assertFalse(result.needs_human)
+        self.assertEqual(result.state, "EMPTY")
+        self.assertEqual(self.leader.mt5.positions, [])
+
     def test_the_bounded_probe_retransmits_this_workers_terminal_status(self) -> None:
         self._enter_and_strand_leader()
         self.net.drop_kinds.discard("leg_status")

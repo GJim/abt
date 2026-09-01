@@ -2755,6 +2755,18 @@ class PairExecutionCell:
         )
         self._transition("close_needs_human", detail)
 
+    def _peer_terminal_proof_stop_reason(self, attempt_id: str) -> str:
+        return (
+            f"attempt {attempt_id} has no peer terminal proof after the bounded recovery path"
+        )
+
+    def _clear_resolved_peer_terminal_proof_stop(self, attempt_id: str) -> None:
+        if self._needs_human != self._peer_terminal_proof_stop_reason(attempt_id):
+            return
+        self._needs_human = None
+        self._db.execute("DELETE FROM cell_operator_stop WHERE id = 1")
+        self._transition("peer_terminal_proof_recovered", attempt_id)
+
     # -- pairing acceptance ------------------------------------------------ #
 
     def freeze_pairing_acceptance(
@@ -4595,6 +4607,9 @@ class PairExecutionCell:
     def _progress(self) -> None:
         if self._needs_human is not None:
             self._state = "NEEDS_HUMAN"
+            self._maybe_finalize_empty()
+            if self._needs_human is not None:
+                self._await_peer_terminal_proof()
             # A stopped cell may not trade or advance an attempt, but peers
             # still need its current fail-closed readiness to avoid waiting
             # indefinitely for a state snapshot after reconnect or restart.
@@ -5943,8 +5958,10 @@ class PairExecutionCell:
             return
         self._state = "EMPTY"
         self._record_timing("terminal_time")
+        attempt_id = self._attempt.attempt_id
         self._terminate_attempt("both_empty_verified")
         self._reset_attempt()
+        self._clear_resolved_peer_terminal_proof_stop(attempt_id)
 
     def _peer_send_possible(self) -> bool:
         """Whether the peer could still hold the mirror leg.
@@ -5977,7 +5994,10 @@ class PairExecutionCell:
             return
         if not self._peer_send_possible() or self._peer_leg.status in _PEER_TERMINAL_STATUSES:
             return  # finalization handles this
-        if self._needs_human is not None:
+        if (
+            self._needs_human is not None
+            and self._needs_human != self._peer_terminal_proof_stop_reason(attempt.attempt_id)
+        ):
             return
         now = self._monotonic()
         timeout = attempt.confirmation_timeout_seconds
@@ -5987,7 +6007,7 @@ class PairExecutionCell:
             return
         if now - self._peer_proof_wait_started >= timeout * _PEER_PROOF_ESCALATION_MULTIPLIER:
             self._set_needs_human(
-                f"attempt {attempt.attempt_id} has no peer terminal proof after the bounded recovery path",
+                self._peer_terminal_proof_stop_reason(attempt.attempt_id),
                 "peer terminal proof unavailable",
             )
             return

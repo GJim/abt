@@ -911,6 +911,13 @@ it never causes it to adopt an unassigned role.
 Relay loss or process failure during an unresolved attempt causes local
 protection and reduction according to available broker evidence; neither
 Worker infers `EMPTY` from a peer acknowledgement or successful close receipt.
+If a Worker reaches `NEEDS_HUMAN` solely because its bounded terminal-proof
+recovery window expired, it remains fail-closed but continues bounded
+terminal-proof probes. It may clear that specific stop only after the same
+attempt has both locally broker-verified `EMPTY` evidence and an authenticated
+peer terminal proof; it then terminalizes the attempt as `EMPTY`. No other
+`NEEDS_HUMAN` reason is automatically cleared, and neither silence nor a
+successful relay acknowledgement is terminal proof.
 
 Timed exit, New York cutoff, risk breach, shutdown, integrity divergence,
 entry failure, and protection failure all use the same desired-`EMPTY`

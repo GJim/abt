@@ -149,6 +149,10 @@ _Avoid_: 獨立 Trader Execution 服務、無狀態策略腳本
 在配對的兩台帳戶工作者上執行相同模組的深模組；leader/follower 角色由持久配對路由指定，不是租約，也沒有 epoch 或交易 TTL，且不綁定任何交易者身分。已配對者由其取代策略執行體成為配對反向避險生命週期擁有者，僅 leader 可建立進場嘗試並持有唯一的 canonical 策略政策；shared 政策由 leader 撰寫，follower 自行撰寫其自身風險參數並經配對接受載荷供 leader 逐字複製。follower 不推導獨立 edge 或 terminal 配對狀態。它保留 ADR-0009 的單一擁有者、durable state 與主控台不推導配對狀態等不變量，只搬移擁有者位置。
 _Avoid_: 配對執行器（與主控台角色混淆）、配對租約、交易者綁定路由
 
+**Peer Terminal Proof**:
+同一配對嘗試中，一台 Worker 對另一台 Worker 所持鏡像 leg 已 terminal 的 authenticated、durable 狀態證據；它不是 relay acknowledgement、broker receipt 或沉默。只有本機 broker-verified `EMPTY` 與同一 attempt 的 peer terminal proof 都存在時，因缺少該 proof 而產生的停機保護才可自動解除。
+_Avoid_: relay 成功確認、推定 peer 空倉
+
 **工作者主導配對（Worker-Initiated Pairing）**:
 兩台帳戶工作者自行建立配對路由的程序；沒有管理員建立的配對路由。工作者於首次未配對連線時宣告期望角色，未宣告即為可用 follower；leader 向主控台查詢當前已連線、可用且未配對的 follower 並選定其一（互動選擇，或以明確 follower worker ID 非互動選定），再經已驗證主控台提出配對提議。非 TTY 且未指定 follower worker ID 的 leader 不得阻塞等待輸入，維持已驗證且未配對並輸出可行動診斷；互動模式取得空清單時亦同。被選中的 follower 只在自身 broker 驗證空倉、沒有任何未結嘗試或效果、具備配對所需就緒條件、可讀取 USD 帳戶且餘額為正、且仍未配對時自動接受，否則明確拒絕。配對以兩階段控制流程完成，不是單一 compare-and-swap。
 _Avoid_: 管理員核准配對、配對合約核發、人工接受步驟、保留與建路由合併為單一 CAS
