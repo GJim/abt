@@ -18,6 +18,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+import sqlite3
 from typing import cast
 import unittest
 
@@ -3441,6 +3442,34 @@ class PeerTerminalProofTests(PairCellTestCase):
         self.assertFalse(result.needs_human)
         self.assertEqual(result.state, "EMPTY")
         self.assertEqual(self.leader.mt5.positions, [])
+
+    def test_a_terminalized_legacy_missing_proof_stop_recovers_at_startup(self) -> None:
+        self._enter_and_strand_leader()
+        result = self.leader.cell.handle_event(ClockTickEvent(self.now))
+        for _ in range(9):
+            self.clock.advance(5.1)
+            result = self.leader.cell.handle_event(ClockTickEvent(self.now))
+            self.net.queue.clear()
+            if result.needs_human:
+                break
+        self.assertTrue(result.needs_human)
+        attempt_id = result.attempt_id
+        self.assertIsNotNone(attempt_id)
+
+        with sqlite3.connect(self.tmp / f"{LEADER}-cell.db") as connection:
+            connection.execute(
+                "UPDATE cell_attempts SET terminal = 1, terminal_reason = 'both_empty_verified'"
+                " WHERE attempt_id = ?",
+                (attempt_id,),
+            )
+        recovered = self.leader.restart().recover()
+
+        self.assertFalse(recovered.needs_human)
+        self.assertEqual(recovered.state, "EMPTY")
+        self.assertIn(
+            "peer_terminal_proof_recovered",
+            [row["event"] for row in self.leader.cell.transition_history()],
+        )
 
     def test_the_bounded_probe_retransmits_this_workers_terminal_status(self) -> None:
         self._enter_and_strand_leader()

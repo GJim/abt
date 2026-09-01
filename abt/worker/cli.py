@@ -34,6 +34,15 @@ from .rotation import (
 from .session import open_authenticated_worker_session
 
 
+class _UtcLogFormatter(logging.Formatter):
+    """Render CLI logs in a host-independent timestamp format."""
+
+    def formatTime(self, record: logging.LogRecord, datefmt: str | None = None) -> str:
+        return datetime.fromtimestamp(record.created, UTC).isoformat(timespec="milliseconds").replace(
+            "+00:00", "Z"
+        )
+
+
 class HTTPEnrollmentTransport:
     """Submit enrollment only to an HTTPS controller origin."""
 
@@ -234,10 +243,13 @@ def main(
     else:
         pair_cell_options = PairCellStartupOptions()
     if arguments.verbose:
+        handler = logging.StreamHandler(error_output)
+        handler.setFormatter(
+            _UtcLogFormatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+        )
         logging.basicConfig(
             level=logging.INFO,
-            format="%(levelname)s %(name)s: %(message)s",
-            stream=error_output,
+            handlers=[handler],
         )
         logging.getLogger("abt").setLevel(logging.DEBUG)
     cleanup_errors: list[Exception] = []

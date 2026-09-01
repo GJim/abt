@@ -2764,8 +2764,27 @@ class PairExecutionCell:
         if self._needs_human != self._peer_terminal_proof_stop_reason(attempt_id):
             return
         self._needs_human = None
+        self._state = "EMPTY"
         self._db.execute("DELETE FROM cell_operator_stop WHERE id = 1")
         self._transition("peer_terminal_proof_recovered", attempt_id)
+
+    def _recover_terminal_proof_stop(self) -> None:
+        """Clear only a legacy missing-proof stop with durable terminal evidence."""
+
+        reason = self._needs_human
+        prefix, suffix = "attempt ", " has no peer terminal proof after the bounded recovery path"
+        if not isinstance(reason, str) or not reason.startswith(prefix) or not reason.endswith(suffix):
+            return
+        attempt_id = reason.removeprefix(prefix).removesuffix(suffix)
+        if not attempt_id:
+            return
+        row = self._db.execute(
+            "SELECT 1 FROM cell_attempts WHERE attempt_id = ? AND route_id = ?"
+            " AND terminal = 1 AND terminal_reason = 'both_empty_verified'",
+            (attempt_id, self._route.route_id),
+        ).fetchone()
+        if row is not None:
+            self._clear_resolved_peer_terminal_proof_stop(attempt_id)
 
     # -- pairing acceptance ------------------------------------------------ #
 
@@ -2896,6 +2915,7 @@ class PairExecutionCell:
                 self._begin_close("unresolved_attempt_after_restart")
         self._transition("recovered", self._state)
         self._recovering = False
+        self._recover_terminal_proof_stop()
         # A running peer may have published an unchanged readiness snapshot
         # while this Worker was offline. Explicitly request its state instead
         # of relying on a later epoch change or market event to trigger it.

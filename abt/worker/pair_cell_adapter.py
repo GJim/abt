@@ -2907,21 +2907,26 @@ class PairCellRuntime:
         for ack in self._session.drain_pair_relay_acks():
             request_id = ack.get("request_id")
             accepted = ack.get("accepted") is True
-            if (
-                not accepted
-                or (self._relay is not None and self._relay.consume_state_relay_ack(request_id))
+            reason = ack.get("reason")
+            peer_disconnected = not accepted and reason == "Peer Worker is disconnected."
+            if peer_disconnected:
+                self._set_peer_session_connected(
+                    False, "the controller reported that the peer Worker is disconnected"
+                )
+            elif not accepted or (
+                self._relay is not None and self._relay.consume_state_relay_ack(request_id)
             ):
                 _LOGGER.debug(
                     "Pair Execution Cell relay acknowledgement: request_id=%s accepted=%s%s.",
                     request_id if isinstance(request_id, str) else "-",
                     accepted,
-                    f" reason={ack.get('reason')}" if not accepted and isinstance(ack.get("reason"), str) else "",
+                    f" reason={reason}" if not accepted and isinstance(reason, str) else "",
                 )
             if ack.get("accepted") is False:
-                self._peer_session_connected = False
+                self._set_peer_session_connected(False, "a relay acknowledgement was rejected")
         envelopes = self._session.drain_pair_relay_envelopes()
         if envelopes and not self._peer_session_connected:
-            self._peer_session_connected = True
+            self._set_peer_session_connected(True, "a peer relay envelope was received")
         for envelope in envelopes:
             inner = unwrap_pair_relay_envelope(envelope)
             if inner is not None and self._cell is not None:
@@ -2953,7 +2958,7 @@ class PairCellRuntime:
         result = self._feed_catalog(observed_at) or result
         if self._relay is not None and self._relay.last_send_failed:
             self._relay.last_send_failed = False
-            self._peer_session_connected = False
+            self._set_peer_session_connected(False, "a peer relay send failed")
         if self._peer_session_connected != self._fed_peer_session:
             self._fed_peer_session = self._peer_session_connected
             if self._peer_session_connected:
@@ -3005,6 +3010,16 @@ class PairCellRuntime:
         self._log_state_diagnostic(cell)
         self._sync_route_control()
         return result
+
+    def _set_peer_session_connected(self, connected: bool, reason: str) -> None:
+        if self._peer_session_connected == connected:
+            return
+        self._peer_session_connected = connected
+        _LOGGER.debug(
+            "Pair Execution Cell peer session %s: %s.",
+            "connected" if connected else "disconnected",
+            reason,
+        )
 
     def _log_state_diagnostic(self, cell: PairExecutionCell) -> None:
         """Log a concise state snapshot only when an observable value changes."""
