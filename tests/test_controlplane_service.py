@@ -16,6 +16,7 @@ import abt.controlplane.service as controlplane_service
 from pathlib import Path
 from unittest.mock import patch
 from uuid import uuid4
+from typing import cast
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes, serialization
@@ -39,6 +40,7 @@ from abt.controlplane.crypto import (
 )
 from abt.controlplane.ledger import LedgerError
 from abt.controlplane.secrets import SecretStore, SecretStoreError
+from abt.trader_protocol import MAX_PAIR_RELAY_ENVELOPE_BYTES, PAIR_CELL_CONTROL_MESSAGE_TYPES
 from abt.controlplane.service import (
     _broadcast_trader_worker_stream,
     _delete_expired_pending_secrets,
@@ -1158,30 +1160,114 @@ class ControlPlaneServiceTests(unittest.TestCase):
         self.assertTrue(_is_authoritative_worker_session(connections, worker_id, authoritative))
         self.assertFalse(_is_authoritative_worker_session(connections, worker_id, superseded))
 
-    def test_pair_relay_forwards_an_opaque_envelope_between_leased_workers(self) -> None:
-        leader_key, leader_id, leader_certificate = self._approved_worker(111111, "Broker-A")
-        follower_key, follower_id, follower_certificate = self._approved_worker(222222, "Broker-B")
-        trader_enrollment = self.app.state.ledger.create_trader_enrollment(
-            strategy_name="pair-execution-cell", claimed_public_ip="203.0.113.4", public_key_pem="trader-public-key"
+    def _pair_route(self, leader_login: int, follower_login: int) -> tuple[
+        ec.EllipticCurvePrivateKey, str, str, ec.EllipticCurvePrivateKey, str, str, str
+    ]:
+        """Form one durable route through the two-phase pairing workflow.
+
+        There is no administrator route-creation surface, so a test route is
+        made exactly the way Workers make one: reserve both Workers under a
+        unique proposal, then compare-and-swap the route into existence.
+        """
+
+        leader_key, leader_id, leader_certificate = self._approved_worker(leader_login, "Broker-A")
+        follower_key, follower_id, follower_certificate = self._approved_worker(follower_login, "Broker-B")
+        ledger = self.app.state.ledger
+        reservation = ledger.reserve_pair_route_proposal(
+            leader_worker_id=leader_id,
+            follower_worker_id=follower_id,
+            connected_worker_ids={leader_id, follower_id},
         )
-        trader_id = self.app.state.ledger.approve_trader_enrollment(
-            trader_enrollment["registration_id"], "ABCDEF", lambda value, *_: f"certificate:{value}"
+        route = ledger.create_pair_route(
+            proposal_id=reservation["proposal_id"], connected_worker_ids={leader_id, follower_id}
         )
-        lease = self.app.state.ledger.issue_pair_lease(
-            leader_worker_id=leader_id, follower_worker_id=follower_id,
-            trader_id=trader_id, contract_hash="contract-hash-1", ttl_seconds=300,
+        return (
+            leader_key, leader_id, leader_certificate,
+            follower_key, follower_id, follower_certificate, route["route_id"],
         )
-        envelope = {
-            "lease": {
-                "leader_worker_id": leader_id, "follower_worker_id": follower_id,
-                "trader_id": trader_id, "contract_hash": "contract-hash-1", "lease_epoch": lease["epoch"],
+
+    @staticmethod
+    def _relay_envelope(
+        leader_id: str, follower_id: str, route_id: str, **overrides: object
+    ) -> dict[str, object]:
+        envelope: dict[str, object] = {
+            "type": "pair_cell_relay",
+            "protocol_version": 1,
+            "route": {
+                "route_id": route_id,
+                "leader_worker_id": leader_id,
+                "follower_worker_id": follower_id,
             },
-            "from_worker_id": leader_id, "to_worker_id": follower_id,
+            "from_worker_id": leader_id,
+            "to_worker_id": follower_id,
             "request_id": "message-1",
-            "attempt_id": "attempt-1",
             "payload_hash": "unused-by-controller",
-            "payload": {"kind": "arm_request", "opaque_to_controller": True},
+            "payload": {"kind": "entry_attempt", "opaque_to_controller": True},
         }
+        envelope.update(overrides)
+        return envelope
+
+    def _pair_cell_request(self, socket: object, message: dict[str, object]) -> dict[str, object]:
+        """Send one pairing control message and read its correlated reply."""
+
+        socket.send_json(message)
+        while True:
+            response = socket.receive_json()
+            if response.get("request_id") == message["request_id"]:
+                return cast(dict[str, object], response)
+
+    @staticmethod
+    def _acceptance_payload(proposal_id: str, follower_worker_id: str) -> dict[str, object]:
+        """A payload shaped like the core's canonical Pairing Acceptance.
+
+        The controller must forward it unchanged and never read a field of
+        it, so these tests only ever assert that it arrives byte-for-byte.
+        """
+
+        return {
+            "proposal_id": proposal_id,
+            "worker_id": follower_worker_id,
+            "startup_balance_usd": "10000.00",
+            "account_currency": "USD",
+            "maximum_margin_fraction": "0.10",
+            "daily_loss_fraction": "0.03",
+            "trade_loss_fraction": "0.02",
+            "maximum_loss_per_trade_usd": "40",
+        }
+
+    def _acceptance(
+        self, request_id: str, proposal_id: str, follower_worker_id: str, **overrides: object
+    ) -> dict[str, object]:
+        message: dict[str, object] = {
+            "type": "pair_cell_pairing_decision",
+            "request_id": request_id,
+            "proposal_id": proposal_id,
+            "accepted": True,
+            "acceptance_payload": self._acceptance_payload(proposal_id, follower_worker_id),
+            "payload_hash": "acceptance-hash-1",
+        }
+        message.update(overrides)
+        return message
+
+    def test_pair_relay_forwards_an_opaque_envelope_unchanged_on_a_live_route(self) -> None:
+        """Requirement: the controller authenticates both Workers, checks the
+        live route record keyed on ``route_id`` and sending role, and forwards
+        the envelope byte-for-byte. It parses no trading field and reports
+        only ordinary delivery, never lifecycle state."""
+
+        (
+            leader_key, leader_id, leader_certificate,
+            follower_key, follower_id, follower_certificate, route_id,
+        ) = self._pair_route(111111, 222222)
+        envelope = self._relay_envelope(
+            leader_id, follower_id, route_id,
+            payload={
+                "kind": "entry_attempt",
+                "attempt": {"attempt_id": "attempt-1", "lots": "0.37", "policy_hash": "abc"},
+                "universe": {"universe_generation": "generation-1", "symbols": ["EURUSD"]},
+                "protection": {"sl": "1.0942", "tp": "1.1058"},
+            },
+        )
 
         with self.client.websocket_connect("/api/worker/session") as leader_socket:
             self._authenticate_worker_socket(leader_socket, leader_key, leader_id, leader_certificate)
@@ -1194,33 +1280,102 @@ class ControlPlaneServiceTests(unittest.TestCase):
                 ack = leader_socket.receive_json()
 
         self.assertEqual({"type": "pair_relay_deliver", "envelope": envelope}, delivered)
-        self.assertEqual({"type": "pair_relay_ack", "request_id": "relay-1", "accepted": True, "result": {"delivered": True, "audited": True, "replay": False}}, ack)
+        self.assertEqual(
+            {"type": "pair_relay_ack", "request_id": "relay-1", "accepted": True, "result": {"delivered": True}},
+            ack,
+        )
+        self.assertNotIn("trader_id", json.dumps(delivered))
 
-    def test_pair_relay_rejects_a_route_outside_the_leased_pair(self) -> None:
-        leader_key, leader_id, leader_certificate = self._approved_worker(333333, "Broker-A")
+    def test_pair_relay_preserves_emission_order_within_one_live_session(self) -> None:
+        """Requirement: order is preserved within each live route session."""
+
+        (
+            leader_key, leader_id, leader_certificate,
+            follower_key, follower_id, follower_certificate, route_id,
+        ) = self._pair_route(112233, 223344)
+        envelopes = [
+            self._relay_envelope(
+                leader_id, follower_id, route_id,
+                request_id=f"message-{index}",
+                payload={"kind": "quote", "sequence": index},
+            )
+            for index in range(5)
+        ]
+
+        with self.client.websocket_connect("/api/worker/session") as leader_socket:
+            self._authenticate_worker_socket(leader_socket, leader_key, leader_id, leader_certificate)
+            with self.client.websocket_connect("/api/worker/session") as follower_socket:
+                self._authenticate_worker_socket(follower_socket, follower_key, follower_id, follower_certificate)
+
+                for envelope in envelopes:
+                    leader_socket.send_json({"type": "pair_relay", "request_id": envelope["request_id"], "envelope": envelope})
+                delivered = [follower_socket.receive_json() for _ in envelopes]
+
+        self.assertEqual([{"type": "pair_relay_deliver", "envelope": envelope} for envelope in envelopes], delivered)
+
+    def test_pair_relay_never_replays_an_execution_envelope_into_a_reconnected_session(self) -> None:
+        """Requirement: an envelope that cannot be delivered now is rejected to
+        its sender, never buffered. A reconnect opens a brand-new ordered
+        session that receives only messages emitted after it began."""
+
+        (
+            leader_key, leader_id, leader_certificate,
+            follower_key, follower_id, follower_certificate, route_id,
+        ) = self._pair_route(334455, 445566)
+        missed = self._relay_envelope(
+            leader_id, follower_id, route_id, request_id="missed-1", payload={"kind": "entry_attempt", "sequence": 1}
+        )
+        fresh = self._relay_envelope(
+            leader_id, follower_id, route_id, request_id="fresh-1", payload={"kind": "entry_attempt", "sequence": 2}
+        )
+
+        with self.client.websocket_connect("/api/worker/session") as leader_socket:
+            self._authenticate_worker_socket(leader_socket, leader_key, leader_id, leader_certificate)
+
+            leader_socket.send_json({"type": "pair_relay", "request_id": "relay-missed", "envelope": missed})
+            rejected = leader_socket.receive_json()
+
+            with self.client.websocket_connect("/api/worker/session") as follower_socket:
+                self._authenticate_worker_socket(follower_socket, follower_key, follower_id, follower_certificate)
+
+                leader_socket.send_json({"type": "pair_relay", "request_id": "relay-fresh", "envelope": fresh})
+                delivered = follower_socket.receive_json()
+                leader_socket.receive_json()
+
+        self.assertFalse(rejected["accepted"])
+        self.assertEqual({"type": "pair_relay_deliver", "envelope": fresh}, delivered)
+
+    def test_pair_relay_forwards_a_resent_message_instead_of_deduplicating_it(self) -> None:
+        """Requirement: the controller holds no attempt projection, so it never
+        suppresses or replays a message. Duplicate suppression belongs to the
+        receiving Worker's durable journal."""
+
+        (
+            leader_key, leader_id, leader_certificate,
+            follower_key, follower_id, follower_certificate, route_id,
+        ) = self._pair_route(556677, 667788)
+        envelope = self._relay_envelope(leader_id, follower_id, route_id)
+
+        with self.client.websocket_connect("/api/worker/session") as leader_socket:
+            self._authenticate_worker_socket(leader_socket, leader_key, leader_id, leader_certificate)
+            with self.client.websocket_connect("/api/worker/session") as follower_socket:
+                self._authenticate_worker_socket(follower_socket, follower_key, follower_id, follower_certificate)
+
+                for request_id in ("relay-1", "relay-2"):
+                    leader_socket.send_json({"type": "pair_relay", "request_id": request_id, "envelope": envelope})
+                delivered = [follower_socket.receive_json() for _ in range(2)]
+                acks = [leader_socket.receive_json() for _ in range(2)]
+
+        self.assertEqual([{"type": "pair_relay_deliver", "envelope": envelope}] * 2, delivered)
+        self.assertEqual([{"delivered": True}] * 2, [ack["result"] for ack in acks])
+
+    def test_pair_relay_rejects_a_worker_outside_the_route(self) -> None:
+        (
+            leader_key, leader_id, leader_certificate,
+            _follower_key, follower_id, _follower_certificate, route_id,
+        ) = self._pair_route(333333, 555555)
         _outsider_key, outsider_id, _outsider_certificate = self._approved_worker(444444, "Broker-C")
-        _follower_key, follower_id, _follower_certificate = self._approved_worker(555555, "Broker-B")
-        trader_enrollment = self.app.state.ledger.create_trader_enrollment(
-            strategy_name="pair-execution-cell", claimed_public_ip="203.0.113.4", public_key_pem="trader-public-key-2"
-        )
-        trader_id = self.app.state.ledger.approve_trader_enrollment(
-            trader_enrollment["registration_id"], "ABCDEF", lambda value, *_: f"certificate:{value}"
-        )
-        lease = self.app.state.ledger.issue_pair_lease(
-            leader_worker_id=leader_id, follower_worker_id=follower_id,
-            trader_id=trader_id, contract_hash="contract-hash-2", ttl_seconds=300,
-        )
-        envelope = {
-            "lease": {
-                "leader_worker_id": leader_id, "follower_worker_id": follower_id,
-                "trader_id": trader_id, "contract_hash": "contract-hash-2", "lease_epoch": lease["epoch"],
-            },
-            "from_worker_id": leader_id, "to_worker_id": outsider_id,
-            "request_id": "message-1",
-            "attempt_id": "attempt-1",
-            "payload_hash": "unused-by-controller",
-            "payload": {"kind": "arm_request"},
-        }
+        envelope = self._relay_envelope(leader_id, follower_id, route_id, to_worker_id=outsider_id)
 
         with self.client.websocket_connect("/api/worker/session") as leader_socket:
             self._authenticate_worker_socket(leader_socket, leader_key, leader_id, leader_certificate)
@@ -1229,11 +1384,1032 @@ class ControlPlaneServiceTests(unittest.TestCase):
 
         self.assertFalse(ack["accepted"])
 
+    def test_pair_relay_rejects_an_unknown_route_id(self) -> None:
+        """Requirement: forwarding requires a live route record; two
+        authenticated Workers alone are not enough."""
+
+        leader_key, leader_id, leader_certificate = self._approved_worker(717171, "Broker-A")
+        _follower_key, follower_id, _follower_certificate = self._approved_worker(727272, "Broker-B")
+        envelope = self._relay_envelope(leader_id, follower_id, "route-that-never-existed")
+
+        with self.client.websocket_connect("/api/worker/session") as leader_socket:
+            self._authenticate_worker_socket(leader_socket, leader_key, leader_id, leader_certificate)
+            leader_socket.send_json({"type": "pair_relay", "request_id": "relay-1", "envelope": envelope})
+            ack = leader_socket.receive_json()
+
+        self.assertFalse(ack["accepted"])
+
+    def test_pair_relay_rejects_a_stale_route_id_after_a_safe_unpair(self) -> None:
+        """Requirement: a ``route_id`` that named a removed route is refused;
+        it is never revived, and it is never reissued to a later pairing."""
+
+        (
+            leader_key, leader_id, leader_certificate,
+            _follower_key, follower_id, _follower_certificate, route_id,
+        ) = self._pair_route(313131, 323232)
+        ledger = self.app.state.ledger
+        ledger.enter_pair_route_unpairing(route_id=route_id, worker_id=leader_id)
+        ledger.record_pair_unpair_assertion(route_id=route_id, worker_id=leader_id, state_version=1)
+        ledger.record_pair_unpair_assertion(route_id=route_id, worker_id=follower_id, state_version=1)
+        envelope = self._relay_envelope(leader_id, follower_id, route_id)
+
+        with self.client.websocket_connect("/api/worker/session") as leader_socket:
+            self._authenticate_worker_socket(leader_socket, leader_key, leader_id, leader_certificate)
+            leader_socket.send_json({"type": "pair_relay", "request_id": "relay-1", "envelope": envelope})
+            ack = leader_socket.receive_json()
+
+        self.assertFalse(ack["accepted"])
+
+    def test_pair_relay_rejects_a_role_the_route_record_never_assigned(self) -> None:
+        """Requirement: the controller's route record is authoritative for
+        the assigned role, so a follower cannot promote itself by claiming to
+        be the leader."""
+
+        (
+            _leader_key, leader_id, _leader_certificate,
+            follower_key, follower_id, follower_certificate, route_id,
+        ) = self._pair_route(343434, 353535)
+        swapped = self._relay_envelope(
+            follower_id, leader_id, route_id, from_worker_id=follower_id, to_worker_id=leader_id
+        )
+
+        with self.client.websocket_connect("/api/worker/session") as follower_socket:
+            self._authenticate_worker_socket(follower_socket, follower_key, follower_id, follower_certificate)
+            follower_socket.send_json({"type": "pair_relay", "request_id": "relay-1", "envelope": swapped})
+            ack = follower_socket.receive_json()
+
+        self.assertFalse(ack["accepted"])
+
+    def test_pair_relay_rejects_a_sender_impersonating_its_peer(self) -> None:
+        """Requirement: both Workers are authenticated and the envelope's
+        declared sender must be the authenticated session that sent it."""
+
+        (
+            _leader_key, leader_id, _leader_certificate,
+            follower_key, follower_id, follower_certificate, route_id,
+        ) = self._pair_route(818181, 828282)
+        spoofed = self._relay_envelope(
+            leader_id, follower_id, route_id, from_worker_id=leader_id, to_worker_id=follower_id
+        )
+
+        with self.client.websocket_connect("/api/worker/session") as follower_socket:
+            self._authenticate_worker_socket(follower_socket, follower_key, follower_id, follower_certificate)
+            follower_socket.send_json({"type": "pair_relay", "request_id": "relay-1", "envelope": spoofed})
+            ack = follower_socket.receive_json()
+
+        self.assertFalse(ack["accepted"])
+
+    def test_pair_relay_rejects_an_unsupported_protocol_version(self) -> None:
+        (
+            leader_key, leader_id, leader_certificate,
+            _follower_key, follower_id, _follower_certificate, route_id,
+        ) = self._pair_route(838383, 848484)
+        envelope = self._relay_envelope(leader_id, follower_id, route_id, protocol_version=2)
+
+        with self.client.websocket_connect("/api/worker/session") as leader_socket:
+            self._authenticate_worker_socket(leader_socket, leader_key, leader_id, leader_certificate)
+            leader_socket.send_json({"type": "pair_relay", "request_id": "relay-1", "envelope": envelope})
+            ack = leader_socket.receive_json()
+
+        self.assertFalse(ack["accepted"])
+
+    def test_pair_relay_rejects_an_envelope_over_the_payload_size_limit(self) -> None:
+        (
+            leader_key, leader_id, leader_certificate,
+            _follower_key, follower_id, _follower_certificate, route_id,
+        ) = self._pair_route(858585, 868686)
+        envelope = self._relay_envelope(
+            leader_id, follower_id, route_id,
+            payload={"kind": "entry_attempt", "blob": "x" * (MAX_PAIR_RELAY_ENVELOPE_BYTES + 1)},
+        )
+
+        with self.client.websocket_connect("/api/worker/session") as leader_socket:
+            self._authenticate_worker_socket(leader_socket, leader_key, leader_id, leader_certificate)
+            leader_socket.send_json({"type": "pair_relay", "request_id": "relay-1", "envelope": envelope})
+            ack = leader_socket.receive_json()
+
+        self.assertFalse(ack["accepted"])
+
+    def test_pair_relay_rejects_a_residual_lease_or_trader_claim(self) -> None:
+        """Requirement: no lease dependency and no Trader identity survives
+        anywhere on the Pair Cell wire."""
+
+        (
+            leader_key, leader_id, leader_certificate,
+            _follower_key, follower_id, _follower_certificate, route_id,
+        ) = self._pair_route(878787, 888888)
+        legacy = self._relay_envelope(
+            leader_id, follower_id, route_id,
+            lease={
+                "leader_worker_id": leader_id, "follower_worker_id": follower_id,
+                "trader_id": "trader-1", "contract_hash": "hash-1", "lease_epoch": 1,
+            },
+            attempt_id="attempt-1",
+        )
+        with_trader = self._relay_envelope(
+            leader_id, follower_id, route_id,
+            route={
+                "route_id": route_id, "leader_worker_id": leader_id,
+                "follower_worker_id": follower_id, "trader_id": "trader-1",
+            },
+        )
+
+        with self.client.websocket_connect("/api/worker/session") as leader_socket:
+            self._authenticate_worker_socket(leader_socket, leader_key, leader_id, leader_certificate)
+            acks = []
+            for index, envelope in enumerate((legacy, with_trader)):
+                leader_socket.send_json(
+                    {"type": "pair_relay", "request_id": f"relay-{index}", "envelope": envelope}
+                )
+                acks.append(leader_socket.receive_json())
+
+        self.assertEqual([False, False], [ack["accepted"] for ack in acks])
+
+    def test_controller_exposes_no_lease_contract_or_administrator_route_surface(self) -> None:
+        """Requirement: Pair Lease issuance, Pair Contract activation, and
+        administrator route creation/revocation are gone from the controller
+        entirely."""
+
+        login = self.client.post(
+            "/api/admin/login", json={"username": "ABCDEF", "password": "A-secure-admin-password!"}
+        )
+        headers = {"X-CSRF-Token": login.json()["csrf_token"]}
+
+        for path in (
+            "/api/admin/pairs/activate",
+            "/api/admin/pairs/route",
+            "/api/admin/pairs/route/revoke",
+        ):
+            with self.subTest(path=path):
+                self.assertEqual(404, self.client.post(path, headers=headers, json={}).status_code)
+        for removed_model in (
+            "PairContractActivationRequest", "PairRouteAuthorizationRequest", "PairRouteRevocationRequest",
+        ):
+            self.assertFalse(hasattr(controlplane_service, removed_model), removed_model)
+        for removed in (
+            "issue_pair_lease", "activate_pair_contract", "pair_cell_activation_for_worker",
+            "authorize_pair_route", "revoke_pair_route", "authorized_pair_route",
+        ):
+            self.assertFalse(hasattr(self.app.state.ledger, removed), removed)
+        self.assertNotIn(
+            "/api/admin/pairs/route", {route.path for route in self.app.routes if hasattr(route, "path")}
+        )
+
+    def test_the_admin_execution_mode_surface_cannot_create_a_pair_cell_claim(self) -> None:
+        """Requirement: Pair Cell exclusivity is claimed only inside the
+        two-phase pairing workflow, never by an administrator."""
+
+        _leader_key, leader_id, _leader_certificate = self._approved_worker(363636, "Broker-A")
+        _follower_key, follower_id, _follower_certificate = self._approved_worker(373737, "Broker-B")
+        login = self.client.post(
+            "/api/admin/login", json={"username": "ABCDEF", "password": "A-secure-admin-password!"}
+        )
+        headers = {"X-CSRF-Token": login.json()["csrf_token"]}
+
+        response = self.client.post(
+            "/api/admin/pairs/execution-mode",
+            headers=headers,
+            json={
+                "leader_worker_id": leader_id, "follower_worker_id": follower_id,
+                "trader_id": "trader-1", "mode": "pair_execution_cell",
+            },
+        )
+
+        self.assertEqual(422, response.status_code)
+
+    def test_worker_session_rejects_a_pair_cell_activation_sync_request(self) -> None:
+        """Requirement: the controller distributes no Pair Contract, so there
+        is nothing for a reconnecting Worker to re-sync."""
+
+        leader_key, leader_id, leader_certificate = self._approved_worker(898989, "Broker-A")
+
+        with self.assertRaises(WebSocketDisconnect):
+            with self.client.websocket_connect("/api/worker/session") as leader_socket:
+                self._authenticate_worker_socket(leader_socket, leader_key, leader_id, leader_certificate)
+                leader_socket.send_json({"type": "pair_cell_sync_request"})
+                leader_socket.receive_json()
+
+    # ---- Worker-initiated pairing over the authenticated session ---- #
+
+    def test_a_worker_that_declares_no_role_becomes_an_available_follower(self) -> None:
+        """Requirement: an omitted role means the Worker is simply an
+        available follower, and the leader's listing shows it."""
+
+        leader_key, leader_id, leader_certificate = self._approved_worker(120001, "Broker-A")
+        follower_key, follower_id, follower_certificate = self._approved_worker(120002, "Broker-B")
+
+        with self.client.websocket_connect("/api/worker/session") as leader_socket:
+            self._authenticate_worker_socket(leader_socket, leader_key, leader_id, leader_certificate)
+            with self.client.websocket_connect("/api/worker/session") as follower_socket:
+                self._authenticate_worker_socket(follower_socket, follower_key, follower_id, follower_certificate)
+                declared = self._pair_cell_request(
+                    follower_socket, {"type": "pair_cell_role", "request_id": "declare-1"}
+                )
+                self._pair_cell_request(
+                    leader_socket, {"type": "pair_cell_role", "request_id": "declare-2", "role": "leader"}
+                )
+                listed = self._pair_cell_request(
+                    leader_socket, {"type": "pair_cell_available_followers", "request_id": "list-1"}
+                )
+
+        self.assertTrue(declared["accepted"])
+        self.assertEqual("follower", declared["role"])
+        self.assertIsNone(declared["declared_role"])
+        self.assertIsNone(declared["route"])
+        self.assertEqual([follower_id], [entry["worker_id"] for entry in listed["followers"]])
+        self.assertNotIn("trader_id", json.dumps(listed))
+
+    def test_only_currently_connected_followers_are_listed(self) -> None:
+        """Requirement: the leader lists *currently connected* available
+        followers; a known but disconnected Worker is not selectable."""
+
+        leader_key, leader_id, leader_certificate = self._approved_worker(120011, "Broker-A")
+        _absent_key, absent_id, _absent_certificate = self._approved_worker(120012, "Broker-B")
+        follower_key, follower_id, follower_certificate = self._approved_worker(120013, "Broker-C")
+
+        with self.client.websocket_connect("/api/worker/session") as leader_socket:
+            self._authenticate_worker_socket(leader_socket, leader_key, leader_id, leader_certificate)
+            alone = self._pair_cell_request(
+                leader_socket, {"type": "pair_cell_available_followers", "request_id": "list-1"}
+            )
+            with self.client.websocket_connect("/api/worker/session") as follower_socket:
+                self._authenticate_worker_socket(follower_socket, follower_key, follower_id, follower_certificate)
+                joined = self._pair_cell_request(
+                    leader_socket, {"type": "pair_cell_available_followers", "request_id": "list-2"}
+                )
+
+        self.assertEqual([], alone["followers"])
+        self.assertEqual([follower_id], [entry["worker_id"] for entry in joined["followers"]])
+        self.assertNotIn(absent_id, json.dumps(joined))
+
+    def test_a_leader_pairs_with_a_selected_follower_through_two_phases(self) -> None:
+        """Requirement: one transaction reserves both Workers under a unique
+        ``proposal_id`` with a 30-second timeout, the controller forwards the
+        proposal to the reserved follower, and a second transaction creates
+        the durable route."""
+
+        leader_key, leader_id, leader_certificate = self._approved_worker(120021, "Broker-A")
+        follower_key, follower_id, follower_certificate = self._approved_worker(120022, "Broker-B")
+
+        with self.client.websocket_connect("/api/worker/session") as leader_socket:
+            self._authenticate_worker_socket(leader_socket, leader_key, leader_id, leader_certificate)
+            with self.client.websocket_connect("/api/worker/session") as follower_socket:
+                self._authenticate_worker_socket(follower_socket, follower_key, follower_id, follower_certificate)
+
+                proposed = self._pair_cell_request(
+                    leader_socket,
+                    {
+                        "type": "pair_cell_pairing_proposal", "request_id": "propose-1",
+                        "follower_worker_id": follower_id,
+                    },
+                )
+                forwarded = follower_socket.receive_json()
+                accepted = self._pair_cell_request(
+                    follower_socket,
+                    self._acceptance("decide-1", forwarded["proposal_id"], follower_id),
+                )
+                established = follower_socket.receive_json()
+                leader_notice = leader_socket.receive_json()
+
+        self.assertTrue(proposed["accepted"])
+        self.assertEqual(30, proposed["timeout_seconds"])
+        self.assertEqual("pair_cell_pairing_proposed", forwarded["type"])
+        self.assertEqual(proposed["proposal_id"], forwarded["proposal_id"])
+        self.assertEqual(leader_id, forwarded["leader_worker_id"])
+        self.assertEqual("paired", accepted["outcome"])
+        self.assertEqual(leader_id, accepted["route"]["leader_worker_id"])
+        self.assertEqual(follower_id, accepted["route"]["follower_worker_id"])
+        self.assertEqual("ACTIVE", accepted["route"]["state"])
+        self.assertEqual("pair_cell_route_established", established["type"])
+        self.assertEqual("pair_cell_route_established", leader_notice["type"])
+        self.assertEqual(accepted["route"]["route_id"], leader_notice["route"]["route_id"])
+        self.assertNotIn("trader_id", json.dumps(accepted))
+        route = self.app.state.ledger.pair_route_for_worker(follower_id)
+        assert route is not None
+        self.assertEqual("follower", route["role"])
+
+    def test_the_acceptance_payload_reaches_the_leader_unchanged(self) -> None:
+        """Requirement: the follower authors its own frozen startup balance
+        and its own four risk tunables and sends them to the leader through
+        the opaque relay, which forwards them unchanged and never parses
+        them. The leader may only transcribe them into ``follower_risk``."""
+
+        leader_key, leader_id, leader_certificate = self._approved_worker(120211, "Broker-A")
+        follower_key, follower_id, follower_certificate = self._approved_worker(120212, "Broker-B")
+
+        with self.client.websocket_connect("/api/worker/session") as leader_socket:
+            self._authenticate_worker_socket(leader_socket, leader_key, leader_id, leader_certificate)
+            with self.client.websocket_connect("/api/worker/session") as follower_socket:
+                self._authenticate_worker_socket(follower_socket, follower_key, follower_id, follower_certificate)
+                proposed = self._pair_cell_request(
+                    leader_socket,
+                    {
+                        "type": "pair_cell_pairing_proposal", "request_id": "propose-1",
+                        "follower_worker_id": follower_id,
+                    },
+                )
+                follower_socket.receive_json()
+                proposal_id = cast(str, proposed["proposal_id"])
+                payload = {
+                    **self._acceptance_payload(proposal_id, follower_id),
+                    "unknown_future_block": {"nested": [1, {"deep": True}]},
+                }
+
+                accepted = self._pair_cell_request(
+                    follower_socket,
+                    {
+                        "type": "pair_cell_pairing_decision", "request_id": "decide-1",
+                        "proposal_id": proposal_id, "accepted": True,
+                        "acceptance_payload": payload, "payload_hash": "acceptance-hash-9",
+                    },
+                )
+                follower_notice = follower_socket.receive_json()
+                leader_notice = leader_socket.receive_json()
+
+        self.assertEqual("paired", accepted["outcome"])
+        self.assertEqual(
+            {
+                "proposal_id": proposal_id,
+                "from_worker_id": follower_id,
+                "payload_hash": "acceptance-hash-9",
+                "payload": payload,
+            },
+            leader_notice["acceptance"],
+        )
+        self.assertEqual(accepted["route"]["route_id"], leader_notice["route"]["route_id"])
+        self.assertNotIn("acceptance", follower_notice)
+        self.assertNotIn("trader_id", json.dumps(leader_notice))
+        recorded = json.dumps(
+            [event["payload"] for event in self.app.state.ledger.events()], default=str
+        )
+        for never_stored in ("startup_balance_usd", "acceptance-hash-9", "10000.00", "unknown_future_block"):
+            self.assertNotIn(never_stored, recorded, never_stored)
+
+    def test_an_acceptance_without_its_payload_is_refused_and_creates_no_route(self) -> None:
+        """Requirement: the leader fails closed without the payload, so an
+        acceptance that omits it never reaches the route-creation step."""
+
+        leader_key, leader_id, leader_certificate = self._approved_worker(120221, "Broker-A")
+        follower_key, follower_id, follower_certificate = self._approved_worker(120222, "Broker-B")
+
+        with self.client.websocket_connect("/api/worker/session") as leader_socket:
+            self._authenticate_worker_socket(leader_socket, leader_key, leader_id, leader_certificate)
+            with self.client.websocket_connect("/api/worker/session") as follower_socket:
+                self._authenticate_worker_socket(follower_socket, follower_key, follower_id, follower_certificate)
+                proposed = self._pair_cell_request(
+                    leader_socket,
+                    {
+                        "type": "pair_cell_pairing_proposal", "request_id": "propose-1",
+                        "follower_worker_id": follower_id,
+                    },
+                )
+                follower_socket.receive_json()
+
+                bare = self._pair_cell_request(
+                    follower_socket,
+                    {
+                        "type": "pair_cell_pairing_decision", "request_id": "decide-1",
+                        "proposal_id": proposed["proposal_id"], "accepted": True,
+                    },
+                )
+                recovered = self._pair_cell_request(
+                    follower_socket,
+                    self._acceptance("decide-2", cast(str, proposed["proposal_id"]), follower_id),
+                )
+
+        self.assertFalse(bare["accepted"])
+        self.assertEqual("paired", recovered["outcome"])
+
+    def test_a_refusal_carrying_an_acceptance_payload_is_refused(self) -> None:
+        """Requirement: a refusal never becomes an implied acceptance, so it
+        may not smuggle the payload that would let a leader publish policy."""
+
+        leader_key, leader_id, leader_certificate = self._approved_worker(120231, "Broker-A")
+        follower_key, follower_id, follower_certificate = self._approved_worker(120232, "Broker-B")
+
+        with self.client.websocket_connect("/api/worker/session") as leader_socket:
+            self._authenticate_worker_socket(leader_socket, leader_key, leader_id, leader_certificate)
+            with self.client.websocket_connect("/api/worker/session") as follower_socket:
+                self._authenticate_worker_socket(follower_socket, follower_key, follower_id, follower_certificate)
+                proposed = self._pair_cell_request(
+                    leader_socket,
+                    {
+                        "type": "pair_cell_pairing_proposal", "request_id": "propose-1",
+                        "follower_worker_id": follower_id,
+                    },
+                )
+                follower_socket.receive_json()
+                proposal_id = cast(str, proposed["proposal_id"])
+
+                contradictory = self._pair_cell_request(
+                    follower_socket,
+                    {
+                        "type": "pair_cell_pairing_decision", "request_id": "decide-1",
+                        "proposal_id": proposal_id, "accepted": False, "reason": "not empty",
+                        "acceptance_payload": self._acceptance_payload(proposal_id, follower_id),
+                        "payload_hash": "acceptance-hash-1",
+                    },
+                )
+                still_reserved = self.app.state.ledger.pair_route_reservation(proposal_id)
+                unrouted = self.app.state.ledger.pair_route_for_worker(leader_id)
+
+        self.assertFalse(contradictory["accepted"])
+        self.assertIsNotNone(still_reserved)
+        self.assertIsNone(unrouted)
+
+    def test_an_oversized_acceptance_payload_releases_the_reservation(self) -> None:
+        """Requirement: the controller enforces the protocol and size limits
+        even though the payload's content is invisible to it, and a failed
+        acceptance releases the reservation entirely and tells the leader."""
+
+        leader_key, leader_id, leader_certificate = self._approved_worker(120241, "Broker-A")
+        follower_key, follower_id, follower_certificate = self._approved_worker(120242, "Broker-B")
+
+        with self.client.websocket_connect("/api/worker/session") as leader_socket:
+            self._authenticate_worker_socket(leader_socket, leader_key, leader_id, leader_certificate)
+            with self.client.websocket_connect("/api/worker/session") as follower_socket:
+                self._authenticate_worker_socket(follower_socket, follower_key, follower_id, follower_certificate)
+                proposed = self._pair_cell_request(
+                    leader_socket,
+                    {
+                        "type": "pair_cell_pairing_proposal", "request_id": "propose-1",
+                        "follower_worker_id": follower_id,
+                    },
+                )
+                follower_socket.receive_json()
+                proposal_id = cast(str, proposed["proposal_id"])
+
+                oversized = self._pair_cell_request(
+                    follower_socket,
+                    {
+                        "type": "pair_cell_pairing_decision", "request_id": "decide-1",
+                        "proposal_id": proposal_id, "accepted": True,
+                        "acceptance_payload": {"blob": "x" * (MAX_PAIR_RELAY_ENVELOPE_BYTES + 1)},
+                        "payload_hash": "acceptance-hash-1",
+                    },
+                )
+                leader_notice = leader_socket.receive_json()
+                ledger = self.app.state.ledger
+                released = ledger.pair_route_reservation(proposal_id)
+                unrouted = ledger.pair_route_for_worker(leader_id)
+                unclaimed = ledger.pair_execution_owner(
+                    leader_id, follower_id, "pair_execution_cell"
+                )
+
+        self.assertFalse(oversized["accepted"])
+        self.assertIn("size limit", oversized["reason"])
+        self.assertEqual("pair_cell_pairing_failed", leader_notice["type"])
+        self.assertEqual(proposal_id, leader_notice["proposal_id"])
+        self.assertIsNone(released)
+        self.assertIsNone(unrouted)
+        self.assertIsNone(unclaimed)
+
+    def test_two_leaders_selecting_the_same_follower_produce_one_route_and_one_conflict(self) -> None:
+        """Requirement: exactly one winner and one deterministic conflict at
+        the reservation transaction; the loser re-lists and pairs elsewhere
+        without waiting out the winner's reservation."""
+
+        winner_key, winner_id, winner_certificate = self._approved_worker(120031, "Broker-A")
+        loser_key, loser_id, loser_certificate = self._approved_worker(120032, "Broker-B")
+        follower_key, follower_id, follower_certificate = self._approved_worker(120033, "Broker-C")
+        spare_key, spare_id, spare_certificate = self._approved_worker(120034, "Broker-D")
+
+        with self.client.websocket_connect("/api/worker/session") as winner_socket:
+            self._authenticate_worker_socket(winner_socket, winner_key, winner_id, winner_certificate)
+            with self.client.websocket_connect("/api/worker/session") as loser_socket:
+                self._authenticate_worker_socket(loser_socket, loser_key, loser_id, loser_certificate)
+                with self.client.websocket_connect("/api/worker/session") as follower_socket:
+                    self._authenticate_worker_socket(
+                        follower_socket, follower_key, follower_id, follower_certificate
+                    )
+                    with self.client.websocket_connect("/api/worker/session") as spare_socket:
+                        self._authenticate_worker_socket(spare_socket, spare_key, spare_id, spare_certificate)
+
+                        won = self._pair_cell_request(
+                            winner_socket,
+                            {
+                                "type": "pair_cell_pairing_proposal", "request_id": "propose-win",
+                                "follower_worker_id": follower_id,
+                            },
+                        )
+                        lost = self._pair_cell_request(
+                            loser_socket,
+                            {
+                                "type": "pair_cell_pairing_proposal", "request_id": "propose-lose",
+                                "follower_worker_id": follower_id,
+                            },
+                        )
+                        relisted = self._pair_cell_request(
+                            loser_socket,
+                            {"type": "pair_cell_available_followers", "request_id": "list-lose"},
+                        )
+                        retried = self._pair_cell_request(
+                            loser_socket,
+                            {
+                                "type": "pair_cell_pairing_proposal", "request_id": "propose-retry",
+                                "follower_worker_id": spare_id,
+                            },
+                        )
+
+        self.assertTrue(won["accepted"])
+        self.assertFalse(lost["accepted"])
+        self.assertIn("already reserved", lost["reason"])
+        self.assertEqual([spare_id], [entry["worker_id"] for entry in relisted["followers"]])
+        self.assertTrue(retried["accepted"])
+        self.assertNotEqual(won["proposal_id"], retried["proposal_id"])
+
+    def test_a_follower_refusal_releases_the_reservation_and_tells_the_leader(self) -> None:
+        """Requirement: a refusal never becomes an implied acceptance, it
+        releases the reservation immediately, and the leader re-lists rather
+        than retrying blindly."""
+
+        leader_key, leader_id, leader_certificate = self._approved_worker(120041, "Broker-A")
+        follower_key, follower_id, follower_certificate = self._approved_worker(120042, "Broker-B")
+
+        with self.client.websocket_connect("/api/worker/session") as leader_socket:
+            self._authenticate_worker_socket(leader_socket, leader_key, leader_id, leader_certificate)
+            with self.client.websocket_connect("/api/worker/session") as follower_socket:
+                self._authenticate_worker_socket(follower_socket, follower_key, follower_id, follower_certificate)
+                proposed = self._pair_cell_request(
+                    leader_socket,
+                    {
+                        "type": "pair_cell_pairing_proposal", "request_id": "propose-1",
+                        "follower_worker_id": follower_id,
+                    },
+                )
+                follower_socket.receive_json()
+
+                refused = self._pair_cell_request(
+                    follower_socket,
+                    {
+                        "type": "pair_cell_pairing_decision", "request_id": "decide-1",
+                        "proposal_id": proposed["proposal_id"], "accepted": False,
+                        "reason": "account is not broker-verified empty",
+                    },
+                )
+                leader_notice = leader_socket.receive_json()
+                relisted = self._pair_cell_request(
+                    leader_socket, {"type": "pair_cell_available_followers", "request_id": "list-1"}
+                )
+
+        self.assertEqual("refused", refused["outcome"])
+        self.assertIsNone(refused["route"])
+        self.assertEqual("pair_cell_pairing_refused", leader_notice["type"])
+        self.assertEqual("account is not broker-verified empty", leader_notice["reason"])
+        self.assertEqual([follower_id], [entry["worker_id"] for entry in relisted["followers"]])
+        ledger = self.app.state.ledger
+        self.assertEqual([], ledger.pair_route_reservations_for_worker(leader_id))
+        self.assertIsNone(ledger.pair_route_for_worker(leader_id))
+        self.assertIsNone(ledger.pair_execution_owner(leader_id, follower_id, "pair_execution_cell"))
+
+    def test_a_proposal_naming_a_disconnected_follower_fails_cleanly(self) -> None:
+        """Requirement: a follower that is not connected at proposal time
+        causes a clean proposal failure with no route, no reservation, and no
+        partially accepted state on either side."""
+
+        leader_key, leader_id, leader_certificate = self._approved_worker(120051, "Broker-A")
+        _absent_key, absent_id, _absent_certificate = self._approved_worker(120052, "Broker-B")
+
+        with self.client.websocket_connect("/api/worker/session") as leader_socket:
+            self._authenticate_worker_socket(leader_socket, leader_key, leader_id, leader_certificate)
+            refused = self._pair_cell_request(
+                leader_socket,
+                {
+                    "type": "pair_cell_pairing_proposal", "request_id": "propose-1",
+                    "follower_worker_id": absent_id,
+                },
+            )
+
+        self.assertFalse(refused["accepted"])
+        self.assertIn("connected", refused["reason"])
+        ledger = self.app.state.ledger
+        self.assertEqual([], ledger.pair_route_reservations_for_worker(leader_id))
+        self.assertIsNone(ledger.pair_route_for_worker(leader_id))
+        self.assertIsNone(ledger.pair_execution_owner(leader_id, absent_id, "pair_execution_cell"))
+
+    def test_a_leader_disconnect_before_the_commit_releases_the_reservation(self) -> None:
+        """Requirement: the reservation is released when either Worker
+        disconnects before the final transaction commits, leaving no route,
+        no role assignment, and no retained execution-mode claim."""
+
+        leader_key, leader_id, leader_certificate = self._approved_worker(120061, "Broker-A")
+        follower_key, follower_id, follower_certificate = self._approved_worker(120062, "Broker-B")
+
+        with self.client.websocket_connect("/api/worker/session") as follower_socket:
+            self._authenticate_worker_socket(follower_socket, follower_key, follower_id, follower_certificate)
+            with self.client.websocket_connect("/api/worker/session") as leader_socket:
+                self._authenticate_worker_socket(leader_socket, leader_key, leader_id, leader_certificate)
+                proposed = self._pair_cell_request(
+                    leader_socket,
+                    {
+                        "type": "pair_cell_pairing_proposal", "request_id": "propose-1",
+                        "follower_worker_id": follower_id,
+                    },
+                )
+                follower_socket.receive_json()
+
+            released = follower_socket.receive_json()
+            stale = self._pair_cell_request(
+                follower_socket,
+                self._acceptance("decide-1", cast(str, proposed["proposal_id"]), follower_id),
+            )
+
+        self.assertEqual("pair_cell_pairing_reservation_released", released["type"])
+        self.assertEqual(proposed["proposal_id"], released["proposal_id"])
+        self.assertFalse(stale["accepted"])
+        ledger = self.app.state.ledger
+        self.assertIsNone(ledger.pair_route_for_worker(follower_id))
+        self.assertIsNone(ledger.pair_execution_owner(leader_id, follower_id, "pair_execution_cell"))
+
+    def test_a_decision_for_an_expired_reservation_creates_no_route(self) -> None:
+        """Requirement: the final compare-and-swap succeeds only while the
+        reservation is still valid and unexpired."""
+
+        leader_key, leader_id, leader_certificate = self._approved_worker(120071, "Broker-A")
+        follower_key, follower_id, follower_certificate = self._approved_worker(120072, "Broker-B")
+
+        with self.client.websocket_connect("/api/worker/session") as leader_socket:
+            self._authenticate_worker_socket(leader_socket, leader_key, leader_id, leader_certificate)
+            with self.client.websocket_connect("/api/worker/session") as follower_socket:
+                self._authenticate_worker_socket(follower_socket, follower_key, follower_id, follower_certificate)
+                proposed = self._pair_cell_request(
+                    leader_socket,
+                    {
+                        "type": "pair_cell_pairing_proposal", "request_id": "propose-1",
+                        "follower_worker_id": follower_id,
+                    },
+                )
+                follower_socket.receive_json()
+                self.app.state.ledger.expire_pair_route_reservations(
+                    datetime.now(UTC) + timedelta(seconds=31)
+                )
+
+                stale = self._pair_cell_request(
+                    follower_socket,
+                    self._acceptance("decide-1", cast(str, proposed["proposal_id"]), follower_id),
+                )
+
+        self.assertFalse(stale["accepted"])
+        ledger = self.app.state.ledger
+        self.assertIsNone(ledger.pair_route_for_worker(leader_id))
+        self.assertIsNone(ledger.pair_execution_owner(leader_id, follower_id, "pair_execution_cell"))
+
+    def test_a_worker_cannot_accept_a_proposal_it_was_not_reserved_for(self) -> None:
+        leader_key, leader_id, leader_certificate = self._approved_worker(120081, "Broker-A")
+        follower_key, follower_id, follower_certificate = self._approved_worker(120082, "Broker-B")
+
+        with self.client.websocket_connect("/api/worker/session") as leader_socket:
+            self._authenticate_worker_socket(leader_socket, leader_key, leader_id, leader_certificate)
+            with self.client.websocket_connect("/api/worker/session") as follower_socket:
+                self._authenticate_worker_socket(follower_socket, follower_key, follower_id, follower_certificate)
+                proposed = self._pair_cell_request(
+                    leader_socket,
+                    {
+                        "type": "pair_cell_pairing_proposal", "request_id": "propose-1",
+                        "follower_worker_id": follower_id,
+                    },
+                )
+                follower_socket.receive_json()
+
+                impostor = self._pair_cell_request(
+                    leader_socket,
+                    self._acceptance("decide-1", cast(str, proposed["proposal_id"]), follower_id),
+                )
+
+        self.assertFalse(impostor["accepted"])
+        self.assertIsNone(self.app.state.ledger.pair_route_for_worker(leader_id))
+
+    def test_a_pairing_is_refused_while_the_legacy_strategy_runtime_holds_either_worker(self) -> None:
+        """Requirement: execution-mode exclusivity is checked for both
+        Workers, and a legacy live Strategy Runtime on either Worker's pair
+        rejects the pairing at phase one."""
+
+        leader_key, leader_id, leader_certificate = self._approved_worker(120091, "Broker-A")
+        follower_key, follower_id, follower_certificate = self._approved_worker(120092, "Broker-B")
+        _third_key, third_id, _third_certificate = self._approved_worker(120093, "Broker-C")
+        trader_enrollment = self.app.state.ledger.create_trader_enrollment(
+            strategy_name="legacy-strategy-runtime",
+            claimed_public_ip="203.0.113.4",
+            public_key_pem="trader-public-key-exclusivity",
+        )
+        trader_id = self.app.state.ledger.approve_trader_enrollment(
+            trader_enrollment["registration_id"], "ABCDEF", lambda value, *_: f"certificate:{value}"
+        )
+        self.app.state.ledger.claim_pair_execution_mode(
+            follower_id, third_id, "strategy_runtime", trader_id
+        )
+
+        with self.client.websocket_connect("/api/worker/session") as leader_socket:
+            self._authenticate_worker_socket(leader_socket, leader_key, leader_id, leader_certificate)
+            with self.client.websocket_connect("/api/worker/session") as follower_socket:
+                self._authenticate_worker_socket(follower_socket, follower_key, follower_id, follower_certificate)
+                refused = self._pair_cell_request(
+                    leader_socket,
+                    {
+                        "type": "pair_cell_pairing_proposal", "request_id": "propose-1",
+                        "follower_worker_id": follower_id,
+                    },
+                )
+
+        self.assertFalse(refused["accepted"])
+        self.assertIn("legacy Strategy Runtime", refused["reason"])
+        owner = self.app.state.ledger.pair_execution_owner(follower_id, third_id, "strategy_runtime")
+        assert owner is not None
+        self.assertEqual(trader_id, owner["trader_id"])
+
+    def test_a_reconnecting_worker_syncs_its_authoritative_route_and_role(self) -> None:
+        """Requirement: a Worker that reconnects and finds itself already on
+        a route resumes its assigned role and never enters the listing or
+        proposal flow, and a contradicting declared role is ignored."""
+
+        (
+            _leader_key, leader_id, _leader_certificate,
+            follower_key, follower_id, follower_certificate, route_id,
+        ) = self._pair_route(120101, 120102)
+
+        with self.client.websocket_connect("/api/worker/session") as follower_socket:
+            self._authenticate_worker_socket(follower_socket, follower_key, follower_id, follower_certificate)
+            synced = self._pair_cell_request(
+                follower_socket, {"type": "pair_cell_route_sync", "request_id": "sync-1"}
+            )
+            contradicting = self._pair_cell_request(
+                follower_socket,
+                {"type": "pair_cell_role", "request_id": "declare-1", "role": "leader"},
+            )
+
+        self.assertEqual(route_id, synced["route"]["route_id"])
+        self.assertEqual("follower", synced["route"]["role"])
+        self.assertEqual(leader_id, synced["route"]["leader_worker_id"])
+        self.assertEqual("follower", contradicting["route"]["role"])
+        self.assertEqual(route_id, contradicting["route"]["route_id"])
+        self.assertNotIn("trader_id", json.dumps(synced))
+
+    def test_an_unpaired_worker_syncs_an_absent_route(self) -> None:
+        worker_key, worker_id, worker_certificate = self._approved_worker(120111, "Broker-A")
+
+        with self.client.websocket_connect("/api/worker/session") as socket:
+            self._authenticate_worker_socket(socket, worker_key, worker_id, worker_certificate)
+            synced = self._pair_cell_request(socket, {"type": "pair_cell_route_sync", "request_id": "sync-1"})
+
+        self.assertTrue(synced["accepted"])
+        self.assertIsNone(synced["route"])
+
+    def test_either_worker_enters_and_cancels_unpairing_and_both_are_told(self) -> None:
+        """Requirement: either authenticated Worker may enter ``UNPAIRING``
+        for the current ``route_id``, it takes effect immediately on both
+        sides, and an explicit cancel from either Worker restores normal
+        operation."""
+
+        (
+            leader_key, leader_id, leader_certificate,
+            follower_key, follower_id, follower_certificate, route_id,
+        ) = self._pair_route(120121, 120122)
+
+        with self.client.websocket_connect("/api/worker/session") as leader_socket:
+            self._authenticate_worker_socket(leader_socket, leader_key, leader_id, leader_certificate)
+            with self.client.websocket_connect("/api/worker/session") as follower_socket:
+                self._authenticate_worker_socket(follower_socket, follower_key, follower_id, follower_certificate)
+
+                entered = self._pair_cell_request(
+                    follower_socket,
+                    {
+                        "type": "pair_cell_unpair", "request_id": "unpair-1",
+                        "route_id": route_id, "action": "enter",
+                    },
+                )
+                leader_notice = leader_socket.receive_json()
+                follower_notice = follower_socket.receive_json()
+
+                cancelled = self._pair_cell_request(
+                    leader_socket,
+                    {
+                        "type": "pair_cell_unpair", "request_id": "unpair-2",
+                        "route_id": route_id, "action": "cancel",
+                    },
+                )
+                leader_socket.receive_json()
+                follower_socket.receive_json()
+
+        self.assertEqual("UNPAIRING", entered["route"]["state"])
+        self.assertIsNotNone(entered["route"]["unpairing_at"])
+        self.assertEqual("pair_cell_route_state_changed", leader_notice["type"])
+        self.assertEqual("UNPAIRING", leader_notice["route"]["state"])
+        self.assertEqual(follower_id, leader_notice["requested_by"])
+        self.assertEqual("UNPAIRING", follower_notice["route"]["state"])
+        self.assertEqual("ACTIVE", cancelled["route"]["state"])
+        self.assertIsNone(cancelled["route"]["unpairing_at"])
+
+    def test_two_fresh_assertions_remove_the_route_and_one_sided_assertions_do_not(self) -> None:
+        """Requirement: the controller removes the route only on two fresh,
+        currently-bound assertions; a one-sided or superseded assertion does
+        not unpair, and the controller derives neither emptiness nor
+        terminality itself."""
+
+        (
+            leader_key, leader_id, leader_certificate,
+            follower_key, follower_id, follower_certificate, route_id,
+        ) = self._pair_route(120131, 120132)
+        ledger = self.app.state.ledger
+
+        with self.client.websocket_connect("/api/worker/session") as leader_socket:
+            self._authenticate_worker_socket(leader_socket, leader_key, leader_id, leader_certificate)
+            with self.client.websocket_connect("/api/worker/session") as follower_socket:
+                self._authenticate_worker_socket(follower_socket, follower_key, follower_id, follower_certificate)
+                self._pair_cell_request(
+                    leader_socket,
+                    {
+                        "type": "pair_cell_unpair", "request_id": "unpair-1",
+                        "route_id": route_id, "action": "enter",
+                    },
+                )
+                leader_socket.receive_json()
+                follower_socket.receive_json()
+
+                one_sided = self._pair_cell_request(
+                    leader_socket,
+                    {
+                        "type": "pair_cell_unpair_assertion", "request_id": "assert-1",
+                        "route_id": route_id, "state_version": 1,
+                    },
+                )
+                still_routed = ledger.pair_route(route_id)
+                advanced = self._pair_cell_request(
+                    leader_socket,
+                    {
+                        "type": "pair_cell_state_version", "request_id": "version-1",
+                        "route_id": route_id, "state_version": 2,
+                    },
+                )
+                partial = self._pair_cell_request(
+                    follower_socket,
+                    {
+                        "type": "pair_cell_unpair_assertion", "request_id": "assert-2",
+                        "route_id": route_id, "state_version": 5,
+                    },
+                )
+                after_invalidation = ledger.pair_route(route_id)
+                completed = self._pair_cell_request(
+                    leader_socket,
+                    {
+                        "type": "pair_cell_unpair_assertion", "request_id": "assert-3",
+                        "route_id": route_id, "state_version": 2,
+                    },
+                )
+                removals = [leader_socket.receive_json(), follower_socket.receive_json()]
+
+        self.assertFalse(one_sided["route_removed"])
+        self.assertIsNotNone(still_routed)
+        self.assertTrue(advanced["assertion_invalidated"])
+        self.assertFalse(partial["route_removed"])
+        self.assertIsNotNone(after_invalidation)
+        self.assertTrue(completed["route_removed"])
+        self.assertEqual(
+            [{"type": "pair_cell_route_removed", "route_id": route_id, "reason": "safe_unpair"}] * 2,
+            removals,
+        )
+        self.assertIsNone(ledger.pair_route(route_id))
+        self.assertIsNone(ledger.pair_execution_owner(leader_id, follower_id, "pair_execution_cell"))
+
+    def test_an_assertion_for_a_wrong_route_id_is_refused(self) -> None:
+        (
+            leader_key, leader_id, leader_certificate,
+            _follower_key, _follower_id, _follower_certificate, route_id,
+        ) = self._pair_route(120141, 120142)
+
+        with self.client.websocket_connect("/api/worker/session") as leader_socket:
+            self._authenticate_worker_socket(leader_socket, leader_key, leader_id, leader_certificate)
+            self.app.state.ledger.enter_pair_route_unpairing(route_id=route_id, worker_id=leader_id)
+            refused = self._pair_cell_request(
+                leader_socket,
+                {
+                    "type": "pair_cell_unpair_assertion", "request_id": "assert-1",
+                    "route_id": "some-other-route", "state_version": 1,
+                },
+            )
+
+        self.assertFalse(refused["accepted"])
+        self.assertIsNotNone(self.app.state.ledger.pair_route(route_id))
+
+    def test_a_worker_outside_the_route_cannot_unpair_it(self) -> None:
+        (
+            _leader_key, _leader_id, _leader_certificate,
+            _follower_key, _follower_id, _follower_certificate, route_id,
+        ) = self._pair_route(120151, 120152)
+        outsider_key, outsider_id, outsider_certificate = self._approved_worker(120153, "Broker-C")
+
+        with self.client.websocket_connect("/api/worker/session") as outsider_socket:
+            self._authenticate_worker_socket(outsider_socket, outsider_key, outsider_id, outsider_certificate)
+            refused = self._pair_cell_request(
+                outsider_socket,
+                {
+                    "type": "pair_cell_unpair", "request_id": "unpair-1",
+                    "route_id": route_id, "action": "enter",
+                },
+            )
+
+        self.assertFalse(refused["accepted"])
+        route = self.app.state.ledger.pair_route(route_id)
+        assert route is not None
+        self.assertEqual("ACTIVE", route["state"])
+
+    def test_identity_revocation_removes_relay_without_unpairing_the_route(self) -> None:
+        """Requirement: identity revocation removes entry readiness and relay
+        but is never a safe unpair and never implies broker ``EMPTY``."""
+
+        (
+            leader_key, leader_id, leader_certificate,
+            _follower_key, follower_id, _follower_certificate, route_id,
+        ) = self._pair_route(120161, 120162)
+        login = self.client.post(
+            "/api/admin/login", json={"username": "ABCDEF", "password": "A-secure-admin-password!"}
+        )
+        headers = {"X-CSRF-Token": login.json()["csrf_token"]}
+        self.client.post(f"/api/admin/workers/{follower_id}/revoke", headers=headers)
+        envelope = self._relay_envelope(leader_id, follower_id, route_id)
+
+        with self.client.websocket_connect("/api/worker/session") as leader_socket:
+            self._authenticate_worker_socket(leader_socket, leader_key, leader_id, leader_certificate)
+            leader_socket.send_json({"type": "pair_relay", "request_id": "relay-1", "envelope": envelope})
+            ack = leader_socket.receive_json()
+
+        self.assertFalse(ack["accepted"])
+        surviving = self.app.state.ledger.pair_route(route_id)
+        assert surviving is not None
+        self.assertEqual("ACTIVE", surviving["state"])
+
+    def test_a_malformed_pairing_control_message_is_refused_without_dropping_the_session(self) -> None:
+        worker_key, worker_id, worker_certificate = self._approved_worker(120171, "Broker-A")
+
+        with self.client.websocket_connect("/api/worker/session") as socket:
+            self._authenticate_worker_socket(socket, worker_key, worker_id, worker_certificate)
+            refused = self._pair_cell_request(
+                socket, {"type": "pair_cell_role", "request_id": "declare-1", "role": "coordinator"}
+            )
+            recovered = self._pair_cell_request(
+                socket, {"type": "pair_cell_role", "request_id": "declare-2", "role": "leader"}
+            )
+
+        self.assertFalse(refused["accepted"])
+        self.assertTrue(recovered["accepted"])
+        self.assertEqual("leader", recovered["role"])
+
+    def test_a_pairing_control_message_carrying_a_trader_id_is_refused(self) -> None:
+        """Requirement: no Pair Cell controller API accepts a Trader
+        identity."""
+
+        worker_key, worker_id, worker_certificate = self._approved_worker(120181, "Broker-A")
+
+        with self.client.websocket_connect("/api/worker/session") as socket:
+            self._authenticate_worker_socket(socket, worker_key, worker_id, worker_certificate)
+            refused = self._pair_cell_request(
+                socket,
+                {
+                    "type": "pair_cell_role", "request_id": "declare-1",
+                    "role": "leader", "trader_id": "trader-1",
+                },
+            )
+
+        self.assertFalse(refused["accepted"])
+
+    def test_the_controller_never_parses_universe_content_on_a_pairing_message(self) -> None:
+        """Requirement: the controller validates ``route_id`` and role only,
+        never discovered universe content."""
+
+        worker_key, worker_id, worker_certificate = self._approved_worker(120191, "Broker-A")
+
+        with self.client.websocket_connect("/api/worker/session") as socket:
+            self._authenticate_worker_socket(socket, worker_key, worker_id, worker_certificate)
+            refused = self._pair_cell_request(
+                socket,
+                {
+                    "type": "pair_cell_available_followers", "request_id": "list-1",
+                    "eligible_products": ["EURUSD"],
+                },
+            )
+
+        self.assertFalse(refused["accepted"])
+
+    def test_every_dispatched_pairing_message_type_has_a_correlated_result_type(self) -> None:
+        """The session's dispatch set and the reply table can never drift, or
+        a Worker's pairing request would drop its authenticated session."""
+
+        self.assertEqual(
+            set(PAIR_CELL_CONTROL_MESSAGE_TYPES),
+            set(controlplane_service._PAIR_CELL_RESULT_TYPES),
+        )
+
+    # ---- Administrator surfaces that survive ---- #
+
     def test_admin_pair_execution_mode_switch_is_mutually_exclusive_and_explicit(self) -> None:
+        """Requirement: the legacy Strategy Runtime keeps its own operator
+        switch and its own Trader identity, unchanged."""
+
         _leader_key, leader_id, _leader_certificate = self._approved_worker(666666, "Broker-A")
         _follower_key, follower_id, _follower_certificate = self._approved_worker(777777, "Broker-B")
         trader_enrollment = self.app.state.ledger.create_trader_enrollment(
-            strategy_name="pair-execution-cell", claimed_public_ip="203.0.113.4", public_key_pem="trader-public-key-3"
+            strategy_name="legacy-strategy-runtime",
+            claimed_public_ip="203.0.113.4",
+            public_key_pem="trader-public-key-3",
         )
         trader_id = self.app.state.ledger.approve_trader_enrollment(
             trader_enrollment["registration_id"], "ABCDEF", lambda value, *_: f"certificate:{value}"
@@ -1251,17 +2427,17 @@ class ControlPlaneServiceTests(unittest.TestCase):
                 "trader_id": trader_id, "mode": "strategy_runtime",
             },
         )
-        self.assertEqual(200, claim.status_code)
+        self.assertEqual(200, claim.status_code, claim.text)
 
-        conflict = self.client.post(
+        blocked = self.client.post(
             "/api/admin/pairs/execution-mode",
             headers=headers,
             json={
                 "leader_worker_id": leader_id, "follower_worker_id": follower_id,
-                "trader_id": trader_id, "mode": "pair_execution_cell",
+                "trader_id": "another-trader", "mode": "strategy_runtime",
             },
         )
-        self.assertEqual(409, conflict.status_code)
+        self.assertEqual(409, blocked.status_code)
 
         release = self.client.post(
             "/api/admin/pairs/execution-mode/release",
@@ -1270,215 +2446,106 @@ class ControlPlaneServiceTests(unittest.TestCase):
         )
         self.assertEqual(204, release.status_code)
 
-        after_release = self.client.post(
-            "/api/admin/pairs/execution-mode",
+        reserved = self.app.state.ledger.reserve_pair_route_proposal(
+            leader_worker_id=leader_id,
+            follower_worker_id=follower_id,
+            connected_worker_ids={leader_id, follower_id},
+        )
+        self.assertEqual(30, reserved["timeout_seconds"])
+
+    def test_admin_cannot_release_a_pair_cell_execution_mode_claim(self) -> None:
+        """Requirement: a Pair Cell claim is released only by its reservation
+        or its route, so no operator can strand a live route."""
+
+        (
+            _leader_key, leader_id, _leader_certificate,
+            _follower_key, follower_id, _follower_certificate, route_id,
+        ) = self._pair_route(120201, 120202)
+        login = self.client.post(
+            "/api/admin/login", json={"username": "ABCDEF", "password": "A-secure-admin-password!"}
+        )
+        headers = {"X-CSRF-Token": login.json()["csrf_token"]}
+
+        response = self.client.post(
+            "/api/admin/pairs/execution-mode/release",
             headers=headers,
             json={
                 "leader_worker_id": leader_id, "follower_worker_id": follower_id,
-                "trader_id": trader_id, "mode": "pair_execution_cell",
-            },
-        )
-        self.assertEqual(200, after_release.status_code)
-
-    def _base_pair_contract_activation_fields(self, leader_id: str, follower_id: str, trader_id: str) -> dict[str, object]:
-        return {
-            "leader_worker_id": leader_id, "follower_worker_id": follower_id, "trader_id": trader_id,
-            "leader_volume": "0.10", "follower_volume": "0.10", "filling_mode": "FOK",
-            "risk_budget_usd": "50", "quote_max_age_seconds": 5.0, "quote_max_skew_seconds": 5.0,
-            "arm_timeout_seconds": 5.0, "commit_lead_seconds": 0.2, "execution_expiry_seconds": 5.0,
-            "mode": "live", "ttl_seconds": 300,
-        }
-
-    def test_admin_activates_an_automatic_entry_edge_points_pair_contract(self) -> None:
-        """Requirement: activation accepts a policy-level ``entry_edge_points``
-        plus ``eligible_symbols`` instead of one fixed symbol/directions."""
-
-        _leader_key, leader_id, _leader_certificate = self._approved_worker(101010, "Broker-A")
-        _follower_key, follower_id, _follower_certificate = self._approved_worker(202020, "Broker-B")
-        trader_enrollment = self.app.state.ledger.create_trader_enrollment(
-            strategy_name="pair-execution-cell", claimed_public_ip="203.0.113.4", public_key_pem="trader-public-key-4"
-        )
-        trader_id = self.app.state.ledger.approve_trader_enrollment(
-            trader_enrollment["registration_id"], "ABCDEF", lambda value, *_: f"certificate:{value}"
-        )
-        login = self.client.post(
-            "/api/admin/login", json={"username": "ABCDEF", "password": "A-secure-admin-password!"}
-        )
-        headers = {"X-CSRF-Token": login.json()["csrf_token"]}
-
-        response = self.client.post(
-            "/api/admin/pairs/activate",
-            headers=headers,
-            json={
-                **self._base_pair_contract_activation_fields(leader_id, follower_id, trader_id),
-                "entry_edge_points": "1.5",
-                "eligible_symbols": ["EURUSD", "GBPUSD", "XAUUSD"],
-            },
-        )
-
-        self.assertEqual(200, response.status_code, response.text)
-        contract = response.json()["contract"]
-        self.assertEqual("1.5", contract["entry_edge_points"])
-        self.assertEqual(["EURUSD", "GBPUSD", "XAUUSD"], contract["eligible_symbols"])
-        self.assertNotIn("symbol", contract)
-
-    def test_automatic_activation_allows_an_empty_filter_for_full_catalog_discovery(self) -> None:
-        activation = controlplane_service.PairContractActivationRequest(
-            **self._base_pair_contract_activation_fields("leader-1", "follower-1", "trader-1"),
-            entry_edge_points="1",
-        )
-
-        self.assertEqual([], activation.eligible_symbols)
-
-    def test_admin_activates_a_legacy_symbol_and_direction_pair_contract(self) -> None:
-        """Requirement: old fixed symbol/directions activation payloads keep working."""
-
-        _leader_key, leader_id, _leader_certificate = self._approved_worker(303030, "Broker-A")
-        _follower_key, follower_id, _follower_certificate = self._approved_worker(404040, "Broker-B")
-        trader_enrollment = self.app.state.ledger.create_trader_enrollment(
-            strategy_name="pair-execution-cell", claimed_public_ip="203.0.113.4", public_key_pem="trader-public-key-5"
-        )
-        trader_id = self.app.state.ledger.approve_trader_enrollment(
-            trader_enrollment["registration_id"], "ABCDEF", lambda value, *_: f"certificate:{value}"
-        )
-        login = self.client.post(
-            "/api/admin/login", json={"username": "ABCDEF", "password": "A-secure-admin-password!"}
-        )
-        headers = {"X-CSRF-Token": login.json()["csrf_token"]}
-
-        response = self.client.post(
-            "/api/admin/pairs/activate",
-            headers=headers,
-            json={
-                **self._base_pair_contract_activation_fields(leader_id, follower_id, trader_id),
-                "symbol": "EURUSD", "leader_direction": "LONG", "follower_direction": "SHORT",
-                "edge_threshold": "0.0005",
-            },
-        )
-
-        self.assertEqual(200, response.status_code, response.text)
-        contract = response.json()["contract"]
-        self.assertEqual("EURUSD", contract["symbol"])
-        self.assertNotIn("entry_edge_points", contract)
-
-    def test_admin_activation_rejects_both_automatic_and_legacy_fields_together(self) -> None:
-        _leader_key, leader_id, _leader_certificate = self._approved_worker(505050, "Broker-A")
-        _follower_key, follower_id, _follower_certificate = self._approved_worker(606060, "Broker-B")
-        trader_enrollment = self.app.state.ledger.create_trader_enrollment(
-            strategy_name="pair-execution-cell", claimed_public_ip="203.0.113.4", public_key_pem="trader-public-key-6"
-        )
-        trader_id = self.app.state.ledger.approve_trader_enrollment(
-            trader_enrollment["registration_id"], "ABCDEF", lambda value, *_: f"certificate:{value}"
-        )
-        login = self.client.post(
-            "/api/admin/login", json={"username": "ABCDEF", "password": "A-secure-admin-password!"}
-        )
-        headers = {"X-CSRF-Token": login.json()["csrf_token"]}
-
-        response = self.client.post(
-            "/api/admin/pairs/activate",
-            headers=headers,
-            json={
-                **self._base_pair_contract_activation_fields(leader_id, follower_id, trader_id),
-                "entry_edge_points": "1.5", "eligible_symbols": ["EURUSD"],
-                "symbol": "EURUSD", "leader_direction": "LONG", "follower_direction": "SHORT",
-                "edge_threshold": "0.0005",
+                "mode": "pair_execution_cell",
             },
         )
 
         self.assertEqual(422, response.status_code)
-
-    def test_admin_activation_rejects_neither_automatic_nor_legacy_fields(self) -> None:
-        _leader_key, leader_id, _leader_certificate = self._approved_worker(707070, "Broker-A")
-        _follower_key, follower_id, _follower_certificate = self._approved_worker(808080, "Broker-B")
-        trader_enrollment = self.app.state.ledger.create_trader_enrollment(
-            strategy_name="pair-execution-cell", claimed_public_ip="203.0.113.4", public_key_pem="trader-public-key-7"
+        self.assertIsNotNone(self.app.state.ledger.pair_route(route_id))
+        self.assertIsNotNone(
+            self.app.state.ledger.pair_execution_owner(leader_id, follower_id, "pair_execution_cell")
         )
-        trader_id = self.app.state.ledger.approve_trader_enrollment(
-            trader_enrollment["registration_id"], "ABCDEF", lambda value, *_: f"certificate:{value}"
-        )
-        login = self.client.post(
-            "/api/admin/login", json={"username": "ABCDEF", "password": "A-secure-admin-password!"}
-        )
-        headers = {"X-CSRF-Token": login.json()["csrf_token"]}
-
-        response = self.client.post(
-            "/api/admin/pairs/activate",
-            headers=headers,
-            json=self._base_pair_contract_activation_fields(leader_id, follower_id, trader_id),
-        )
-
-        self.assertEqual(422, response.status_code)
 
     def test_admin_release_of_pair_quarantine_requires_admin_auth(self) -> None:
         response = self.client.post(
             "/api/admin/pairs/quarantine/release",
-            json={
-                "leader_worker_id": "worker-a", "follower_worker_id": "worker-b",
-                "symbol": "EURUSD", "reason": "operator review",
-            },
+            json={"route_id": "route-1", "symbol": "EURUSD", "reason": "operator review"},
         )
 
         self.assertEqual(401, response.status_code)
 
-    def test_admin_release_of_pair_quarantine_request_requires_a_non_empty_reason(self) -> None:
+    def test_admin_release_of_pair_quarantine_names_the_route_and_never_a_trader(self) -> None:
+        """Requirement: the authenticated operator quarantine release is
+        adapted to ``route_id``; it carries no Trader identity."""
+
         login = self.client.post(
             "/api/admin/login", json={"username": "ABCDEF", "password": "A-secure-admin-password!"}
         )
         headers = {"X-CSRF-Token": login.json()["csrf_token"]}
 
-        response = self.client.post(
-            "/api/admin/pairs/quarantine/release",
-            headers=headers,
-            json={"leader_worker_id": "worker-a", "follower_worker_id": "worker-b", "symbol": "EURUSD", "reason": ""},
-        )
-
-        self.assertEqual(422, response.status_code)
-
-    def test_admin_release_of_pair_quarantine_rejects_the_same_worker_as_leader_and_follower(self) -> None:
-        _leader_key, leader_id, _leader_certificate = self._approved_worker(909090, "Broker-A")
-        login = self.client.post(
-            "/api/admin/login", json={"username": "ABCDEF", "password": "A-secure-admin-password!"}
-        )
-        headers = {"X-CSRF-Token": login.json()["csrf_token"]}
-
-        response = self.client.post(
-            "/api/admin/pairs/quarantine/release",
-            headers=headers,
-            json={
-                "leader_worker_id": leader_id, "follower_worker_id": leader_id,
+        for body in (
+            {"route_id": "route-1", "symbol": "EURUSD", "reason": ""},
+            {"symbol": "EURUSD", "reason": "operator review"},
+            {
+                "route_id": "route-1", "symbol": "EURUSD", "reason": "operator review",
+                "trader_id": "trader-1",
+            },
+            {
+                "leader_worker_id": "worker-a", "follower_worker_id": "worker-b",
                 "symbol": "EURUSD", "reason": "operator review",
             },
+        ):
+            with self.subTest(body=body):
+                response = self.client.post(
+                    "/api/admin/pairs/quarantine/release", headers=headers, json=body
+                )
+
+                self.assertEqual(422, response.status_code)
+
+    def test_admin_release_of_pair_quarantine_requires_a_live_route(self) -> None:
+        """Requirement: quarantine release stays an authenticated route-level
+        operation. Without a live route the controller has no standing to
+        address the pair at all."""
+
+        login = self.client.post(
+            "/api/admin/login", json={"username": "ABCDEF", "password": "A-secure-admin-password!"}
+        )
+        headers = {"X-CSRF-Token": login.json()["csrf_token"]}
+
+        response = self.client.post(
+            "/api/admin/pairs/quarantine/release",
+            headers=headers,
+            json={"route_id": "no-such-route", "symbol": "EURUSD", "reason": "operator review"},
         )
 
         self.assertEqual(409, response.status_code)
-
-    def test_admin_release_of_pair_quarantine_rejects_an_unknown_worker(self) -> None:
-        _leader_key, leader_id, _leader_certificate = self._approved_worker(919191, "Broker-A")
-        login = self.client.post(
-            "/api/admin/login", json={"username": "ABCDEF", "password": "A-secure-admin-password!"}
-        )
-        headers = {"X-CSRF-Token": login.json()["csrf_token"]}
-
-        response = self.client.post(
-            "/api/admin/pairs/quarantine/release",
-            headers=headers,
-            json={
-                "leader_worker_id": leader_id, "follower_worker_id": "no-such-worker",
-                "symbol": "EURUSD", "reason": "operator review",
-            },
-        )
-
-        self.assertEqual(409, response.status_code)
+        self.assertIn("live Worker route", response.json()["detail"])
 
     def test_admin_release_of_pair_quarantine_requires_both_workers_to_be_connected(self) -> None:
-        """Requirement: unlike contract activation (idempotent latest-state a
-        Worker can fetch on reconnect), a quarantine release is a one-time
-        action, so it must never be silently accepted for delivery "later" --
-        both the leader and follower Worker session must be connected now."""
+        """Requirement: a quarantine release is a one-time action that the
+        controller never persists for later replay, so it must never be
+        silently accepted for delivery "later" -- both the leader and
+        follower Worker session must be connected now."""
 
-        _leader_key, leader_id, _leader_certificate = self._approved_worker(929292, "Broker-A")
-        _follower_key, follower_id, _follower_certificate = self._approved_worker(939393, "Broker-B")
+        (
+            _leader_key, _leader_id, _leader_certificate,
+            _follower_key, _follower_id, _follower_certificate, route_id,
+        ) = self._pair_route(929292, 939393)
         login = self.client.post(
             "/api/admin/login", json={"username": "ABCDEF", "password": "A-secure-admin-password!"}
         )
@@ -1487,10 +2554,7 @@ class ControlPlaneServiceTests(unittest.TestCase):
         response = self.client.post(
             "/api/admin/pairs/quarantine/release",
             headers=headers,
-            json={
-                "leader_worker_id": leader_id, "follower_worker_id": follower_id,
-                "symbol": "EURUSD", "reason": "operator review",
-            },
+            json={"route_id": route_id, "symbol": "EURUSD", "reason": "operator review"},
         )
 
         self.assertEqual(409, response.status_code)

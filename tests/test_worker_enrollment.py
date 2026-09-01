@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+from argparse import Namespace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
@@ -15,7 +16,14 @@ from websockets.frames import Close
 from websockets.http11 import Response
 
 from abt.controlplane.crypto import enrollment_payload
-from abt.worker.cli import HTTPEnrollmentTransport, MetaTrader5Adapter, _print_diagnostic, main
+from abt.worker.cli import (
+    HTTPEnrollmentTransport,
+    MetaTrader5Adapter,
+    _pair_cell_startup_options,
+    _print_diagnostic,
+    _select_follower,
+    main,
+)
 from abt.worker.credentials import retrieve_mt5_password
 from abt.worker.enrollment import WorkerEnrollmentError, WorkerSessionDisconnected, register_worker
 from abt.worker.reconciliation import reconnect_worker_session
@@ -191,6 +199,112 @@ class WorkerEnrollmentTests(unittest.TestCase):
         self.assertEqual(password, transport.request["mt5_password"])
         self.assertTrue(key_store.closed)
         self.assertTrue(transport.closed)
+
+    def test_follower_worker_id_is_leader_only(self) -> None:
+        errors = io.StringIO()
+        with patch("abt.worker.cli.sys.platform", "win32"):
+            exit_code = main(
+                ["reconcile", "--config", str(self.config_path), "--follower-worker-id", "worker-b"],
+                mt5_factory=FakeMT5,
+                transport_factory=FakeTransport,
+                key_store_factory=lambda _: FakeKeyStore(),
+                error_output=errors,
+            )
+
+        self.assertEqual(1, exit_code)
+        self.assertIn("leader only", errors.getvalue())
+
+    def test_unpair_and_cancel_unpair_cannot_be_requested_together(self) -> None:
+        errors = io.StringIO()
+        with patch("abt.worker.cli.sys.platform", "win32"):
+            exit_code = main(
+                [
+                    "reconcile",
+                    "--config",
+                    str(self.config_path),
+                    "--pair-cell-unpair",
+                    "--pair-cell-cancel-unpair",
+                ],
+                mt5_factory=FakeMT5,
+                transport_factory=FakeTransport,
+                key_store_factory=lambda _: FakeKeyStore(),
+                error_output=errors,
+            )
+
+        self.assertEqual(1, exit_code)
+        self.assertIn("cannot be requested together", errors.getvalue())
+
+    def test_an_omitted_pair_cell_role_means_available_follower(self) -> None:
+        options = _pair_cell_startup_options(
+            Namespace(pair_cell_role=None),
+            interactive=True,
+            input_prompt=lambda _: "",
+            output=io.StringIO(),
+        )
+
+        self.assertIsNone(options.role)
+        self.assertIsNone(options.follower_worker_id)
+        self.assertIsNone(options.select_follower)
+        self.assertFalse(options.unpair)
+        self.assertFalse(options.cancel_unpair)
+        self.assertFalse(options.rediscover)
+
+    def test_a_non_tty_leader_never_gets_an_interactive_selector(self) -> None:
+        options = _pair_cell_startup_options(
+            Namespace(pair_cell_role="leader"),
+            interactive=False,
+            input_prompt=lambda _: "1",
+            output=io.StringIO(),
+        )
+
+        self.assertEqual("leader", options.role)
+        self.assertFalse(options.interactive)
+        self.assertIsNone(options.select_follower)
+
+    def test_an_interactive_leader_without_the_flag_gets_a_selector(self) -> None:
+        options = _pair_cell_startup_options(
+            Namespace(pair_cell_role="leader", pair_cell_rediscover=True),
+            interactive=True,
+            input_prompt=lambda _: "1",
+            output=io.StringIO(),
+        )
+
+        self.assertIsNotNone(options.select_follower)
+        self.assertTrue(options.rediscover)
+
+    def test_an_unattended_leader_with_the_flag_gets_no_selector(self) -> None:
+        options = _pair_cell_startup_options(
+            Namespace(pair_cell_role="leader", follower_worker_id="worker-b"),
+            interactive=True,
+            input_prompt=lambda _: "1",
+            output=io.StringIO(),
+        )
+
+        self.assertEqual("worker-b", options.follower_worker_id)
+        self.assertIsNone(options.select_follower)
+
+    def test_interactive_follower_selection_accepts_a_number_or_a_worker_id(self) -> None:
+        followers = [
+            {"worker_id": "worker-b", "login": 1, "server": "Broker-B"},
+            {"worker_id": "worker-c", "login": 2, "server": "Broker-C"},
+        ]
+        listing = io.StringIO()
+
+        self.assertEqual(
+            "worker-c",
+            _select_follower(followers, input_prompt=lambda _: "2", output=listing),
+        )
+        self.assertIn("worker-b", listing.getvalue())
+        self.assertEqual(
+            "worker-b",
+            _select_follower(followers, input_prompt=lambda _: "worker-b", output=io.StringIO()),
+        )
+        self.assertIsNone(
+            _select_follower(followers, input_prompt=lambda _: "", output=io.StringIO())
+        )
+        self.assertIsNone(
+            _select_follower(followers, input_prompt=lambda _: "9", output=io.StringIO())
+        )
 
     def test_cli_fails_closed_outside_windows(self) -> None:
         errors = io.StringIO()

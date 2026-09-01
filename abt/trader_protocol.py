@@ -381,57 +381,237 @@ worker_fact_envelope_adapter = TypeAdapter(WorkerFactEnvelope)
 
 
 # --------------------------------------------------------------------------- #
-# Pair Execution Cell opaque Worker-to-Worker relay (ADR-0010)
+# Pair Execution Cell opaque Worker-to-Worker relay
 # --------------------------------------------------------------------------- #
 #
-# The controller relays these envelopes between the two Workers of one leased
-# pair.  It validates identity, route, lease epoch/expiry, payload size, and
-# protocol version only; it never inspects ``payload`` (quotes, arm/commit,
-# leg status) and never calculates an edge or derives pair lifecycle state.
+# The controller is an authenticated identity authority, the arbiter of
+# exclusive route ownership, and an opaque control-and-data relay -- nothing
+# more.  It validates the two Worker identities, that the message stays on a
+# live route named by its ``route_id``, that the sending Worker holds the
+# sending role on the controller's own route record, the protocol version, and
+# the payload size; it then forwards the envelope unchanged.  It never inspects
+# ``payload`` (policy, quotes, attempts, discovered universe content, leg
+# status), never issues a trading lease or contract, never derives
+# pair-lifecycle state, and never replays an execution envelope after a
+# reconnect.
 
 MAX_PAIR_RELAY_ENVELOPE_BYTES = 65_536
 PAIR_CELL_PROTOCOL_VERSION = 1
 
 
-class PairLeaseClaim(_ProtocolModel):
-    """The identity/route/fencing fields the controller validates on every message."""
+class PairRouteClaim(_ProtocolModel):
+    """The route fields the controller validates on every relayed message.
 
+    Durable route identity is the controller-generated, globally unique,
+    never-reused ``route_id`` plus the ordered leader/follower Worker pair.
+    There is deliberately no ``trader_id``: a Pair Execution Cell route binds
+    no Trader identity anywhere -- not on the route, not in an envelope, not
+    in an ownership record, and not in a controller API.  (The legacy Strategy
+    Runtime and Trader RPC surfaces above keep their own Trader identity
+    untouched.)
+
+    ``route_id`` is *not* a lease epoch.  It has no TTL, is never renewed,
+    never expires, fences no broker effect, confers no trading authorization,
+    and is never derived from or compared against a Worker's own
+    ``recovery_epoch``.  It is only the durable name of one pairing
+    relationship.
+    """
+
+    route_id: str = Field(min_length=1)
     leader_worker_id: str
     follower_worker_id: str
-    trader_id: str
-    contract_hash: str
-    lease_epoch: int
 
 
 class PairCellRelayEnvelope(_ProtocolModel):
     """One opaque, versioned pair-cell message relayed Worker-to-Worker.
 
-    ``request_id`` uniquely identifies *this* message instance and is the
-    controller's sole replay-deduplication key: it is fresh for every
-    logically distinct message a Pair Execution Cell emits, and reused only
-    when the Worker-side transport retries delivering that exact instance.
-    ``attempt_id`` is a separate, non-unique correlation field spanning every
-    message of one attempt (arm, arm-ack, commit, leg-status, ...); several
-    distinct messages legitimately share one ``attempt_id``, so it must never
-    be used as the dedup key.
+    ``request_id`` identifies this message instance for ordinary connection
+    and delivery diagnostics only.  It is deliberately *not* a durable
+    idempotency key: the controller keeps no attempt projection, so it can
+    neither deduplicate against an earlier session nor replay a message from
+    one.  Duplicate suppression is the receiving Worker's own durable
+    responsibility.
     """
 
     type: Literal["pair_cell_relay"] = "pair_cell_relay"
     protocol_version: Literal[1] = PAIR_CELL_PROTOCOL_VERSION
-    lease: PairLeaseClaim
+    route: PairRouteClaim
     from_worker_id: str
     to_worker_id: str
     request_id: str = Field(min_length=1)
-    attempt_id: str | None = None
     payload_hash: str
     payload: dict[str, object]
 
     @model_validator(mode="after")
-    def route_within_lease(self) -> PairCellRelayEnvelope:
-        pair = {self.lease.leader_worker_id, self.lease.follower_worker_id}
+    def route_between_the_paired_workers(self) -> PairCellRelayEnvelope:
+        pair = {self.route.leader_worker_id, self.route.follower_worker_id}
         if self.from_worker_id not in pair or self.to_worker_id not in pair or self.from_worker_id == self.to_worker_id:
-            raise ValueError("The pair-cell relay route must be between the leased leader and follower.")
+            raise ValueError("The pair-cell relay route must be between the routed leader and follower.")
         return self
 
 
 pair_cell_relay_envelope_adapter = TypeAdapter(PairCellRelayEnvelope)
+
+
+# --------------------------------------------------------------------------- #
+# Pair Execution Cell Worker-facing pairing control plane
+# --------------------------------------------------------------------------- #
+#
+# Pairing is Worker-initiated: there is no administrator-created route and no
+# administrator approval of an individual pairing.  A Worker declares a desired
+# role on its first unpaired connection, a leader lists currently connected,
+# available, unpaired followers and proposes one, and the selected follower
+# accepts or refuses from its own local safety evidence.  Every message below
+# is authenticated as the sending Worker's own session; none of them carries a
+# ``trader_id``.
+
+
+class PairCellRoleDeclaration(_ProtocolModel):
+    """A Worker's desired Pair Execution Cell role on an unpaired connection.
+
+    An omitted ``role`` means the Worker is simply an *available follower*.
+    A durable route always wins over this declaration: a Worker that is
+    already routed resumes its assigned role, and a contradicting declaration
+    is recorded as a diagnostic rather than silently changing who leads.
+    """
+
+    type: Literal["pair_cell_role"]
+    protocol_version: Literal[1] = PAIR_CELL_PROTOCOL_VERSION
+    request_id: str = Field(min_length=1)
+    role: Literal["leader", "follower"] | None = None
+
+
+class PairCellFollowerListingRequest(_ProtocolModel):
+    """A leader asking for the currently connected, available, unpaired followers."""
+
+    type: Literal["pair_cell_available_followers"]
+    protocol_version: Literal[1] = PAIR_CELL_PROTOCOL_VERSION
+    request_id: str = Field(min_length=1)
+
+
+class PairCellPairingProposal(_ProtocolModel):
+    """Phase one: a leader proposing a pairing with one selected follower."""
+
+    type: Literal["pair_cell_pairing_proposal"]
+    protocol_version: Literal[1] = PAIR_CELL_PROTOCOL_VERSION
+    request_id: str = Field(min_length=1)
+    follower_worker_id: str = Field(min_length=1)
+
+
+class PairCellPairingDecision(_ProtocolModel):
+    """Phase two: the reserved follower's acceptance or reasoned refusal.
+
+    An acceptance is not a bare yes.  It carries the follower's **Pairing
+    Acceptance payload** -- its own frozen startup balance and its own four
+    authored risk tunables -- which the controller forwards to the reserved
+    leader unchanged and never parses.  ``acceptance_payload`` is therefore
+    declared as an opaque mapping and ``payload_hash`` as an opaque string:
+    the controller checks that they are present, encodable, and within the
+    size limit, and nothing else.  The leader copies the block verbatim into
+    the canonical policy's ``follower_risk``; only the two Workers know what
+    the fields mean.
+
+    A refusal never becomes an implied acceptance: it releases the
+    reservation immediately, carries no acceptance payload, and may carry an
+    opaque ``reason`` the controller likewise never inspects.
+    """
+
+    type: Literal["pair_cell_pairing_decision"]
+    protocol_version: Literal[1] = PAIR_CELL_PROTOCOL_VERSION
+    request_id: str = Field(min_length=1)
+    proposal_id: str = Field(min_length=1)
+    accepted: bool
+    acceptance_payload: dict[str, object] | None = None
+    payload_hash: str | None = None
+    reason: str | None = None
+
+    @model_validator(mode="after")
+    def acceptance_carries_its_payload_and_refusal_carries_its_reason(self) -> PairCellPairingDecision:
+        if self.accepted:
+            if self.acceptance_payload is None or not self.payload_hash:
+                raise ValueError(
+                    "A pairing acceptance must carry its opaque Pairing Acceptance payload and hash."
+                )
+            if self.reason is not None:
+                raise ValueError("A pairing acceptance carries no refusal reason.")
+        elif self.acceptance_payload is not None or self.payload_hash is not None:
+            raise ValueError("A pairing refusal carries no Pairing Acceptance payload.")
+        return self
+
+
+class PairCellRouteSyncRequest(_ProtocolModel):
+    """A reconnecting Worker asking the controller for its authoritative route."""
+
+    type: Literal["pair_cell_route_sync"]
+    protocol_version: Literal[1] = PAIR_CELL_PROTOCOL_VERSION
+    request_id: str = Field(min_length=1)
+
+
+class PairCellUnpairCommand(_ProtocolModel):
+    """Either routed Worker entering or cancelling the ``UNPAIRING`` state."""
+
+    type: Literal["pair_cell_unpair"]
+    protocol_version: Literal[1] = PAIR_CELL_PROTOCOL_VERSION
+    request_id: str = Field(min_length=1)
+    route_id: str = Field(min_length=1)
+    action: Literal["enter", "cancel"]
+
+
+class PairCellStateVersionReport(_ProtocolModel):
+    """A Worker's current local attempt/effect state version for this route.
+
+    The version advances on any new or changed local attempt or broker effect,
+    which invalidates that Worker's outstanding safe-unpair assertion.  The
+    controller stores the number and compares it; it never derives emptiness
+    or terminality itself.
+    """
+
+    type: Literal["pair_cell_state_version"]
+    protocol_version: Literal[1] = PAIR_CELL_PROTOCOL_VERSION
+    request_id: str = Field(min_length=1)
+    route_id: str = Field(min_length=1)
+    state_version: int = Field(ge=0)
+
+
+class PairCellUnpairAssertion(_ProtocolModel):
+    """One Worker's safe-unpair assertion, bound to ``route_id`` + state version.
+
+    The assertion's *content* -- broker-verified empty, every attempt and
+    local effect terminal -- is the Worker's claim from its own fresh
+    evidence.  The controller records it, checks both bindings, and removes
+    the route only when it holds two fresh currently-bound assertions.
+    """
+
+    type: Literal["pair_cell_unpair_assertion"]
+    protocol_version: Literal[1] = PAIR_CELL_PROTOCOL_VERSION
+    request_id: str = Field(min_length=1)
+    route_id: str = Field(min_length=1)
+    state_version: int = Field(ge=0)
+
+
+PairCellControlMessage = Annotated[
+    PairCellRoleDeclaration
+    | PairCellFollowerListingRequest
+    | PairCellPairingProposal
+    | PairCellPairingDecision
+    | PairCellRouteSyncRequest
+    | PairCellUnpairCommand
+    | PairCellStateVersionReport
+    | PairCellUnpairAssertion,
+    Field(discriminator="type"),
+]
+
+pair_cell_control_message_adapter = TypeAdapter(PairCellControlMessage)
+
+PAIR_CELL_CONTROL_MESSAGE_TYPES = frozenset(
+    {
+        "pair_cell_role",
+        "pair_cell_available_followers",
+        "pair_cell_pairing_proposal",
+        "pair_cell_pairing_decision",
+        "pair_cell_route_sync",
+        "pair_cell_unpair",
+        "pair_cell_state_version",
+        "pair_cell_unpair_assertion",
+    }
+)

@@ -22,10 +22,14 @@ from fastapi import Cookie, FastAPI, Header, HTTPException, Query, Response, Web
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
-from ..pair_cell import PairContract
-from ..trader_protocol import pair_cell_relay_envelope_adapter, trader_rpc_response_adapter
+from ..trader_protocol import (
+    PAIR_CELL_CONTROL_MESSAGE_TYPES,
+    pair_cell_control_message_adapter,
+    pair_cell_relay_envelope_adapter,
+    trader_rpc_response_adapter,
+)
 
 from .backup import BackupManager
 from .crypto import (
@@ -79,33 +83,12 @@ class LoginRequest(BaseModel):
 
 
 class PairExecutionModeClaimRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    """One operator's explicit legacy Strategy Runtime execution-mode claim.
 
-    leader_worker_id: str = Field(min_length=1)
-    follower_worker_id: str = Field(min_length=1)
-    trader_id: str = Field(min_length=1)
-    mode: Literal["strategy_runtime", "pair_execution_cell", "shadow"]
-
-
-class PairContractActivationRequest(BaseModel):
-    """The complete, structurally-validated Pair Execution Cell contract.
-
-    Only structural/identity/route/lease concerns are validated here (field
-    types, presence, distinct Workers); strategy values -- ``edge_threshold``
-    /``entry_edge_points``, ``risk_budget_usd``, volumes, quote/timing policy
-    -- are opaque to the controller and stored/relayed as-is.
-
-    A pair contract activates one of two mutually exclusive policy shapes,
-    matching ``abt.pair_cell.PairContract``'s own activation-time rule:
-
-    * an *automatic* policy (``entry_edge_points`` plus ``eligible_symbols``)
-      that authorizes the Worker pair and lets the leader evaluate every
-      coherent eligible product itself, never requiring a per-symbol
-      operator approval; or
-    * a *legacy* one-symbol/one-direction-pair activation (``symbol``,
-      ``leader_direction``, ``follower_direction``, ``edge_threshold``),
-      preserved so existing operator tooling and older activation payloads
-      keep working unchanged.
+    A ``pair_execution_cell`` claim is deliberately unreachable here: Pair
+    Cell exclusivity is claimed for both Workers inside the pairing
+    reservation transaction and confirmed inside the final route-creation
+    commit, so no administrator surface can create or contradict one.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -113,51 +96,7 @@ class PairContractActivationRequest(BaseModel):
     leader_worker_id: str = Field(min_length=1)
     follower_worker_id: str = Field(min_length=1)
     trader_id: str = Field(min_length=1)
-    symbol: str | None = Field(min_length=1, default=None)
-    leader_direction: Literal["LONG", "SHORT"] | None = None
-    follower_direction: Literal["LONG", "SHORT"] | None = None
-    edge_threshold: str | None = Field(min_length=1, default=None)
-    entry_edge_points: str | None = Field(min_length=1, default=None)
-    eligible_symbols: list[str] = Field(default_factory=list)
-    leader_volume: str = Field(min_length=1)
-    follower_volume: str = Field(min_length=1)
-    filling_mode: Literal["FOK", "IOC"]
-    risk_budget_usd: str = Field(min_length=1)
-    quote_max_age_seconds: float = Field(gt=0)
-    quote_max_skew_seconds: float = Field(gt=0)
-    arm_timeout_seconds: float = Field(gt=0)
-    commit_lead_seconds: float = Field(gt=0)
-    execution_expiry_seconds: float = Field(gt=0)
-    mode: Literal["live", "shadow"] = "live"
-    maximum_holding_seconds: float | None = Field(
-        gt=0, le=7 * 24 * 60 * 60, allow_inf_nan=False, default=None
-    )
-    flatten_at_ny: str | None = Field(
-        pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$", default=None
-    )
-    ttl_seconds: float = Field(gt=0, default=3600.0)
-
-    @model_validator(mode="after")
-    def _validate_policy_shape(self) -> "PairContractActivationRequest":
-        automatic = self.entry_edge_points is not None
-        legacy_fields = (
-            self.symbol, self.leader_direction, self.follower_direction, self.edge_threshold
-        )
-        legacy = all(
-            value is not None
-            for value in legacy_fields
-        )
-        if automatic and any(value is not None for value in legacy_fields):
-            raise ValueError("Automatic pair activation cannot include legacy product or direction fields.")
-        if automatic == legacy:
-            raise ValueError(
-                "A pair contract activation must define either an automatic entry_edge_points policy "
-                "or one complete legacy symbol/direction/edge_threshold product, "
-                "not both or neither."
-            )
-        if any(not symbol.strip() for symbol in self.eligible_symbols):
-            raise ValueError("Eligible symbols must be non-empty canonical product names.")
-        return self
+    mode: Literal["strategy_runtime", "shadow"]
 
 
 class PairExecutionModeReleaseRequest(BaseModel):
@@ -165,21 +104,21 @@ class PairExecutionModeReleaseRequest(BaseModel):
 
     leader_worker_id: str = Field(min_length=1)
     follower_worker_id: str = Field(min_length=1)
-    mode: Literal["strategy_runtime", "pair_execution_cell", "shadow"]
+    mode: Literal["strategy_runtime", "shadow"]
 
 
 class PairQuarantineReleaseRequest(BaseModel):
     """One operator's explicit, audited release of one quarantined product.
 
-    ``actor`` is intentionally not a client-supplied field: it is always the
-    authenticated admin session's own username, so the audit trail cannot be
-    forged by the request body.
+    The pair is named by its ``route_id`` alone -- a Pair Execution Cell
+    route binds no Trader identity -- and ``actor`` is intentionally not a
+    client-supplied field: it is always the authenticated admin session's own
+    username, so the audit trail cannot be forged by the request body.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    leader_worker_id: str = Field(min_length=1)
-    follower_worker_id: str = Field(min_length=1)
+    route_id: str = Field(min_length=1)
     symbol: str = Field(min_length=1)
     reason: str = Field(min_length=1)
 
@@ -873,12 +812,12 @@ def create_app(
         abt_admin_session: Annotated[str | None, Cookie()] = None,
         x_csrf_token: Annotated[str | None, Header()] = None,
     ) -> dict[str, object]:
-        """Explicitly declare one Worker pair's execution-mode owner.
+        """Explicitly declare one Worker pair's legacy execution-mode owner.
 
-        This is the operator-controlled switch described by the Pair
-        Execution Cell specification: it never runs automatically, and the
-        legacy Strategy Runtime and a live Pair Execution Cell cannot both
-        hold the same pair.
+        This is the operator-controlled rollout switch: the legacy Strategy
+        Runtime and a live Pair Execution Cell cannot both hold the same
+        pair. It never creates a pairing -- Pair Execution Cell exclusivity
+        is taken only by the Worker-initiated two-phase pairing workflow.
         """
 
         _require_admin(ledger, abt_admin_session, x_csrf_token, require_csrf=True)
@@ -890,49 +829,6 @@ def create_app(
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
         return {"status": "claimed", "mode": payload.mode}
 
-    @app.post("/api/admin/pairs/activate")
-    def activate_pair_contract_route(
-        payload: PairContractActivationRequest,
-        abt_admin_session: Annotated[str | None, Cookie()] = None,
-        x_csrf_token: Annotated[str | None, Header()] = None,
-    ) -> dict[str, object]:
-        """Create and distribute the complete immutable pair contract plus lease.
-
-        This is the controller surface that activates a Pair Execution Cell
-        pair end-to-end: it stores the full contract (not only an opaque
-        lease hash), issues the epoch-fenced lease, and pushes both to every
-        currently-connected leader/follower Worker session.  A Worker that is
-        offline (or connects later) fetches the same activation itself via
-        ``pair_cell_sync_request``, so delivery never depends on connection
-        timing.  This is the narrowly-scoped explicit operator activation
-        path: it never runs automatically, and execution-mode exclusivity
-        with a live legacy Strategy Runtime is enforced by the ledger exactly
-        as it is for the existing claim/release endpoints.
-        """
-
-        _require_admin(ledger, abt_admin_session, x_csrf_token, require_csrf=True)
-        fields = payload.model_dump(exclude={"ttl_seconds"})
-        fields["eligible_symbols"] = tuple(fields["eligible_symbols"])
-        contract = PairContract(contract_id=str(uuid4()), **fields)
-        try:
-            activation = ledger.activate_pair_contract(
-                contract=contract.canonical(),
-                contract_hash=contract.hash,
-                trader_id=payload.trader_id,
-                ttl_seconds=payload.ttl_seconds,
-            )
-        except LedgerError as error:
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
-        activation = jsonable_encoder(activation)
-        for worker_id in (payload.leader_worker_id, payload.follower_worker_id):
-            connections = worker_connections.get(worker_id)
-            if connections and len(connections) == 1:
-                _push_worker_relay(
-                    next(iter(connections)),
-                    {"type": "pair_cell_activate", "contract": activation["contract"], "lease": activation["lease"]},
-                )
-        return {"status": "activated", **activation}
-
     @app.post("/api/admin/pairs/execution-mode/release", status_code=status.HTTP_204_NO_CONTENT)
     def release_pair_execution_mode_route(
         payload: PairExecutionModeReleaseRequest,
@@ -940,7 +836,12 @@ def create_app(
         x_csrf_token: Annotated[str | None, Header()] = None,
     ) -> Response:
         _require_admin(ledger, abt_admin_session, x_csrf_token, require_csrf=True)
-        ledger.release_pair_execution_mode(payload.leader_worker_id, payload.follower_worker_id, payload.mode)
+        try:
+            ledger.release_pair_execution_mode(
+                payload.leader_worker_id, payload.follower_worker_id, payload.mode
+            )
+        except LedgerError as error:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     @app.post("/api/admin/pairs/quarantine/release")
@@ -951,6 +852,10 @@ def create_app(
     ) -> dict[str, object]:
         """Explicitly, audibly release one quarantined product for a Worker pair.
 
+        This is an authenticated route-level operator action, not lifecycle
+        ownership: it is authorized against the same live ``route_id`` as any
+        relayed envelope, names no Trader, and the controller neither tracks
+        quarantines nor decides whether a release may take effect.
         Quarantine is per-Worker durable state with no controller-side
         mirror, and ``PairExecutionCell`` silently rejects a release while an
         attempt is unresolved -- it never raises and never reports whether a
@@ -970,20 +875,19 @@ def create_app(
         username = _require_admin(ledger, abt_admin_session, x_csrf_token, require_csrf=True)
         try:
             release = ledger.release_pair_quarantine(
-                leader_worker_id=payload.leader_worker_id,
-                follower_worker_id=payload.follower_worker_id,
+                route_id=payload.route_id,
                 symbol=payload.symbol,
                 actor=username,
                 reason=payload.reason,
             )
             leader_connection = _connected_worker_session(
                 worker_connections,
-                payload.leader_worker_id,
+                cast(str, release["leader_worker_id"]),
                 reason="The leader Worker must be connected to receive the quarantine release.",
             )
             follower_connection = _connected_worker_session(
                 worker_connections,
-                payload.follower_worker_id,
+                cast(str, release["follower_worker_id"]),
                 reason="The follower Worker must be connected to receive the quarantine release.",
             )
         except LedgerError as error:
@@ -996,8 +900,7 @@ def create_app(
         )
         applied = leader_outcome == "applied" and follower_outcome == "applied"
         ledger.record_pair_quarantine_release_outcome(
-            leader_worker_id=payload.leader_worker_id,
-            follower_worker_id=payload.follower_worker_id,
+            route_id=payload.route_id,
             symbol=payload.symbol,
             actor=username,
             leader_outcome=leader_outcome,
@@ -1006,6 +909,7 @@ def create_app(
         )
         body = {
             "status": "released" if applied else "rejected",
+            "route_id": payload.route_id,
             "symbol": release["symbol"],
             "actor": release["actor"],
             "reason": release["reason"],
@@ -1481,15 +1385,6 @@ def create_app(
                     await websocket.send_json(
                         {"type": "password", "password": secret_store.read_password(worker.password_secret_ref)}
                     )
-                elif message_type == "pair_cell_sync_request" and set(request) == {"type"}:
-                    activation = ledger.pair_cell_activation_for_worker(worker.worker_id)
-                    await websocket.send_json(
-                        {
-                            "type": "pair_cell_sync",
-                            "contract": None if activation is None else activation["contract"],
-                            "lease": None if activation is None else jsonable_encoder(activation["lease"]),
-                        }
-                    )
                 elif (
                     message_type == "recovery_sync"
                     and set(request) == {"type", "epoch", "journal"}
@@ -1559,6 +1454,10 @@ def create_app(
                                 "reason": str(error),
                             }
                         )
+                elif message_type in PAIR_CELL_CONTROL_MESSAGE_TYPES:
+                    _handle_pair_cell_control_message(
+                        ledger, worker_connections, worker.worker_id, connection, request
+                    )
                 elif (
                     message_type == "pair_cell_quarantine_release_result"
                     and set(request) == {"type", "request_id", "symbol", "outcome"}
@@ -1587,6 +1486,7 @@ def create_app(
                     worker.worker_id,
                     "worker_session_disconnected",
                     f"Worker session disconnected with code {error.code}.",
+                    worker_connections,
                 )
             await _close_policy_violation(websocket)
         except (LedgerError, ProofError, SecretStoreError, ValueError) as error:
@@ -1605,6 +1505,7 @@ def create_app(
                     worker.worker_id,
                     "worker_session_failure",
                     f"Worker session request failed: {error}",
+                    worker_connections,
                 )
             await _close_policy_violation(websocket)
         except Exception:
@@ -1623,6 +1524,7 @@ def create_app(
                     worker.worker_id,
                     "worker_session_failure",
                     "Worker session request failed unexpectedly.",
+                    worker_connections,
                 )
             await _close_policy_violation(websocket)
         finally:
@@ -1899,12 +1801,19 @@ async def _relay_pair_cell_envelope(
     from_worker_id: str,
     envelope: dict[str, Any],
 ) -> dict[str, Any]:
-    """Authorize, audit, and forward one opaque Pair Execution Cell envelope.
+    """Authenticate, authorize, and forward one opaque Pair Execution Cell envelope.
 
-    Only identity, route, lease epoch/expiry, protocol version, and size are
-    validated (by pydantic and :meth:`ControlLedger.record_pair_relay`); the
-    opaque ``payload`` (quotes, arm/commit, leg status) is never inspected and
-    no edge or pair-lifecycle state is calculated here.
+    Only the sender's authenticated identity, the live route named by the
+    envelope's ``route_id``, the sending role the controller's own route
+    record assigns, the protocol version, and the payload size are checked (by
+    pydantic and :meth:`ControlLedger.authorize_pair_relay`). The envelope is
+    then forwarded byte-for-byte unchanged to the peer's single live session
+    writer, which preserves emission order for that session.
+
+    Nothing is queued, buffered, or persisted for a disconnected peer: an
+    undeliverable envelope is rejected to its sender now, so a later
+    reconnect starts a fresh ordered session and can never receive a replayed
+    execution message from the previous one.
     """
 
     try:
@@ -1913,12 +1822,344 @@ async def _relay_pair_cell_envelope(
         raise LedgerError("Pair Execution Cell relay envelope is invalid.") from error
     if parsed.from_worker_id != from_worker_id:
         raise LedgerError("Pair Execution Cell relay envelope sender does not match the authenticated Worker.")
-    result = ledger.record_pair_relay(envelope)
+    result = ledger.authorize_pair_relay(envelope)
     connection = _connected_worker_session(
         worker_connections, parsed.to_worker_id, reason="Peer Worker is disconnected."
     )
     _push_worker_relay(connection, {"type": "pair_relay_deliver", "envelope": envelope})
     return result
+
+
+# --------------------------------------------------------------------------- #
+# Worker-initiated pairing control plane
+# --------------------------------------------------------------------------- #
+
+_PAIR_CELL_RESULT_TYPES = {
+    "pair_cell_role": "pair_cell_role_result",
+    "pair_cell_available_followers": "pair_cell_available_followers_result",
+    "pair_cell_pairing_proposal": "pair_cell_pairing_proposal_result",
+    "pair_cell_pairing_decision": "pair_cell_pairing_decision_result",
+    "pair_cell_route_sync": "pair_cell_route_sync_result",
+    "pair_cell_unpair": "pair_cell_unpair_result",
+    "pair_cell_state_version": "pair_cell_state_version_result",
+    "pair_cell_unpair_assertion": "pair_cell_unpair_assertion_result",
+}
+
+
+def _connected_worker_ids(worker_connections: dict[str, set[_WorkerSessionConnection]]) -> set[str]:
+    """Exactly the Workers reachable through one live authenticated session now."""
+
+    return {
+        worker_id for worker_id, connections in worker_connections.items() if len(connections) == 1
+    }
+
+
+def _pair_cell_route_view(route: dict[str, Any] | None) -> dict[str, object] | None:
+    """The controller's authoritative route record as the Workers see it."""
+
+    if route is None:
+        return None
+    view = {
+        "route_id": route["route_id"],
+        "leader_worker_id": route["leader_worker_id"],
+        "follower_worker_id": route["follower_worker_id"],
+        "state": route["state"],
+        "created_at": route["created_at"],
+        "unpairing_at": route["unpairing_at"],
+    }
+    if "role" in route:
+        view["role"] = route["role"]
+    return cast(dict[str, object], jsonable_encoder(view))
+
+
+def _push_pair_cell_message(
+    worker_connections: dict[str, set[_WorkerSessionConnection]],
+    worker_id: str,
+    message: dict[str, object],
+) -> None:
+    """Best-effort notify one Worker through its single live session writer.
+
+    A disconnected Worker is simply not notified: pairing control messages
+    are never queued or replayed into a later session, and a reconnecting
+    Worker re-reads the authoritative route record instead.
+    """
+
+    connections = worker_connections.get(worker_id)
+    if connections and len(connections) == 1:
+        _push_worker_relay(next(iter(connections)), message)
+
+
+def _handle_pair_cell_control_message(
+    ledger: ControlLedger,
+    worker_connections: dict[str, set[_WorkerSessionConnection]],
+    worker_id: str,
+    connection: _WorkerSessionConnection,
+    request: dict[str, Any],
+) -> None:
+    """Answer one authenticated Worker's pairing control message.
+
+    Every reply and every peer notification is queued through the target
+    session's single writer, so ordering within a live session is preserved.
+    A malformed or refused control message is answered with an explicit
+    reasoned refusal rather than dropping the authenticated session: pairing
+    is a Worker-driven negotiation, and a refusal is a normal outcome.
+    """
+
+    result_type = _PAIR_CELL_RESULT_TYPES[str(request.get("type"))]
+    request_id = request.get("request_id")
+    try:
+        message = pair_cell_control_message_adapter.validate_python(request)
+    except ValidationError:
+        _push_worker_relay(
+            connection,
+            {
+                "type": result_type,
+                "request_id": request_id if isinstance(request_id, str) else None,
+                "accepted": False,
+                "reason": "Pair Execution Cell control message is invalid.",
+            },
+        )
+        return
+    try:
+        reply, notifications = _apply_pair_cell_control_message(
+            ledger, worker_connections, worker_id, message
+        )
+    except LedgerError as error:
+        _push_worker_relay(
+            connection,
+            {
+                "type": result_type,
+                "request_id": message.request_id,
+                "accepted": False,
+                "reason": str(error),
+            },
+        )
+        return
+    _push_worker_relay(connection, reply)
+    for target_worker_id, notification in notifications:
+        _push_pair_cell_message(worker_connections, target_worker_id, notification)
+
+
+def _apply_pair_cell_control_message(
+    ledger: ControlLedger,
+    worker_connections: dict[str, set[_WorkerSessionConnection]],
+    worker_id: str,
+    message: Any,
+) -> tuple[dict[str, object], list[tuple[str, dict[str, object]]]]:
+    result_type = _PAIR_CELL_RESULT_TYPES[message.type]
+    reply: dict[str, object] = {
+        "type": result_type, "request_id": message.request_id, "accepted": True
+    }
+    notifications: list[tuple[str, dict[str, object]]] = []
+
+    if message.type == "pair_cell_role":
+        declaration = ledger.declare_pair_cell_role(worker_id, message.role)
+        reply["role"] = declaration["role"]
+        reply["declared_role"] = declaration["declared_role"]
+        reply["route"] = _pair_cell_route_view(cast(dict[str, Any] | None, declaration["route"]))
+        return reply, notifications
+
+    if message.type == "pair_cell_available_followers":
+        reply["followers"] = jsonable_encoder(
+            ledger.available_pair_followers(
+                requesting_worker_id=worker_id,
+                connected_worker_ids=_connected_worker_ids(worker_connections),
+            )
+        )
+        return reply, notifications
+
+    if message.type == "pair_cell_route_sync":
+        reply["route"] = _pair_cell_route_view(ledger.pair_route_for_worker(worker_id))
+        return reply, notifications
+
+    if message.type == "pair_cell_pairing_proposal":
+        reservation = ledger.reserve_pair_route_proposal(
+            leader_worker_id=worker_id,
+            follower_worker_id=message.follower_worker_id,
+            connected_worker_ids=_connected_worker_ids(worker_connections),
+        )
+        proposal_id = cast(str, reservation["proposal_id"])
+        follower_connections = worker_connections.get(message.follower_worker_id)
+        if not follower_connections or len(follower_connections) != 1:
+            ledger.release_pair_route_reservation(
+                proposal_id=proposal_id, reason="follower_disconnected"
+            )
+            raise LedgerError("The selected follower Worker is no longer connected.")
+        reply["proposal_id"] = proposal_id
+        reply["follower_worker_id"] = message.follower_worker_id
+        reply["expires_at"] = jsonable_encoder(reservation["expires_at"])
+        reply["timeout_seconds"] = reservation["timeout_seconds"]
+        notifications.append(
+            (
+                message.follower_worker_id,
+                {
+                    "type": "pair_cell_pairing_proposed",
+                    "proposal_id": proposal_id,
+                    "leader_worker_id": worker_id,
+                    "follower_worker_id": message.follower_worker_id,
+                    "expires_at": jsonable_encoder(reservation["expires_at"]),
+                    "timeout_seconds": reservation["timeout_seconds"],
+                },
+            )
+        )
+        return reply, notifications
+
+    if message.type == "pair_cell_pairing_decision":
+        reservation = ledger.pair_route_reservation(message.proposal_id)
+        if reservation is None or reservation["follower_worker_id"] != worker_id:
+            raise LedgerError("No live pairing reservation names this Worker as its follower.")
+        leader_worker_id = cast(str, reservation["leader_worker_id"])
+        if not message.accepted:
+            ledger.release_pair_route_reservation(
+                proposal_id=message.proposal_id, reason="follower_refused"
+            )
+            reply["outcome"] = "refused"
+            reply["route"] = None
+            notifications.append(
+                (
+                    leader_worker_id,
+                    {
+                        "type": "pair_cell_pairing_refused",
+                        "proposal_id": message.proposal_id,
+                        "follower_worker_id": worker_id,
+                        "reason": message.reason,
+                    },
+                )
+            )
+            return reply, notifications
+        try:
+            authorized = ledger.authorize_pair_acceptance_payload(
+                proposal_id=message.proposal_id,
+                from_worker_id=worker_id,
+                acceptance_payload=message.acceptance_payload,
+                payload_hash=message.payload_hash,
+            )
+            route = ledger.create_pair_route(
+                proposal_id=message.proposal_id,
+                connected_worker_ids=_connected_worker_ids(worker_connections),
+            )
+        except LedgerError as error:
+            ledger.release_pair_route_reservation(
+                proposal_id=message.proposal_id, reason="pairing_acceptance_failed"
+            )
+            _push_pair_cell_message(
+                worker_connections,
+                leader_worker_id,
+                {
+                    "type": "pair_cell_pairing_failed",
+                    "proposal_id": message.proposal_id,
+                    "follower_worker_id": worker_id,
+                    "reason": str(error),
+                },
+            )
+            raise
+        view = _pair_cell_route_view(route)
+        reply["outcome"] = "paired"
+        reply["route"] = view
+        notifications.append(
+            (
+                cast(str, route["leader_worker_id"]),
+                {
+                    "type": "pair_cell_route_established",
+                    "route": view,
+                    "acceptance": authorized["acceptance"],
+                },
+            )
+        )
+        notifications.append(
+            (
+                cast(str, route["follower_worker_id"]),
+                {"type": "pair_cell_route_established", "route": view},
+            )
+        )
+        return reply, notifications
+
+    if message.type == "pair_cell_unpair":
+        if message.action == "enter":
+            route = ledger.enter_pair_route_unpairing(route_id=message.route_id, worker_id=worker_id)
+        else:
+            route = ledger.cancel_pair_route_unpairing(route_id=message.route_id, worker_id=worker_id)
+        view = _pair_cell_route_view(route)
+        reply["action"] = message.action
+        reply["route"] = view
+        for target_worker_id in (route["leader_worker_id"], route["follower_worker_id"]):
+            notifications.append(
+                (
+                    cast(str, target_worker_id),
+                    {
+                        "type": "pair_cell_route_state_changed",
+                        "route": view,
+                        "requested_by": worker_id,
+                    },
+                )
+            )
+        return reply, notifications
+
+    if message.type == "pair_cell_state_version":
+        recorded = ledger.record_pair_worker_state_version(
+            route_id=message.route_id, worker_id=worker_id, state_version=message.state_version
+        )
+        reply["route_id"] = recorded["route_id"]
+        reply["state_version"] = recorded["state_version"]
+        reply["assertion_invalidated"] = recorded["assertion_invalidated"]
+        return reply, notifications
+
+    outcome = ledger.record_pair_unpair_assertion(
+        route_id=message.route_id, worker_id=worker_id, state_version=message.state_version
+    )
+    reply["route_id"] = outcome["route_id"]
+    reply["state_version"] = outcome["state_version"]
+    reply["asserted_worker_ids"] = outcome["asserted_worker_ids"]
+    reply["route_removed"] = outcome["route_removed"]
+    if outcome["route_removed"]:
+        for target_worker_id in (outcome["leader_worker_id"], outcome["follower_worker_id"]):
+            notifications.append(
+                (
+                    cast(str, target_worker_id),
+                    {
+                        "type": "pair_cell_route_removed",
+                        "route_id": outcome["route_id"],
+                        "reason": "safe_unpair",
+                    },
+                )
+            )
+    return reply, notifications
+
+
+def _release_pair_cell_reservations_for_worker(
+    ledger: ControlLedger,
+    worker_connections: dict[str, set[_WorkerSessionConnection]] | None,
+    worker_id: str,
+    *,
+    reason: str,
+) -> None:
+    """Release every pairing reservation a vanished Worker was holding.
+
+    A leader or follower that disconnects before the final route-creation
+    commit must never strand its counterpart: the reservation, the role
+    assignment it would have produced, and the execution-mode claim it took
+    all go away together, and the surviving peer is told why.
+    """
+
+    live = ledger.pair_route_reservations_for_worker(worker_id)
+    released = set(ledger.release_pair_route_reservations_for_worker(worker_id, reason))
+    if worker_connections is None:
+        return
+    for reservation in live:
+        if reservation["proposal_id"] not in released:
+            continue
+        for peer_worker_id in (reservation["leader_worker_id"], reservation["follower_worker_id"]):
+            if peer_worker_id == worker_id:
+                continue
+            _push_pair_cell_message(
+                worker_connections,
+                cast(str, peer_worker_id),
+                {
+                    "type": "pair_cell_pairing_reservation_released",
+                    "proposal_id": reservation["proposal_id"],
+                    "reason": reason,
+                },
+            )
 
 
 def _fail_pending_worker_relay_requests(connection: _WorkerSessionConnection, reason: str) -> None:
@@ -2118,8 +2359,17 @@ def _trader_market_subscription(value: object) -> set[str] | None:
     return worker_ids
 
 
-def _handle_worker_disconnect(ledger: ControlLedger, worker_id: str, source: str, reason: str) -> None:
+def _handle_worker_disconnect(
+    ledger: ControlLedger,
+    worker_id: str,
+    source: str,
+    reason: str,
+    worker_connections: dict[str, set[_WorkerSessionConnection]] | None = None,
+) -> None:
     ledger.record_worker_connection_audit(worker_id, source, reason)
+    _release_pair_cell_reservations_for_worker(
+        ledger, worker_connections, worker_id, reason="worker_disconnected"
+    )
 
 
 async def _close_policy_violation(websocket: WebSocket) -> None:

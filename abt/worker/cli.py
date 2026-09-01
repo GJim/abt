@@ -4,7 +4,7 @@ import argparse
 import getpass
 import logging
 import sys
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TextIO
@@ -22,7 +22,7 @@ from .identity import (
     save_identity,
 )
 from .keystore import HardwareKeyStore, WindowsCNGKeyStore
-from .pair_cell_adapter import PairCellRuntime
+from .pair_cell_adapter import PairCellRuntime, PairCellStartupOptions
 from .reconciliation import reconnect_worker_session
 from .rotation import (
     WorkerCertificateExpired,
@@ -206,6 +206,7 @@ def main(
     input_prompt: Callable[[str], str] = input,
     output: TextIO | None = None,
     error_output: TextIO | None = None,
+    interactive: bool | None = None,
 ) -> int:
     """Run the native Windows worker registration command."""
 
@@ -219,6 +220,19 @@ def main(
     arguments = parser.parse_args(argv)
     if arguments.command not in {"enroll", "reconcile"}:
         parser.error("a command is required")
+    if arguments.command == "reconcile":
+        try:
+            pair_cell_options = _pair_cell_startup_options(
+                arguments,
+                interactive=_interactive(interactive),
+                input_prompt=input_prompt,
+                output=output,
+            )
+        except WorkerEnrollmentError as error:
+            print(f"Worker reconciliation failed: {error}", file=error_output)
+            return 1
+    else:
+        pair_cell_options = PairCellStartupOptions()
     if arguments.verbose:
         logging.basicConfig(
             level=logging.INFO,
@@ -274,6 +288,8 @@ def main(
                     key_store_factory=key_store_factory,
                     transport_factory=transport_factory,
                     error_output=error_output,
+                    pair_cell_config_path=getattr(arguments, "pair_cell_config", None),
+                    pair_cell_options=pair_cell_options,
                 )
                 return 0
             transport = transport_factory()
@@ -335,6 +351,8 @@ def _reconcile_with_certificate_maintenance(
     key_store_factory: Callable[[str], HardwareKeyStore],
     transport_factory: Callable[[], EnrollmentTransport],
     error_output: TextIO,
+    pair_cell_config_path: Path | None = None,
+    pair_cell_options: PairCellStartupOptions = PairCellStartupOptions(),
 ) -> None:
     current_identity = identity
     current_key = key_store
@@ -372,6 +390,7 @@ def _reconcile_with_certificate_maintenance(
             try:
                 effect_journal = WorkerEffectJournal(identity_path.with_suffix(".effects.sqlite"))
                 pair_cell_db_path = identity_path.with_suffix(".paircell.sqlite")
+                pair_cell_config_path = pair_cell_config_path or identity_path.with_suffix(".paircell.json")
                 reconnect_worker_session(
                     open_session=lambda: open_authenticated_worker_session(
                         controller_url=current_identity.controller_url,
@@ -395,6 +414,8 @@ def _reconcile_with_certificate_maintenance(
                         recovery_epoch=getattr(session, "recovery_epoch", ""),
                         login=login,
                         server=server,
+                        config_path=pair_cell_config_path,
+                        options=pair_cell_options,
                     ),
                 )
                 return
@@ -432,7 +453,141 @@ def _parser() -> argparse.ArgumentParser:
         "-v", "--verbose", action="store_true", default=argparse.SUPPRESS, help="show safe failure diagnostics"
     )
     reconcile.add_argument("--config", type=Path, default=default_identity_path(), help="worker identity configuration path")
+    reconcile.add_argument(
+        "--pair-cell-config",
+        type=Path,
+        default=None,
+        help=(
+            "optional Pair Execution Cell tunables file (risk tunables, allow_live, and -- for a"
+            " leader -- shared policy); absent means the documented defaults are synthesized"
+        ),
+    )
+    reconcile.add_argument(
+        "--pair-cell-role",
+        choices=("leader", "follower"),
+        default=None,
+        help=(
+            "desired Pair Execution Cell role on this Worker's first unpaired connection;"
+            " omitted means available follower. A durable route always wins over this."
+        ),
+    )
+    reconcile.add_argument(
+        "--follower-worker-id",
+        default=None,
+        help=(
+            "leader only: select the follower non-interactively for unattended deployment"
+            " instead of choosing from the controller's available-follower list"
+        ),
+    )
+    reconcile.add_argument(
+        "--pair-cell-unpair",
+        action="store_true",
+        help="request a safe unpair of this Worker's current Pair Execution Cell route",
+    )
+    reconcile.add_argument(
+        "--pair-cell-cancel-unpair",
+        action="store_true",
+        help="cancel an in-progress safe unpair and return this route to normal operation",
+    )
+    reconcile.add_argument(
+        "--pair-cell-rediscover",
+        action="store_true",
+        help="request an explicit rediscovery on this Worker's current route",
+    )
     return parser
+
+
+def _interactive(override: bool | None) -> bool:
+    if override is not None:
+        return override
+    stream = getattr(sys, "stdin", None)
+    isatty = getattr(stream, "isatty", None)
+    if not callable(isatty):
+        return False
+    try:
+        return bool(isatty())
+    except ValueError:  # pragma: no cover - a closed stream is not interactive
+        return False
+
+
+def _pair_cell_startup_options(
+    arguments: argparse.Namespace,
+    *,
+    interactive: bool,
+    input_prompt: Callable[[str], str],
+    output: TextIO,
+) -> PairCellStartupOptions:
+    """Translate the Pair Execution Cell command line into runtime options.
+
+    A leader without ``--follower-worker-id`` gets an interactive selector.
+    On a non-TTY process it deliberately gets none: the runtime then stays
+    authenticated and unpaired with an actionable diagnostic rather than
+    blocking on input, selecting implicitly, or exiting.
+    """
+
+    role = getattr(arguments, "pair_cell_role", None)
+    follower_worker_id = getattr(arguments, "follower_worker_id", None)
+    if follower_worker_id is not None and role != "leader":
+        raise WorkerEnrollmentError(
+            "--follower-worker-id is leader only; pass --pair-cell-role leader to use it."
+        )
+    if getattr(arguments, "pair_cell_unpair", False) and getattr(
+        arguments, "pair_cell_cancel_unpair", False
+    ):
+        raise WorkerEnrollmentError(
+            "--pair-cell-unpair and --pair-cell-cancel-unpair cannot be requested together."
+        )
+    selector = None
+    if role == "leader" and follower_worker_id is None and interactive:
+        selector = lambda followers: _select_follower(  # noqa: E731 - a tiny bound closure
+            followers, input_prompt=input_prompt, output=output
+        )
+    return PairCellStartupOptions(
+        role=role,
+        follower_worker_id=follower_worker_id,
+        interactive=interactive,
+        select_follower=selector,
+        unpair=bool(getattr(arguments, "pair_cell_unpair", False)),
+        cancel_unpair=bool(getattr(arguments, "pair_cell_cancel_unpair", False)),
+        rediscover=bool(getattr(arguments, "pair_cell_rediscover", False)),
+    )
+
+
+def _select_follower(
+    followers: Sequence[Mapping[str, object]],
+    *,
+    input_prompt: Callable[[str], str],
+    output: TextIO,
+) -> str | None:
+    """Show the controller's available-follower list and pick exactly one."""
+
+    print("Available followers:", file=output)
+    for index, follower in enumerate(followers, start=1):
+        print(
+            f"  {index}. {follower.get('worker_id')}"
+            f" (login {follower.get('login')} on {follower.get('server')})",
+            file=output,
+        )
+    try:
+        answer = input_prompt("Select a follower by number (or press Enter to skip): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return None
+    if not answer:
+        return None
+    try:
+        choice = int(answer)
+    except ValueError:
+        return next(
+            (
+                str(follower["worker_id"])
+                for follower in followers
+                if str(follower.get("worker_id")) == answer
+            ),
+            None,
+        )
+    if 1 <= choice <= len(followers):
+        return str(followers[choice - 1]["worker_id"])
+    return None
 
 
 def _positive_login(value: str) -> int:

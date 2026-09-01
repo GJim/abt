@@ -1,13 +1,20 @@
 """End-to-end integration tests across a live Worker session <-> controller
 websocket <-> peer Worker session <-> :class:`~abt.pair_cell.PairExecutionCell`
-adapter, plus execution-mode exclusivity and restart-construction coverage.
+adapter.
 
 These run a real ``uvicorn`` server (the actual FastAPI app), connect two real
 ``AuthenticatedWorkerSession`` objects over real websockets, and drive two
 real :class:`~abt.worker.pair_cell_adapter.PairCellRuntime` instances -- one
-leader, one follower -- with deterministic MT5 fakes. They fail if the
-production wiring (controller contract/lease distribution, opaque relay,
-scheduler sharing, MT5 request translation) is removed or short-circuited.
+declaring ``leader`` and one that declares nothing at all -- with
+deterministic MT5 fakes and **no** pre-existing route, no configuration file
+carrying a route, and no administrator action of any kind.
+
+They fail if the production wiring (Worker-initiated pairing over the
+authenticated control plane, the two-phase reservation, the opaque relay keyed
+on ``route_id``, Initial Compatible Product Discovery, leader-owned canonical
+policy built from the follower's Pairing Acceptance payload, scheduler
+sharing, MT5 request translation, or safe unpair) is removed or
+short-circuited.
 """
 
 from __future__ import annotations
@@ -18,6 +25,7 @@ import http.cookies
 import json
 from pathlib import Path
 import socket
+import sqlite3
 import tempfile
 import threading
 import time
@@ -38,14 +46,33 @@ from abt.controlplane.crypto import (
 )
 from abt.controlplane.service import create_app
 from abt.worker.effect_journal import WorkerEffectJournal
-from abt.worker.pair_cell_adapter import PairCellPollingConfig, PairCellRuntime
+from abt.worker.pair_cell_adapter import (
+    PRESERVED_SAFETY_TABLES,
+    PairCellConfig,
+    PairCellPollingConfig,
+    PairCellRuntime,
+    PairCellStartupOptions,
+    load_durable_route,
+    parse_pair_cell_config,
+)
 from abt.worker.session import AuthenticatedWorkerSession
 
 
+SYMBOL = "EURUSD"
+
+#: The leader authors the shared policy; a wide quote-age/skew budget keeps a
+#: real-websocket round trip from being mistaken for stale market evidence.
+LEADER_CONFIG = parse_pair_cell_config(
+    {
+        "entry_edge_points": "1",
+        "quote_max_age_seconds": 30.0,
+        "quote_max_skew_seconds": 30.0,
+    }
+)
+
+
 class MemorySecretStore:
-    """A minimal in-memory secret store; the worker password path is unused
-    by these tests (Pair Execution Cell activation/relay does not touch it),
-    but ``create_app`` requires a store."""
+    """A minimal in-memory secret store; ``create_app`` requires one."""
 
     def __init__(self) -> None:
         self.passwords: dict[str, str] = {}
@@ -100,17 +127,39 @@ class FakeMT5:
     TRADE_RETCODE_DONE = 10009
     TRADE_RETCODE_PLACED = 10008
 
-    def __init__(self, *, login: int, server: str, bid: float, ask: float) -> None:
-        self.account = {"login": login, "server": server, "margin_free": 100_000.0}
+    def __init__(self, *, login: int, server: str, bid: float, ask: float, balance: float) -> None:
+        self.account: dict[str, object] = {
+            "login": login,
+            "server": server,
+            "margin_free": 100_000.0,
+            "balance": balance,
+            "equity": balance + 1_000.0,
+            "currency": "USD",
+        }
         self.terminal = {"connected": True, "trade_allowed": True, "tradeapi_disabled": False}
         self.orders: list[dict[str, object]] = []
         self.positions: list[dict[str, object]] = []
-        self.symbol = {
-            "trade_tick_size": 0.00001, "point": 0.00001,
-            "trade_stops_level": 5, "trade_freeze_level": 0, "trade_tick_value": 1.0,
+        self.symbol: dict[str, object] = {
+            "digits": 5,
+            "point": 0.00001,
+            "trade_tick_size": 0.00001,
+            "trade_contract_size": 100000.0,
+            "volume_min": 0.01,
+            "volume_step": 0.01,
+            "volume_max": 50.0,
+            "currency_base": "EUR",
+            "currency_profit": "USD",
+            "trade_calc_mode": 0,
+            "trade_mode": 4,
+            "filling_mode": 1,
+            "trade_tick_value": 1.0,
+            "trade_stops_level": 5,
+            "trade_freeze_level": 0,
+            "visible": True,
         }
         self.tick = {"bid": bid, "ask": ask, "last": (bid + ask) / 2, "time_msc": int(time.time() * 1000)}
         self._next_ticket = 5000
+        self.deals_by_position: dict[int, list[dict[str, object]]] = {}
         self.lock = threading.Lock()
 
     def account_info(self) -> object:
@@ -121,22 +170,41 @@ class FakeMT5:
 
     def orders_get(self) -> object:
         with self.lock:
-            return [dict(o) for o in self.orders]
+            return [dict(order) for order in self.orders]
 
     def positions_get(self) -> object:
         with self.lock:
-            return [dict(p) for p in self.positions]
+            return [dict(position) for position in self.positions]
+
+    def symbols_get(self) -> object:
+        return [{"name": SYMBOL}]
 
     def symbol_info(self, symbol: str) -> object:
-        return dict(self.symbol)
+        return None if symbol != SYMBOL else dict(self.symbol)
 
     def symbol_select(self, symbol: str, enable: bool) -> bool:
         return True
 
     def symbol_info_tick(self, symbol: str) -> object:
+        if symbol != SYMBOL:
+            return None
         with self.lock:
             self.tick["time_msc"] = int(time.time() * 1000)
             return dict(self.tick)
+
+    def order_calc_margin(self, action: int, symbol: str, volume: float, price: float) -> object:
+        return 1000.0 * volume
+
+    def history_deals_get(self, *, position: int) -> object:
+        with self.lock:
+            return [dict(deal) for deal in self.deals_by_position.get(position, [])] or None
+
+    def _realized(self, position: dict[str, object]) -> float:
+        volume = float(cast(float, position["volume"]))
+        opened = float(cast(float, position["price_open"]))
+        if position["type"] == self.ORDER_TYPE_BUY:
+            return round((float(cast(float, self.tick["bid"])) - opened) * volume * 100_000, 2)
+        return round((opened - float(cast(float, self.tick["ask"]))) * volume * 100_000, 2)
 
     def order_send(self, request: dict[str, object]) -> object:
         with self.lock:
@@ -155,6 +223,7 @@ class FakeMT5:
                         "tp": request.get("tp", 0.0),
                     }
                 )
+                self.deals_by_position[ticket] = [{"entry": 0, "profit": 0.0}]
                 return {"retcode": self.TRADE_RETCODE_DONE, "position": ticket, "price": request["price"]}
             if action == self.TRADE_ACTION_SLTP:
                 for position in self.positions:
@@ -162,7 +231,13 @@ class FakeMT5:
                         position["sl"], position["tp"] = request["sl"], request["tp"]
                 return {"retcode": self.TRADE_RETCODE_DONE}
             if action == self.TRADE_ACTION_DEAL and "position" in request:
-                self.positions = [p for p in self.positions if p["ticket"] != request["position"]]
+                ticket = cast(int, request["position"])
+                closed = [p for p in self.positions if p["ticket"] == ticket]
+                self.positions = [p for p in self.positions if p["ticket"] != ticket]
+                for position in closed:
+                    self.deals_by_position.setdefault(ticket, []).append(
+                        {"entry": 1, "profit": self._realized(position)}
+                    )
                 return {"retcode": self.TRADE_RETCODE_DONE}
             return {"retcode": self.TRADE_RETCODE_DONE}
 
@@ -273,64 +348,29 @@ class _LiveServer:
             raw_socket, reconciliation_cursor=authenticated["cursor"], worker_id=worker_id, certificate=certificate
         )
 
-    def activate_pair_contract(self, *, leader_worker_id: str, follower_worker_id: str) -> dict[str, object]:
-        cookie, csrf = self.admin_session()
-        response = httpx.post(
-            f"{self.base_url}/api/admin/pairs/activate",
-            headers={"Cookie": cookie, "X-CSRF-Token": csrf},
-            json={
-                "leader_worker_id": leader_worker_id,
-                "follower_worker_id": follower_worker_id,
-                "trader_id": "trader-1",
-                "symbol": "EURUSD",
-                "leader_direction": "LONG",
-                "follower_direction": "SHORT",
-                "leader_volume": "0.10",
-                "follower_volume": "0.10",
-                "filling_mode": "FOK",
-                "edge_threshold": "0.0005",
-                "risk_budget_usd": "50",
-                "quote_max_age_seconds": 5.0,
-                "quote_max_skew_seconds": 5.0,
-                "arm_timeout_seconds": 5.0,
-                "commit_lead_seconds": 0.3,
-                "execution_expiry_seconds": 5.0,
-                "mode": "live",
-                "ttl_seconds": 300,
-            },
-            timeout=5,
-        )
-        assert response.status_code == 200, response.text
-        return response.json()
-
     def claim_execution_mode(self, *, leader_worker_id: str, follower_worker_id: str, mode: str) -> httpx.Response:
         cookie, csrf = self.admin_session()
         return httpx.post(
             f"{self.base_url}/api/admin/pairs/execution-mode",
             headers={"Cookie": cookie, "X-CSRF-Token": csrf},
             json={
-                "leader_worker_id": leader_worker_id, "follower_worker_id": follower_worker_id,
-                "trader_id": "trader-1", "mode": mode,
+                "leader_worker_id": leader_worker_id,
+                "follower_worker_id": follower_worker_id,
+                "trader_id": "trader-1",
+                "mode": mode,
             },
             timeout=5,
         )
 
-    def release_pair_quarantine(
-        self, *, leader_worker_id: str, follower_worker_id: str, symbol: str, reason: str
-    ) -> httpx.Response:
+    def release_pair_quarantine(self, *, route_id: str, symbol: str, reason: str) -> httpx.Response:
         cookie, csrf = self.admin_session()
         return httpx.post(
             f"{self.base_url}/api/admin/pairs/quarantine/release",
             headers={"Cookie": cookie, "X-CSRF-Token": csrf},
-            json={
-                "leader_worker_id": leader_worker_id, "follower_worker_id": follower_worker_id,
-                "symbol": symbol, "reason": reason,
-            },
-            # Release is now correlated/acknowledged: the server awaits a
+            json={"route_id": route_id, "symbol": symbol, "reason": reason},
+            # Release is correlated/acknowledged: the server awaits a
             # ``pair_cell_quarantine_release_result`` from each connected
-            # Worker (up to 15s per Worker, run concurrently) before
-            # replying, so the client-side timeout must comfortably exceed
-            # that.
+            # Worker before replying.
             timeout=20,
         )
 
@@ -343,6 +383,8 @@ def _drive(
     login: int,
     server: str,
     directory: Path,
+    config: PairCellConfig,
+    options: PairCellStartupOptions,
     stop: threading.Event,
     results: list,
     holder: list,
@@ -362,18 +404,24 @@ def _drive(
         recovery_epoch=str(uuid4()),
         login=login,
         server=server,
+        config=config,
+        options=options,
         polling=PairCellPollingConfig(
-            quote_interval=timedelta(milliseconds=50),
-            readiness_interval=timedelta(milliseconds=50),
+            quote_interval=timedelta(milliseconds=100),
+            readiness_interval=timedelta(milliseconds=100),
             broker_snapshot_interval=timedelta(milliseconds=100),
-            calibration_interval=timedelta(seconds=1),
+            # Real spaced samples, just compressed: this fake's tick epoch is
+            # real wall-clock time, so 5ms apart is still strictly advancing.
+            clock_sample_interval=timedelta(milliseconds=5),
         ),
     )
     holder.append(runtime)
     try:
         while not stop.is_set():
             try:
-                session.receive_worker_relay(timeout=0.05)
+                for _ in range(10):
+                    if not session.receive_worker_relay(timeout=0.02):
+                        break
             except Exception:
                 return
             try:
@@ -387,6 +435,104 @@ def _drive(
         journal.close()
 
 
+class _Pair:
+    """Two live Workers that pair themselves, plus their pump threads."""
+
+    def __init__(
+        self,
+        test: unittest.TestCase,
+        server: _LiveServer,
+        directory: Path,
+        *,
+        follower_worker_id_known: bool = True,
+        leader_config: PairCellConfig = LEADER_CONFIG,
+        follower_config: PairCellConfig | None = None,
+        named_follower: str | None = None,
+    ) -> None:
+        leader_key, self.leader_id, leader_cert = server.approved_worker(910001, "Broker-A")
+        follower_key, self.follower_id, follower_cert = server.approved_worker(910002, "Broker-B")
+
+        # Leader is LONG (prices from its ask); follower is SHORT (prices from
+        # its bid). A coherent edge needs follower.bid - leader.ask to clear
+        # ``entry_edge_points``.
+        self.leader_mt5 = FakeMT5(login=910001, server="Broker-A", bid=1.10000, ask=1.10010, balance=10_000.0)
+        self.follower_mt5 = FakeMT5(login=910002, server="Broker-B", bid=1.10100, ask=1.10110, balance=4_000.0)
+
+        self.leader_session = server.connect_worker_session(leader_key, self.leader_id, leader_cert)
+        test.addCleanup(self.leader_session.socket.__exit__, None, None, None)
+        self.follower_session = server.connect_worker_session(follower_key, self.follower_id, follower_cert)
+        test.addCleanup(self.follower_session.socket.__exit__, None, None, None)
+
+        self.stop = threading.Event()
+        test.addCleanup(self.stop.set)
+        self.leader_results: list = []
+        self.follower_results: list = []
+        self.leader_holder: list = []
+        self.follower_holder: list = []
+        selected = named_follower if named_follower is not None else (
+            self.follower_id if follower_worker_id_known else None
+        )
+        self.threads = [
+            threading.Thread(
+                target=_drive,
+                kwargs=dict(
+                    worker_id=self.follower_id, session=self.follower_session, mt5=self.follower_mt5,
+                    login=910002, server="Broker-B", directory=directory,
+                    config=follower_config or parse_pair_cell_config({}),
+                    # No role at all: an omitted role means available follower.
+                    options=PairCellStartupOptions(),
+                    stop=self.stop, results=self.follower_results, holder=self.follower_holder,
+                ),
+                daemon=True,
+            ),
+            threading.Thread(
+                target=_drive,
+                kwargs=dict(
+                    worker_id=self.leader_id, session=self.leader_session, mt5=self.leader_mt5,
+                    login=910001, server="Broker-A", directory=directory,
+                    config=leader_config,
+                    options=PairCellStartupOptions(role="leader", follower_worker_id=selected),
+                    stop=self.stop, results=self.leader_results, holder=self.leader_holder,
+                ),
+                daemon=True,
+            ),
+        ]
+        # Start the follower first so it is a connected, available, unpaired
+        # candidate by the time the leader proposes.
+        for thread in self.threads:
+            thread.start()
+            time.sleep(0.2)
+
+    @property
+    def leader(self) -> PairCellRuntime | None:
+        return self.leader_holder[0] if self.leader_holder else None
+
+    @property
+    def follower(self) -> PairCellRuntime | None:
+        return self.follower_holder[0] if self.follower_holder else None
+
+    def wait_for(self, predicate, *, seconds: float = 30) -> bool:
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if predicate():
+                return True
+            time.sleep(0.05)
+        return False
+
+    def both_states(self, state: str) -> bool:
+        return (
+            bool(self.leader_results)
+            and bool(self.follower_results)
+            and self.leader_results[-1].state == state
+            and self.follower_results[-1].state == state
+        )
+
+    def shutdown(self) -> None:
+        self.stop.set()
+        for thread in self.threads:
+            thread.join(timeout=5)
+
+
 class PairExecutionCellEndToEndTests(unittest.TestCase):
     def setUp(self) -> None:
         self.server = _LiveServer()
@@ -394,240 +540,272 @@ class PairExecutionCellEndToEndTests(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
 
-    def test_full_pair_lifecycle_over_a_live_controller_between_two_workers(self) -> None:
-        leader_key, leader_id, leader_cert = self.server.approved_worker(910001, "Broker-A")
-        follower_key, follower_id, follower_cert = self.server.approved_worker(910002, "Broker-B")
+    def test_two_fresh_workers_pair_discover_and_complete_one_entry(self) -> None:
+        """No route, no administrator action, no configuration file naming a
+        route: the two Workers pair themselves over the authenticated control
+        plane, discover their compatible universe, and complete one protected
+        two-leg entry."""
 
-        # Leader is LONG (prices from the ask); follower is SHORT (prices
-        # from the bid). A coherent edge needs follower.bid - leader.ask to
-        # clear the configured edge_threshold.
-        leader_mt5 = FakeMT5(login=910001, server="Broker-A", bid=1.10000, ask=1.10010)
-        follower_mt5 = FakeMT5(login=910002, server="Broker-B", bid=1.10100, ask=1.10110)
+        pair = _Pair(self, self.server, Path(self._tmp.name))
 
-        self.server.activate_pair_contract(leader_worker_id=leader_id, follower_worker_id=follower_id)
-
-        leader_session = self.server.connect_worker_session(leader_key, leader_id, leader_cert)
-        self.addCleanup(leader_session.socket.__exit__, None, None, None)
-        follower_session = self.server.connect_worker_session(follower_key, follower_id, follower_cert)
-        self.addCleanup(follower_session.socket.__exit__, None, None, None)
-
-        directory = Path(self._tmp.name)
-        stop = threading.Event()
-        self.addCleanup(stop.set)
-        leader_results: list = []
-        follower_results: list = []
-        leader_holder: list = []
-        follower_holder: list = []
-        leader_thread = threading.Thread(
-            target=_drive,
-            kwargs=dict(
-                worker_id=leader_id, session=leader_session, mt5=leader_mt5, login=910001, server="Broker-A",
-                directory=directory, stop=stop, results=leader_results, holder=leader_holder,
-            ),
-            daemon=True,
+        self.assertTrue(
+            pair.wait_for(lambda: pair.both_states("ACTIVE")),
+            "Pair did not reach ACTIVE on both Workers "
+            f"(leader last={pair.leader_results[-1] if pair.leader_results else None}, "
+            f"follower last={pair.follower_results[-1] if pair.follower_results else None}, "
+            f"leader diag={pair.leader.pairing_diagnostic if pair.leader else None}, "
+            f"follower diag={pair.follower.pairing_diagnostic if pair.follower else None}).",
         )
-        follower_thread = threading.Thread(
-            target=_drive,
-            kwargs=dict(
-                worker_id=follower_id, session=follower_session, mt5=follower_mt5, login=910002, server="Broker-B",
-                directory=directory, stop=stop, results=follower_results, holder=follower_holder,
-            ),
-            daemon=True,
+
+        leader_runtime, follower_runtime = pair.leader, pair.follower
+        assert leader_runtime is not None and follower_runtime is not None
+        route_id = leader_runtime.route_id
+        self.assertIsNotNone(route_id)
+        self.assertEqual(route_id, follower_runtime.route_id)
+        self.assertEqual("leader", leader_runtime.role)
+        self.assertEqual("follower", follower_runtime.role)
+        # Discovery ran on this route before any quote became a candidate.
+        self.assertEqual(1, leader_runtime.universe_generation())
+        self.assertEqual(1, follower_runtime.universe_generation())
+
+        pair.shutdown()
+
+        self.assertEqual(1, len(pair.leader_mt5.positions))
+        self.assertEqual(1, len(pair.follower_mt5.positions))
+        # Both legs use exactly the common lots: the lower Worker capacity,
+        # 4 000 * 0.10 / 1 000 = 0.4 lots, never a fixed volume.
+        self.assertEqual(0.4, float(cast(float, pair.leader_mt5.positions[0]["volume"])))
+        self.assertEqual(0.4, float(cast(float, pair.follower_mt5.positions[0]["volume"])))
+        for mt5 in (pair.leader_mt5, pair.follower_mt5):
+            self.assertGreater(float(cast(float, mt5.positions[0]["sl"])), 0.0)
+            self.assertGreater(float(cast(float, mt5.positions[0]["tp"])), 0.0)
+
+    def test_the_controller_route_record_carries_no_trader_identity(self) -> None:
+        pair = _Pair(self, self.server, Path(self._tmp.name))
+        self.assertTrue(
+            pair.wait_for(lambda: pair.leader is not None and pair.leader.enabled),
+            f"the leader never paired ({pair.leader.pairing_diagnostic if pair.leader else None}).",
         )
-        leader_thread.start()
-        follower_thread.start()
+        route_id = cast(str, cast(PairCellRuntime, pair.leader).route_id)
+        pair.shutdown()
 
-        deadline = time.monotonic() + 15
-        while time.monotonic() < deadline:
-            if leader_holder and leader_holder[0].activated and follower_holder and follower_holder[0].activated:
-                break
-            time.sleep(0.05)
-        else:
-            self.fail("Pair Execution Cell adapters did not activate within the deadline.")
+        ledger = self.server.app.state.ledger
+        route = ledger.pair_route(route_id)
+        assert route is not None
+        self.assertNotIn("trader_id", route)
+        self.assertEqual(pair.leader_id, route["leader_worker_id"])
+        self.assertEqual(pair.follower_id, route["follower_worker_id"])
+        self.assertEqual("ACTIVE", route["state"])
+        owner = ledger.pair_execution_owner(pair.leader_id, pair.follower_id, "pair_execution_cell")
+        assert owner is not None
+        self.assertEqual("pair_execution_cell", owner["owner_kind"])
+        self.assertIsNone(owner["trader_id"])
 
-        deadline = time.monotonic() + 15
-        while time.monotonic() < deadline:
-            if (
-                leader_results and follower_results
-                and leader_results[-1].state == "ACTIVE"
-                and follower_results[-1].state == "ACTIVE"
-            ):
-                break
-            time.sleep(0.05)
-        else:
-            self.fail(
-                "Pair did not reach ACTIVE on both Workers within the deadline "
-                f"(leader last={leader_results[-1] if leader_results else None}, "
-                f"follower last={follower_results[-1] if follower_results else None})."
-            )
+    def test_there_is_no_administrator_route_creation_surface(self) -> None:
+        cookie, csrf = self.server.admin_session()
+        for path in ("/api/admin/pairs/route", "/api/admin/pairs/route/revoke"):
+            with self.subTest(path=path):
+                response = httpx.post(
+                    f"{self.server.base_url}{path}",
+                    headers={"Cookie": cookie, "X-CSRF-Token": csrf},
+                    json={"leader_worker_id": "a", "follower_worker_id": "b"},
+                    timeout=5,
+                )
+                self.assertEqual(404, response.status_code)
 
-        stop.set()
-        leader_thread.join(timeout=5)
-        follower_thread.join(timeout=5)
+    def test_a_leader_naming_an_unavailable_follower_stays_unpaired(self) -> None:
+        pair = _Pair(
+            self, self.server, Path(self._tmp.name), named_follower="worker-that-does-not-exist"
+        )
+        self.assertTrue(
+            pair.wait_for(
+                lambda: pair.leader is not None and pair.leader.pairing_state == "unpaired",
+                seconds=15,
+            ),
+            "the leader never failed closed on an unavailable follower",
+        )
+        leader_runtime = cast(PairCellRuntime, pair.leader)
+        self.assertFalse(leader_runtime.enabled)
+        self.assertIsNone(leader_runtime.route_id)
+        pair.shutdown()
+        # No route, no partial role assignment, no leaked reservation.
+        self.assertIsNone(self.server.app.state.ledger.pair_route_for_worker(pair.leader_id))
+        self.assertEqual([], self.server.app.state.ledger.pair_route_reservations_for_worker(pair.leader_id))
 
-        self.assertEqual(1, len(leader_mt5.positions))
-        self.assertEqual(1, len(follower_mt5.positions))
-        self.assertNotEqual(0.0, leader_mt5.positions[0]["sl"])
-        self.assertNotEqual(0.0, follower_mt5.positions[0]["sl"])
-
-    def test_pair_contract_activation_is_blocked_while_a_live_strategy_runtime_owns_the_pair(self) -> None:
-        _leader_key, leader_id, _leader_cert = self.server.approved_worker(910101, "Broker-A")
-        _follower_key, follower_id, _follower_cert = self.server.approved_worker(910102, "Broker-B")
-
-        claim = self.server.claim_execution_mode(
+    def test_the_legacy_strategy_runtime_blocks_a_pairing_for_the_same_workers(self) -> None:
+        leader_key, leader_id, leader_cert = self.server.approved_worker(910011, "Broker-A")
+        follower_key, follower_id, follower_cert = self.server.approved_worker(910012, "Broker-B")
+        claimed = self.server.claim_execution_mode(
             leader_worker_id=leader_id, follower_worker_id=follower_id, mode="strategy_runtime"
         )
-        self.assertEqual(200, claim.status_code)
-
-        cookie, csrf = self.server.admin_session()
-        response = httpx.post(
-            f"{self.server.base_url}/api/admin/pairs/activate",
-            headers={"Cookie": cookie, "X-CSRF-Token": csrf},
-            json={
-                "leader_worker_id": leader_id, "follower_worker_id": follower_id, "trader_id": "trader-1",
-                "symbol": "EURUSD", "leader_direction": "LONG", "follower_direction": "SHORT",
-                "leader_volume": "0.10", "follower_volume": "0.10", "filling_mode": "FOK",
-                "edge_threshold": "0.0005", "risk_budget_usd": "50",
-                "quote_max_age_seconds": 5.0, "quote_max_skew_seconds": 5.0,
-                "arm_timeout_seconds": 5.0, "commit_lead_seconds": 0.3, "execution_expiry_seconds": 5.0,
-            },
-            timeout=5,
-        )
-
-        self.assertEqual(409, response.status_code)
-
-    def test_pair_cell_sync_delivers_activation_to_a_worker_that_connects_after_activation(self) -> None:
-        leader_key, leader_id, leader_cert = self.server.approved_worker(910201, "Broker-A")
-        _follower_key, follower_id, _follower_cert = self.server.approved_worker(910202, "Broker-B")
-
-        self.server.activate_pair_contract(leader_worker_id=leader_id, follower_worker_id=follower_id)
-
-        # The leader connects only *after* activation already happened; it
-        # must still receive its contract/lease via pair_cell_sync_request,
-        # not only via the (missed) push at activation time.
-        leader_session = self.server.connect_worker_session(leader_key, leader_id, leader_cert)
-        self.addCleanup(leader_session.socket.__exit__, None, None, None)
-
-        activation = leader_session.request_pair_cell_activation()
-
-        assert activation is not None
-        self.assertEqual(leader_id, activation["contract"]["leader_worker_id"])
-
-    def test_quarantine_release_is_pushed_to_both_connected_worker_sessions_with_actor_and_reason(self) -> None:
-        leader_key, leader_id, leader_cert = self.server.approved_worker(910301, "Broker-A")
-        follower_key, follower_id, follower_cert = self.server.approved_worker(910302, "Broker-B")
+        self.assertEqual(200, claimed.status_code, claimed.text)
 
         leader_session = self.server.connect_worker_session(leader_key, leader_id, leader_cert)
         self.addCleanup(leader_session.socket.__exit__, None, None, None)
         follower_session = self.server.connect_worker_session(follower_key, follower_id, follower_cert)
         self.addCleanup(follower_session.socket.__exit__, None, None, None)
 
-        responses: list[httpx.Response] = []
+        follower_session.declare_pair_cell_role(None)
+        self.assertTrue(_await_result(follower_session, "pair_cell_role_result")["accepted"])
+        leader_session.declare_pair_cell_role("leader")
+        self.assertTrue(_await_result(leader_session, "pair_cell_role_result")["accepted"])
+        leader_session.propose_pair_cell_pairing(follower_id)
+        reply = _await_result(leader_session, "pair_cell_pairing_proposal_result")
 
-        def _call() -> None:
-            responses.append(
-                self.server.release_pair_quarantine(
-                    leader_worker_id=leader_id,
-                    follower_worker_id=follower_id,
-                    symbol="EURUSD",
-                    reason="broker confirmed the symbol is tradable again",
-                )
-            )
+        self.assertFalse(reply["accepted"])
+        self.assertIsNone(self.server.app.state.ledger.pair_route_for_worker(leader_id))
 
-        caller = threading.Thread(target=_call, daemon=True)
-        caller.start()
+    def test_the_leader_builds_the_canonical_policy_from_the_forwarded_acceptance(self) -> None:
+        """The follower's own authored block reaches the leader through the
+        controller and is copied verbatim into ``follower_risk``."""
 
-        # The route now awaits a genuine per-Worker outcome before replying,
-        # so this test must play the Worker side of the correlated
-        # request/response protocol on the main thread for both connections
-        # before the background HTTP call can return.
-        for session in (leader_session, follower_session):
-            self.assertTrue(session.receive_worker_relay(timeout=5))
-            releases = session.drain_pair_cell_quarantine_releases()
-            self.assertEqual(1, len(releases))
-            self.assertEqual("EURUSD", releases[0]["symbol"])
-            self.assertEqual("ABCDEF", releases[0]["actor"])
-            self.assertEqual("broker confirmed the symbol is tradable again", releases[0]["reason"])
-            session.send_pair_cell_quarantine_release_result(
-                request_id=cast(str, releases[0]["request_id"]), symbol="EURUSD", outcome="applied"
-            )
+        pair = _Pair(
+            self,
+            self.server,
+            Path(self._tmp.name),
+            follower_config=parse_pair_cell_config(
+                {"trade_loss_fraction": "0.01", "maximum_loss_per_trade_usd": "25"}
+            ),
+        )
+        self.assertTrue(
+            pair.wait_for(
+                lambda: pair.follower is not None
+                and pair.follower.enforced_risk_limits() is not None
+            ),
+            "the follower never accepted a canonical policy "
+            f"({pair.follower_results[-1] if pair.follower_results else None}).",
+        )
+        leader_runtime = cast(PairCellRuntime, pair.leader)
+        follower_runtime = cast(PairCellRuntime, pair.follower)
+        cell = leader_runtime.cell
+        assert cell is not None
+        acceptance = cell.peer_pairing_acceptance()
+        assert acceptance is not None
+        follower_risk = follower_runtime.enforced_risk_limits()
+        leader_risk = leader_runtime.enforced_risk_limits()
+        pair.shutdown()
 
-        caller.join(timeout=10)
-        self.assertFalse(caller.is_alive())
-        response = responses[0]
+        self.assertEqual(pair.follower_id, acceptance.worker_id)
+        assert follower_risk is not None and leader_risk is not None
+        self.assertTrue(follower_risk.is_verbatim_copy_of(acceptance.risk_limits()))
+        # The follower authored its own budget and its own tunables ...
+        self.assertEqual("4000", follower_risk.strategy_budget_usd)
+        self.assertEqual("0.01", follower_risk.trade_loss_fraction)
+        self.assertEqual("25", follower_risk.maximum_loss_per_trade_usd)
+        # ... and the leader authored only its own.
+        self.assertEqual("10000", leader_risk.strategy_budget_usd)
+        self.assertEqual("40", leader_risk.maximum_loss_per_trade_usd)
+
+    def test_an_operator_quarantine_release_is_addressed_by_route_id(self) -> None:
+        pair = _Pair(self, self.server, Path(self._tmp.name), leader_config=LEADER_CONFIG)
+        self.assertTrue(
+            pair.wait_for(
+                lambda: pair.leader is not None
+                and pair.follower is not None
+                and pair.leader.enabled
+                and pair.follower.enabled
+            ),
+            "the two Workers never paired",
+        )
+        route_id = cast(str, cast(PairCellRuntime, pair.leader).route_id)
+        response = self.server.release_pair_quarantine(
+            route_id=route_id, symbol=SYMBOL, reason="operator release"
+        )
+        pair.shutdown()
         self.assertEqual(200, response.status_code, response.text)
         body = response.json()
-        self.assertEqual("EURUSD", body["symbol"])
-        self.assertEqual("ABCDEF", body["actor"])
-        self.assertEqual("broker confirmed the symbol is tradable again", body["reason"])
+        self.assertEqual("released", body["status"])
+        self.assertEqual(route_id, body["route_id"])
         self.assertEqual("applied", body["leader_outcome"])
         self.assertEqual("applied", body["follower_outcome"])
+        self.assertNotIn("trader_id", body)
 
-    def test_quarantine_release_reports_409_and_never_a_false_success_when_a_worker_rejects_it(self) -> None:
-        """Live-safety requirement: if either Worker genuinely rejects the
-        release (e.g. an unresolved attempt still holds the quarantine),
-        the route must never report overall success -- and it must say so
-        per-Worker, so an operator can tell which side still needs a retry."""
+    def test_a_safe_unpair_removes_the_route_over_the_live_controller(self) -> None:
+        """Both Workers prove safety from their own fresh local evidence and
+        the controller removes the route on two fresh, currently-bound
+        assertions."""
 
-        leader_key, leader_id, leader_cert = self.server.approved_worker(910303, "Broker-A")
-        follower_key, follower_id, follower_cert = self.server.approved_worker(910304, "Broker-B")
-
-        leader_session = self.server.connect_worker_session(leader_key, leader_id, leader_cert)
-        self.addCleanup(leader_session.socket.__exit__, None, None, None)
-        follower_session = self.server.connect_worker_session(follower_key, follower_id, follower_cert)
-        self.addCleanup(follower_session.socket.__exit__, None, None, None)
-
-        responses: list[httpx.Response] = []
-
-        def _call() -> None:
-            responses.append(
-                self.server.release_pair_quarantine(
-                    leader_worker_id=leader_id,
-                    follower_worker_id=follower_id,
-                    symbol="EURUSD",
-                    reason="operator review",
-                )
-            )
-
-        caller = threading.Thread(target=_call, daemon=True)
-        caller.start()
-
-        outcomes = [(leader_session, "applied"), (follower_session, "rejected")]
-        for session, outcome in outcomes:
-            self.assertTrue(session.receive_worker_relay(timeout=5))
-            releases = session.drain_pair_cell_quarantine_releases()
-            self.assertEqual(1, len(releases))
-            session.send_pair_cell_quarantine_release_result(
-                request_id=cast(str, releases[0]["request_id"]), symbol="EURUSD", outcome=outcome
-            )
-
-        caller.join(timeout=10)
-        self.assertFalse(caller.is_alive())
-        response = responses[0]
-        self.assertEqual(409, response.status_code)
-        body = response.json()["detail"]
-        self.assertEqual("applied", body["leader_outcome"])
-        self.assertEqual("rejected", body["follower_outcome"])
-
-    def test_quarantine_release_is_rejected_while_either_worker_is_disconnected(self) -> None:
-        leader_key, leader_id, leader_cert = self.server.approved_worker(910401, "Broker-A")
-        _follower_key, follower_id, _follower_cert = self.server.approved_worker(910402, "Broker-B")
-
-        # Only the leader is connected; the follower is offline, and unlike
-        # contract activation (idempotent latest-state a Worker can fetch via
-        # pair_cell_sync_request on reconnect), a quarantine release is a
-        # one-time action, so it must never be silently queued/dropped for a
-        # Worker that happens to be offline right now.
-        leader_session = self.server.connect_worker_session(leader_key, leader_id, leader_cert)
-        self.addCleanup(leader_session.socket.__exit__, None, None, None)
-
-        response = self.server.release_pair_quarantine(
-            leader_worker_id=leader_id, follower_worker_id=follower_id, symbol="EURUSD", reason="operator review",
+        pair = _Pair(
+            self,
+            self.server,
+            Path(self._tmp.name),
+            # An edge nothing can clear keeps this test on the unpair path.
+            leader_config=parse_pair_cell_config(
+                {
+                    "entry_edge_points": "100000",
+                    "quote_max_age_seconds": 30.0,
+                    "quote_max_skew_seconds": 30.0,
+                }
+            ),
+        )
+        self.assertTrue(
+            pair.wait_for(
+                lambda: pair.leader is not None
+                and pair.follower is not None
+                and pair.leader.enabled
+                and pair.follower.enabled
+            ),
+            "the two Workers never paired",
+        )
+        leader_runtime = cast(PairCellRuntime, pair.leader)
+        route_id = cast(str, leader_runtime.route_id)
+        self.assertTrue(
+            pair.wait_for(
+                lambda: bool(pair.leader_results) and pair.leader_results[-1].ready, seconds=30
+            ),
+            f"the leader never became entry-ready "
+            f"({pair.leader_results[-1] if pair.leader_results else None}).",
         )
 
-        self.assertEqual(409, response.status_code)
-        self.assertFalse(leader_session.receive_worker_relay(timeout=0.2))
+        self.assertTrue(leader_runtime.request_safe_unpair())
+        self.assertTrue(
+            pair.wait_for(
+                lambda: self.server.app.state.ledger.pair_route(route_id) is None, seconds=30
+            ),
+            "the controller never removed the route on two fresh assertions",
+        )
+        # Let the Worker observe the removal before its loop is stopped, so
+        # this asserts the adopted end state rather than a shutdown race.
+        self.assertTrue(
+            pair.wait_for(
+                lambda: pair.leader is not None and pair.leader.route_id != route_id, seconds=30
+            ),
+            "the leader never observed its own route removal",
+        )
+        pair.shutdown()
+        self.assertIsNone(self.server.app.state.ledger.pair_route(route_id))
+
+        # The route-scoped durable state is cleared and this Worker's own
+        # account/product-scoped safety history survives.  (The exact per-table
+        # accounting is asserted deterministically in
+        # ``test_pair_cell_adapter``; here the pair is free to re-pair itself
+        # immediately, which is precisely what must not resurrect the old
+        # route.)
+        directory = Path(self._tmp.name)
+        record = load_durable_route(directory / f"{pair.leader_id}.paircell.route.json")
+        self.assertNotEqual(route_id, None if record is None else record.route_id)
+        connection = sqlite3.connect(directory / f"{pair.leader_id}.paircell.sqlite")
+        try:
+            tables = {
+                str(row[0])
+                for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+            }
+        finally:
+            connection.close()
+        for table in PRESERVED_SAFETY_TABLES:
+            with self.subTest(preserved=table):
+                self.assertIn(table, tables)
 
 
-if __name__ == "__main__":
+def _await_result(session: AuthenticatedWorkerSession, message_type: str, *, seconds: float = 10) -> dict:
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        session.receive_worker_relay(timeout=0.2)
+        for reply in session.drain_pair_cell_results():
+            if reply.get("type") == message_type:
+                return cast(dict, reply)
+    raise AssertionError(f"no {message_type} arrived")
+
+
+if __name__ == "__main__":  # pragma: no cover - convenience entry point
     unittest.main()

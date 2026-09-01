@@ -142,45 +142,91 @@ _Avoid_: 配對的逐腿 Trader worker operation
 策略執行體獨自決定活躍配對數、名目曝險、保證金使用量與損失上限；主控台不另設這些聚合風險硬上限，也不推導配對生命週期。
 
 **策略執行體（Strategy Runtime）**:
-以單一交易者身分運行策略決策與配對執行的持久程序；它擁有配對反向避險的完整生命週期，並以本地 durable state 在重啟後從帳戶工作者事實恢復。已選擇加入配對執行單元的配對不適用本節；其生命週期改由已租約的 leader 帳戶工作者擁有。
+以單一交易者身分運行策略決策與配對執行的持久程序；它擁有配對反向避險的完整生命週期，並以本地 durable state 在重啟後從帳戶工作者事實恢復。已配對進入配對執行單元的配對不適用本節；其生命週期改由持久配對路由指定的 leader 帳戶工作者擁有。
 _Avoid_: 獨立 Trader Execution 服務、無狀態策略腳本
 
 **配對執行單元（Pair Execution Cell）**:
-在配對的兩台帳戶工作者上執行相同模組、以租約角色（leader/follower）決定行為的深模組；已選擇加入的配對由其取代策略執行體成為配對反向避險生命週期擁有者，僅 leader 可建立進場嘗試。它保留 ADR-0009 的單一擁有者、durable state 與主控台不推導配對狀態等不變量，只搬移擁有者位置。
-_Avoid_: 配對執行器（與主控台角色混淆）
+在配對的兩台帳戶工作者上執行相同模組的深模組；leader/follower 角色由持久配對路由指定，不是租約，也沒有 epoch 或交易 TTL，且不綁定任何交易者身分。已配對者由其取代策略執行體成為配對反向避險生命週期擁有者，僅 leader 可建立進場嘗試並持有唯一的 canonical 策略政策；shared 政策由 leader 撰寫，follower 自行撰寫其自身風險參數並經配對接受載荷供 leader 逐字複製。follower 不推導獨立 edge 或 terminal 配對狀態。它保留 ADR-0009 的單一擁有者、durable state 與主控台不推導配對狀態等不變量，只搬移擁有者位置。
+_Avoid_: 配對執行器（與主控台角色混淆）、配對租約、交易者綁定路由
 
-**工作者配對啟用（Worker Pair Activation）**:
-操作員授權一組 leader/follower 帳戶工作者在不可變策略與風控政策下運行配對執行單元的動作；授權範圍是工作者配對及其可交易商品宇宙，不是逐一批准單一商品。啟用建立配對合約與配對租約，但不預先選定下一筆交易商品或方向。
-_Avoid_: 商品啟用、交易核准
+**工作者主導配對（Worker-Initiated Pairing）**:
+兩台帳戶工作者自行建立配對路由的程序；沒有管理員建立的配對路由。工作者於首次未配對連線時宣告期望角色，未宣告即為可用 follower；leader 向主控台查詢當前已連線、可用且未配對的 follower 並選定其一（互動選擇，或以明確 follower worker ID 非互動選定），再經已驗證主控台提出配對提議。非 TTY 且未指定 follower worker ID 的 leader 不得阻塞等待輸入，維持已驗證且未配對並輸出可行動診斷；互動模式取得空清單時亦同。被選中的 follower 只在自身 broker 驗證空倉、沒有任何未結嘗試或效果、具備配對所需就緒條件、可讀取 USD 帳戶且餘額為正、且仍未配對時自動接受，否則明確拒絕。配對以兩階段控制流程完成，不是單一 compare-and-swap。
+_Avoid_: 管理員核准配對、配對合約核發、人工接受步驟、保留與建路由合併為單一 CAS
+
+**配對保留（Pairing Reservation）**:
+兩階段配對流程的第一階段：主控台以單一原子 transaction 產生唯一 `proposal_id` 並同時保留 leader 與 follower 兩台工作者，成功條件為雙方皆已驗證連線、未出現於任何其他路由或保留、無衝突的 live strategy runtime 擁有權，且可為雙方取得 `pair_execution_cell` 執行模式互斥。保留帶 30 秒配對保留逾時，該逾時純屬配對控制中繼資料，不是交易租約或 TTL，不 fence 任何 effect、嘗試或既有路由。主控台於保留成立後才轉送提議。follower 拒絕、逾時、任一方斷線或最終 transaction 失敗都會完整釋放保留，不留下路由、角色指派、執行模式主張或工作者本機配對狀態。兩個 leader 選中同一 follower 時，敗方於保留階段即取得決定性衝突並可立即重新列表。
+_Avoid_: 配對租約、以保留逾時視為交易期限
+
+**配對接受載荷（Pairing Acceptance Payload）**:
+follower 接受配對時經不透明 relay 送交 leader 的內容，包含 `proposal_id`、自身 worker ID、當下讀取並凍結的啟動帳戶餘額與帳戶幣別（必須為 USD），以及自身撰寫的風險參數 `maximum_margin_fraction`、`daily_loss_fraction`、`trade_loss_fraction`、`maximum_loss_per_trade_usd`。leader 必須將其逐字複製為 canonical 政策中的 `follower_risk`，不得重算、夾限、換算或以自身值取代；載荷缺失、格式錯誤、非 USD 或餘額非正時 leader 失效關閉且不發布政策。主控台全程不解讀該載荷。
+_Avoid_: leader 代訂 follower 風險、以預設值補齊 follower 參數
+
+**剩餘可用單腿虧損摘要（Remaining Allowed Leg Loss Summary）**:
+每台帳戶工作者持續向對側發布的版本化摘要，內容為自身 worker ID、單調版本與當前 `allowed_leg_loss_usd`；leader 必須持有對側當前摘要才可建立嘗試，且指派給任一腿的虧損不得超過該腿擁有者最後發布的額度，所用摘要版本凍結於該嘗試。摘要只是 leader 的最佳化，不構成對 follower 的權威：follower 於收到嘗試時仍以自身當下本機額度重新檢查，指派虧損超出即拒絕。該檢查屬本機風險運算，不涉及報價或 edge 評估。
+
+**可用 follower（Available Follower）**:
+已通過身分驗證、當前連線、尚未配對、未被其他配對提議保留，且宣告或預設為 follower 的帳戶工作者；主控台只以此清單回應提出配對的 leader，清單本身不構成任何交易授權。
+
+**持久配對路由（Durable Pair Route）**:
+一組 leader/follower 帳戶工作者的獨佔配對關係；身分為有序的 leader/follower 工作者組合加上主控台產生的全域唯一 `route_id`，不含交易者身分、租約、epoch 或 TTL。每次新配對取得新的 `route_id`，且永不重用。`route_id` 不是租約 epoch：不續期、不到期、不 fence 任何 broker effect，也不構成交易授權；工作者本機的 `recovery_epoch` 是另一個獨立概念，屬該工作者自身 broker session 的市場證據，兩者不得互相比較或推導。路由跨重連與重啟持續有效，且永遠優先於啟動時的角色旗標或預設角色，重連者恢復原指派角色。主控台的路由紀錄是 relay 權限與角色指派的權威，工作者的持久副本只是自身參與的復原證據；兩者不一致時工作者立即移除進場就緒並觸發 metadata 對帳，但絕不因此丟棄、平掉或推導本機曝險，也不得取得未被指派的角色。
+_Avoid_: 配對租約、管理員授權路由、以撤銷代替解除配對、以 route_id 作為租約 epoch
+
+**安全解除配對（Safe Unpair）與 UNPAIRING 狀態**:
+解除配對必須經過明確的 `UNPAIRING` 路由狀態。任一已驗證工作者皆可以指令針對當前 `route_id` 進入該狀態，無提議者特權。進入即刻對雙方生效：雙方立即移除進場就緒，`UNPAIRING` 期間不得開始任何新嘗試，leader 停止候選評估；但保護、減曝險與收斂既有曝險完全不受限制。雙方各自以新鮮本機證據提出安全解除配對聲明（自身 broker 驗證空倉、所有嘗試與效果 terminal），聲明綁定當前 `route_id` 加上該工作者當前本機 attempt/effect 狀態版本；任何新增或變更的本機 effect 都會推進版本並使既有聲明失效，必須重新提出。主控台只在同時持有兩份新鮮且綁定當前值的聲明時才移除路由，並不自行推導空倉或 terminality；單邊、過期或綁定舊版本／舊 `route_id` 的聲明不生效。任一方可明確取消 `UNPAIRING` 回到正常運作。路由移除後雙方回到未配對、釋放執行模式主張，並可再次配對取得全新且不重用的 `route_id`。緊急身分撤銷是另一機制，會移除進場就緒但絕不等同 broker 空倉，也不構成安全解除配對。
+_Avoid_: 單一訊息解除配對、以撤銷代替解除配對、無狀態版本綁定的聲明
+
+**初始相容商品探索（Initial Compatible Product Discovery）**:
+路由建立後、任何報價處理之前，兩台帳戶工作者經不透明 relay 交換版本化商品目錄與規格摘要以決定共同可交易宇宙的階段；主控台全程不解讀這些摘要。取交集前先對各自目錄套用 `trade_mode == 4`（完全交易）前置條件，與 `strategy/realtime_arbitrage.py` 一致；`trade_mode` 缺失、非整數或為布林值時該目錄視為無效，而非僅略過該符號。候選為兩份已過濾目錄的精確符號名稱交集（不做後綴正規化）；`trade_calc_mode`、`contract_size`、`volume_min`、`volume_step`、`allowed_directions` 任一不相等即排除，必須同時允許 LONG 與 SHORT，填單模式取雙方共有 FOK，否則共有 IOC，否則排除；base/profit 幣別、digits、point 與 trade tick size 不要求相等。錄取商品的 canonical 執行 point 取雙方較大值、共同 volume_max 取較小值，商品識別由精確符號名稱與 canonical 相容摘要雜湊決定性衍生。任一目錄不可得或無效、或無任何相容符號時探索失敗且不進場。
+_Avoid_: 已建置商品宇宙、等名即相容、刷新時自動擴充宇宙、交集後才過濾 trade_mode
+
+**宇宙世代（Universe Generation）**:
+探索結果的識別碼，於同一路由內唯一且單調遞增；它命名一次探索結果，不命名配對關係，不取代 `route_id`，也不會到期。探索結果凍結於當前 `universe_generation`，每小時刷新只重新驗證與暫停既選符號，不自動納入新出現的符號，也不改變 `universe_generation`。任一已驗證工作者可請求明確重新探索，僅在雙方 broker 驗證空倉且無任何未結嘗試或效果時受理；重新探索在**同一路由**上安裝新的 `universe_generation`，`route_id`、角色與 canonical 政策皆不變，不是重新配對。重新探索失敗時保留原 `universe_generation`，不得安裝空宇宙。relay envelope 攜帶 `route_id`；政策、嘗試、商品、量規劃與隔離狀態在涉及商品識別處攜帶 `universe_generation`。主控台只驗證 `route_id` 與發送者角色，不驗證宇宙內容。
+_Avoid_: 以路由世代同時表示配對與探索、重新探索產生新 route_id
 
 **可交易商品宇宙（Eligible Product Universe）**:
-兩個帳戶工作者共同支援、未遭隔離，且雙方報價、point/tick size、帳戶幣別 tick value、volume、填單模式與保護校準皆新鮮完整的配對商品集合。任一商品資料缺失或過期只移除該商品資格，不觸發 signal-time RPC，也不使其他商品失去資格。
+由初始相容商品探索錄取、凍結於當前 `universe_generation`、未遭隔離，且雙方報價、point/tick size、帳戶幣別 tick value、volume、填單模式與保護校準皆新鮮完整的配對商品集合。任一商品資料缺失或過期只移除該商品資格，不觸發 signal-time RPC，也不使其他商品失去資格。
 
 **最佳進場候選（Best Entry Candidate）**:
-leader 對可交易商品宇宙內每個商品的兩個鏡像方向套用 edge-points 門檻後，以雙方預先快取之每 point USD 價值計算保守預期 edge USD 並選出的唯一候選；同值時依 normalized edge points、canonical product identity、direction 決定固定順序。選定後商品、方向、量與排名證據凍結於該次嘗試。
+leader 對可交易商品宇宙內每個商品的兩個鏡像方向套用 edge-points 門檻（以該商品 canonical 執行 point 換算）後，以雙方預先快取之每 point USD 價值計算保守預期 edge USD 並選出的唯一候選；同值時依 normalized edge points、衍生商品識別、direction 決定固定順序。選定後商品、方向、量與排名證據凍結於該次嘗試。
 _Avoid_: 最大 raw price edge
 
 **配對商品隔離（Pair Product Quarantine）**:
-任一進場腿收到 MT5 `10021 TRADE_RETCODE_PRICE_OFF`／`No prices` 後，配對執行單元針對該工作者配對與 canonical product 持久建立的禁止進場狀態。隔離保存 offending Worker、attempt 與 broker receipt 證據，跨重啟及租約更新有效；顯示或恢復 bid/ask 不會自動解除，只能在沒有 unresolved attempt 時由已驗證操作員明確解除並留下稽核事件。
+任一進場腿收到 MT5 `10021 TRADE_RETCODE_PRICE_OFF`／`No prices` 後，配對執行單元針對該工作者配對與衍生商品識別持久建立的禁止進場狀態。隔離保存 offending Worker、attempt、broker receipt 證據與觀測當時的 `universe_generation`，跨重啟持續有效且無自動到期；因商品識別由精確符號名稱與 canonical 相容摘要雜湊決定性衍生，重新探索後識別相同者隔離仍然有效。顯示或恢復 bid/ask 不會自動解除，只能在沒有 unresolved attempt 時由已驗證操作員明確解除並留下稽核事件。
 _Avoid_: 暫時沒有報價、報價過期
 
-**配對租約**:
-主控台核發、帶嚴格遞增 fencing epoch 的短期授權，綁定 leader 帳戶工作者、follower 帳戶工作者、交易者身分與配對合約雜湊；兩台帳戶工作者只接受較高或相等 epoch 的租約，過期租約移除建立或提交新進場嘗試的權限，但不取消已跨越 `send_started` 的 broker effect。
+**策略政策雜湊（Canonical Policy Hash）**:
+leader 持有並發布之唯一 canonical 策略與風控政策版本雜湊，涵蓋執行模式、雙方各自的 strategy budget 與逐商品量規劃依據、雙方各自的紐約已實現虧損預算、edge-points 門檻、報價新鮮度與 skew 上限、follower 確認逾時秒數與生命週期退出政策；它不預先選定單一商品或方向，也不列舉商品篩選清單。政策撰寫權責分明：shared 政策（`mode`、`entry_edge_points`、`quote_max_age_seconds`、`quote_max_skew_seconds`、`follower_confirmation_timeout_seconds`、`flatten_at_ny`、`maximum_holding_seconds`）由 leader 獨自撰寫；`leader_risk` 由 leader 為自身撰寫；`follower_risk` 與 follower 的凍結啟動餘額只來自配對接受載荷並由 leader 逐字複製。未提供設定檔時政策由執行期以預設值合成，其中每台工作者的 strategy budget 預設為其啟動時的 broker 帳戶**餘額**（必須為 USD 帳戶且餘額為正，否則失效關閉）並凍結於該次配對。follower 先逐位元組驗證自身區塊與所送內容相同，再只在自身帳戶已 broker 驗證空倉時依雜湊持久接受該政策。雙方必須持久保存**完整 canonical 政策內容**，而非僅保存雜湊；雜湊只是對雙方各自已持有內容的完整性檢查，重啟後不需重新索取政策即可驗證嘗試。政策內容變更需要新雜湊及兩台帳戶工作者的 broker 驗證空倉事實，主控台全程不解讀政策內容。
+_Avoid_: 配對合約、配對租約、商品白名單、只保存政策雜湊
 
-**配對合約**:
-配對執行單元租約內不可變的工作者配對政策快照，包含可交易商品宇宙與篩選條件、逐商品量規劃、填單模式、edge-points 門檻、最佳候選排名、報價新鮮度與 skew 上限、arm 逾時、commit 前置時間、執行到期與生命週期退出政策；它不預先選定單一商品或方向。合約變更需要新租約 epoch 及兩台帳戶工作者的 broker 驗證空倉事實。
+**配對設定檔權責（Role-Specific Configuration Authority）**:
+配對執行單元不要求設定檔，缺少設定檔即由執行期合成預設值並可運作。若提供設定檔，其權限依該工作者實際取得的角色而定：follower 設定檔只能設定自身四項風險參數（`maximum_margin_fraction`、`daily_loss_fraction`、`trade_loss_fraction`、`maximum_loss_per_trade_usd`）與自身 `allow_live` 安全開關，不得設定 `entry_edge_points`、`quote_max_age_seconds`、`quote_max_skew_seconds`、`follower_confirmation_timeout_seconds`、`flatten_at_ny`、`maximum_holding_seconds` 或 `mode`；leader 設定檔可設定 shared 政策與自身風險，但永遠不得設定 follower 的風險參數或預算。任何設定檔都不得含路由、`route_id`、`trader_id`、`built_products` 或 `eligible_products`。上述違反皆為啟動設定錯誤而非靜默忽略；取得的角色與設定檔權限不符時失效關閉，不得部分套用。
+_Avoid_: 設定檔一律可覆寫任意 tunable、follower 覆寫共享政策
 
-**進場提交授權**:
-每台帳戶工作者對單一嘗試持久保存的送單授權；leader 於發出 commit 時、follower 於驗證該 commit 時各自寫入，arm 本身不構成授權。缺少該嘗試的授權即不得 `order_send`，因此遺失的 arm_ack 或 commit 不會產生單邊進場。leader 未曾授權的嘗試在結構上證明 follower 不可能送單。
+**執行模式權責與 allow_live**:
+`mode` 是配對層級且由 leader 撰寫的值，預設為 `live`，follower 不撰寫也不改寫。follower 可於本機設定明確的 `allow_live` 安全開關（預設 `true`）；當 `allow_live` 為 `false` 而 canonical 政策為 `live` 時，follower 失效關閉：明確拒絕該政策、不發布接受、不受理任何嘗試，維持已配對但不具進場就緒。它不得將 `mode` 改寫為 `shadow`，不得在 leader 為 live 時靜默以 shadow 運作，也不進行協商。leader 只能將該拒絕視為對側未就緒而不建立任何嘗試，不得視為接受。化解方式為操作員行為：在雙方 broker 驗證空倉時由 leader 發布 `shadow` 政策，或調整 follower 的 `allow_live` 後於空倉狀態重新評估。
+_Avoid_: follower 靜默降級為 shadow、以 follower 設定改寫配對政策
+
+**逐商品量規劃（Per-Product Sizing Plan）**:
+量規劃無法早於探索存在，因此順序為：建立路由、初始相容商品探索、接受 canonical 政策、開始收集報價、以**當前本機報價與當前 MT5 每手保證金計算**建立初始量規劃與緊急保護規劃，其後才開始候選評估；任一有效正值規劃缺失前不得處理任何候選。此後每小時刷新一次，依自身 `strategy_budget_usd`、`maximum_margin_fraction` 與當前 MT5 每手保證金本地計算最大量，連同 point、tick size、帳戶幣別 tick value、volume 上限、填單模式與粗略保護輸入一併快取；雙方交換版本化摘要後，配對量取兩側較低值並依共同 volume step 對齊。單一商品刷新失敗只暫停該商品至下次每小時刷新，不需 signal-time 保證金查詢。每個規劃版本不可變且具名，被取代的版本至少保留 `follower_confirmation_timeout_seconds` 加上有界 relay 處理時間，且在該期間仍可用於驗證已派遣的嘗試，使跨刷新界線的在途嘗試以其具名版本驗證而非必然遭拒；被取代的版本不得用於新候選。
+_Avoid_: 啟動時即建立量規劃、刷新即刪除舊版本
+
+**每帳戶紐約已實現虧損預算（Per-Worker NY Realized-Loss Budget）**:
+每台帳戶工作者依 `America/New_York` 曆日獨立追蹤、只累計已平倉策略腿已實現損益（不含浮動損益）的每日虧損上限；單腿允許損失取 `trade_loss_fraction`、`maximum_loss_per_trade_usd` 與當日剩餘允許額度三者最小值，且停利與該允許損失金額 1:1 對稱。leader 以 `leader_risk`、follower 以 `follower_risk` 各自計算。`maximum_loss_per_trade_usd` 預設 `40` 沿用 legacy `--emergency-stop-loss-usd` 的數值，但語意是**刻意重新詮釋**：此處為送單前的每筆硬性上限（三個上限之一），而非 legacy 的緊急停損觸發；粗略緊急保護以當前計算所得的 `allowed_leg_loss_usd` 為目標，而非固定常數。任一帳戶額度用盡即不得再開新腿，另一帳戶額度不受影響。
+_Avoid_: 視 maximum_loss_per_trade_usd 等同 legacy 緊急停損語意
+
+**立即派遣進場（Immediate Entry Dispatch）**:
+leader 選定最佳進場候選後，於同一次持久決策內同時完成：持久化不可變嘗試與自身已備妥的 broker effect、啟動只屬於自己的本地單調確認計時器、送出自身受保護市價進場，並將該不可變嘗試轉送 follower。嘗試攜帶 `route_id` 與 `universe_generation`，其 relay envelope 攜帶 `route_id`。follower 只執行非市場安全檢查（持久路由與當前 `route_id` 且路由不在 `UNPAIRING`、當前 `universe_generation`、政策雜湊逐字相符且已接受、量與商品資格、具名量規劃版本為當前版本或仍在保留期的舊版本、指派虧損不超過自身當前本機剩餘額度、隔離狀態、粗略保護可建構性），通過後立即啟動自己的本地單調確認計時器並送出自身受保護市價進場，不重新檢查報價或 edge，也不等待第二則 leader 訊息；相同 ID 且內容相同的重複投遞回傳既有結果，絕不重送。leader 與 follower 之間沒有 arm/commit 交握、沒有共同未來執行時間，也沒有 execution expiry。
+_Avoid_: arm/commit、進場提交授權
 
 **嘗試終止**:
-配對嘗試只有在雙方都被證明安全後才是 terminal：兩台帳戶工作者各自提出新鮮的 broker 空倉事實，或該嘗試從未取得進場提交授權因而證明只有一邊涉入。逾時、租約遺失、報價過期或就緒條件消失都不得直接遺棄嘗試，而是通知對側、轉為 desired `EMPTY` 並以 broker 事實收斂。
+配對嘗試只有在雙方都被證明安全後才是 terminal：兩台帳戶工作者各自在自己本地啟動、彼此獨立的單調確認計時器內取得雙方 exact broker 部位證據並套用精確保護後宣告 `ACTIVE`；或任一方計時器到期、拒單、送單結果未知、報價過期或 peer session 遺失時，各自僅以自身 durable effect 與新鮮 broker 事實收斂至 desired `EMPTY`，並盡力通知對側加速其收斂。逾時、報價過期或就緒條件消失都不得直接遺棄嘗試，也不得假設對側已完成或尚未送單。
 
 **部署模式開關**:
-每配對明確設定的執行模式（`strategy_runtime`、`pair_execution_cell` 或 `shadow`）；主控台強制同一配對的 `strategy_runtime` 與 `pair_execution_cell` 互斥存在，避免兩個生命週期擁有者同時啟用。
+每配對的執行模式（`strategy_runtime`、`pair_execution_cell` 或 `shadow`）；配對執行單元的執行模式預設為 live，`shadow` 需明確選擇。主控台強制同一配對的 `strategy_runtime` 與 `pair_execution_cell` 互斥存在，避免兩個生命週期擁有者同時啟用。配對執行單元的互斥主張在配對保留 transaction 中同時為**兩台**工作者取得，並於最終建立路由的 transaction 再次確認；其 owner kind 固定為 `pair_execution_cell` 且不帶 `trader_id`，legacy 策略執行體則保留自身交易者身分。安全解除配對移除路由時同時釋放雙方主張。
 
 **影子模式**:
-配對執行單元只執行報價一致性、就緒狀態、edge 決策與 arm 模擬並記錄遙測，不寫入 Worker effect journal 或送出 broker 寫入的執行模式；用於在正式切換前比較新舊路徑的 edge 決策。
+配對執行單元執行完整的候選排名與立即派遣進場決策路徑（報價一致性、就緒狀態、edge 決策），但以模擬 ticket 與模擬成交價取代真正的 `order_send`，不寫入 Worker effect journal 也不送出任何 broker 寫入；用於在正式切換前比較新舊路徑的候選決策與遙測。
+_Avoid_: arm 模擬
 
 **交易者指令 ID**:
 策略執行體為每次配對生命週期變更建立的唯一識別碼；策略執行體與帳戶工作者以指令 ID、effect ID 與 payload hash 持久去重，主控台只轉送並稽核。

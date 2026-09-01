@@ -19,11 +19,14 @@ from ..mt5.config import TimeCalibrationFamily
 from ..mt5.output import render
 from ..mt5.timecalibration import MARKET_DATA, render_calibration
 from ..trader_protocol import (
+    PAIR_CELL_CONTROL_MESSAGE_TYPES,
+    PAIR_CELL_PROTOCOL_VERSION,
     TraderRpcFailure,
     TraderRpcRequest,
     TraderRpcSuccess,
     WorkerEffectRequested,
     WorkerReadRequested,
+    pair_cell_control_message_adapter,
     worker_request_envelope_adapter,
 )
 from .credentials import (
@@ -40,6 +43,31 @@ from .scheduler import DeadlineAwareTraderRpcScheduler, ScheduledTraderRpc, Trad
 
 
 _LOGGER = logging.getLogger(__name__)
+_MAX_PAIR_RELAY_ACKS = 128
+#: Pairing control traffic is small, bursty and entirely superseded by the
+#: next authoritative route read, so its inboxes are bounded rather than
+#: unbounded queues that a disconnected consumer could grow without limit.
+_MAX_PAIR_CELL_CONTROL_MESSAGES = 256
+
+#: Every Worker-facing pairing control message is answered with exactly one
+#: ``<type>_result`` reply on the same authenticated session.
+PAIR_CELL_CONTROL_RESULT_TYPES = frozenset(
+    f"{message_type}_result" for message_type in PAIR_CELL_CONTROL_MESSAGE_TYPES
+)
+#: Unsolicited controller pushes that belong to the pairing control plane.
+#: None of them is a trading instruction: they announce reservation, route and
+#: unpair state that the Worker re-reads authoritatively on reconnect.
+PAIR_CELL_CONTROL_PUSH_TYPES = frozenset(
+    {
+        "pair_cell_pairing_proposed",
+        "pair_cell_pairing_refused",
+        "pair_cell_pairing_failed",
+        "pair_cell_pairing_reservation_released",
+        "pair_cell_route_established",
+        "pair_cell_route_state_changed",
+        "pair_cell_route_removed",
+    }
+)
 from .keystore import HardwareKeyStore
 
 
@@ -69,8 +97,10 @@ class AuthenticatedWorkerSession:
         default_factory=dict, init=False, repr=False
     )
     _pair_relay_inbox: list[dict[str, object]] = field(default_factory=list, init=False, repr=False)
-    _pair_cell_activation_inbox: list[dict[str, object]] = field(default_factory=list, init=False, repr=False)
+    _pair_relay_ack_inbox: list[dict[str, object]] = field(default_factory=list, init=False, repr=False)
     _pair_cell_quarantine_release_inbox: list[dict[str, object]] = field(default_factory=list, init=False, repr=False)
+    _pair_cell_result_inbox: list[dict[str, object]] = field(default_factory=list, init=False, repr=False)
+    _pair_cell_push_inbox: list[dict[str, object]] = field(default_factory=list, init=False, repr=False)
 
     def __enter__(self) -> Self:
         return self
@@ -174,13 +204,17 @@ class AuthenticatedWorkerSession:
             if response_type == "pair_relay_deliver":
                 self._queue_pair_relay_envelope(response)
                 continue
-            if response_type == "pair_cell_activate":
-                self._queue_pair_cell_activation(response)
-                continue
             if response_type == "pair_cell_quarantine_release_request":
                 self._queue_pair_cell_quarantine_release(response)
                 continue
+            if response_type in PAIR_CELL_CONTROL_RESULT_TYPES:
+                self._queue_pair_cell_result(response)
+                continue
+            if response_type in PAIR_CELL_CONTROL_PUSH_TYPES:
+                self._queue_pair_cell_push(response)
+                continue
             if response_type == "pair_relay_ack":
+                self._queue_pair_relay_ack(response)
                 continue  # fire-and-forget sends do not correlate this synchronously
             return response
 
@@ -381,13 +415,14 @@ class AuthenticatedWorkerSession:
         """Pull one pending controller-pushed message and route it by type.
 
         This single receive seam serves every push the controller may send on
-        this connection: ordinary Trader-relay ``worker_relay`` requests, and
-        the Pair Execution Cell's own opaque ``pair_relay_deliver``/
-        ``pair_cell_activate``/``pair_cell_quarantine_release_request`` pushes
-        and ``pair_relay_ack`` receipts. Each is queued for its own consumer
-        so this method never confuses one kind of push for another, and
-        interleaved traffic on the same socket is handled one message at a
-        time in arrival order.
+        this connection: ordinary Trader-relay ``worker_relay`` requests, the
+        Pair Execution Cell's own opaque ``pair_relay_deliver``/
+        ``pair_cell_quarantine_release_request`` pushes, ``pair_relay_ack``
+        receipts, and the Worker-facing pairing control plane's ``*_result``
+        replies and route/reservation notifications. Each is queued for its
+        own consumer so this method never confuses one kind of push for
+        another, and interleaved traffic on the same socket is handled one
+        message at a time in arrival order.
         """
 
         try:
@@ -403,13 +438,17 @@ class AuthenticatedWorkerSession:
         if response_type == "pair_relay_deliver":
             self._queue_pair_relay_envelope(response)
             return True
-        if response_type == "pair_cell_activate":
-            self._queue_pair_cell_activation(response)
-            return True
         if response_type == "pair_cell_quarantine_release_request":
             self._queue_pair_cell_quarantine_release(response)
             return True
+        if response_type in PAIR_CELL_CONTROL_RESULT_TYPES:
+            self._queue_pair_cell_result(response)
+            return True
+        if response_type in PAIR_CELL_CONTROL_PUSH_TYPES:
+            self._queue_pair_cell_push(response)
+            return True
         if response_type == "pair_relay_ack":
+            self._queue_pair_relay_ack(response)
             return True  # fire-and-forget sends do not correlate this synchronously
         raise WorkerEnrollmentError("The controller returned an invalid Worker relay request.")
 
@@ -418,16 +457,29 @@ class AuthenticatedWorkerSession:
             raise WorkerEnrollmentError("The controller returned an invalid Pair Execution Cell relay push.")
         self._pair_relay_inbox.append(cast(dict[str, object], response["envelope"]))
 
-    def _queue_pair_cell_activation(self, response: dict[str, object]) -> None:
-        if (
-            set(response) != {"type", "contract", "lease"}
-            or not isinstance(response.get("contract"), dict)
-            or not isinstance(response.get("lease"), dict)
-        ):
-            raise WorkerEnrollmentError("The controller returned an invalid Pair Execution Cell activation push.")
-        self._pair_cell_activation_inbox.append(
-            {"contract": cast(dict[str, object], response["contract"]), "lease": cast(dict[str, object], response["lease"])}
+    def _queue_pair_relay_ack(self, response: dict[str, object]) -> None:
+        """Retain one relay delivery receipt for the Pair Execution Cell.
+
+        A rejected acknowledgement (most importantly "Peer Worker is
+        disconnected") is the Worker's only genuine, controller-authenticated
+        evidence that the authorized peer route session is not live, and the
+        specification requires that loss to remove entry readiness
+        immediately. The queue is bounded because nothing else consumes it
+        when no cell is running.
+        """
+
+        accepted = response.get("accepted")
+        if not isinstance(accepted, bool):
+            return
+        self._pair_relay_ack_inbox.append(
+            {
+                "request_id": response.get("request_id"),
+                "accepted": accepted,
+                "reason": response.get("reason"),
+            }
         )
+        if len(self._pair_relay_ack_inbox) > _MAX_PAIR_RELAY_ACKS:
+            del self._pair_relay_ack_inbox[:-_MAX_PAIR_RELAY_ACKS]
 
     def _queue_pair_cell_quarantine_release(self, response: dict[str, object]) -> None:
         if (
@@ -456,17 +508,152 @@ class AuthenticatedWorkerSession:
             }
         )
 
+    def _queue_pair_cell_result(self, response: dict[str, object]) -> None:
+        """Retain one reply to this Worker's own pairing control message.
+
+        Replies are queued rather than awaited inline so pairing never blocks
+        the serialized Trader RPC path: the receive loop keeps draining
+        ordinary relay traffic while a pairing negotiation is in flight, and
+        the Pair Execution Cell runtime correlates replies by ``request_id``
+        on its own cadence.
+        """
+
+        if not isinstance(response.get("accepted"), bool):
+            raise WorkerEnrollmentError(
+                "The controller returned an invalid Pair Execution Cell control reply."
+            )
+        self._pair_cell_result_inbox.append(dict(response))
+        if len(self._pair_cell_result_inbox) > _MAX_PAIR_CELL_CONTROL_MESSAGES:
+            del self._pair_cell_result_inbox[:-_MAX_PAIR_CELL_CONTROL_MESSAGES]
+
+    def _queue_pair_cell_push(self, response: dict[str, object]) -> None:
+        """Retain one unsolicited pairing/route notification.
+
+        These are never replayed into a later session by the controller, so a
+        reconnecting Worker re-reads the authoritative route record instead of
+        depending on any of them arriving.
+        """
+
+        self._pair_cell_push_inbox.append(dict(response))
+        if len(self._pair_cell_push_inbox) > _MAX_PAIR_CELL_CONTROL_MESSAGES:
+            del self._pair_cell_push_inbox[:-_MAX_PAIR_CELL_CONTROL_MESSAGES]
+
+    def drain_pair_cell_results(self) -> list[dict[str, object]]:
+        """Pop every pairing control reply queued since the last drain."""
+
+        results, self._pair_cell_result_inbox = self._pair_cell_result_inbox, []
+        return results
+
+    def drain_pair_cell_pushes(self) -> list[dict[str, object]]:
+        """Pop every pairing/route notification queued since the last drain."""
+
+        pushes, self._pair_cell_push_inbox = self._pair_cell_push_inbox, []
+        return pushes
+
+    def send_pair_cell_control(self, message: dict[str, object]) -> str:
+        """Send one Worker-facing pairing control message and return its id.
+
+        The message is validated against
+        :data:`~abt.trader_protocol.pair_cell_control_message_adapter` before
+        it leaves this process, so a malformed local request is a loud local
+        error rather than a refused session. Nothing is awaited here: the
+        controller's reply arrives as a queued ``<type>_result``.
+        """
+
+        request_id = message.get("request_id")
+        if not isinstance(request_id, str) or not request_id:
+            request_id = str(uuid4())
+        outgoing = {**message, "request_id": request_id, "protocol_version": PAIR_CELL_PROTOCOL_VERSION}
+        try:
+            pair_cell_control_message_adapter.validate_python(outgoing)
+        except ValidationError as error:
+            raise WorkerEnrollmentError(
+                "The Worker cannot send an invalid Pair Execution Cell control message."
+            ) from error
+        try:
+            _send(self.socket, outgoing)
+        except Exception as error:
+            _raise_closed_connection(error, "Pair Execution Cell control message")
+        return request_id
+
+    def declare_pair_cell_role(self, role: str | None) -> str:
+        """Declare a desired role on this unpaired connection.
+
+        An omitted ``role`` means this Worker is simply an available
+        follower; a durable route always wins over the declaration.
+        """
+
+        return self.send_pair_cell_control({"type": "pair_cell_role", "role": role})
+
+    def request_available_pair_followers(self) -> str:
+        return self.send_pair_cell_control({"type": "pair_cell_available_followers"})
+
+    def propose_pair_cell_pairing(self, follower_worker_id: str) -> str:
+        return self.send_pair_cell_control(
+            {"type": "pair_cell_pairing_proposal", "follower_worker_id": follower_worker_id}
+        )
+
+    def send_pair_cell_pairing_decision(
+        self,
+        *,
+        proposal_id: str,
+        accepted: bool,
+        acceptance_payload: dict[str, object] | None = None,
+        payload_hash: str | None = None,
+        reason: str | None = None,
+    ) -> str:
+        """Accept or refuse one pairing proposal.
+
+        An acceptance is never a bare yes: it carries the follower's own
+        opaque Pairing Acceptance payload and its hash, which the controller
+        forwards to the reserved leader unchanged and never parses.  A
+        refusal carries no payload at all.
+        """
+
+        message: dict[str, object] = {
+            "type": "pair_cell_pairing_decision",
+            "proposal_id": proposal_id,
+            "accepted": accepted,
+        }
+        if accepted:
+            message["acceptance_payload"] = acceptance_payload
+            message["payload_hash"] = payload_hash
+        elif reason is not None:
+            message["reason"] = reason
+        return self.send_pair_cell_control(message)
+
+    def request_pair_cell_route_sync(self) -> str:
+        return self.send_pair_cell_control({"type": "pair_cell_route_sync"})
+
+    def send_pair_cell_unpair(self, *, route_id: str, action: str) -> str:
+        return self.send_pair_cell_control(
+            {"type": "pair_cell_unpair", "route_id": route_id, "action": action}
+        )
+
+    def send_pair_cell_state_version(self, *, route_id: str, state_version: int) -> str:
+        return self.send_pair_cell_control(
+            {"type": "pair_cell_state_version", "route_id": route_id, "state_version": state_version}
+        )
+
+    def send_pair_cell_unpair_assertion(self, *, route_id: str, state_version: int) -> str:
+        return self.send_pair_cell_control(
+            {
+                "type": "pair_cell_unpair_assertion",
+                "route_id": route_id,
+                "state_version": state_version,
+            }
+        )
+
     def drain_pair_relay_envelopes(self) -> list[dict[str, object]]:
         """Pop every opaque Pair Execution Cell envelope queued since the last drain."""
 
         envelopes, self._pair_relay_inbox = self._pair_relay_inbox, []
         return envelopes
+    def drain_pair_relay_acks(self) -> list[dict[str, object]]:
+        """Pop every ``{request_id, accepted, reason}`` relay receipt queued since the last drain."""
 
-    def drain_pair_cell_activations(self) -> list[dict[str, object]]:
-        """Pop every controller-pushed ``{contract, lease}`` activation queued since the last drain."""
-
-        activations, self._pair_cell_activation_inbox = self._pair_cell_activation_inbox, []
-        return activations
+        acks, self._pair_relay_ack_inbox = self._pair_relay_ack_inbox, []
+        return acks
 
     def drain_pair_cell_quarantine_releases(self) -> list[dict[str, object]]:
         """Pop every controller-pushed ``{request_id, symbol, actor, reason, observed_at}``
@@ -515,26 +702,6 @@ class AuthenticatedWorkerSession:
             )
         except Exception as error:
             _raise_closed_connection(error, "Pair Execution Cell quarantine-release result")
-
-    def request_pair_cell_activation(self) -> dict[str, object] | None:
-        """Synchronously ask the controller for this Worker's current pair
-        lease and contract, used once at Worker startup (or reconnect) before
-        entering the low-latency event loop -- not on any hot path."""
-
-        try:
-            _send(self.socket, {"type": "pair_cell_sync_request"})
-            response = self._response()
-            if response.get("type") != "pair_cell_sync" or set(response) != {"type", "contract", "lease"}:
-                raise WorkerEnrollmentError("The controller returned an invalid Pair Execution Cell sync response.")
-            contract = response["contract"]
-            if contract is None:
-                return None
-            lease = response["lease"]
-            if not isinstance(contract, dict) or not isinstance(lease, dict):
-                raise WorkerEnrollmentError("The controller returned an invalid Pair Execution Cell sync response.")
-            return {"contract": contract, "lease": lease}
-        except Exception as error:
-            _raise_closed_connection(error, "Pair Execution Cell activation sync")
 
     @property
     def trader_rpc_scheduler(self) -> DeadlineAwareTraderRpcScheduler:
