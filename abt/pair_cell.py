@@ -1771,6 +1771,7 @@ class RelayEnvelopeReceived:
     """An authenticated, already identity/route-validated opaque envelope."""
 
     envelope: Mapping[str, object]
+    received_at: datetime | None = None
 
 
 PairCellEvent = (
@@ -3755,6 +3756,8 @@ class PairExecutionCell:
     def handle_event(self, event: PairCellEvent) -> PairResult:
         if isinstance(event, ClockTickEvent):
             self._now = max(self._now, _as_utc(event.now))
+        elif isinstance(event, RelayEnvelopeReceived) and event.received_at is not None:
+            self._now = max(self._now, _as_utc(event.received_at))
         elif isinstance(event, ReadinessFactsEvent):
             self._now = max(self._now, _as_utc(event.observed_at))
             self._local_facts = event
@@ -4255,6 +4258,35 @@ class PairExecutionCell:
         seen = self._quote_epochs.get(product_id, [])
         return epoch in seen and seen[-1] != epoch
 
+    def _log_peer_quote_delivery(self, payload: Mapping[str, object], *, quote_count: int) -> None:
+        """Temporary leader-side probe for follower quote relay latency."""
+
+        if self._role != "leader":
+            return
+        published_at = payload.get("published_at")
+        if not isinstance(published_at, str):
+            _LOGGER.debug(
+                "[DEBUG-quote-latency] follower quote batch missing published_at: quotes=%s.",
+                quote_count,
+            )
+            return
+        try:
+            delivery_ms = (self._now - _parse_utc(published_at)).total_seconds() * 1000
+        except (ValueError, PairExecutionCellError):
+            _LOGGER.debug(
+                "[DEBUG-quote-latency] follower quote batch has invalid published_at: quotes=%s.",
+                quote_count,
+            )
+            return
+        _LOGGER.debug(
+            "[DEBUG-quote-latency] follower quote batch delivered: quotes=%s delivery_ms=%.1f "
+            "published_at=%s leader_received_at=%s.",
+            quote_count,
+            delivery_ms,
+            published_at,
+            _iso(self._now),
+        )
+
     def _accept_peer_quote(self, payload: Mapping[str, object]) -> None:
         product_id = payload.get("product_id")
         symbol = payload.get("symbol")
@@ -4325,13 +4357,22 @@ class PairExecutionCell:
         )
 
     def _publish_quote(self, quote: QuoteSnapshot) -> None:
-        self._relay.send(self._envelope("quote", quote.canonical()))
+        payload = quote.canonical()
+        payload["published_at"] = _iso(self._now)
+        self._relay.send(self._envelope("quote", payload))
 
     def _publish_quote_batch(self, quotes: tuple[QuoteSnapshot, ...]) -> None:
         if not quotes:
             return
+        published_at = _iso(self._now)
         self._relay.send(
-            self._envelope("quote_batch", {"quotes": [quote.canonical() for quote in quotes]})
+            self._envelope(
+                "quote_batch",
+                {
+                    "published_at": published_at,
+                    "quotes": [{**quote.canonical(), "published_at": published_at} for quote in quotes],
+                },
+            )
         )
 
     def _publish_remaining_allowance(self) -> None:
@@ -4528,10 +4569,12 @@ class PairExecutionCell:
             return
         kind = envelope.get("kind")
         if kind == "quote":
+            self._log_peer_quote_delivery(payload, quote_count=1)
             self._accept_peer_quote(payload)
         elif kind == "quote_batch":
             raw_quotes = payload.get("quotes")
             if isinstance(raw_quotes, list):
+                self._log_peer_quote_delivery(payload, quote_count=len(raw_quotes))
                 for quote in raw_quotes:
                     if isinstance(quote, dict):
                         self._accept_peer_quote(quote)
