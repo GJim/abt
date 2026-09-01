@@ -13,6 +13,7 @@ from abt.worker.reconciliation import (
     LiveWorkerMarketStateAdapter,
     MT5ReconciliationAdapter,
     WorkerSafetyAdapter,
+    _GracefulShutdown,
     _mt5_last_error,
     _broker_order_request,
     _broker_receipt,
@@ -809,6 +810,31 @@ class WorkerReconciliationTests(unittest.TestCase):
              "reconnecting attempt 1/10 in 5 seconds."],
             logs.output,
         )
+
+    def test_reconnect_preserves_a_graceful_shutdown_request(self) -> None:
+        seen: list[_GracefulShutdown] = []
+        runs = 0
+
+        def run_reconciliation(*, graceful_shutdown: _GracefulShutdown, **_: object) -> None:
+            nonlocal runs
+            runs += 1
+            seen.append(graceful_shutdown)
+            if runs == 1:
+                graceful_shutdown.requested = True
+                raise WorkerSessionDisconnected("controller disconnected")
+            self.assertTrue(graceful_shutdown.requested)
+
+        reconnect_worker_session(
+            open_session=ReconnectSession,
+            mt5=ReadOnlyMT5(),
+            login=123456,
+            server="Broker-Demo",
+            sleep=lambda _: None,
+            run_reconciliation=run_reconciliation,
+        )
+
+        self.assertEqual(2, runs)
+        self.assertIs(seen[0], seen[1])
 
     def test_stops_reconnecting_after_ten_wss_retry_attempts(self) -> None:
         opened = 0

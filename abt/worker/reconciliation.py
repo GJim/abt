@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 import logging
 import math
@@ -83,6 +84,11 @@ class PairCellPump(Protocol):
     def request_close(self, reason: str) -> object: ...
 
     def close(self) -> None: ...
+
+
+@dataclass
+class _GracefulShutdown:
+    requested: bool = False
 
 
 PairCellFactory = Callable[
@@ -371,6 +377,7 @@ def reconcile_authenticated_worker(
     maintenance: Callable[[], None] | None = None,
     effect_journal: WorkerEffectJournal | None = None,
     pair_cell_factory: PairCellFactory | None = None,
+    graceful_shutdown: _GracefulShutdown | None = None,
 ) -> None:
     """Use an authenticated session's memory-only password for read-only MT5 reconciliation."""
 
@@ -415,6 +422,7 @@ def reconcile_authenticated_worker(
             live_state=live_state,
             effect_journal=effect_journal,
             pair_cell=pair_cell,
+            graceful_shutdown=graceful_shutdown,
         )
     finally:
         if pair_cell is not None:
@@ -437,6 +445,7 @@ def reconcile_with_safety(
     maintenance: Callable[[], None] | None = None,
     effect_journal: WorkerEffectJournal | None = None,
     pair_cell_factory: PairCellFactory | None = None,
+    graceful_shutdown: _GracefulShutdown | None = None,
 ) -> None:
     """Run reconciliation with bounded terminal/API recovery and human escalation."""
 
@@ -444,6 +453,7 @@ def reconcile_with_safety(
         lambda: reconcile_authenticated_worker(
             mt5=mt5, session=session, login=login, server=server, now=now, sleep=sleep, maintenance=maintenance,
             effect_journal=effect_journal, pair_cell_factory=pair_cell_factory,
+            graceful_shutdown=graceful_shutdown,
         ),
         sleep=sleep,
     )
@@ -465,6 +475,7 @@ def reconnect_worker_session(
     """Reconnect an interrupted proved WSS session with a bounded exponential backoff."""
 
     attempts = 0
+    graceful_shutdown = _GracefulShutdown()
     while True:
         connected_at: float | None = None
         try:
@@ -479,6 +490,7 @@ def reconnect_worker_session(
                     maintenance=None if maintenance is None else lambda: maintenance(session),
                     effect_journal=effect_journal,
                     pair_cell_factory=pair_cell_factory,
+                    graceful_shutdown=graceful_shutdown,
                 )
             return
         except WorkerSessionDisconnected as error:
@@ -508,13 +520,14 @@ def _run_reconciliation_with_relay(
     live_state: LiveWorkerMarketStateAdapter | None,
     effect_journal: WorkerEffectJournal | None,
     pair_cell: PairCellPump | None = None,
+    graceful_shutdown: _GracefulShutdown | None = None,
 ) -> None:
     next_maintenance = now()
     next_reconciliation = next_maintenance
-    shutdown_requested = False
+    graceful_shutdown = graceful_shutdown or _GracefulShutdown()
     while True:
         try:
-            if shutdown_requested and pair_cell is not None and pair_cell.shutdown_complete:
+            if graceful_shutdown.requested and pair_cell is not None and pair_cell.shutdown_complete:
                 _LOGGER.info("Pair Execution Cell graceful shutdown completed.")
                 return
             observed_at = now()
@@ -541,13 +554,13 @@ def _run_reconciliation_with_relay(
                 pair_cell.pump(observed_at)
                 if bool(getattr(pair_cell, "should_exit", False)):
                     return
-                if shutdown_requested and pair_cell.shutdown_complete:
+                if graceful_shutdown.requested and pair_cell.shutdown_complete:
                     _LOGGER.info("Pair Execution Cell graceful shutdown completed.")
                     return
         except KeyboardInterrupt:
-            if shutdown_requested or pair_cell is None:
+            if graceful_shutdown.requested or pair_cell is None:
                 raise
-            shutdown_requested = True
+            graceful_shutdown.requested = True
             pair_cell.request_close("operator interrupt")
             _LOGGER.info(
                 "Pair Execution Cell graceful shutdown requested; waiting for both legs to become terminal. "

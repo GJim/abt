@@ -936,8 +936,11 @@ entry failure, and protection failure all use the same desired-`EMPTY`
 convergence path.
 
 An interactive Worker interrupt requests this same shutdown convergence rather
-than immediately terminating the process. The Worker keeps its authenticated
-relay, broker observation, and Pair Execution Cell pump active until its
+than immediately terminating the process. The shutdown intent belongs to the
+running Worker process and survives authenticated-relay reconnect and Pair
+Execution Cell runtime reconstruction; recovery may continue containment but
+must never resume entry. The Worker keeps its authenticated relay, broker
+observation, and Pair Execution Cell pump active until its
 locally owned leg and the peer's terminal proof make the attempt terminal;
 only then does it close the session and MT5 connection. A second interrupt may
 force immediate process exit. This shutdown path acts only on the attempt's
