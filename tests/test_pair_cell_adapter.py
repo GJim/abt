@@ -1390,6 +1390,19 @@ class PairingTestCase(unittest.TestCase):
         )
         return leader, follower
 
+    def test_unpair_without_a_route_exits_after_the_controller_confirms_none_exists(self) -> None:
+        worker = self.worker(
+            LEADER,
+            options=PairCellStartupOptions(unpair=True),
+        )
+
+        self.assertTrue(
+            pump_until([worker], lambda: worker.runtime.should_exit, rounds=12),
+            "the idempotent safe-unpair did not exit after the controller confirmed no route",
+        )
+        self.assertFalse(worker.runtime.enabled)
+        self.assertEqual("no Pair Execution Cell route exists to unpair", worker.runtime.pairing_diagnostic)
+
 
 class WorkerInitiatedPairingTests(PairingTestCase):
     def test_a_worker_started_with_no_role_becomes_an_available_follower(self) -> None:

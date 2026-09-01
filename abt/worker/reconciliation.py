@@ -74,6 +74,9 @@ class PairCellPump(Protocol):
 
     def pump(self, observed_at: datetime) -> object: ...
 
+    @property
+    def should_exit(self) -> bool: ...
+
     def close(self) -> None: ...
 
 
@@ -526,6 +529,8 @@ def _run_reconciliation_with_relay(
                 safety.heartbeat(now())
         if pair_cell is not None:
             pair_cell.pump(observed_at)
+            if bool(getattr(pair_cell, "should_exit", False)):
+                return
 
 
 def _serve_pending_trader_rpc(

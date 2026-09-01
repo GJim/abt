@@ -136,6 +136,23 @@ _MAX_CALIBRATION_DISPERSION_SECONDS = 5.0
 # Calibration is a per-terminal fact, so only a bounded number of symbols is
 # tried before giving up for this cycle.
 _MAX_CALIBRATION_SYMBOLS = 8
+_STATE_RELAY_KINDS = frozenset(
+    {
+        "attempt",
+        "catalog_summary",
+        "leg_status",
+        "pair_entry_confirmed",
+        "pair_entry_failed",
+        "pairing_acceptance",
+        "policy",
+        "policy_ack",
+        "readiness",
+        "remaining_allowance",
+        "reseed_request",
+        "sizing_plans",
+        "universe",
+    }
+)
 # A pairing reservation lives for 30 seconds.  A Worker that is still waiting
 # on a one-shot decision reply or route-established notice keeps re-reading the
 # authoritative route until comfortably past that, so an in-flight pairing is
@@ -743,6 +760,7 @@ class WorkerPairCellRelay:
         self._route = route
         self._observer = observer
         self.last_send_failed = False
+        self._state_relay_request_ids: set[str] = set()
 
     def claim(self) -> dict[str, object]:
         return {
@@ -784,6 +802,14 @@ class WorkerPairCellRelay:
         }
         try:
             self._session.send_pair_relay(wire_envelope, request_id=request_id)
+            if kind in _STATE_RELAY_KINDS:
+                self._state_relay_request_ids.add(request_id)
+                _LOGGER.debug(
+                    "Pair Execution Cell relay queued: kind=%s request_id=%s target_worker_id=%s.",
+                    kind,
+                    request_id,
+                    wire_envelope["to_worker_id"],
+                )
         except Exception:
             # A relay send never propagates into the cell's decision path: the
             # authenticated-session loss is reported as a peer-session event,
@@ -791,6 +817,14 @@ class WorkerPairCellRelay:
             # Worker already owns.
             self.last_send_failed = True
             _LOGGER.warning("Pair Execution Cell relay send failed.", exc_info=True)
+
+    def consume_state_relay_ack(self, request_id: object) -> bool:
+        """Whether an acknowledgement belongs to a logged state envelope."""
+
+        if not isinstance(request_id, str) or request_id not in self._state_relay_request_ids:
+            return False
+        self._state_relay_request_ids.remove(request_id)
+        return True
 
 
 def unwrap_pair_relay_envelope(envelope: Mapping[str, object]) -> dict[str, object] | None:
@@ -1494,11 +1528,13 @@ class PairCellRuntime:
         self._asserted_state_version: int | None = None
         self._probed_state_version: int | None = None
         self._operator_requests_applied = False
+        self._exit_after_safe_unpair = False
         self._published_policy = False
         self._next_route_sync_at = epoch_placeholder = now()
         self._next_acceptance_publication = epoch_placeholder
         self._next_safe_unpair_probe = epoch_placeholder
         self._next_acceptance_diagnostic = epoch_placeholder
+        self._last_state_diagnostic: tuple[object, ...] | None = None
         self._pending_budget: tuple[str, StartupBalance] | None = None
         self._pairing_deadline: datetime | None = None
 
@@ -1534,6 +1570,12 @@ class PairCellRuntime:
                     record.role,
                 )
             self._construct_cell(record)
+            _LOGGER.debug(
+                "Pair Execution Cell restored: route_id=%s role=%s peer_worker_id=%s.",
+                record.route_id,
+                record.role,
+                record.assignment().peer_of(worker_id),
+            )
 
     # -- observability ------------------------------------------------------ #
 
@@ -1565,6 +1607,12 @@ class PairCellRuntime:
     @property
     def pairing_state(self) -> str:
         return self._pairing_state
+
+    @property
+    def should_exit(self) -> bool:
+        """Whether an invoked ``--pair-cell-unpair`` completed safely."""
+
+        return self._exit_after_safe_unpair
 
     @property
     def pairing_diagnostic(self) -> str:
@@ -1810,6 +1858,12 @@ class PairCellRuntime:
             route = reply.get("route")
             if isinstance(route, Mapping):
                 self._adopt_controller_route(route)
+                return
+            if self._options.unpair:
+                self._pairing_state = "unpaired"
+                self._pairing_reason = "no Pair Execution Cell route exists to unpair"
+                self._exit_after_safe_unpair = True
+                _LOGGER.info("No Pair Execution Cell route exists; the safe-unpair request is already complete.")
                 return
             declared = reply.get("declared_role")
             resolved = reply.get("role")
@@ -2609,6 +2663,8 @@ class PairCellRuntime:
         self._pairing_state = "unstarted"
         self._pairing_reason = f"the Pair Execution Cell route was removed ({reason})"
         _LOGGER.info("The Pair Execution Cell route was removed: %s.", reason)
+        if self._options.unpair and reason in {"safe_unpair", "safe_unpair_completed_while_offline"}:
+            self._exit_after_safe_unpair = True
 
     def _reset_route_scoped_state(self) -> None:
         """Clear one pairing's durable state, keeping local safety history.
@@ -2741,6 +2797,11 @@ class PairCellRuntime:
             {"type": "symbols", "purpose": "pair_cell_catalog_refresh", "cycle": cycle},
             lambda: self._refresh_locally(observed_at),
         )
+        if ran is not True:
+            _LOGGER.debug(
+                "Pair Execution Cell catalog refresh was not admitted by the MT5 scheduler: cycle=%s.",
+                cycle,
+            )
         return ran is True
 
     def _refresh_locally(self, observed_at: datetime) -> bool:
@@ -2766,6 +2827,17 @@ class PairCellRuntime:
         if entries is not None and entries != self._catalog_entries:
             self._catalog_entries = entries
             self._catalog_generation += 1
+            _LOGGER.debug(
+                "Pair Execution Cell catalog refreshed: generation=%s entries=%s.",
+                self._catalog_generation,
+                len(entries),
+            )
+        elif entries is not None:
+            _LOGGER.debug(
+                "Pair Execution Cell catalog refresh found no change: generation=%s entries=%s.",
+                self._catalog_generation,
+                len(entries),
+            )
         self._calibrate()
         return True
 
@@ -2802,6 +2874,11 @@ class PairCellRuntime:
         if self._catalog_generation == self._fed_catalog_generation:
             return None
         self._fed_catalog_generation = self._catalog_generation
+        _LOGGER.debug(
+            "Pair Execution Cell submitted local catalog to discovery: generation=%s entries=%s.",
+            self._catalog_generation,
+            len(entries),
+        )
         return cell.handle_event(LocalCatalogEvent(entries=entries, observed_at=observed_at))
 
     # -- per-loop pumping ----------------------------------------------------- #
@@ -2828,6 +2905,18 @@ class PairCellRuntime:
                 request_id=request_id, symbol=symbol, outcome="applied" if applied else "rejected"
             )
         for ack in self._session.drain_pair_relay_acks():
+            request_id = ack.get("request_id")
+            accepted = ack.get("accepted") is True
+            if (
+                not accepted
+                or (self._relay is not None and self._relay.consume_state_relay_ack(request_id))
+            ):
+                _LOGGER.debug(
+                    "Pair Execution Cell relay acknowledgement: request_id=%s accepted=%s%s.",
+                    request_id if isinstance(request_id, str) else "-",
+                    accepted,
+                    f" reason={ack.get('reason')}" if not accepted and isinstance(ack.get("reason"), str) else "",
+                )
             if ack.get("accepted") is False:
                 self._peer_session_connected = False
         envelopes = self._session.drain_pair_relay_envelopes()
@@ -2836,6 +2925,13 @@ class PairCellRuntime:
         for envelope in envelopes:
             inner = unwrap_pair_relay_envelope(envelope)
             if inner is not None and self._cell is not None:
+                kind = inner.get("kind")
+                if kind in _STATE_RELAY_KINDS:
+                    _LOGGER.debug(
+                        "Pair Execution Cell relay received: kind=%s source_worker_id=%s.",
+                        kind,
+                        inner.get("from_worker_id"),
+                    )
                 result = self._cell.handle_event(RelayEnvelopeReceived(inner))
         if self._cell is not None:
             result = self._maybe_publish_policy() or result
@@ -2846,6 +2942,8 @@ class PairCellRuntime:
         """Drain relay and pairing traffic, then advance time-gated evidence."""
 
         result = self.drain_relay()
+        if self._exit_after_safe_unpair:
+            return result
         cell = self._cell
         if observed_at >= self._next_refresh_at:
             if self._refresh_local_evidence(observed_at):
@@ -2904,8 +3002,52 @@ class PairCellRuntime:
                 result = cell.handle_event(snapshot)
                 for realized in self._realized_loss_facts(snapshot, observed_at, result):
                     result = cell.handle_event(realized)
+        self._log_state_diagnostic(cell)
         self._sync_route_control()
         return result
+
+    def _log_state_diagnostic(self, cell: PairExecutionCell) -> None:
+        """Log a concise state snapshot only when an observable value changes."""
+
+        status = cell.status()
+        diagnostic = cell.entry_admission_diagnostic()
+        snapshot = (
+            status.route_state,
+            status.universe_generation,
+            status.state,
+            status.attempt_id,
+            status.desired_state,
+            status.ready,
+            status.ready_reason,
+            status.policy_accepted,
+            status.plan_set_version,
+            status.pair_confirmed,
+            status.needs_human,
+            status.needs_human_reason,
+            status.metadata_reconciliation,
+            diagnostic,
+        )
+        if snapshot == self._last_state_diagnostic:
+            return
+        self._last_state_diagnostic = snapshot
+        _LOGGER.debug(
+            "Pair Execution Cell state: route_id=%s route_state=%s universe_generation=%s "
+            "state=%s desired=%s attempt_id=%s ready=%s reason=%s policy_accepted=%s "
+            "plan_set_version=%s pair_confirmed=%s needs_human=%s admission=%s.",
+            status.route_id,
+            status.route_state,
+            status.universe_generation,
+            status.state,
+            status.desired_state,
+            status.attempt_id or "-",
+            status.ready,
+            status.ready_reason,
+            status.policy_accepted,
+            status.plan_set_version or "-",
+            status.pair_confirmed,
+            status.needs_human,
+            diagnostic,
+        )
 
     def _sync_route_control(self) -> None:
         """Publish the local state version and, while ``UNPAIRING``, assertions.

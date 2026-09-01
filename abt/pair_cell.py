@@ -64,6 +64,7 @@ from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR
 from hashlib import sha256
 import json
+import logging
 import math
 import sqlite3
 import time as _time
@@ -80,6 +81,9 @@ from .worker.scheduler import (
     TraderRpcOutcome,
     TraderRpcOutcomeCategory,
 )
+
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class PairExecutionCellError(RuntimeError):
@@ -2516,6 +2520,13 @@ class PairExecutionCell:
             (None if self._attempt is None else self._attempt.attempt_id, event, detail, _iso(self._now)),
         )
         self._db.commit()
+        _LOGGER.debug(
+            "Pair Execution Cell transition: event=%s state=%s attempt_id=%s detail=%s.",
+            event,
+            self._state,
+            None if self._attempt is None else self._attempt.attempt_id,
+            detail or "-",
+        )
 
     def _record_timing(self, key: str) -> None:
         self._last_timing[key] = _iso(self._now)
@@ -2873,6 +2884,10 @@ class PairExecutionCell:
                 self._begin_close("unresolved_attempt_after_restart")
         self._transition("recovered", self._state)
         self._recovering = False
+        # A running peer may have published an unchanged readiness snapshot
+        # while this Worker was offline. Explicitly request its state instead
+        # of relying on a later epoch change or market event to trigger it.
+        self._request_reseed("local Worker recovered", ask_peer=True)
         if self._attempt is not None:
             self._request_broker_read()
             self._progress()
@@ -2895,6 +2910,11 @@ class PairExecutionCell:
 
     def route_id(self) -> str:
         return self._route.route_id
+
+    def status(self) -> PairResult:
+        """Return the current observable state for Worker diagnostics."""
+
+        return self._result()
 
     def route_state(self) -> RouteState:
         return self._route_state
@@ -4709,6 +4729,42 @@ class PairExecutionCell:
             }
             for edge_usd, points, product_id, direction in self._candidates()
         ]
+
+    def entry_admission_diagnostic(self) -> str:
+        """Return the current, most specific reason a leader cannot enter.
+
+        This deliberately describes only durable safety and admission gates;
+        it never includes account credentials, order payloads, or raw broker
+        records.  The Worker emits it at debug level for ``abt-worker -v``.
+        """
+
+        if self._role != "leader":
+            return "this Worker is the follower; only the leader creates entries"
+        ready, reason = self._local_ready()
+        if not ready:
+            return f"local admission blocked: {reason}"
+        if not self._peer_ready:
+            return f"peer admission blocked: {self._peer_ready_reason or 'no current peer readiness'}"
+        if not self._peer_session:
+            return "peer admission blocked: authenticated peer session lost"
+        policy = self._policy
+        if policy is None or self._peer_policy_hash != policy.hash:
+            return "peer admission blocked: canonical policy acknowledgement is not current"
+        if self._peer_allowance is None:
+            return "peer admission blocked: no current remaining-loss allowance"
+        if self._peer_allowance.publisher_epoch < self._peer_publisher_epoch:
+            return "peer admission blocked: remaining-loss allowance has not been reseeded"
+        candidates = self._candidates()
+        if not candidates:
+            return (
+                "no entry candidate passed sizing, quote freshness/skew, quarantine, "
+                f"and edge threshold gates (entry_edge_points={policy.entry_edge_points})"
+            )
+        candidate = candidates[0]
+        return (
+            f"entry candidate selected: product_id={candidate[2]} direction={candidate[3]} "
+            f"edge_points={candidate[1]} expected_edge_usd={candidate[0]}"
+        )
 
     # -- leader: immediate entry -------------------------------------------- #
 

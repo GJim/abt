@@ -1050,6 +1050,45 @@ class WorkerReconciliationTests(unittest.TestCase):
         self.assertGreater(len(fake_pair_cell.pump_calls), 0)
         self.assertTrue(fake_pair_cell.closed)
 
+    def test_pair_cell_can_end_reconciliation_cleanly_after_safe_unpair(self) -> None:
+        mt5 = ReadOnlyMT5()
+        mt5.initialize = lambda: True  # type: ignore[attr-defined]
+        mt5.login = lambda login, *, password, server: True  # type: ignore[attr-defined]
+        mt5.shutdown = lambda: None  # type: ignore[attr-defined]
+
+        class Session(MemoryOnlySession):
+            def receive_worker_relay(self, timeout: float | None = None) -> bool:
+                return False
+
+        class CompletedUnpairCell:
+            def __init__(self) -> None:
+                self.closed = False
+
+            def drain_relay(self) -> object:
+                return None
+
+            def pump(self, observed_at: object) -> object:
+                return None
+
+            @property
+            def should_exit(self) -> bool:
+                return True
+
+            def close(self) -> None:
+                self.closed = True
+
+        cell = CompletedUnpairCell()
+        reconcile_authenticated_worker(
+            mt5=mt5,
+            session=Session([]),
+            login=123456,
+            server="Broker-Demo",
+            now=lambda: datetime(2026, 8, 16, tzinfo=UTC),
+            pair_cell_factory=lambda *_: cell,
+        )
+
+        self.assertTrue(cell.closed)
+
     def _serve_market_data_analysis(self, stage: str, timeframe: str) -> dict[str, object]:
         mt5 = AnalysisMT5()
         session = AnalysisSession(

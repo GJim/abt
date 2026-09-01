@@ -239,7 +239,7 @@ def main(
             format="%(levelname)s %(name)s: %(message)s",
             stream=error_output,
         )
-        logging.getLogger("abt.worker").setLevel(logging.DEBUG)
+        logging.getLogger("abt").setLevel(logging.DEBUG)
     cleanup_errors: list[Exception] = []
     try:
         if arguments.command == "reconcile":
