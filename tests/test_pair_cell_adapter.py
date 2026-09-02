@@ -871,6 +871,7 @@ class PairCellConfigurationTests(unittest.TestCase):
         self.assertEqual({}, dict(config.risk_overrides))
         self.assertEqual({}, dict(config.shared_policy))
         self.assertTrue(config.allow_live)
+        self.assertEqual("20", config.daily_loss_warning_threshold_usd)
         limits = worker_risk_limits(StartupBalance(amount_usd="2500"), config)
         self.assertEqual("2500", limits.strategy_budget_usd)
         self.assertEqual("0.10", limits.maximum_margin_fraction)
@@ -898,6 +899,15 @@ class PairCellConfigurationTests(unittest.TestCase):
     def test_allow_live_must_be_a_boolean(self) -> None:
         with self.assertRaises(WorkerEnrollmentError):
             parse_pair_cell_config({"allow_live": "false"})
+
+    def test_daily_loss_warning_threshold_is_a_local_non_negative_usd_setting(self) -> None:
+        config = parse_pair_cell_config({"daily_loss_warning_threshold_usd": "12.50"})
+        self.assertEqual("12.5", config.daily_loss_warning_threshold_usd)
+        self.assertIsNone(config.role_authority_error("follower"))
+        for value in ("-1", "NaN", True):
+            with self.subTest(value=value):
+                with self.assertRaises(WorkerEnrollmentError):
+                    parse_pair_cell_config({"daily_loss_warning_threshold_usd": value})
 
     def test_a_follower_permissible_file_is_valid_for_either_role(self) -> None:
         config = parse_pair_cell_config(

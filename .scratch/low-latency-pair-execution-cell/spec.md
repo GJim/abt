@@ -403,7 +403,8 @@ A **follower** override file may set only:
   `daily_loss_fraction`, `trade_loss_fraction`, and
   `maximum_loss_per_trade_usd` — which it authors and sends in its Pairing
   Acceptance payload; and
-- its own local safety guard `allow_live` (see below).
+- its own local safety guards `allow_live` and
+  `daily_loss_warning_threshold_usd` (see below).
 
 A follower file may **not** set shared policy: `entry_edge_points`,
 `quote_max_age_seconds`, `quote_max_skew_seconds`,
@@ -1047,6 +1048,7 @@ attribute.
 42. As a strategy operator, I want one failed product refresh to suspend only that product until the next refresh, so that other products remain eligible.
 43. As a strategy operator, I want each account to enforce its own 3% New York daily realized-loss limit, so that one account cannot conceal the other's budget use.
 44. As a strategy operator, I want each leg's loss capped by the smallest of 2% of strategy budget, `maximum_loss_per_trade_usd`, and remaining daily allowance, understanding that the `40` default is a deliberate hard-cap reinterpretation of the legacy emergency-stop value rather than the same semantic.
+45. As a strategy operator, I want a Worker to warn and pause new entries when its positive remaining daily-loss allowance reaches the local `daily_loss_warning_threshold_usd` guard (default `$20`), while leaving an already protected pair to exit normally and automatically resuming after the next New York day.
 45. As a strategy operator, I want each Worker to publish a continuous versioned remaining-allowed-leg-loss summary before any signal, so that the leader never assigns a leg more loss than its owner can accept.
 46. As a follower operator, I want to reject an attempt whose assigned loss exceeds my current local remaining allowance, so that a stale summary can never spend more of my daily budget than I have left.
 47. As a strategy operator, I want each leg's precise TP and SL to use equal USD amounts, so that the protection target is 1:1.

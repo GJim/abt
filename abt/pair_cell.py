@@ -502,6 +502,7 @@ DEFAULT_MAXIMUM_MARGIN_FRACTION = "0.10"
 DEFAULT_DAILY_LOSS_FRACTION = "0.03"
 DEFAULT_TRADE_LOSS_FRACTION = "0.02"
 DEFAULT_MAXIMUM_LOSS_PER_TRADE_USD = "40"
+DEFAULT_DAILY_LOSS_WARNING_THRESHOLD_USD = "20"
 DEFAULT_QUOTE_MAX_AGE_SECONDS = 1.0
 DEFAULT_QUOTE_MAX_SKEW_SECONDS = 1.0
 DEFAULT_FOLLOWER_CONFIRMATION_TIMEOUT_SECONDS = 5.0
@@ -527,7 +528,7 @@ WORKER_RISK_KEYS = (
     "maximum_loss_per_trade_usd",
 )
 #: Worker-local, non-policy settings.
-LOCAL_SETTING_KEYS = ("allow_live",)
+LOCAL_SETTING_KEYS = ("allow_live", "daily_loss_warning_threshold_usd")
 #: Keys that belong to pairing and discovery, never to operator configuration.
 FORBIDDEN_CONFIG_KEYS = (
     "route",
@@ -2146,6 +2147,7 @@ class PairExecutionCell:
         effect_journal: WorkerEffectJournal,
         scheduler: DeadlineAwareTraderRpcScheduler,
         allow_live: bool = DEFAULT_ALLOW_LIVE,
+        daily_loss_warning_threshold_usd: str = DEFAULT_DAILY_LOSS_WARNING_THRESHOLD_USD,
         monotonic: Callable[[], float] = _time.monotonic,
         serve_foreign_scheduler_item: Callable[[ScheduledTraderRpc], None] | None = None,
         dispatch_foreign_scheduler_outcome: Callable[[TraderRpcOutcome], None] | None = None,
@@ -2191,6 +2193,13 @@ class PairExecutionCell:
         self._mt5 = mt5
         self._declared_limits = local_risk_limits
         self._allow_live = bool(allow_live)
+        threshold = _to_decimal(daily_loss_warning_threshold_usd)
+        if threshold is None or threshold < 0:
+            raise PairExecutionCellError(
+                "daily_loss_warning_threshold_usd must be a non-negative USD amount."
+            )
+        self._daily_loss_warning_threshold_usd = threshold
+        self._daily_loss_warning_active = False
         self._journal = effect_journal
         self._scheduler = scheduler
         self._monotonic = monotonic
@@ -3767,8 +3776,16 @@ class PairExecutionCell:
         limits = self._limits
         if limits is None or self._risk_configuration_drift() is not None:
             return Decimal(0)
-        remaining = max(Decimal(0), limits.daily_loss_limit_usd - self.accumulated_realized_loss_usd())
+        remaining = self.remaining_daily_loss_allowance_usd()
         return min(limits.leg_loss_cap_usd, remaining)
+
+    def remaining_daily_loss_allowance_usd(self) -> Decimal:
+        """The raw daily allowance before per-trade loss caps are applied."""
+
+        limits = self._limits
+        if limits is None or self._risk_configuration_drift() is not None:
+            return Decimal(0)
+        return max(Decimal(0), limits.daily_loss_limit_usd - self.accumulated_realized_loss_usd())
 
     def accumulated_realized_loss_usd(self) -> Decimal:
         row = self._db.execute(
@@ -4252,6 +4269,13 @@ class PairExecutionCell:
             return False, drift
         if self._flatten_reached():
             return False, "New York flatten cutoff has passed"
+        remaining_daily = self.remaining_daily_loss_allowance_usd()
+        if Decimal(0) < remaining_daily <= self._daily_loss_warning_threshold_usd:
+            return (
+                False,
+                "the New York daily-loss warning threshold is reached"
+                f" (remaining ${remaining_daily}, threshold ${self._daily_loss_warning_threshold_usd})",
+            )
         facts = self._local_facts
         if facts is None:
             return False, "no local readiness facts observed yet"
@@ -4775,6 +4799,7 @@ class PairExecutionCell:
             return
         if self._role == "follower":
             self._maybe_install_pending_universe()
+        self._update_daily_loss_warning()
         self._enforce_rediscovery_deadline()
         if self._refresh_due():
             self._refresh_sizing_plans()
@@ -4794,6 +4819,23 @@ class PairExecutionCell:
         self._maybe_finalize_empty()
         self._await_peer_terminal_proof()
         self._maybe_declare_active()
+
+    def _update_daily_loss_warning(self) -> None:
+        """Pause new entries once, and clear the pause automatically at NY reset."""
+
+        remaining = self.remaining_daily_loss_allowance_usd()
+        active = Decimal(0) < remaining <= self._daily_loss_warning_threshold_usd
+        if active == self._daily_loss_warning_active:
+            return
+        self._daily_loss_warning_active = active
+        if active:
+            detail = (
+                f"remaining=${remaining}; threshold=${self._daily_loss_warning_threshold_usd}"
+            )
+            _LOGGER.warning("Pair Execution Cell daily-loss warning: %s.", detail)
+            self._transition("daily_loss_warning_started", detail)
+        else:
+            self._transition("daily_loss_warning_cleared", f"remaining=${remaining}")
 
     def _enforce_exit_policy(self) -> None:
         policy = self._policy

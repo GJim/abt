@@ -365,7 +365,12 @@ simultaneously enabled for the same pair.
   the lower of `trade_loss_fraction` (default `0.02`) of budget,
   `maximum_loss_per_trade_usd`, and the Worker's own remaining daily
   allowance; rough take-profit targets the same USD amount 1:1. No entry is
-  admitted when either Worker's allowance is exhausted. Each Worker
+  admitted when either Worker's allowance is exhausted. A Worker also pauses
+  new entries and logs a one-time warning when its positive raw remaining
+  daily allowance is at or below its local
+  `daily_loss_warning_threshold_usd` guard (default `$20`); existing
+  protected pairs remain open and the guard clears automatically at the next
+  New York day. Each Worker
   continuously publishes a versioned remaining-allowed-leg-loss summary to its
   peer; the leader must hold a current peer summary before creating an attempt
   and may assign no leg more than its owner's published allowance, and the

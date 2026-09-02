@@ -2344,6 +2344,30 @@ class LossPolicyTests(PairCellTestCase):
         self.feed_quotes()
         self.assertEqual(self.attempt_payloads(), [])
 
+    def test_daily_loss_warning_pauses_entries_until_the_new_york_day_resets(self) -> None:
+        self.prime()
+        self.leader.cell.handle_event(
+            RealizedPnLEvent(attempt_id="a1", realized_usd="-285", closed_at=self.now)
+        )
+
+        result = self.leader.cell.handle_event(ClockTickEvent(self.now))
+
+        self.assertEqual(self.leader.cell.remaining_daily_loss_allowance_usd(), Decimal("15"))
+        self.assertFalse(result.ready)
+        self.assertIn("daily-loss warning threshold", result.ready_reason)
+        self.assertIn(
+            "daily_loss_warning_started",
+            [row["event"] for row in self.leader.cell.transition_history()],
+        )
+        self.now += timedelta(hours=16)
+        result = self.leader.cell.handle_event(ClockTickEvent(self.now))
+        self.assertEqual(self.leader.cell.remaining_daily_loss_allowance_usd(), Decimal("300"))
+        self.assertNotIn("daily-loss warning threshold", result.ready_reason)
+        self.assertIn(
+            "daily_loss_warning_cleared",
+            [row["event"] for row in self.leader.cell.transition_history()],
+        )
+
     def test_daily_realized_loss_resets_at_the_new_york_calendar_boundary(self) -> None:
         self.prime()
         self.leader.cell.handle_event(

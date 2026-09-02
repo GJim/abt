@@ -68,6 +68,7 @@ from uuid import uuid4
 from ..pair_cell import (
     PROTOCOL_VERSION as PAIR_CELL_ENVELOPE_VERSION,
     DEFAULT_ALLOW_LIVE,
+    DEFAULT_DAILY_LOSS_WARNING_THRESHOLD_USD,
     LOCAL_SETTING_KEYS,
     REQUIRED_ACCOUNT_CURRENCY,
     SHARED_POLICY_KEYS,
@@ -308,6 +309,7 @@ class PairCellConfig:
     risk_overrides: Mapping[str, object]
     shared_policy: Mapping[str, object]
     allow_live: bool = DEFAULT_ALLOW_LIVE
+    daily_loss_warning_threshold_usd: str = DEFAULT_DAILY_LOSS_WARNING_THRESHOLD_USD
     source: str = "<defaults>"
 
     @property
@@ -327,7 +329,13 @@ class PairCellConfig:
 def default_pair_cell_config() -> PairCellConfig:
     """The synthesized defaults used when no configuration file exists."""
 
-    return PairCellConfig(raw={}, risk_overrides={}, shared_policy={}, allow_live=DEFAULT_ALLOW_LIVE)
+    return PairCellConfig(
+        raw={},
+        risk_overrides={},
+        shared_policy={},
+        allow_live=DEFAULT_ALLOW_LIVE,
+        daily_loss_warning_threshold_usd=DEFAULT_DAILY_LOSS_WARNING_THRESHOLD_USD,
+    )
 
 
 def load_pair_cell_config(path: Path | None) -> PairCellConfig:
@@ -374,6 +382,18 @@ def parse_pair_cell_config(raw: object, *, source: object = "<memory>") -> PairC
         raise WorkerEnrollmentError(
             f"The Pair Execution Cell configuration is invalid: {source}: allow_live must be a boolean."
         )
+    threshold = values.get("daily_loss_warning_threshold_usd", DEFAULT_DAILY_LOSS_WARNING_THRESHOLD_USD)
+    try:
+        if isinstance(threshold, bool):
+            raise InvalidOperation
+        threshold_text = _decimal_text(threshold)
+        if not Decimal(threshold_text).is_finite() or Decimal(threshold_text) < 0:
+            raise InvalidOperation
+    except (InvalidOperation, ValueError) as error:
+        raise WorkerEnrollmentError(
+            f"The Pair Execution Cell configuration is invalid: {source}: "
+            "daily_loss_warning_threshold_usd must be a non-negative USD amount."
+        ) from error
     risk_overrides = {key: values[key] for key in WORKER_RISK_KEYS if key in values}
     shared_policy = {key: values[key] for key in SHARED_POLICY_KEYS if key in values}
     config = PairCellConfig(
@@ -381,6 +401,7 @@ def parse_pair_cell_config(raw: object, *, source: object = "<memory>") -> PairC
         risk_overrides=risk_overrides,
         shared_policy=shared_policy,
         allow_live=allow_live,
+        daily_loss_warning_threshold_usd=threshold_text,
         source=str(source),
     )
     # Fail on unusable numbers now rather than at pairing time.
@@ -2519,6 +2540,7 @@ class PairCellRuntime:
                 effect_journal=self._effect_journal,
                 scheduler=self._session.trader_rpc_scheduler,
                 allow_live=self._config.allow_live,
+                daily_loss_warning_threshold_usd=self._config.daily_loss_warning_threshold_usd,
                 serve_foreign_scheduler_item=self._serve_foreign_scheduler_item,
                 dispatch_foreign_scheduler_outcome=self._session.dispatch_scheduler_outcome,
             )
