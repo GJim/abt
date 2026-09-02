@@ -2321,6 +2321,12 @@ class DurablePersistenceTests(PairingTestCase):
                 event_id="position:1",
             )
         )
+        with sqlite3.connect(follower_db) as connection:
+            connection.execute(
+                "INSERT INTO cell_operator_stop (id, reason, updated_at) VALUES (1, ?, ?)",
+                ("containment effect old-route:cancel:123 has non-success replay evidence",
+                 self.clock().isoformat()),
+            )
         self.assertTrue(follower.runtime.request_safe_unpair())
         # Keep the pair from immediately re-pairing and repopulating the very
         # tables this test is inspecting.

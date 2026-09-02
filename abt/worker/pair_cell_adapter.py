@@ -177,6 +177,7 @@ ROUTE_SCOPED_TABLES = (
     "cell_plan_version",
     "cell_sizing_plans",
     "cell_peer_sizing_plans",
+    "cell_operator_stop",
 )
 #: Attempt evidence, cleared **as one set** and only once every attempt is
 #: provably terminal.  ``cell_desired_state`` and ``cell_active_state`` belong
@@ -196,8 +197,8 @@ ATTEMPT_SCOPED_TABLES = (
 #: must outlive any number of pairings.  The New York daily realized-loss
 #: accumulator keeps a same-day re-pair from resetting its own loss budget, the
 #: MT5 ``10021`` quarantine (and its release audit) is keyed by derived product
-#: identity and has no automatic expiry, an operator stop is a human decision,
-#: and the local attempt/effect state version and publisher epoch must never
+#: identity and has no automatic expiry, and the local attempt/effect state
+#: version and publisher epoch must never
 #: move backwards.  The reset is a deny-list, so any table this module does not
 #: name is preserved; ``test_pair_cell_adapter`` fails when a new durable cell
 #: table is left unclassified.
@@ -206,7 +207,6 @@ PRESERVED_SAFETY_TABLES = (
     "cell_product_quarantine",
     "cell_product_quarantine_release",
     "cell_product_release_marker",
-    "cell_operator_stop",
     "cell_state_version",
     "cell_publisher_epoch",
     "cell_transitions",
@@ -2706,7 +2706,8 @@ class PairCellRuntime:
         must equally never erase this account's own realized-loss accounting
         or a durable product quarantine: those are not route state, they have
         no automatic expiry, and a quarantine is released only by an explicit
-        authenticated operator action.
+        authenticated operator action. A containment operator stop is route
+        state, so safe-unpair clears it only after proving that route terminal.
 
         Attempt evidence -- the attempt, both legs, and the desired/active
         state the cell converges through -- is cleared **as one set** and only

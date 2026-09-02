@@ -278,6 +278,14 @@ explicit cancel from either Worker, which restores entry readiness subject to
 the ordinary admission chain. After the route is removed, both Workers become
 unpaired, all execution-mode claims for the pairing are released, and they are
 eligible to pair again — which produces a new, never-reused `route_id`.
+The new route remains entry-ineligible until both Workers independently
+publish fresh, complete broker facts showing no orders and no positions.
+Those facts are Worker-local MT5 evidence; the controller relays readiness
+but never derives emptiness. A containment or recovery operator stop belongs
+to its `route_id`. Once safe-unpair has obtained both terminal assertions and
+removed that route, its route-scoped stop is cleared and cannot block the
+next route. Account/product-scoped daily realized-loss history and product
+quarantine remain in force across re-pairing.
 
 Emergency identity revocation remains a separate mechanism and is never a safe
 unpair. Revoking a Worker's device credential removes authentication and
