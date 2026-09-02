@@ -1539,6 +1539,69 @@ def compute_protection(
     return str(sl), str(tp)
 
 
+def compute_shared_protection(
+    *,
+    leader_fill: Decimal,
+    follower_fill: Decimal,
+    volume: Decimal,
+    leader_plan: SizingPlan,
+    follower_plan: SizingPlan,
+    leader_allowed_loss_usd: Decimal,
+    follower_allowed_loss_usd: Decimal,
+    upper: Decimal,
+    lower: Decimal,
+) -> tuple[str, str, str, str] | None:
+    """Return executable shared ``(leader_sl, leader_tp, follower_sl, follower_tp)``.
+
+    The caller supplies the inward-only candidate interval.  This module owns
+    the cross-leg ordering, common tick-grid, stop distance, and SL loss-cap
+    checks so both Workers make the same safety decision from durable facts.
+    """
+
+    leader_tick = _to_decimal(leader_plan.tick_size)
+    follower_tick = _to_decimal(follower_plan.tick_size)
+    leader_stop = _to_decimal(leader_plan.minimum_stop_distance)
+    follower_stop = _to_decimal(follower_plan.minimum_stop_distance)
+    leader_loss_value = _to_decimal(leader_plan.loss_tick_value)
+    follower_loss_value = _to_decimal(follower_plan.loss_tick_value)
+    if any(
+        value is None or value <= 0
+        for value in (leader_tick, follower_tick, leader_loss_value, follower_loss_value)
+    ) or leader_stop is None or follower_stop is None:
+        return None
+    assert leader_tick is not None and follower_tick is not None
+    assert leader_stop is not None and follower_stop is not None
+    assert leader_loss_value is not None and follower_loss_value is not None
+    # MT5 tick sizes are terminating decimals.  A common grid is their decimal
+    # least common multiple, not merely the coarser tick, which may not be
+    # executable when a broker uses a non-divisor grid.
+    scale = max(-leader_tick.as_tuple().exponent, -follower_tick.as_tuple().exponent)
+    leader_units = int(leader_tick.scaleb(scale))
+    follower_units = int(follower_tick.scaleb(scale))
+    common_tick = Decimal(math.lcm(leader_units, follower_units)).scaleb(-scale)
+    upper = _round_to_tick(upper, common_tick, ROUND_FLOOR)
+    lower = _round_to_tick(lower, common_tick, ROUND_CEILING)
+    if lower <= 0 or lower >= upper:
+        return None
+    if not (lower < leader_fill < upper and lower < follower_fill < upper):
+        return None
+    if (
+        leader_fill - lower < leader_stop
+        or upper - leader_fill < leader_stop
+        or upper - follower_fill < follower_stop
+        or follower_fill - lower < follower_stop
+    ):
+        return None
+    leader_loss_ticks = (leader_fill - lower) / leader_tick
+    follower_loss_ticks = (upper - follower_fill) / follower_tick
+    if (
+        leader_loss_ticks * leader_loss_value * volume > leader_allowed_loss_usd
+        or follower_loss_ticks * follower_loss_value * volume > follower_allowed_loss_usd
+    ):
+        return None
+    return str(lower), str(upper), str(upper), str(lower)
+
+
 # --------------------------------------------------------------------------- #
 # Quotes and typed events
 # --------------------------------------------------------------------------- #
@@ -2007,7 +2070,7 @@ def _attempt_from_canonical(value: Mapping[str, object]) -> Attempt:
 LegEntryStatus = Literal[
     "pending", "sent", "rejected", "expired_not_started", "unknown_after_send", "filled"
 ]
-LegProtectionStatus = Literal["rough", "precise", "failed"]
+LegProtectionStatus = Literal["rough", "precise", "fallback", "frozen", "failed"]
 
 
 @dataclass(slots=True)
@@ -2027,6 +2090,9 @@ class LegState:
     protection_status: LegProtectionStatus = "rough"
     precise_sl: str | None = None
     precise_tp: str | None = None
+    last_protection_update_at: str | None = None
+    previous_precise_sl: str | None = None
+    previous_precise_tp: str | None = None
     close_effect_id: str | None = None
     empty_verified: bool = False
     timer_started_at: str | None = None
@@ -2538,7 +2604,7 @@ class PairExecutionCell:
             return "ENTRY_UNCERTAIN"
         if self._desired == "EMPTY":
             return "CONVERGING_EMPTY"
-        if self._leg.protection_status == "precise" and self._active_since is not None:
+        if self._leg.protection_status in ("precise", "fallback", "frozen") and self._active_since is not None:
             return "ACTIVE"
         if self._leg.entry_status == "filled":
             return "AWAITING_PAIR_CONFIRMATION"
@@ -5483,7 +5549,7 @@ class PairExecutionCell:
         if leg is None:
             return
         role = leg.role
-        precise_already = leg.protection_status == "precise"
+        protection_verified = leg.protection_status in ("precise", "fallback", "frozen")
         symbol = attempt.symbol_of(role)
         direction = attempt.direction_of(role)
         matches = [p for p in event.positions if _position_matches(p, symbol, direction, attempt.lots)]
@@ -5587,9 +5653,14 @@ class PairExecutionCell:
                     )
             if owned is None and leg.entry_status == "filled" and not leg.empty_verified:
                 self._begin_close("owned_ticket_disappeared")
-            elif owned is not None and precise_already:
+            elif owned is not None and protection_verified:
                 observed_sl, observed_tp = _to_decimal(owned.get("sl")), _to_decimal(owned.get("tp"))
-                expected_sl, expected_tp = _to_decimal(leg.precise_sl), _to_decimal(leg.precise_tp)
+                expected = (
+                    (leg.precise_sl, leg.precise_tp)
+                    if leg.protection_status in ("precise", "frozen")
+                    else attempt.rough_of(leg.role)
+                )
+                expected_sl, expected_tp = _to_decimal(expected[0]), _to_decimal(expected[1])
                 plan = self._attempt_plan_for_role(attempt, leg.role)
                 if (
                     plan is None
@@ -5635,14 +5706,14 @@ class PairExecutionCell:
         plan = self._attempt_plan_for_role(attempt, leg.role)
         if plan is None:
             return "no sizing plan exists for the immutable attempt version"
-        if leg.protection_status == "rough":
+        if leg.protection_status in ("rough", "fallback"):
             if not _same_protection_price(rough_sl, leg.observed_sl, plan.tick_size):
                 return "the observed stop loss does not match the attached rough protection"
             if not _same_protection_price(rough_tp, leg.observed_tp, plan.tick_size):
                 return "the observed take profit does not match the attached rough protection"
         return None
 
-    # -- pair confirmation and precise 1:1 protection ------------------------ #
+    # -- pair confirmation and shared protection ------------------------------ #
 
     def _peer_evidence_state(self) -> tuple[bool, str | None]:
         """``(exact, inconsistency)`` for the peer's self-reported leg evidence."""
@@ -5737,41 +5808,179 @@ class PairExecutionCell:
         self._transition("peer_reported_entry_failed", str(payload.get("reason") or ""))
         self._begin_close("peer_reported_entry_failed")
 
-    def _maybe_apply_precise_protection(self) -> None:
-        """Precise 1:1 protection is modified only after pair confirmation."""
+    def _shared_protection(self, *, contract: bool) -> tuple[str, str] | None:
+        """Plan this Worker's half of an inward-only common protection revision."""
+
+        attempt, leg, peer = self._attempt, self._leg, self._peer_leg
+        if attempt is None or leg is None:
+            return None
+        leader_plan = self._attempt_plan_for_role(attempt, "leader")
+        follower_plan = self._attempt_plan_for_role(attempt, "follower")
+        leader_fill = _to_decimal(leg.fill_price if self._role == "leader" else peer.fill_price)
+        follower_fill = _to_decimal(peer.fill_price if self._role == "leader" else leg.fill_price)
+        volume = _to_decimal(attempt.lots)
+        leader_allowed = _to_decimal(attempt.leader_allowed_loss_usd)
+        follower_allowed = _to_decimal(attempt.follower_allowed_loss_usd)
+        if None in (leader_plan, follower_plan, leader_fill, follower_fill, volume, leader_allowed, follower_allowed):
+            return None
+        assert leader_plan is not None and follower_plan is not None
+        assert leader_fill is not None and follower_fill is not None
+        assert volume is not None and leader_allowed is not None and follower_allowed is not None
+        if contract:
+            current_upper = _to_decimal(
+                leg.precise_tp if self._role == "leader" else leg.precise_sl
+            )
+            current_lower = _to_decimal(
+                leg.precise_sl if self._role == "leader" else leg.precise_tp
+            )
+            if current_upper is None or current_lower is None:
+                return None
+            upper = min(
+                leader_fill + (current_upper - leader_fill) * Decimal("0.9"),
+                follower_fill + (current_upper - follower_fill) * Decimal("0.9"),
+            )
+            lower = max(
+                leader_fill - (leader_fill - current_lower) * Decimal("0.9"),
+                follower_fill - (follower_fill - current_lower) * Decimal("0.9"),
+            )
+        else:
+            upper = min(Decimal(attempt.leader_rough_tp), Decimal(attempt.follower_rough_sl))
+            lower = max(Decimal(attempt.leader_rough_sl), Decimal(attempt.follower_rough_tp))
+        planned = compute_shared_protection(
+            leader_fill=leader_fill,
+            follower_fill=follower_fill,
+            volume=volume,
+            leader_plan=leader_plan,
+            follower_plan=follower_plan,
+            leader_allowed_loss_usd=leader_allowed,
+            follower_allowed_loss_usd=follower_allowed,
+            upper=upper,
+            lower=lower,
+        )
+        if planned is None:
+            return None
+        leader_sl, leader_tp, follower_sl, follower_tp = planned
+        return (leader_sl, leader_tp) if self._role == "leader" else (follower_sl, follower_tp)
+
+    def _freeze_or_fallback_protection(self, reason: str) -> None:
+        assert self._leg is not None
+        if self._leg.protection_status == "precise":
+            self._leg.protection_status = "frozen"
+            status = "protection_frozen"
+        else:
+            self._leg.protection_status = "fallback"
+            status = "protection_rough_fallback"
+        self._persist_leg()
+        self._transition(status, reason)
+        self._report_leg_status(status, sl=self._leg.observed_sl, tp=self._leg.observed_tp, reason=reason)
+
+    def _restore_rough_protection(self, reason: str) -> None:
+        """Rollback an accepted initial shared write when the peer kept rough protection."""
 
         attempt, leg = self._attempt, self._leg
-        if attempt is None or leg is None or not self._pair_confirmed:
+        if attempt is None or leg is None or leg.protection_status != "precise":
             return
-        if leg.protection_status != "rough" or leg.entry_status != "filled" or self._desired != "ACTIVE":
+        sl, tp = attempt.rough_of(leg.role)
+        effect_id = f"{attempt.attempt_id}:{self._worker_id}:protection:rollback"
+        payload = {
+            "type": "modify_sl_tp",
+            "symbol": attempt.symbol_of(leg.role),
+            "position": leg.ticket,
+            "sl": sl,
+            "tp": tp,
+        }
+        try:
+            self._journal.prepare(effect_id, payload)
+        except EffectJournalError as error:
+            self._transition("rough_protection_rollback_failed", str(error))
+            self._begin_close("rough_protection_rollback_prepare_failed")
             return
-        plan = self._plans.get((attempt.product_id, attempt.direction_of(leg.role)))
-        if plan is None:
-            plan = self._plan_for_validation(
-                attempt.product_id, attempt.direction_of(leg.role), attempt.plan_version_of(leg.role)
+        outcome = self._run_broker_write(effect_id, payload, priority="protection")
+        if outcome.category != "completed":
+            self._transition("rough_protection_rollback_failed", outcome.category)
+            self._begin_close("rough_protection_rollback_failed")
+            return
+        leg.protection_effect_id = effect_id
+        leg.protection_status = "fallback"
+        leg.precise_sl = None
+        leg.precise_tp = None
+        leg.last_protection_update_at = None
+        self._persist_leg()
+        self._transition("rough_protection_rollback_applied", reason)
+        self._request_broker_read()
+        self._report_leg_status("protection_rough_fallback", sl=sl, tp=tp, reason=reason)
+
+    def _restore_previous_shared_protection(self, reason: str) -> None:
+        """Undo a partially accepted contraction before freezing protection."""
+
+        attempt, leg = self._attempt, self._leg
+        if (
+            attempt is None
+            or leg is None
+            or leg.protection_status != "precise"
+            or leg.previous_precise_sl is None
+            or leg.previous_precise_tp is None
+        ):
+            return
+        sl, tp = leg.previous_precise_sl, leg.previous_precise_tp
+        effect_id = f"{attempt.attempt_id}:{self._worker_id}:protection:restore"
+        payload = {
+            "type": "modify_sl_tp",
+            "symbol": attempt.symbol_of(leg.role),
+            "position": leg.ticket,
+            "sl": sl,
+            "tp": tp,
+        }
+        try:
+            self._journal.prepare(effect_id, payload)
+        except EffectJournalError as error:
+            self._transition("shared_protection_restore_failed", str(error))
+            self._begin_close("shared_protection_restore_prepare_failed")
+            return
+        outcome = self._run_broker_write(effect_id, payload, priority="protection")
+        if outcome.category != "completed":
+            self._transition("shared_protection_restore_failed", outcome.category)
+            self._begin_close("shared_protection_restore_failed")
+            return
+        leg.protection_effect_id = effect_id
+        leg.precise_sl, leg.precise_tp = sl, tp
+        leg.previous_precise_sl = None
+        leg.previous_precise_tp = None
+        leg.protection_status = "frozen"
+        self._persist_leg()
+        self._transition("shared_protection_restore_applied", reason)
+        self._request_broker_read()
+        self._report_leg_status("protection_frozen", sl=sl, tp=tp, reason=reason)
+
+    def _maybe_apply_precise_protection(self) -> None:
+        """Apply initial shared protection, then contract it every five minutes."""
+
+        attempt, leg = self._attempt, self._leg
+        if attempt is None or leg is None or not self._pair_confirmed or self._desired != "ACTIVE":
+            return
+        initial = leg.protection_status == "rough"
+        contract = (
+            leg.protection_status == "precise"
+            and self._active_since is not None
+            and (
+                leg.last_protection_update_at is None
+                or self._now >= _parse_utc(leg.last_protection_update_at) + timedelta(seconds=300)
             )
-        fill_price = _to_decimal(leg.fill_price)
-        volume = _to_decimal(attempt.lots)
-        allowed = _to_decimal(attempt.allowed_loss_of(leg.role))
-        protection = None
-        if plan is not None and fill_price is not None and volume is not None and allowed is not None:
-            protection = compute_protection(
-                entry=fill_price,
-                direction=attempt.direction_of(leg.role),
-                volume=volume,
-                plan=plan,
-                allowed_loss_usd=allowed,
-            )
+        )
+        if not initial and not contract:
+            return
+        protection = self._shared_protection(contract=contract)
         if protection is None:
-            leg.protection_status = "failed"
-            self._persist_leg()
-            self._transition("precise_protection_failed", "no valid precise protection could be constructed")
-            self._report_leg_status("protection_failed")
-            self._notify_entry_failed("precise protection could not be constructed")
-            self._begin_close("precise_protection_failed")
+            self._freeze_or_fallback_protection(
+                "no executable shared boundary exists" if initial else "shared protection contraction is no longer executable"
+            )
             return
         sl, tp = protection
         effect_id = f"{attempt.attempt_id}:{self._worker_id}:protection"
+        if contract:
+            effect_id += f":{int(self._now.timestamp())}"
+            leg.previous_precise_sl, leg.previous_precise_tp = leg.precise_sl, leg.precise_tp
+            self._persist_leg()
         leg.protection_effect_id = effect_id
         payload = {
             "type": "modify_sl_tp",
@@ -5783,44 +5992,48 @@ class PairExecutionCell:
         if self._policy is not None and self._policy.mode == "shadow":
             leg.precise_sl, leg.precise_tp, leg.protection_status = sl, tp, "precise"
             leg.observed_sl, leg.observed_tp = sl, tp
+            leg.last_protection_update_at = _iso(self._now)
             self._persist_leg()
             self._report_leg_status("protection_precise", sl=sl, tp=tp)
             return
         try:
             self._journal.prepare(effect_id, payload)
         except EffectJournalError as error:
-            leg.protection_status = "failed"
-            self._persist_leg()
-            self._transition("precise_protection_failed", str(error))
-            self._notify_entry_failed("precise protection could not be journaled")
-            self._begin_close("precise_protection_prepare_failed")
+            self._freeze_or_fallback_protection(f"shared protection could not be journaled: {error}")
             return
         outcome = self._run_broker_write(effect_id, payload, priority="protection")
         if outcome.category == "completed":
             leg.precise_sl, leg.precise_tp, leg.protection_status = sl, tp, "precise"
+            leg.last_protection_update_at = _iso(self._now)
             self._persist_leg()
             self._state = "PROTECTING"
-            self._transition("precise_protection_applied", attempt.attempt_id)
-            self._record_timing("precise_protection_applied")
+            self._transition("shared_protection_applied", attempt.attempt_id)
+            self._record_timing("shared_protection_applied")
             self._report_leg_status("protection_precise", sl=sl, tp=tp)
             self._request_broker_read()
         else:
-            leg.protection_status = "failed"
-            self._persist_leg()
-            self._transition("precise_protection_failed", outcome.category)
-            self._report_leg_status("protection_failed", reason=outcome.category)
-            self._notify_entry_failed("precise protection failed at the broker")
-            self._begin_close("precise_protection_failed")
+            self._freeze_or_fallback_protection(f"shared protection broker result: {outcome.category}")
 
     def _maybe_declare_active(self) -> None:
-        leg = self._leg
-        if leg is None or not self._pair_confirmed or self._desired != "ACTIVE":
+        attempt, leg = self._attempt, self._leg
+        if attempt is None or leg is None or not self._pair_confirmed or self._desired != "ACTIVE":
             return
-        if leg.protection_status != "precise" or self._peer_leg.status != "protection_precise":
+        accepted = {
+            "precise": "protection_precise",
+            "fallback": "protection_rough_fallback",
+            "frozen": "protection_frozen",
+        }
+        if leg.protection_status not in accepted or self._peer_leg.status != accepted[leg.protection_status]:
             return
-        if _to_decimal(leg.observed_sl) != _to_decimal(leg.precise_sl):
+        expected = (
+            (leg.precise_sl, leg.precise_tp)
+            if leg.protection_status in ("precise", "frozen")
+            else attempt.rough_of(leg.role)
+        )
+        plan = self._attempt_plan_for_role(attempt, leg.role)
+        if plan is None or not _same_protection_price(expected[0], leg.observed_sl, plan.tick_size):
             return
-        if _to_decimal(leg.observed_tp) != _to_decimal(leg.precise_tp):
+        if not _same_protection_price(expected[1], leg.observed_tp, plan.tick_size):
             return
         self._state = "ACTIVE"
         if self._active_since is None:
@@ -5901,13 +6114,13 @@ class PairExecutionCell:
         previous_status = self._peer_leg.status
         self._peer_leg = PeerLegView(
             status=status,
-            ticket=cast(str | None, payload.get("ticket")),
-            symbol=cast(str | None, payload.get("symbol")),
-            side=cast(str | None, payload.get("side")),
-            volume=cast(str | None, payload.get("volume")),
-            fill_price=cast(str | None, payload.get("fill_price")),
-            sl=cast(str | None, payload.get("sl")),
-            tp=cast(str | None, payload.get("tp")),
+            ticket=cast(str | None, payload.get("ticket")) or self._peer_leg.ticket,
+            symbol=cast(str | None, payload.get("symbol")) or self._peer_leg.symbol,
+            side=cast(str | None, payload.get("side")) or self._peer_leg.side,
+            volume=cast(str | None, payload.get("volume")) or self._peer_leg.volume,
+            fill_price=cast(str | None, payload.get("fill_price")) or self._peer_leg.fill_price,
+            sl=cast(str | None, payload.get("sl")) or self._peer_leg.sl,
+            tp=cast(str | None, payload.get("tp")) or self._peer_leg.tp,
             reason=cast(str, payload.get("reason") or ""),
         )
         self._persist_peer_leg()
@@ -5917,7 +6130,16 @@ class PairExecutionCell:
             # identical chatter must not extend it forever.
             self._peer_proof_wait_started = None
             self._peer_proof_last_probe = None
-        if status in ("rejected", "expired_not_started", "protection_failed", "inconsistent", "no_attempt_record"):
+        if status == "protection_rough_fallback" and self._leg is not None:
+            self._restore_rough_protection("peer retained rough protection")
+        elif status == "protection_frozen" and self._leg is not None and self._leg.protection_status == "precise":
+            self._restore_previous_shared_protection("peer stopped further contraction")
+            if self._leg.protection_status == "precise":
+                self._leg.protection_status = "frozen"
+                self._persist_leg()
+                self._transition("protection_frozen", "peer stopped further contraction")
+                self._report_leg_status("protection_frozen", sl=self._leg.precise_sl, tp=self._leg.precise_tp)
+        elif status in ("rejected", "expired_not_started", "protection_failed", "inconsistent", "no_attempt_record"):
             self._begin_close(f"peer_leg_{status}")
             self._maybe_finalize_empty()
         elif status == "empty":

@@ -245,6 +245,7 @@ class FakeMT5:
         self.margin_unavailable: set[str] = set()
         self.reject = False
         self.reject_next_entry_retcode: int | None = None
+        self.reject_next_modify = False
         self.no_change_next_entry = False
         self.no_change_for_identical_protection = False
         self.reads_unavailable = False
@@ -326,6 +327,9 @@ class FakeMT5:
                 return None
             return {"retcode": _DONE, "order": ticket, "deal": ticket, "price": self.fill_price}
         if kind == "modify_sl_tp":
+            if self.reject_next_modify:
+                self.reject_next_modify = False
+                return {"retcode": _REJECTED, "comment": "protection rejected"}
             for position in self.positions:
                 if str(position["ticket"]) == str(request["position"]):
                     if (
@@ -2587,18 +2591,64 @@ class ImmediateEntryTests(PairCellTestCase):
         self.assertEqual(Decimal(attempt.leader_rough_sl), Decimal("1.10010") - Decimal("0.00075"))
         self.assertEqual(Decimal(attempt.leader_rough_tp), Decimal("1.10010") + Decimal("0.00075"))
 
-    def test_both_legs_reach_active_with_precise_one_to_one_protection(self) -> None:
+    def test_no_common_protection_boundary_keeps_verified_rough_protection(self) -> None:
         self.run_entry()
         self.assertEqual(self.leader.cell.handle_event(ClockTickEvent(self.now)).state, "ACTIVE")
         self.assertEqual(self.follower.cell.handle_event(ClockTickEvent(self.now)).state, "ACTIVE")
+        self.assertEqual(self.leader.modify_requests(), [])
+        self.assertEqual(self.follower.modify_requests(), [])
+        self.assertIn(
+            "protection_rough_fallback",
+            [row["event"] for row in self.leader.cell.transition_history()],
+        )
+
+    def test_both_legs_apply_a_common_inward_protection_boundary(self) -> None:
+        self.leader.mt5.fill_price = 1.10030
+        self.follower.mt5.fill_price = 1.10050
+
+        self.run_entry()
+
+        self.assertEqual(self.leader.cell.handle_event(ClockTickEvent(self.now)).state, "ACTIVE")
+        self.assertEqual(self.follower.cell.handle_event(ClockTickEvent(self.now)).state, "ACTIVE")
         leader_modify = self.leader.modify_requests()[-1]
-        # Precise protection uses the real leader fill of 1.10010 and 150 USD.
-        self.assertEqual(Decimal(str(leader_modify["sl"])), Decimal("1.09935"))
-        self.assertEqual(Decimal(str(leader_modify["tp"])), Decimal("1.10085"))
         follower_modify = self.follower.modify_requests()[-1]
-        # The follower filled at 1.10040 with an 80 USD allowance (40 ticks).
-        self.assertEqual(Decimal(str(follower_modify["sl"])), Decimal("1.10080"))
-        self.assertEqual(Decimal(str(follower_modify["tp"])), Decimal("1.10000"))
+        self.assertEqual(Decimal(str(leader_modify["sl"])), Decimal("1.10010"))
+        self.assertEqual(Decimal(str(leader_modify["tp"])), Decimal("1.10085"))
+        self.assertEqual(Decimal(str(follower_modify["sl"])), Decimal("1.10085"))
+        self.assertEqual(Decimal(str(follower_modify["tp"])), Decimal("1.10010"))
+
+    def test_common_protection_contracts_inward_after_five_minutes(self) -> None:
+        self.leader.mt5.fill_price = 1.10030
+        self.follower.mt5.fill_price = 1.10050
+        self.run_entry()
+
+        self.tick(seconds=300)
+
+        leader_modify = self.leader.modify_requests()[-1]
+        follower_modify = self.follower.modify_requests()[-1]
+        self.assertEqual(Decimal(str(leader_modify["sl"])), Decimal("1.10014"))
+        self.assertEqual(Decimal(str(leader_modify["tp"])), Decimal("1.10079"))
+        self.assertEqual(Decimal(str(follower_modify["sl"])), Decimal("1.10079"))
+        self.assertEqual(Decimal(str(follower_modify["tp"])), Decimal("1.10014"))
+
+    def test_peer_protection_rejection_rolls_back_the_accepted_leg_to_rough(self) -> None:
+        self.leader.mt5.fill_price = 1.10030
+        self.follower.mt5.fill_price = 1.10050
+        self.follower.mt5.reject_next_modify = True
+
+        self.run_entry()
+
+        attempt = self.last_attempt()
+        self.assertEqual(self.leader.cell.handle_event(ClockTickEvent(self.now)).state, "ACTIVE")
+        self.assertEqual(self.follower.cell.handle_event(ClockTickEvent(self.now)).state, "ACTIVE")
+        self.assertEqual(len(self.leader.modify_requests()), 2)
+        self.assertEqual(len(self.follower.modify_requests()), 1)
+        self.assertEqual(
+            Decimal(str(self.leader.mt5.positions[0]["sl"])), Decimal(attempt.leader_rough_sl)
+        )
+        self.assertEqual(
+            Decimal(str(self.leader.mt5.positions[0]["tp"])), Decimal(attempt.leader_rough_tp)
+        )
 
     def test_float_representation_of_rough_protection_is_not_inconsistent_evidence(self) -> None:
         self.prime()
@@ -2643,7 +2693,7 @@ class ImmediateEntryTests(PairCellTestCase):
             self.leader.cell.handle_event(ClockTickEvent(self.now)).state, "EMPTY"
         )
 
-    def test_precise_protection_is_applied_only_after_pair_confirmation(self) -> None:
+    def test_shared_protection_is_not_evaluated_before_pair_confirmation(self) -> None:
         self.prime()
         self.net.hold_kinds.add("leg_status")
         self.feed_quotes()
@@ -2655,7 +2705,7 @@ class ImmediateEntryTests(PairCellTestCase):
         self.net.release_held()
         self.net.pump()
         self.assertTrue(self.leader.cell.handle_event(ClockTickEvent(self.now)).pair_confirmed)
-        self.assertEqual(len(self.leader.modify_requests()), 1)
+        self.assertEqual(self.leader.modify_requests(), [])
         self.assertEqual(len(self.net.payloads("pair_entry_confirmed", LEADER)), 1)
 
     def test_identical_precise_protection_does_not_trigger_containment(self) -> None:

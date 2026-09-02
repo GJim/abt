@@ -862,25 +862,68 @@ price, or unavailable attempt-bound plan is inconsistent. An order receipt
 alone is insufficient for either leg.
 
 If both exact positions are confirmed in time, the leader emits
-`pair_entry_confirmed`. Only then does each Worker compute precise SL/TP from:
+`pair_entry_confirmed`. The entry-attached rough SL/TP remains independent:
+before both exact fills exist there is no safe shared boundary, and neither
+leg may ever be naked while waiting for its peer.
 
-- its own broker-observed fill price;
-- its current point, tick size, profit/loss tick values, stop level, and freeze
-  level;
-- the attempt's immutable volume; and
-- that Worker's immutable `allowed_leg_loss_usd`.
+After confirmation, the leader coordinates one pair-level protection grid from
+both actual fill prices, the immutable rough grid, both Workers' current
+point, tick size, stop/freeze constraints, and the immutable attempt volume.
+The upper shared boundary is the LONG take profit and the SHORT stop loss; the
+lower shared boundary is the LONG stop loss and the SHORT take profit. A
+boundary is chosen only when it can be represented exactly on a common
+executable tick grid, is on the correct side of both fills, meets both
+Workers' current stop/freeze distances, and only moves each original rough
+boundary inward:
 
-Precise SL and TP each target the same USD amount, producing a 1:1
-risk-to-reward ratio. Each modification is a separate journaled broker effect.
-The pair becomes `ACTIVE` only after both exact tickets are broker-observed
-with the expected precise protection.
+```text
+upper <= min(long_rough_tp, short_rough_sl)
+lower >= max(long_rough_sl, short_rough_tp)
+```
+
+The shared price used as an SL must not exceed that Worker's immutable
+`allowed_leg_loss_usd`; this value is a hard maximum loss, not a requirement
+to target that exact amount. TP is consequently allowed to target a smaller
+gross profit. Commission, fee, swap, and an additional spread model are
+outside the first version's calculation.
+
+Each shared update is a separate journaled broker effect on both exact
+tickets. The pair becomes `ACTIVE` only after both tickets are
+broker-observed with either the same shared protection revision or their
+verified rough fallback. `ACTIVE` therefore publishes one of:
+
+```text
+shared_precise: both legs carry the current shared upper/lower boundaries
+rough_fallback: both legs still carry the immutable entry-attached rough values
+```
+
+If no initial inward-only shared boundary exists, the pair remains protected by
+the broker-verified rough values, records an audible `rough_fallback` reason,
+and does not attempt a later contraction for that attempt. A broker rejection,
+unknown receipt, or failed observation while applying that initial update has
+the same outcome only after every leg that already accepted the update is
+journaled back to its immutable rough values and both rollbacks are
+broker-verified. A failed or unverifiable rollback is the only initial-grid
+failure that starts desired-`EMPTY` containment.
+
+While `ACTIVE` with `shared_precise`, the leader schedules a shared update
+every 300 seconds from the durable active time. Each update moves each
+boundary's distance from its corresponding actual fill to 90 percent of the
+previous revision's distance, rounded only inward on the common executable
+tick grid. It rechecks both current quotes and stop/freeze constraints before
+each update. If the next contraction cannot meet those constraints, the pair
+preserves its most recently broker-verified shared revision and permanently
+stops contracting. A partially accepted contraction is journaled back to that
+prior shared revision before this frozen state is published; an unverifiable
+rollback starts containment. The system never trails, widens, or otherwise
+changes a boundary after it is frozen.
 
 If MT5 returns `10025 TRADE_RETCODE_NO_CHANGES` for a `modify_sl_tp` effect,
-the effect is a successful idempotent no-op: the requested precise SL/TP was
-already attached to that exact ticket. The Worker must still obtain fresh
-broker evidence matching the expected executable ticks before reporting
-`protection_precise` or becoming `ACTIVE`. `10025` is not a successful result
-for entry, close, cancel, or any other broker effect.
+the effect is a successful idempotent no-op: the requested shared or rough
+protection was already attached to that exact ticket. The Worker must still
+obtain fresh broker evidence matching the expected executable ticks before
+reporting the protection revision or becoming `ACTIVE`. `10025` is not a
+successful result for entry, close, cancel, or any other broker effect.
 
 The follower accepts `pair_entry_confirmed` only for the exact unresolved
 attempt and only before its own receive-relative local timer expires. If that
@@ -891,10 +934,10 @@ follower restart with an unresolved entered attempt contains immediately
 rather than attempting to reconstruct elapsed monotonic time.
 
 If either entry rejects, is unknown after send, cannot be observed, has
-inconsistent evidence, misses the leader's confirmation timer, or fails
-precise protection, desired state becomes `EMPTY`. The leader emits a
-best-effort `pair_entry_failed` notification in addition to starting its own
-containment. Receipt of that notification makes the follower contain
+inconsistent evidence, misses the leader's confirmation timer, or cannot
+verify a required rough rollback, desired state becomes `EMPTY`. The leader
+emits a best-effort `pair_entry_failed` notification in addition to starting
+its own containment. Receipt of that notification makes the follower contain
 immediately rather than waiting for its local timer. Safety never depends on
 the failure notification arriving.
 

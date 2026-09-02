@@ -364,7 +364,7 @@ simultaneously enabled for the same pair.
   strategy-owned legs (floating P&L excluded). Each leg's allowed loss is
   the lower of `trade_loss_fraction` (default `0.02`) of budget,
   `maximum_loss_per_trade_usd`, and the Worker's own remaining daily
-  allowance; take-profit targets the same USD amount 1:1. No entry is
+  allowance; rough take-profit targets the same USD amount 1:1. No entry is
   admitted when either Worker's allowance is exhausted. Each Worker
   continuously publishes a versioned remaining-allowed-leg-loss summary to its
   peer; the leader must hold a current peer summary before creating an attempt
@@ -410,11 +410,18 @@ simultaneously enabled for the same pair.
   broker-observed evidence (ticket, symbol, side, volume, fill price,
   attached rough SL/TP -- an order receipt alone is never sufficient) for
   both its own leg and the follower leg. Only once both exact positions are
-  confirmed does each Worker compute precise, actual-fill-based 1:1 SL/TP
-  and the pair become `ACTIVE`.
+  confirmed may the pair apply a shared actual-fill-based grid: LONG TP equals
+  SHORT SL at the inward executable upper boundary, and LONG SL equals SHORT
+  TP at the inward executable lower boundary. The grid never widens the
+  immutable rough values or exceeds either SL leg's allowed loss. If no safe
+  common grid exists, both legs retain verified rough protection and the pair
+  may become `ACTIVE`; a successfully shared grid contracts every 300 seconds
+  to 90 percent of its prior entry-relative distance until a constraint makes
+  a further contraction unsafe, after which it remains frozen.
 - An attempt is terminal only when both sides are proven safe: either both
   Workers produce fresh broker-observed empty facts, or both exact
-  positions are broker-observed with precise protection applied. Missed
+  positions are broker-observed with verified shared, frozen, or rough-fallback
+  protection. Missed
   confirmation, entry rejection, unknown-after-send outcomes, inconsistent
   evidence, stale quotes, or lost peer-session readiness never abandon an
   attempt outright; each Worker instead converges through its own local
