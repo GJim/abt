@@ -62,6 +62,7 @@ from abt.worker.scheduler import DeadlineAwareTraderRpcScheduler
 _DONE = 10009
 _REJECTED = 10013
 _PRICE_OFF = 10021
+_NO_CHANGES = 10025
 
 LEADER = "worker-leader"
 FOLLOWER = "worker-follower"
@@ -244,6 +245,8 @@ class FakeMT5:
         self.margin_unavailable: set[str] = set()
         self.reject = False
         self.reject_next_entry_retcode: int | None = None
+        self.no_change_next_entry = False
+        self.no_change_for_identical_protection = False
         self.reads_unavailable = False
         self.raise_after_fill = False
         self.receipt_none_after_fill = False
@@ -286,6 +289,9 @@ class FakeMT5:
         self._trace.append(("order_send", f"{self.worker_id}:{request['type']}"))
         kind = request["type"]
         if kind == "market":
+            if self.no_change_next_entry:
+                self.no_change_next_entry = False
+                return {"retcode": _NO_CHANGES}
             if self.reject_next_entry_retcode is not None:
                 retcode = self.reject_next_entry_retcode
                 self.reject_next_entry_retcode = None
@@ -322,6 +328,12 @@ class FakeMT5:
         if kind == "modify_sl_tp":
             for position in self.positions:
                 if str(position["ticket"]) == str(request["position"]):
+                    if (
+                        self.no_change_for_identical_protection
+                        and position["sl"] == float(str(request["sl"]))
+                        and position["tp"] == float(str(request["tp"]))
+                    ):
+                        return {"retcode": _NO_CHANGES}
                     position["sl"] = float(str(request["sl"]))
                     position["tp"] = float(str(request["tp"]))
                     return {"retcode": _DONE}
@@ -2645,6 +2657,28 @@ class ImmediateEntryTests(PairCellTestCase):
         self.assertTrue(self.leader.cell.handle_event(ClockTickEvent(self.now)).pair_confirmed)
         self.assertEqual(len(self.leader.modify_requests()), 1)
         self.assertEqual(len(self.net.payloads("pair_entry_confirmed", LEADER)), 1)
+
+    def test_identical_precise_protection_does_not_trigger_containment(self) -> None:
+        self.leader.mt5.no_change_for_identical_protection = True
+
+        self.run_entry()
+
+        self.assertEqual(self.leader.cell.handle_event(ClockTickEvent(self.now)).state, "ACTIVE")
+        self.assertEqual(self.follower.cell.handle_event(ClockTickEvent(self.now)).state, "ACTIVE")
+        self.assertEqual(self.leader.close_requests(), [])
+        self.assertEqual(self.follower.close_requests(), [])
+        self.assertNotIn(
+            "precise_protection_failed",
+            [row["event"] for row in self.leader.cell.transition_history()],
+        )
+
+    def test_no_changes_does_not_make_an_entry_successful(self) -> None:
+        self.leader.mt5.no_change_next_entry = True
+
+        self.run_entry()
+
+        self.assertEqual(self.leader.cell.handle_event(ClockTickEvent(self.now)).state, "EMPTY")
+        self.assertEqual(self.follower.cell.handle_event(ClockTickEvent(self.now)).state, "EMPTY")
 
 
 # --------------------------------------------------------------------------- #

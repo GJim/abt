@@ -875,6 +875,13 @@ risk-to-reward ratio. Each modification is a separate journaled broker effect.
 The pair becomes `ACTIVE` only after both exact tickets are broker-observed
 with the expected precise protection.
 
+If MT5 returns `10025 TRADE_RETCODE_NO_CHANGES` for a `modify_sl_tp` effect,
+the effect is a successful idempotent no-op: the requested precise SL/TP was
+already attached to that exact ticket. The Worker must still obtain fresh
+broker evidence matching the expected executable ticks before reporting
+`protection_precise` or becoming `ACTIVE`. `10025` is not a successful result
+for entry, close, cancel, or any other broker effect.
+
 The follower accepts `pair_entry_confirmed` only for the exact unresolved
 attempt and only before its own receive-relative local timer expires. If that
 message does not arrive in time, the follower immediately sets desired state

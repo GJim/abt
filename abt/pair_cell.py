@@ -100,6 +100,7 @@ PROTOCOL_VERSION = 4
 NEW_YORK = ZoneInfo("America/New_York")
 PRICE_OFF_RETCODE = 10021
 _SUCCESS_RETCODES = (10008, 10009)
+_NO_CHANGES_RETCODE = 10025
 _SIZING_REFRESH_SECONDS = 3600.0
 _MAXIMUM_HOLDING_SECONDS = 7 * 24 * 60 * 60
 # The bounded relay-handling window: the maximum time the design allows between
@@ -5352,7 +5353,7 @@ class PairExecutionCell:
                 return BrokerWriteResult("unknown_after_send")
             self._record_timing("broker_response")
             category, reason = "completed", "broker receipt observed"
-            if receipt.get("retcode") not in _SUCCESS_RETCODES:
+            if not _successful_broker_write(payload, receipt):
                 return BrokerWriteResult("rejected", receipt)
             return BrokerWriteResult("completed", receipt)
         finally:
@@ -6474,6 +6475,15 @@ def _receipt(raw: object) -> dict[str, object] | None:
         if hasattr(raw, field_name):
             result[field_name] = getattr(raw, field_name)
     return result if result else None
+
+
+def _successful_broker_write(payload: Mapping[str, object], receipt: Mapping[str, object]) -> bool:
+    """Accept MT5's idempotent protection no-op, but not for entry or containment."""
+
+    retcode = receipt.get("retcode")
+    return retcode in _SUCCESS_RETCODES or (
+        payload.get("type") == "modify_sl_tp" and retcode == _NO_CHANGES_RETCODE
+    )
 
 
 def _records(value: object) -> list[dict[str, object]] | None:
