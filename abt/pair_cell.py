@@ -6578,10 +6578,40 @@ class PairExecutionCell:
             )
             return
         outcome = self._run_broker_write(effect_id, payload, priority="emergency")
+        if (
+            outcome.category == "rejected"
+            and outcome.receipt is not None
+            and self._await_post_failure_containment_observation(
+                effect_id, payload, outcome.receipt
+            )
+        ):
+            return
         if outcome.category != "completed":
             self._set_needs_human(f"containment effect {effect_id} ended {outcome.category}", outcome.category)
             return
         self._request_broker_read()
+
+    def _await_post_failure_containment_observation(
+        self,
+        effect_id: str,
+        payload: Mapping[str, object],
+        receipt: Mapping[str, object],
+    ) -> bool:
+        """Defer terminality to the next broker snapshot after a rejected close.
+
+        A broker may reject removal of an order while it is terminalizing that
+        same order, or reject a close while it has already terminalized the
+        position. The receipt remains durable and is never retried. A later
+        complete broker snapshot, rather than the rejected receipt, decides
+        whether containment has converged.
+        """
+
+        if payload.get("type") not in ("cancel", "close"):
+            return False
+        if receipt.get("retcode") in _SUCCESS_RETCODES:
+            return False
+        self._transition("containment_receipt_reconciliation_pending", effect_id)
+        return True
 
     def _reset_attempt(self) -> None:
         self._attempt = None

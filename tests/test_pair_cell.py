@@ -246,6 +246,10 @@ class FakeMT5:
         self.reject = False
         self.reject_next_entry_retcode: int | None = None
         self.reject_next_modify = False
+        self.reject_next_cancel_retcode: int | None = None
+        self.reject_next_close_retcode: int | None = None
+        self.remove_order_on_rejected_cancel = False
+        self.remove_position_on_rejected_close = False
         self.no_change_next_entry = False
         self.no_change_for_identical_protection = False
         self.reads_unavailable = False
@@ -343,10 +347,24 @@ class FakeMT5:
                     return {"retcode": _DONE}
             return {"retcode": _REJECTED, "comment": "unknown ticket"}
         if kind == "close":
+            if self.reject_next_close_retcode is not None:
+                retcode = self.reject_next_close_retcode
+                self.reject_next_close_retcode = None
+                if self.remove_position_on_rejected_close:
+                    self.positions = [
+                        p for p in self.positions if str(p["ticket"]) != str(request["ticket"])
+                    ]
+                return {"retcode": retcode, "comment": "broker close already terminalizing"}
             if not self.close_leaves_position_visible:
                 self.positions = [p for p in self.positions if str(p["ticket"]) != str(request["ticket"])]
             return {"retcode": _DONE}
         if kind == "cancel":
+            if self.reject_next_cancel_retcode is not None:
+                retcode = self.reject_next_cancel_retcode
+                self.reject_next_cancel_retcode = None
+                if self.remove_order_on_rejected_cancel:
+                    self.orders = [o for o in self.orders if str(o["ticket"]) != str(request["ticket"])]
+                return {"retcode": retcode, "comment": "broker order already terminalizing"}
             self.orders = [o for o in self.orders if str(o["ticket"]) != str(request["ticket"])]
             return {"retcode": _DONE}
         raise AssertionError(f"unhandled fake MT5 request kind: {kind}")
@@ -3141,6 +3159,92 @@ class EntryResultTests(PairCellTestCase):
 
 
 class RecoveryTests(PairCellTestCase):
+    def test_rejected_containment_cancel_rechecks_broker_before_stopping(self) -> None:
+        self.run_entry()
+        self.leader.mt5.orders.append({"ticket": 123, "symbol": SYMBOL})
+        self.leader.mt5.reject_next_cancel_retcode = _REJECTED
+        self.leader.mt5.remove_order_on_rejected_cancel = True
+
+        self.follower.mt5.positions = []
+        self.follower.cell.handle_event(
+            BrokerSnapshotEvent(orders=[], positions=[], observed_at=self.now)
+        )
+        self.net.pump()
+
+        result = self.leader.cell.handle_event(ClockTickEvent(self.now))
+
+        self.assertFalse(result.needs_human)
+        self.assertEqual(result.state, "EMPTY")
+        self.assertEqual(self.leader.mt5.orders, [])
+        self.assertEqual(self.leader.mt5.positions, [])
+        self.assertEqual(
+            [request["type"] for request in self.leader.mt5.requests[-2:]],
+            ["cancel", "close"],
+        )
+
+    def test_rejected_containment_close_rechecks_broker_before_stopping(self) -> None:
+        self.run_entry()
+        self.leader.mt5.reject_next_close_retcode = _REJECTED
+        self.leader.mt5.remove_position_on_rejected_close = True
+
+        self.follower.mt5.positions = []
+        self.follower.cell.handle_event(
+            BrokerSnapshotEvent(orders=[], positions=[], observed_at=self.now)
+        )
+        self.net.pump()
+
+        result = self.leader.cell.handle_event(ClockTickEvent(self.now))
+
+        self.assertFalse(result.needs_human)
+        self.assertEqual(result.state, "EMPTY")
+        self.assertEqual(self.leader.mt5.positions, [])
+        self.assertEqual(self.leader.close_requests()[-1]["type"], "close")
+
+    def test_rejected_containment_cancel_stops_when_next_snapshot_keeps_the_order(self) -> None:
+        self.run_entry()
+        self.leader.mt5.orders.append({"ticket": 123, "symbol": SYMBOL})
+        self.leader.mt5.reject_next_cancel_retcode = _REJECTED
+
+        self.follower.mt5.positions = []
+        self.follower.cell.handle_event(
+            BrokerSnapshotEvent(orders=[], positions=[], observed_at=self.now)
+        )
+        self.net.pump()
+
+        result = self.leader.cell.handle_event(ClockTickEvent(self.now))
+
+        self.assertTrue(result.needs_human)
+        self.assertIn("non-success replay evidence", str(result.needs_human_reason))
+        self.assertEqual(
+            [request["type"] for request in self.leader.mt5.requests[-1:]],
+            ["cancel"],
+        )
+
+    def test_restart_rechecks_a_rejected_containment_cancel_before_stopping(self) -> None:
+        self.run_entry()
+        self.leader.mt5.orders.append({"ticket": 123, "symbol": SYMBOL})
+        self.leader.mt5.reject_next_cancel_retcode = _REJECTED
+        self.leader.mt5.remove_order_on_rejected_cancel = True
+
+        self.follower.mt5.positions = []
+        self.follower.cell.handle_event(
+            BrokerSnapshotEvent(orders=[], positions=[], observed_at=self.now)
+        )
+        self.net.pump()
+        cancels_before_restart = [
+            request for request in self.leader.mt5.requests if request["type"] == "cancel"
+        ]
+
+        result = self.leader.restart().recover()
+
+        self.assertFalse(result.needs_human)
+        self.assertEqual(result.state, "EMPTY")
+        self.assertEqual(
+            [request for request in self.leader.mt5.requests if request["type"] == "cancel"],
+            cancels_before_restart,
+        )
+        self.assertEqual(self.leader.mt5.positions, [])
+
     def test_restart_before_any_attempt_restores_readiness_and_the_route(self) -> None:
         self.prime()
         cell = self.leader.restart()

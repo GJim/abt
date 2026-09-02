@@ -946,6 +946,20 @@ Each Worker contains only from durable local effects and exact broker facts:
 it immediately cancels attempt-owned pending orders, closes exact
 attempt-owned positions, and requires fresh broker-verified empty facts.
 
+If a containment `cancel` or `close` receives a non-success broker receipt,
+the Worker preserves that receipt and never blindly resends the same effect.
+It does not immediately enter `NEEDS_HUMAN`: it remains desired-`EMPTY` and
+requires a subsequent, complete `orders_get()` and `positions_get()` snapshot
+as post-failure broker evidence. If that new snapshot proves no order or
+position remains, local containment proceeds to the existing authenticated
+peer-terminal-proof requirement. If it proves a different exact owned
+position remains after a rejected cancel, containment may journal and send
+the distinct position-close effect. If the rejected effect's target remains,
+any exposure cannot be exactly attributed, or either broker read is
+unavailable or malformed, the Worker remains fail-closed and enters
+`NEEDS_HUMAN`. A failed receipt is never itself treated as success; only
+subsequent broker evidence can establish terminality.
+
 ### Durable recovery
 
 Each Worker durably owns only its local broker effects and its copy of pair
@@ -985,6 +999,9 @@ successful relay acknowledgement is terminal proof.
 A rejected containment-effect stop is cleared only when the same route and
 attempt have durable `both_empty_verified` proof. The proof is stronger than
 the rejected broker action; no other operator stop is cleared automatically.
+On restart, a retained non-success containment `cancel` or `close` receipt
+first follows the same post-failure broker-evidence path rather than being
+treated as conclusive evidence of unresolved exposure.
 
 Timed exit, New York cutoff, risk breach, shutdown, integrity divergence,
 entry failure, and protection failure all use the same desired-`EMPTY`
