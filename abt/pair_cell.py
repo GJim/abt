@@ -1542,62 +1542,62 @@ def compute_protection(
 
 def compute_shared_protection(
     *,
-    leader_fill: Decimal,
-    follower_fill: Decimal,
+    long_fill: Decimal,
+    short_fill: Decimal,
     volume: Decimal,
-    leader_plan: SizingPlan,
-    follower_plan: SizingPlan,
-    leader_allowed_loss_usd: Decimal,
-    follower_allowed_loss_usd: Decimal,
+    long_plan: SizingPlan,
+    short_plan: SizingPlan,
+    long_allowed_loss_usd: Decimal,
+    short_allowed_loss_usd: Decimal,
     upper: Decimal,
     lower: Decimal,
 ) -> tuple[str, str, str, str] | None:
-    """Return executable shared ``(leader_sl, leader_tp, follower_sl, follower_tp)``.
+    """Return executable shared ``(long_sl, long_tp, short_sl, short_tp)``.
 
     The caller supplies the inward-only candidate interval.  This module owns
     the cross-leg ordering, common tick-grid, stop distance, and SL loss-cap
     checks so both Workers make the same safety decision from durable facts.
     """
 
-    leader_tick = _to_decimal(leader_plan.tick_size)
-    follower_tick = _to_decimal(follower_plan.tick_size)
-    leader_stop = _to_decimal(leader_plan.minimum_stop_distance)
-    follower_stop = _to_decimal(follower_plan.minimum_stop_distance)
-    leader_loss_value = _to_decimal(leader_plan.loss_tick_value)
-    follower_loss_value = _to_decimal(follower_plan.loss_tick_value)
+    long_tick = _to_decimal(long_plan.tick_size)
+    short_tick = _to_decimal(short_plan.tick_size)
+    long_stop = _to_decimal(long_plan.minimum_stop_distance)
+    short_stop = _to_decimal(short_plan.minimum_stop_distance)
+    long_loss_value = _to_decimal(long_plan.loss_tick_value)
+    short_loss_value = _to_decimal(short_plan.loss_tick_value)
     if any(
         value is None or value <= 0
-        for value in (leader_tick, follower_tick, leader_loss_value, follower_loss_value)
-    ) or leader_stop is None or follower_stop is None:
+        for value in (long_tick, short_tick, long_loss_value, short_loss_value)
+    ) or long_stop is None or short_stop is None:
         return None
-    assert leader_tick is not None and follower_tick is not None
-    assert leader_stop is not None and follower_stop is not None
-    assert leader_loss_value is not None and follower_loss_value is not None
+    assert long_tick is not None and short_tick is not None
+    assert long_stop is not None and short_stop is not None
+    assert long_loss_value is not None and short_loss_value is not None
     # MT5 tick sizes are terminating decimals.  A common grid is their decimal
     # least common multiple, not merely the coarser tick, which may not be
     # executable when a broker uses a non-divisor grid.
-    scale = max(-leader_tick.as_tuple().exponent, -follower_tick.as_tuple().exponent)
-    leader_units = int(leader_tick.scaleb(scale))
-    follower_units = int(follower_tick.scaleb(scale))
-    common_tick = Decimal(math.lcm(leader_units, follower_units)).scaleb(-scale)
+    scale = max(-long_tick.as_tuple().exponent, -short_tick.as_tuple().exponent)
+    long_units = int(long_tick.scaleb(scale))
+    short_units = int(short_tick.scaleb(scale))
+    common_tick = Decimal(math.lcm(long_units, short_units)).scaleb(-scale)
     upper = _round_to_tick(upper, common_tick, ROUND_FLOOR)
     lower = _round_to_tick(lower, common_tick, ROUND_CEILING)
     if lower <= 0 or lower >= upper:
         return None
-    if not (lower < leader_fill < upper and lower < follower_fill < upper):
+    if not (lower < long_fill < upper and lower < short_fill < upper):
         return None
     if (
-        leader_fill - lower < leader_stop
-        or upper - leader_fill < leader_stop
-        or upper - follower_fill < follower_stop
-        or follower_fill - lower < follower_stop
+        long_fill - lower < long_stop
+        or upper - long_fill < long_stop
+        or upper - short_fill < short_stop
+        or short_fill - lower < short_stop
     ):
         return None
-    leader_loss_ticks = (leader_fill - lower) / leader_tick
-    follower_loss_ticks = (upper - follower_fill) / follower_tick
+    long_loss_ticks = (long_fill - lower) / long_tick
+    short_loss_ticks = (upper - short_fill) / short_tick
     if (
-        leader_loss_ticks * leader_loss_value * volume > leader_allowed_loss_usd
-        or follower_loss_ticks * follower_loss_value * volume > follower_allowed_loss_usd
+        long_loss_ticks * long_loss_value * volume > long_allowed_loss_usd
+        or short_loss_ticks * short_loss_value * volume > short_allowed_loss_usd
     ):
         return None
     return str(lower), str(upper), str(upper), str(lower)
@@ -5869,11 +5869,12 @@ class PairExecutionCell:
         assert leader_fill is not None and follower_fill is not None
         assert volume is not None and leader_allowed is not None and follower_allowed is not None
         if contract:
+            local_direction = attempt.direction_of(self._role)
             current_upper = _to_decimal(
-                leg.precise_tp if self._role == "leader" else leg.precise_sl
+                leg.precise_tp if local_direction == "LONG" else leg.precise_sl
             )
             current_lower = _to_decimal(
-                leg.precise_sl if self._role == "leader" else leg.precise_tp
+                leg.precise_sl if local_direction == "LONG" else leg.precise_tp
             )
             if current_upper is None or current_lower is None:
                 return None
@@ -5886,23 +5887,66 @@ class PairExecutionCell:
                 follower_fill - (follower_fill - current_lower) * Decimal("0.9"),
             )
         else:
-            upper = min(Decimal(attempt.leader_rough_tp), Decimal(attempt.follower_rough_sl))
-            lower = max(Decimal(attempt.leader_rough_sl), Decimal(attempt.follower_rough_tp))
+            leader_precise = compute_protection(
+                entry=leader_fill,
+                direction=attempt.leader_direction,
+                volume=volume,
+                plan=leader_plan,
+                allowed_loss_usd=leader_allowed,
+            )
+            follower_precise = compute_protection(
+                entry=follower_fill,
+                direction=attempt.follower_direction,
+                volume=volume,
+                plan=follower_plan,
+                allowed_loss_usd=follower_allowed,
+            )
+            if leader_precise is None or follower_precise is None:
+                return None
+            if attempt.leader_direction == "LONG":
+                upper = min(
+                    Decimal(leader_precise[1]),
+                    Decimal(follower_precise[0]),
+                    Decimal(attempt.leader_rough_tp),
+                    Decimal(attempt.follower_rough_sl),
+                )
+                lower = max(
+                    Decimal(leader_precise[0]),
+                    Decimal(follower_precise[1]),
+                    Decimal(attempt.leader_rough_sl),
+                    Decimal(attempt.follower_rough_tp),
+                )
+            else:
+                upper = min(
+                    Decimal(follower_precise[1]),
+                    Decimal(leader_precise[0]),
+                    Decimal(attempt.follower_rough_tp),
+                    Decimal(attempt.leader_rough_sl),
+                )
+                lower = max(
+                    Decimal(follower_precise[0]),
+                    Decimal(leader_precise[1]),
+                    Decimal(attempt.follower_rough_sl),
+                    Decimal(attempt.leader_rough_tp),
+                )
+        leader_is_long = attempt.leader_direction == "LONG"
         planned = compute_shared_protection(
-            leader_fill=leader_fill,
-            follower_fill=follower_fill,
+            long_fill=leader_fill if leader_is_long else follower_fill,
+            short_fill=follower_fill if leader_is_long else leader_fill,
             volume=volume,
-            leader_plan=leader_plan,
-            follower_plan=follower_plan,
-            leader_allowed_loss_usd=leader_allowed,
-            follower_allowed_loss_usd=follower_allowed,
+            long_plan=leader_plan if leader_is_long else follower_plan,
+            short_plan=follower_plan if leader_is_long else leader_plan,
+            long_allowed_loss_usd=leader_allowed if leader_is_long else follower_allowed,
+            short_allowed_loss_usd=follower_allowed if leader_is_long else leader_allowed,
             upper=upper,
             lower=lower,
         )
         if planned is None:
             return None
-        leader_sl, leader_tp, follower_sl, follower_tp = planned
-        return (leader_sl, leader_tp) if self._role == "leader" else (follower_sl, follower_tp)
+        long_sl, long_tp, short_sl, short_tp = planned
+        if attempt.direction_of(self._role) == "LONG":
+            return long_sl, long_tp
+        return short_sl, short_tp
 
     def _freeze_or_fallback_protection(self, reason: str) -> None:
         assert self._leg is not None

@@ -2644,6 +2644,58 @@ class ImmediateEntryTests(PairCellTestCase):
             [row["event"] for row in self.leader.cell.transition_history()],
         )
 
+    def test_initial_shared_protection_recomputes_each_leg_from_actual_fill(self) -> None:
+        self.leader.mt5.fill_price = 1.10010
+        self.follower.mt5.fill_price = 1.10035
+        self.prime()
+        self.feed_quotes(follower_bid="1.10040", follower_ask="1.10050")
+
+        self.assertEqual(self.leader.cell.handle_event(ClockTickEvent(self.now)).state, "ACTIVE")
+        self.assertEqual(self.follower.cell.handle_event(ClockTickEvent(self.now)).state, "ACTIVE")
+        leader_modify = self.leader.modify_requests()[-1]
+        follower_modify = self.follower.modify_requests()[-1]
+        self.assertEqual(Decimal(str(leader_modify["sl"])), Decimal("1.10000"))
+        self.assertEqual(Decimal(str(leader_modify["tp"])), Decimal("1.10075"))
+        self.assertEqual(Decimal(str(follower_modify["sl"])), Decimal("1.10075"))
+        self.assertEqual(Decimal(str(follower_modify["tp"])), Decimal("1.10000"))
+        self.assertNotIn(
+            "protection_rough_fallback",
+            [row["event"] for row in self.leader.cell.transition_history()],
+        )
+
+    def test_initial_shared_protection_maps_a_short_leader_to_shared_boundaries(self) -> None:
+        self.leader.mt5.fill_price = 1.10045
+        self.follower.mt5.fill_price = 1.10010
+        self.prime()
+        self.feed_quotes(
+            leader_bid="1.10050",
+            leader_ask="1.10060",
+            follower_bid="1.10000",
+            follower_ask="1.10010",
+        )
+
+        self.assertEqual(self.leader.cell.handle_event(ClockTickEvent(self.now)).state, "ACTIVE")
+        self.assertEqual(self.follower.cell.handle_event(ClockTickEvent(self.now)).state, "ACTIVE")
+        leader_modify = self.leader.modify_requests()[-1]
+        follower_modify = self.follower.modify_requests()[-1]
+        self.assertEqual(Decimal(str(leader_modify["sl"])), Decimal("1.10050"))
+        self.assertEqual(Decimal(str(leader_modify["tp"])), Decimal("1.09975"))
+        self.assertEqual(Decimal(str(follower_modify["sl"])), Decimal("1.09975"))
+        self.assertEqual(Decimal(str(follower_modify["tp"])), Decimal("1.10050"))
+        self.assertNotIn(
+            "protection_rough_fallback",
+            [row["event"] for row in self.leader.cell.transition_history()],
+        )
+
+        self.tick(seconds=300)
+
+        leader_contraction = self.leader.modify_requests()[-1]
+        follower_contraction = self.follower.modify_requests()[-1]
+        self.assertEqual(Decimal(str(leader_contraction["sl"])), Decimal("1.10046"))
+        self.assertEqual(Decimal(str(leader_contraction["tp"])), Decimal("1.09982"))
+        self.assertEqual(Decimal(str(follower_contraction["sl"])), Decimal("1.09982"))
+        self.assertEqual(Decimal(str(follower_contraction["tp"])), Decimal("1.10046"))
+
     def test_both_legs_apply_a_common_inward_protection_boundary(self) -> None:
         self.leader.mt5.fill_price = 1.10030
         self.follower.mt5.fill_price = 1.10050

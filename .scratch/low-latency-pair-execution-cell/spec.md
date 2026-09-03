@@ -875,26 +875,40 @@ If both exact positions are confirmed in time, the leader emits
 before both exact fills exist there is no safe shared boundary, and neither
 leg may ever be naked while waiting for its peer.
 
-After confirmation, the leader coordinates one pair-level protection grid from
-both actual fill prices, the immutable rough grid, both Workers' current
-point, tick size, stop/freeze constraints, and the immutable attempt volume.
+After confirmation, each leg first recomputes an independent precise SL/TP
+from its actual fill, immutable `allowed_leg_loss_usd`, immutable attempt
+volume, and attempt-bound sizing plan. The leader then coordinates one
+pair-level protection grid by intersecting those per-leg precise prices with
+the immutable rough grid and both Workers' current point, tick size, and
+stop/freeze constraints. The initial shared upper boundary is the minimum of
+the LONG precise TP, SHORT precise SL, LONG rough TP, and SHORT rough SL. The
+initial shared lower boundary is the maximum of the LONG precise SL, SHORT
+precise TP, LONG rough SL, and SHORT rough TP.
+
 The upper shared boundary is the LONG take profit and the SHORT stop loss; the
 lower shared boundary is the LONG stop loss and the SHORT take profit. A
 boundary is chosen only when it can be represented exactly on a common
-executable tick grid, is on the correct side of both fills, meets both
-Workers' current stop/freeze distances, and only moves each original rough
-boundary inward:
+executable tick grid, is on the correct side of both actual fills, meets both
+Workers' current stop/freeze distances, does not exceed either leg's immutable
+loss allowance, and only moves each original rough boundary inward:
 
 ```text
-upper <= min(long_rough_tp, short_rough_sl)
-lower >= max(long_rough_sl, short_rough_tp)
+upper = min(long_precise_tp, short_precise_sl,
+            long_rough_tp, short_rough_sl)
+lower = max(long_precise_sl, short_precise_tp,
+            long_rough_sl, short_rough_tp)
 ```
 
-The shared price used as an SL must not exceed that Worker's immutable
-`allowed_leg_loss_usd`; this value is a hard maximum loss, not a requirement
-to target that exact amount. TP is consequently allowed to target a smaller
-gross profit. Commission, fee, swap, and an additional spread model are
-outside the first version's calculation.
+Recomputing from actual fills is mandatory before declaring that no initial
+shared boundary exists. In particular, adverse entry slippage may make an
+entry-attached rough SL exceed its leg's loss allowance when measured from
+the actual fill; that stale rough SL must be replaced by the inward
+actual-fill-derived precise candidate rather than causing an immediate
+fallback. The shared price used as an SL must not exceed that Worker's
+immutable `allowed_leg_loss_usd`; this value is a hard maximum loss, not a
+requirement to target that exact amount. TP is consequently allowed to target
+a smaller gross profit. Commission, fee, swap, and an additional spread model
+are outside the first version's calculation.
 
 Each shared update is a separate journaled broker effect on both exact
 tickets. The pair becomes `ACTIVE` only after both tickets are
@@ -918,14 +932,16 @@ failure that starts desired-`EMPTY` containment.
 While `ACTIVE` with `shared_precise`, the leader schedules a shared update
 every 300 seconds from the durable active time. Each update moves each
 boundary's distance from its corresponding actual fill to 90 percent of the
-previous revision's distance, rounded only inward on the common executable
-tick grid. It rechecks both current quotes and stop/freeze constraints before
-each update. If the next contraction cannot meet those constraints, the pair
-preserves its most recently broker-verified shared revision and permanently
-stops contracting. A partially accepted contraction is journaled back to that
-prior shared revision before this frozen state is published; an unverifiable
-rollback starts containment. The system never trails, widens, or otherwise
-changes a boundary after it is frozen.
+previous broker-verified shared revision's distance, rounded only inward on
+the common executable tick grid. Later contractions never recompute a new
+per-leg loss target and never use an unverified requested or externally
+modified broker value as their baseline. They recheck both current quotes and
+stop/freeze constraints before each update. If the next contraction cannot
+meet those constraints, the pair preserves its most recently broker-verified
+shared revision and permanently stops contracting. A partially accepted
+contraction is journaled back to that prior shared revision before this frozen
+state is published; an unverifiable rollback starts containment. The system
+never trails, widens, or otherwise changes a boundary after it is frozen.
 
 If MT5 returns `10025 TRADE_RETCODE_NO_CHANGES` for a `modify_sl_tp` effect,
 the effect is a successful idempotent no-op: the requested shared or rough
