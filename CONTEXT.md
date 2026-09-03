@@ -118,7 +118,7 @@ _Avoid_: 配對的逐腿 Trader worker operation
 已廢止的初始 worker password 交付方式。新的工作者註冊不使用 bootstrap grant。
 
 **初始憑證交付**:
-尚未批准的帳戶工作者在本機互動輸入 MT5 password、成功登入並取得帳戶與 terminal evidence 後，經 Cloudflare TLS 將 password 與簽署的註冊請求交給主控台。password 是不顯示、不回顯的傳送欄位；主控台立即將其寫入 OpenBao，註冊被拒絕或逾期時刪除該 secret，且 worker 不得持久保存或記錄 password。
+尚未批准的帳戶工作者在本機透過一般可見的互動欄位輸入 MT5 password、成功登入並取得帳戶與 terminal evidence 後，經 Cloudflare TLS 將 password 與簽署的註冊請求交給主控台。主控台立即將其寫入 OpenBao，註冊被拒絕或逾期時刪除該 secret，且 worker 不得持久保存或記錄 password。
 
 **MT5 憑證代理**:
 已批准工作者在每次需要登入 MT5 時，於已驗證 WSS 工作階段中請求其綁定帳戶的 MT5 password；主控台驗證 worker/account binding 後由內部 OpenBao 讀取並只在該工作階段回覆。工作者只可在記憶體保存 password，OpenBao 不得公開給工作者網路；password 下發信任 Cloudflare 的 TLS proxy，不另加應用層加密。

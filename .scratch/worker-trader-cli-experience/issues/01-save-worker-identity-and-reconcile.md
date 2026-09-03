@@ -6,7 +6,7 @@
 
 **Status:** needs-triage
 
-- [x] `abt-worker enroll` prompts for absent controller, MT5 account, server, and registration-invite inputs while preserving flag-based automation and the non-echoing password prompt.
+- [x] `abt-worker enroll` prompts for absent controller, MT5 account, server, registration-invite, and MT5 password inputs while preserving flag-based automation and visibly echoing the password like the other fields.
 - [x] Successful enrollment atomically writes versioned, non-secret Worker identity configuration beside the executable or at the explicit configuration path; password and invite are never written or displayed.
 - [x] Existing identity configuration is preserved unless enrollment uses explicit replacement; missing, invalid, or unwritable default configuration produces a clear safe failure.
 - [x] `abt-worker reconcile` reads its Worker identity from configuration, reports pending approval clearly, and does not accept conflicting identity overrides.

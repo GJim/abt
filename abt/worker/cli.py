@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import getpass
 import logging
 import sys
 from collections.abc import Callable, Mapping, Sequence
@@ -211,7 +210,7 @@ def main(
     mt5_factory: Callable[[], MT5Client] = MetaTrader5Adapter,
     transport_factory: Callable[[], EnrollmentTransport] = HTTPEnrollmentTransport,
     key_store_factory: Callable[[str], HardwareKeyStore] = WindowsCNGKeyStore,
-    password_prompt: Callable[[str], str] = getpass.getpass,
+    password_prompt: Callable[[str], str] | None = None,
     input_prompt: Callable[[str], str] = input,
     output: TextIO | None = None,
     error_output: TextIO | None = None,
@@ -314,7 +313,7 @@ def main(
                     key_store=key_store,
                     mt5=mt5,
                     transport=transport,
-                    password_prompt=password_prompt,
+                    password_prompt=password_prompt or input_prompt,
                 )
                 saved_identity = WorkerIdentity(
                     controller_url=identity.controller_url,

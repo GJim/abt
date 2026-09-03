@@ -200,6 +200,40 @@ class WorkerEnrollmentTests(unittest.TestCase):
         self.assertTrue(key_store.closed)
         self.assertTrue(transport.closed)
 
+    def test_cli_uses_the_visible_input_prompt_for_the_mt5_password(self) -> None:
+        prompts: list[str] = []
+
+        def visible_input(prompt: str) -> str:
+            prompts.append(prompt)
+            return "visible-password"
+
+        transport = FakeTransport()
+        exit_code = main(
+            [
+                "enroll",
+                "--config",
+                str(self.config_path),
+                "--controller-url",
+                "https://controller.example",
+                "--login",
+                "123456",
+                "--server",
+                "Broker-Demo",
+                "--registration-invite",
+                "worker-invite",
+            ],
+            mt5_factory=FakeMT5,
+            transport_factory=lambda: transport,
+            key_store_factory=lambda _: FakeKeyStore(),
+            input_prompt=visible_input,
+            output=io.StringIO(),
+            error_output=io.StringIO(),
+        )
+
+        self.assertEqual(0, exit_code)
+        self.assertEqual(["MT5 password: "], prompts)
+        self.assertEqual("visible-password", transport.request["mt5_password"])
+
     def test_follower_worker_id_is_leader_only(self) -> None:
         errors = io.StringIO()
         with patch("abt.worker.cli.sys.platform", "win32"):

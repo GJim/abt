@@ -20,7 +20,7 @@ Unify the control plane’s Worker and Trader device-identity requirements on Wi
 
 1. As a Worker operator, I want `abt-worker enroll` to prompt for missing enrollment values, so that I can enroll without memorising a long command line.
 2. As a Worker operator, I want supplied enrollment flags to take precedence over prompts, so that automated deployment remains possible.
-3. As a Worker operator, I want the MT5 password prompt to be non-echoing and absent from output and files, so that enrollment does not leak the password.
+3. As a Worker operator, I want the MT5 password prompt to use the same visible input behavior as the other enrollment fields while remaining absent from application output and files.
 4. As a Worker operator, I want successful enrollment to save my controller URL, account binding, enrollment ID, and CNG key name, so that I can subsequently run `abt-worker reconcile` without repeating them.
 5. As a Worker operator, I want `reconcile` to report that my enrollment is awaiting approval, so that I know not to re-enroll or reuse an invite prematurely.
 6. As a Worker operator, I want my enrollment invite excluded from saved files, so that a one-time admission credential cannot be recovered locally.
