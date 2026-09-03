@@ -198,12 +198,14 @@ def _positive_text(value: object) -> str | None:
     return decimal_text(number)
 
 
-def _parse_ny_time(value: str) -> time:
+def _parse_ny_time(value: str, field_name: str) -> time:
+    if not isinstance(value, str):
+        raise PairExecutionCellError(f"{field_name} must be 'HH:MM'.")
     try:
         hour_text, minute_text = value.split(":")
         return time(int(hour_text), int(minute_text))
     except (ValueError, TypeError) as error:
-        raise PairExecutionCellError("flatten_at_ny must be 'HH:MM'.") from error
+        raise PairExecutionCellError(f"{field_name} must be 'HH:MM'.") from error
 
 
 def _parse_utc(value: str) -> datetime:
@@ -506,7 +508,8 @@ DEFAULT_DAILY_LOSS_WARNING_THRESHOLD_USD = "20"
 DEFAULT_QUOTE_MAX_AGE_SECONDS = 1.0
 DEFAULT_QUOTE_MAX_SKEW_SECONDS = 1.0
 DEFAULT_FOLLOWER_CONFIRMATION_TIMEOUT_SECONDS = 5.0
-DEFAULT_FLATTEN_AT_NY = "16:00"
+DEFAULT_TRADING_BLACKOUT_START_NY = "16:30"
+DEFAULT_TRADING_BLACKOUT_END_NY = "18:30"
 DEFAULT_MAXIMUM_HOLDING_SECONDS: float | None = None
 REQUIRED_ACCOUNT_CURRENCY = "USD"
 
@@ -517,7 +520,8 @@ SHARED_POLICY_KEYS = (
     "quote_max_age_seconds",
     "quote_max_skew_seconds",
     "follower_confirmation_timeout_seconds",
-    "flatten_at_ny",
+    "trading_blackout_start_ny",
+    "trading_blackout_end_ny",
     "maximum_holding_seconds",
 )
 #: Per-Worker values every Worker authors for itself, in either role.
@@ -548,7 +552,8 @@ def default_shared_policy_values() -> dict[str, object]:
         "quote_max_age_seconds": DEFAULT_QUOTE_MAX_AGE_SECONDS,
         "quote_max_skew_seconds": DEFAULT_QUOTE_MAX_SKEW_SECONDS,
         "follower_confirmation_timeout_seconds": DEFAULT_FOLLOWER_CONFIRMATION_TIMEOUT_SECONDS,
-        "flatten_at_ny": DEFAULT_FLATTEN_AT_NY,
+        "trading_blackout_start_ny": DEFAULT_TRADING_BLACKOUT_START_NY,
+        "trading_blackout_end_ny": DEFAULT_TRADING_BLACKOUT_END_NY,
         "maximum_holding_seconds": DEFAULT_MAXIMUM_HOLDING_SECONDS,
     }
 
@@ -815,7 +820,8 @@ class StrategyPolicy:
     follower_risk: WorkerRiskLimits
     follower_confirmation_timeout_seconds: float = DEFAULT_FOLLOWER_CONFIRMATION_TIMEOUT_SECONDS
     maximum_holding_seconds: float | None = None
-    flatten_at_ny: str | None = None
+    trading_blackout_start_ny: str = DEFAULT_TRADING_BLACKOUT_START_NY
+    trading_blackout_end_ny: str = DEFAULT_TRADING_BLACKOUT_END_NY
     mode: ExecutionMode = DEFAULT_MODE
 
     def __post_init__(self) -> None:
@@ -844,8 +850,16 @@ class StrategyPolicy:
             or not 0 < self.maximum_holding_seconds <= _MAXIMUM_HOLDING_SECONDS
         ):
             raise PairExecutionCellError("maximum_holding_seconds is out of range.")
-        if self.flatten_at_ny is not None:
-            _parse_ny_time(self.flatten_at_ny)
+        blackout_start = _parse_ny_time(
+            self.trading_blackout_start_ny, "trading_blackout_start_ny"
+        )
+        blackout_end = _parse_ny_time(
+            self.trading_blackout_end_ny, "trading_blackout_end_ny"
+        )
+        if blackout_start >= blackout_end:
+            raise PairExecutionCellError(
+                "trading_blackout_start_ny must be earlier than trading_blackout_end_ny."
+            )
         if self.mode not in ("live", "shadow"):
             raise PairExecutionCellError("mode must be 'live' or 'shadow'.")
 
@@ -866,7 +880,8 @@ class StrategyPolicy:
             "quote_max_skew_seconds": self.quote_max_skew_seconds,
             "follower_confirmation_timeout_seconds": self.follower_confirmation_timeout_seconds,
             "maximum_holding_seconds": self.maximum_holding_seconds,
-            "flatten_at_ny": self.flatten_at_ny,
+            "trading_blackout_start_ny": self.trading_blackout_start_ny,
+            "trading_blackout_end_ny": self.trading_blackout_end_ny,
             "mode": self.mode,
             "leader_risk": self.leader_risk.canonical(),
             "follower_risk": self.follower_risk.canonical(),
@@ -878,6 +893,11 @@ class StrategyPolicy:
 
 
 def _policy_from_canonical(value: Mapping[str, object]) -> StrategyPolicy:
+    if "flatten_at_ny" in value:
+        raise PairExecutionCellError(
+            "The persisted policy uses removed flatten_at_ny semantics; "
+            "both accounts must be empty and accept a fresh policy."
+        )
     return StrategyPolicy(
         policy_version=cast(str, value["policy_version"]),
         entry_edge_points=cast(str, value["entry_edge_points"]),
@@ -889,7 +909,12 @@ def _policy_from_canonical(value: Mapping[str, object]) -> StrategyPolicy:
             cast(float, value["follower_confirmation_timeout_seconds"])
         ),
         maximum_holding_seconds=cast(float | None, value.get("maximum_holding_seconds")),
-        flatten_at_ny=cast(str | None, value.get("flatten_at_ny")),
+        trading_blackout_start_ny=cast(
+            str, value["trading_blackout_start_ny"]
+        ),
+        trading_blackout_end_ny=cast(
+            str, value["trading_blackout_end_ny"]
+        ),
         mode=cast(ExecutionMode, value.get("mode", DEFAULT_MODE)),
     )
 
@@ -923,7 +948,8 @@ def canonical_policy_from_acceptance(
             cast(float, values["follower_confirmation_timeout_seconds"])
         ),
         maximum_holding_seconds=cast(float | None, values["maximum_holding_seconds"]),
-        flatten_at_ny=cast(str | None, values["flatten_at_ny"]),
+        trading_blackout_start_ny=cast(str, values["trading_blackout_start_ny"]),
+        trading_blackout_end_ny=cast(str, values["trading_blackout_end_ny"]),
         mode=cast(ExecutionMode, values["mode"]),
     )
 
@@ -4267,8 +4293,9 @@ class PairExecutionCell:
         drift = self._risk_configuration_drift()
         if drift is not None:
             return False, drift
-        if self._flatten_reached():
-            return False, "New York flatten cutoff has passed"
+        blackout = self._trading_blackout()
+        if blackout is not None:
+            return False, blackout[1]
         remaining_daily = self.remaining_daily_loss_allowance_usd()
         if Decimal(0) < remaining_daily <= self._daily_loss_warning_threshold_usd:
             return (
@@ -4841,8 +4868,9 @@ class PairExecutionCell:
         policy = self._policy
         if policy is None or self._attempt is None or self._desired == "EMPTY":
             return
-        if self._flatten_reached():
-            self._begin_close("flatten_at_ny")
+        blackout = self._trading_blackout()
+        if blackout is not None:
+            self._begin_close(blackout[0])
             return
         if (
             self._active_since is not None
@@ -4851,13 +4879,22 @@ class PairExecutionCell:
         ):
             self._begin_close("maximum_holding_seconds")
 
-    def _flatten_reached(self) -> bool:
+    def _trading_blackout(self) -> tuple[str, str] | None:
         policy = self._policy
-        if policy is None or policy.flatten_at_ny is None:
-            return False
-        cutoff = _parse_ny_time(policy.flatten_at_ny)
+        if policy is None:
+            return None
         local = self._now.astimezone(NEW_YORK)
-        return local.time() >= cutoff
+        if local.weekday() >= 5:
+            return "new_york_weekend", "New York weekend trading blackout"
+        start = _parse_ny_time(
+            policy.trading_blackout_start_ny, "trading_blackout_start_ny"
+        )
+        end = _parse_ny_time(
+            policy.trading_blackout_end_ny, "trading_blackout_end_ny"
+        )
+        if start <= local.time() < end:
+            return "new_york_trading_blackout", "New York trading blackout"
+        return None
 
     def _enforce_timers(self) -> None:
         """One independent local monotonic timer per role; never a shared deadline."""

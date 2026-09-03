@@ -337,8 +337,9 @@ The canonical policy therefore contains exactly two risk blocks:
 `leader_risk`, authored by the leader for itself, and `follower_risk`, copied
 verbatim from the Pairing Acceptance payload. Shared policy — `mode`,
 `entry_edge_points`, `quote_max_age_seconds`, `quote_max_skew_seconds`,
-`follower_confirmation_timeout_seconds`, `flatten_at_ny`, and
-`maximum_holding_seconds` — is authored by the leader alone.
+`follower_confirmation_timeout_seconds`, `trading_blackout_start_ny`,
+`trading_blackout_end_ny`, and `maximum_holding_seconds` — is authored by the
+leader alone.
 
 #### Policy acceptance and persistence
 
@@ -416,9 +417,10 @@ A **follower** override file may set only:
 
 A follower file may **not** set shared policy: `entry_edge_points`,
 `quote_max_age_seconds`, `quote_max_skew_seconds`,
-`follower_confirmation_timeout_seconds`, `flatten_at_ny`,
-`maximum_holding_seconds`, or `mode`. Any of those in a follower's file is a
-startup configuration error, not a silently ignored field.
+`follower_confirmation_timeout_seconds`, `trading_blackout_start_ny`,
+`trading_blackout_end_ny`, `maximum_holding_seconds`, or `mode`. Any of those
+in a follower's file is a startup configuration error, not a silently ignored
+field.
 
 A **leader** override file may set the shared policy values above and its own
 per-Worker risk tunables. It may never set the follower's risk tunables or the
@@ -516,7 +518,8 @@ already-operated strategy's numbers:
 - `maximum_loss_per_trade_usd` = `40`;
 - `quote_max_age_seconds` = `1`;
 - `follower_confirmation_timeout_seconds` = `5`;
-- `flatten_at_ny` = `16:00`; and
+- `trading_blackout_start_ny` = `16:30`;
+- `trading_blackout_end_ny` = `18:30`; and
 - `maximum_holding_seconds` unset.
 
 `quote_max_skew_seconds` has no legacy equivalent — the legacy realtime
@@ -1027,9 +1030,34 @@ On restart, a retained non-success containment `cancel` or `close` receipt
 first follows the same post-failure broker-evidence path rather than being
 treated as conclusive evidence of unresolved exposure.
 
-Timed exit, New York cutoff, risk breach, shutdown, integrity divergence,
-entry failure, and protection failure all use the same desired-`EMPTY`
-convergence path.
+Timed exit, New York trading blackout, risk breach, shutdown, integrity
+divergence, entry failure, and protection failure all use the same
+desired-`EMPTY` convergence path.
+
+The New York trading blackout replaces the former one-way daily cutoff. On
+Monday through Friday the half-open interval
+`[trading_blackout_start_ny, trading_blackout_end_ny)` blocks entry. Crossing
+the start while an attempt exists makes each Worker independently set its own
+desired state to `EMPTY` and run the ordinary exact-ticket containment path;
+safety does not depend on a leader relay reaching the follower. Reaching the
+end only removes the time gate: entry still requires fresh broker facts,
+quotes, peer readiness, risk capacity, and every other ordinary admission
+condition.
+
+Saturday and Sunday in `America/New_York` are full-day blackout periods.
+Friday after the daily interval and Monday before it remain governed by the
+ordinary admission chain; stale quotes or a closed broker never become
+positive evidence of tradability. Broker holidays and exceptional closures
+are deliberately outside this policy and remain an operator responsibility.
+The first version accepts only same-day intervals with start strictly before
+end. It has no automatic lead time and does not reject an entry merely because
+its maximum holding horizon could cross the next blackout.
+
+Both blackout values are canonical leader-authored policy. The removed
+`flatten_at_ny` field is not silently translated because doing so would change
+the semantics and policy hash of durable state. Deployment across this schema
+change requires both accounts to be broker-verified empty and a fresh
+canonical policy to be accepted.
 
 An interactive Worker interrupt requests this same shutdown convergence rather
 than immediately terminating the process. The shutdown intent belongs to the
@@ -1332,7 +1360,8 @@ permitted to set that value; anything else is a startup configuration error.
 | `quote_max_age_seconds` | `1` | leader |
 | `quote_max_skew_seconds` | `1` (Pair Cell parameter; legacy realtime strategy has no equivalent) | leader |
 | `follower_confirmation_timeout_seconds` | `5` | leader |
-| `flatten_at_ny` | `16:00` | leader |
+| `trading_blackout_start_ny` | `16:30` | leader |
+| `trading_blackout_end_ny` | `18:30` | leader |
 | `maximum_holding_seconds` | unset | leader |
 
 Defaults other than `quote_max_skew_seconds`, `mode`, and
@@ -1478,11 +1507,12 @@ details of the Worker runtime rather than strategy policy.
 - Configuration-authority tests prove a follower file may set only its four
   risk tunables and `allow_live`, that a follower file containing
   `entry_edge_points`, `quote_max_age_seconds`, `quote_max_skew_seconds`,
-  `follower_confirmation_timeout_seconds`, `flatten_at_ny`,
-  `maximum_holding_seconds`, or `mode` is a startup error, that a leader file
-  may set shared policy plus its own risk but never the follower's risk or
-  budget, and that a Worker receiving a role contradicting its file's authority
-  fails closed rather than applying the file partially.
+  `follower_confirmation_timeout_seconds`, `trading_blackout_start_ny`,
+  `trading_blackout_end_ny`, `maximum_holding_seconds`, or `mode` is a startup
+  error, that a leader file may set shared policy plus its own risk but never
+  the follower's risk or budget, and that a Worker receiving a role
+  contradicting its file's authority fails closed rather than applying the
+  file partially.
 - Mode-disagreement tests prove `mode` is leader-authored and defaults to
   `live`, that a follower with `allow_live = false` refuses a `live` policy
   with an explicit reason and stays paired but not entry-ready, that it never

@@ -153,7 +153,8 @@ rescale, or substitute them; a missing, malformed, non-USD, or non-positive
 payload makes the leader fail closed without publishing a policy. Shared policy
 (`mode`, `entry_edge_points`, `quote_max_age_seconds`,
 `quote_max_skew_seconds`, `follower_confirmation_timeout_seconds`,
-`flatten_at_ny`, `maximum_holding_seconds`) is leader-authored alone.
+`trading_blackout_start_ny`, `trading_blackout_end_ny`,
+`maximum_holding_seconds`) is leader-authored alone.
 
 Before quote processing begins the leader sends the follower that canonical,
 versioned policy and its hash over the opaque relay. The follower verifies its
@@ -239,7 +240,7 @@ simultaneously enabled for the same pair.
 - MT5 `None`/malformed/unavailable records are read failures, never an empty
   or ready fact, in every readiness, verification, containment, and final
   -empty check.
-- Every close path (risk, cutoff, timed exit, shutdown, asymmetric
+- Every close path (risk, trading blackout, timed exit, shutdown, asymmetric
   containment, integrity divergence) converges through one owned
   desired-`EMPTY` implementation, exactly as ADR-0008 requires for a single
   account.
@@ -291,8 +292,12 @@ simultaneously enabled for the same pair.
   `daily_loss_fraction` `0.03`, `trade_loss_fraction` `0.02`,
   `maximum_loss_per_trade_usd` `40`, `quote_max_age_seconds` `1`,
   `quote_max_skew_seconds` `1`, `follower_confirmation_timeout_seconds` `5`,
-  `flatten_at_ny` `16:00`, and no `maximum_holding_seconds`. Live by default
-  is an intentional operator decision and does not relax any admission rule:
+  `trading_blackout_start_ny` `16:30`, `trading_blackout_end_ny` `18:30`, and
+  no `maximum_holding_seconds`. Monday through Friday that half-open New York
+  interval blocks entry and starts ordinary desired-`EMPTY` containment on
+  both Workers; New York Saturday and Sunday are full-day blackout periods.
+  Holiday closures remain an operator responsibility. Live by default is an
+  intentional operator decision and does not relax any admission rule:
   pairing, discovery, clock calibration, sizing, protection, emptiness, and
   peer readiness must all pass first.
 - Startup **balance** is deliberately chosen over legacy

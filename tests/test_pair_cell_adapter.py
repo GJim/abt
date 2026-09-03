@@ -925,7 +925,8 @@ class PairCellConfigurationTests(unittest.TestCase):
             ("quote_max_age_seconds", 2.0),
             ("quote_max_skew_seconds", 2.0),
             ("follower_confirmation_timeout_seconds", 9.0),
-            ("flatten_at_ny", "15:30"),
+            ("trading_blackout_start_ny", "16:30"),
+            ("trading_blackout_end_ny", "18:30"),
             ("maximum_holding_seconds", 60.0),
         ):
             with self.subTest(key=key):
@@ -935,6 +936,11 @@ class PairCellConfigurationTests(unittest.TestCase):
                 self.assertIsNotNone(reason)
                 self.assertIn(key, cast(str, reason))
                 self.assertIsNone(config.role_authority_error("leader"))
+
+    def test_removed_flatten_setting_is_rejected(self) -> None:
+        with self.assertRaises(WorkerEnrollmentError) as raised:
+            parse_pair_cell_config({"flatten_at_ny": "16:00"})
+        self.assertIn("unknown settings flatten_at_ny", str(raised.exception))
 
     def test_unusable_risk_numbers_are_a_startup_error(self) -> None:
         with self.assertRaises(WorkerEnrollmentError):

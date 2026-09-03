@@ -867,7 +867,11 @@ class RemovedArchitectureTests(unittest.TestCase):
             policy_version="policy-1",
             leader_risk=LEADER_RISK,
             acceptance=acceptance,
-            shared={"maximum_holding_seconds": 60.0, "flatten_at_ny": "16:55"},
+            shared={
+                "maximum_holding_seconds": 60.0,
+                "trading_blackout_start_ny": "16:55",
+                "trading_blackout_end_ny": "18:30",
+            },
         )
         self.assertEqual(
             set(policy.canonical()),
@@ -878,7 +882,8 @@ class RemovedArchitectureTests(unittest.TestCase):
                 "quote_max_skew_seconds",
                 "follower_confirmation_timeout_seconds",
                 "maximum_holding_seconds",
-                "flatten_at_ny",
+                "trading_blackout_start_ny",
+                "trading_blackout_end_ny",
                 "mode",
                 "leader_risk",
                 "follower_risk",
@@ -902,6 +907,72 @@ class RemovedArchitectureTests(unittest.TestCase):
         restored = pair_cell._policy_from_canonical(policy.canonical())
         self.assertEqual(restored, policy)
         self.assertEqual(restored.hash, policy.hash)
+
+    def test_trading_blackout_requires_a_same_day_non_empty_interval(self) -> None:
+        acceptance = build_pairing_acceptance(
+            proposal_id=PROPOSAL,
+            worker_id=FOLLOWER,
+            startup_balance_usd="4000",
+            account_currency="USD",
+        )
+        for start, end in (("18:30", "16:30"), ("16:30", "16:30")):
+            with self.subTest(start=start, end=end):
+                with self.assertRaises(PairExecutionCellError):
+                    canonical_policy_from_acceptance(
+                        policy_version="policy-1",
+                        leader_risk=LEADER_RISK,
+                        acceptance=acceptance,
+                        shared={
+                            "trading_blackout_start_ny": start,
+                            "trading_blackout_end_ny": end,
+                        },
+                    )
+
+    def test_removed_flatten_policy_is_not_silently_migrated(self) -> None:
+        acceptance = build_pairing_acceptance(
+            proposal_id=PROPOSAL,
+            worker_id=FOLLOWER,
+            startup_balance_usd="4000",
+            account_currency="USD",
+        )
+        policy = canonical_policy_from_acceptance(
+            policy_version="policy-1", leader_risk=LEADER_RISK, acceptance=acceptance
+        )
+        legacy = policy.canonical()
+        legacy.pop("trading_blackout_start_ny")
+        legacy.pop("trading_blackout_end_ny")
+        legacy["flatten_at_ny"] = "16:00"
+        with self.assertRaises(PairExecutionCellError):
+            pair_cell._policy_from_canonical(legacy)
+
+    def test_persisted_policy_requires_blackout_interval(self) -> None:
+        acceptance = build_pairing_acceptance(
+            proposal_id=PROPOSAL,
+            worker_id=FOLLOWER,
+            startup_balance_usd="4000",
+            account_currency="USD",
+        )
+        canonical = canonical_policy_from_acceptance(
+            policy_version="policy-1", leader_risk=LEADER_RISK, acceptance=acceptance
+        ).canonical()
+        canonical.pop("trading_blackout_start_ny")
+        with self.assertRaises(KeyError):
+            pair_cell._policy_from_canonical(canonical)
+
+    def test_trading_blackout_times_must_be_strings(self) -> None:
+        acceptance = build_pairing_acceptance(
+            proposal_id=PROPOSAL,
+            worker_id=FOLLOWER,
+            startup_balance_usd="4000",
+            account_currency="USD",
+        )
+        with self.assertRaises(PairExecutionCellError):
+            canonical_policy_from_acceptance(
+                policy_version="policy-1",
+                leader_risk=LEADER_RISK,
+                acceptance=acceptance,
+                shared={"trading_blackout_start_ny": 1630},
+            )
 
 
 # --------------------------------------------------------------------------- #
@@ -928,7 +999,8 @@ class ConfigurationAuthorityTests(unittest.TestCase):
             ("quote_max_age_seconds", 1.0),
             ("quote_max_skew_seconds", 1.0),
             ("follower_confirmation_timeout_seconds", 5.0),
-            ("flatten_at_ny", "16:00"),
+            ("trading_blackout_start_ny", "16:30"),
+            ("trading_blackout_end_ny", "18:30"),
             ("maximum_holding_seconds", 60.0),
             ("mode", "shadow"),
         ):
@@ -971,7 +1043,8 @@ class DefaultMaterializationTests(unittest.TestCase):
                 "quote_max_age_seconds": 1.0,
                 "quote_max_skew_seconds": 1.0,
                 "follower_confirmation_timeout_seconds": 5.0,
-                "flatten_at_ny": "16:00",
+                "trading_blackout_start_ny": "16:30",
+                "trading_blackout_end_ny": "18:30",
                 "maximum_holding_seconds": None,
             },
         )
@@ -3482,13 +3555,82 @@ class ExitConvergenceTests(PairCellTestCase):
         self.assertEqual(self.leader.mt5.positions, [])
         self.assertEqual(self.follower.mt5.positions, [])
 
-    def test_new_york_cutoff_uses_the_desired_empty_path(self) -> None:
-        self.prime(shared={"flatten_at_ny": "09:30"})
+    def test_new_york_blackout_uses_the_desired_empty_path_on_both_workers(self) -> None:
+        self.prime(
+            shared={
+                "trading_blackout_start_ny": "09:30",
+                "trading_blackout_end_ny": "10:30",
+            }
+        )
         self.feed_quotes()
-        self.now = datetime(2026, 3, 4, 14, 35, tzinfo=UTC)  # 09:35 New York
+        self.now = datetime(2026, 3, 4, 14, 30, tzinfo=UTC)  # 09:30 New York
+        self.follower.cell.handle_event(ClockTickEvent(self.now))
+        self.assertEqual(self.follower.mt5.positions, [])
+        self.assertNotEqual(self.leader.mt5.positions, [])
         self.leader.cell.handle_event(ClockTickEvent(self.now))
         self.net.pump()
         self.assertEqual(self.leader.mt5.positions, [])
+        self.assertEqual(self.follower.mt5.positions, [])
+
+    def test_new_york_blackout_blocks_entry_and_reopens_at_the_end(self) -> None:
+        self.prime(
+            shared={
+                "trading_blackout_start_ny": "09:30",
+                "trading_blackout_end_ny": "10:30",
+            }
+        )
+        self.now = datetime(2026, 3, 4, 14, 35, tzinfo=UTC)  # 09:35 New York
+        self.feed_quotes()
+        self.assertEqual(self.attempt_payloads(), [])
+        self.assertIn(
+            "New York trading blackout",
+            self.leader.cell.handle_event(ClockTickEvent(self.now)).ready_reason,
+        )
+
+        self.now = datetime(2026, 3, 4, 15, 30, tzinfo=UTC)  # 10:30 New York
+        self.feed_quotes(sequence=3)
+        self.assertEqual(len(self.attempt_payloads()), 1)
+
+    def test_new_york_weekend_blocks_entry(self) -> None:
+        self.prime()
+        self.now = datetime(2026, 3, 7, 17, 0, tzinfo=UTC)  # Saturday noon New York
+        self.feed_quotes()
+        self.assertEqual(self.attempt_payloads(), [])
+        self.assertIn(
+            "New York weekend",
+            self.leader.cell.handle_event(ClockTickEvent(self.now)).ready_reason,
+        )
+
+    def test_new_york_weekend_closes_an_existing_pair(self) -> None:
+        self.run_entry()
+        self.now = datetime(2026, 3, 7, 17, 0, tzinfo=UTC)  # Saturday noon New York
+        self.follower.cell.handle_event(ClockTickEvent(self.now))
+        self.assertEqual(self.follower.mt5.positions, [])
+        self.assertNotEqual(self.leader.mt5.positions, [])
+        self.leader.cell.handle_event(ClockTickEvent(self.now))
+        self.net.pump()
+        self.assertEqual(self.leader.mt5.positions, [])
+        self.assertEqual(self.follower.mt5.positions, [])
+
+    def test_follower_rejects_an_attempt_delivered_during_blackout(self) -> None:
+        self.prime(
+            shared={
+                "trading_blackout_start_ny": "09:30",
+                "trading_blackout_end_ny": "10:30",
+            }
+        )
+        self.net.hold_kinds.add("attempt")
+        self.feed_quotes()
+        self.now = datetime(2026, 3, 4, 14, 35, tzinfo=UTC)  # 09:35 New York
+        self.follower.cell.handle_event(ClockTickEvent(self.now))
+        self.net.hold_kinds.discard("attempt")
+        self.net.release_held()
+        self.net.pump()
+        self.assertEqual(self.follower.entry_requests(), [])
+        self.assertIn(
+            "attempt_rejected",
+            [row["event"] for row in self.follower.cell.transition_history()],
+        )
 
     def test_integrity_divergence_contains(self) -> None:
         self.run_entry()
