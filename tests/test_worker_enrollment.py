@@ -70,6 +70,26 @@ class FakeKeyStore:
         self.closed = True
 
 
+class FakeKeyStoreProvider:
+    def __init__(self, key_store: FakeKeyStore) -> None:
+        self.key_store = key_store
+        self.enrolled: list[str] = []
+        self.opened: list[str] = []
+        self.created: list[str] = []
+
+    def enroll(self, name: str) -> FakeKeyStore:
+        self.enrolled.append(name)
+        return self.key_store
+
+    def open(self, name: str) -> FakeKeyStore:
+        self.opened.append(name)
+        return self.key_store
+
+    def create(self, name: str) -> FakeKeyStore:
+        self.created.append(name)
+        return self.key_store
+
+
 class FakeTransport:
     def __init__(self) -> None:
         self.controller_url: str | None = None
@@ -199,6 +219,84 @@ class WorkerEnrollmentTests(unittest.TestCase):
         self.assertEqual(password, transport.request["mt5_password"])
         self.assertTrue(key_store.closed)
         self.assertTrue(transport.closed)
+
+    def test_linux_cli_enrollment_uses_provider_enroll_without_platform_rejection(self) -> None:
+        key_store = FakeKeyStore()
+        provider = FakeKeyStoreProvider(key_store)
+        output = io.StringIO()
+        errors = io.StringIO()
+
+        with patch("abt.worker.cli.sys.platform", "linux"):
+            exit_code = main(
+                [
+                    "enroll",
+                    "--config",
+                    str(self.config_path),
+                    "--controller-url",
+                    "https://controller.example",
+                    "--login",
+                    "123456",
+                    "--server",
+                    "Broker-Demo",
+                    "--registration-invite",
+                    "worker-invite",
+                ],
+                mt5_factory=FakeMT5,
+                transport_factory=FakeTransport,
+                key_store_factory=provider,
+                password_prompt=lambda _: "memory-only",
+                output=output,
+                error_output=errors,
+            )
+
+        self.assertEqual(0, exit_code)
+        self.assertEqual(["abt-worker-device-key"], provider.enrolled)
+        self.assertEqual([], provider.opened)
+        self.assertEqual([], provider.created)
+        self.assertEqual("", errors.getvalue())
+
+    def test_linux_cli_uses_wine_mt5_adapter_by_default(self) -> None:
+        provider = FakeKeyStoreProvider(FakeKeyStore())
+        mt5 = FakeMT5()
+        wine_prefix = Path(self._config_directory.name) / "wine-prefix"
+
+        with (
+            patch("abt.worker.cli.sys.platform", "linux"),
+            patch("abt.worker.wine_mt5.WineMetaTrader5Adapter", return_value=mt5) as adapter,
+        ):
+            exit_code = main(
+                [
+                    "enroll",
+                    "--config",
+                    str(self.config_path),
+                    "--controller-url",
+                    "https://controller.example",
+                    "--login",
+                    "123456",
+                    "--server",
+                    "Broker-Demo",
+                    "--registration-invite",
+                    "worker-invite",
+                    "--wine-prefix",
+                    str(wine_prefix),
+                    "--windows-python",
+                    r"C:\\Python313\\python.exe",
+                    "--bridge-timeout-seconds",
+                    "20",
+                ],
+                transport_factory=FakeTransport,
+                key_store_factory=provider,
+                password_prompt=lambda _: "memory-only",
+                output=io.StringIO(),
+                error_output=io.StringIO(),
+            )
+
+        self.assertEqual(0, exit_code)
+        adapter.assert_called_once_with(
+            wine_prefix=wine_prefix,
+            windows_python=r"C:\\Python313\\python.exe",
+            timeout_seconds=20.0,
+        )
 
     def test_cli_uses_the_visible_input_prompt_for_the_mt5_password(self) -> None:
         prompts: list[str] = []
@@ -340,13 +438,13 @@ class WorkerEnrollmentTests(unittest.TestCase):
             _select_follower(followers, input_prompt=lambda _: "9", output=io.StringIO())
         )
 
-    def test_cli_fails_closed_outside_windows(self) -> None:
+    def test_cli_fails_closed_on_an_unsupported_platform(self) -> None:
         errors = io.StringIO()
-        with patch("abt.worker.cli.sys.platform", "linux"):
+        with patch("abt.worker.cli.sys.platform", "darwin"):
             exit_code = main(["enroll"], error_output=errors)
 
         self.assertEqual(1, exit_code)
-        self.assertIn("only supported on native Windows", errors.getvalue())
+        self.assertIn("unsupported on darwin", errors.getvalue())
 
     def test_cli_reconcile_stops_cleanly_on_keyboard_interrupt(self) -> None:
         errors = io.StringIO()

@@ -3,19 +3,62 @@ from __future__ import annotations
 import base64
 import ctypes
 import hashlib
+import os
 import sys
+from collections.abc import Callable
 from functools import lru_cache
-from typing import Protocol
+from pathlib import Path
+from typing import Protocol, TypeAlias, cast
 
 
 class HardwareKeyStore(Protocol):
-    """A non-exportable ECDSA P-256 device identity key."""
+    """A signing-only ECDSA P-256 device identity key."""
 
     def public_key_pem(self) -> str:
         """Return the public key that is safe to submit during enrollment."""
 
     def sign(self, payload: bytes) -> bytes:
         """Sign payload without exposing the device private key."""
+
+
+class HardwareKeyStoreProvider(Protocol):
+    """Distinguish enrollment, intentional creation, and fail-closed reopen."""
+
+    def enroll(self, name: str) -> HardwareKeyStore: ...
+
+    def create(self, name: str) -> HardwareKeyStore: ...
+
+    def open(self, name: str) -> HardwareKeyStore: ...
+
+
+KeyStoreFactory: TypeAlias = Callable[[str], HardwareKeyStore] | HardwareKeyStoreProvider
+
+
+def enroll_key_store(factory: KeyStoreFactory, name: str) -> HardwareKeyStore:
+    enroll = getattr(factory, "enroll", None)
+    if callable(enroll):
+        return cast(HardwareKeyStore, enroll(name))
+    if callable(factory):
+        return factory(name)
+    raise UnsupportedKeyStore("key-store provider cannot enroll identities")
+
+
+def create_key_store(factory: KeyStoreFactory, name: str) -> HardwareKeyStore:
+    create = getattr(factory, "create", None)
+    if callable(create):
+        return cast(HardwareKeyStore, create(name))
+    if callable(factory):
+        return factory(name)
+    raise UnsupportedKeyStore("key-store provider cannot create identities")
+
+
+def open_key_store(factory: KeyStoreFactory, name: str) -> HardwareKeyStore:
+    open_existing = getattr(factory, "open", None)
+    if callable(open_existing):
+        return cast(HardwareKeyStore, open_existing(name))
+    if callable(factory):
+        return factory(name)
+    raise UnsupportedKeyStore("key-store provider cannot open identities")
 
 
 class UnsupportedKeyStore(RuntimeError):
@@ -384,3 +427,50 @@ class WindowsCNGKeyStore:
             self.close()
         except Exception:
             pass
+
+
+class WindowsCNGKeyStoreProvider:
+    def enroll(self, name: str) -> WindowsCNGKeyStore:
+        return WindowsCNGKeyStore(name)
+
+    def create(self, name: str) -> WindowsCNGKeyStore:
+        return WindowsCNGKeyStore(name)
+
+    def open(self, name: str) -> WindowsCNGKeyStore:
+        return WindowsCNGKeyStore(name)
+
+
+def default_key_store_provider(
+    identity_path: Path,
+    *,
+    platform: str | None = None,
+    module_path: Path | None = None,
+) -> KeyStoreFactory:
+    selected_platform = sys.platform if platform is None else platform
+    if selected_platform == "win32":
+        return WindowsCNGKeyStoreProvider()
+    if selected_platform != "linux":
+        raise UnsupportedKeyStore(f"Worker device identity is unsupported on {selected_platform}.")
+
+    selected_module = module_path
+    if selected_module is None and "ABT_SOFTHSM2_MODULE" in os.environ:
+        env_module = Path(os.environ["ABT_SOFTHSM2_MODULE"])
+        if env_module.is_file():
+            selected_module = env_module
+    if selected_module is None:
+        candidates = (
+            Path.home() / ".local/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so",
+            Path.home() / ".local/usr/lib/softhsm/libsofthsm2.so",
+            Path("/usr/lib/softhsm/libsofthsm2.so"),
+            Path("/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so"),
+        )
+        selected_module = next((candidate for candidate in candidates if candidate.is_file()), None)
+    if selected_module is None or not selected_module.is_file():
+        raise UnsupportedKeyStore("SoftHSM2 PKCS#11 module is unavailable; install the softhsm2 runtime package.")
+
+    try:
+        from .pkcs11_keystore import LinuxPKCS11KeyStoreFactory
+    except ImportError as error:
+        raise UnsupportedKeyStore("The python-pkcs11 dependency is unavailable.") from error
+    root = identity_path.with_name(f"{identity_path.stem}.keys")
+    return cast(KeyStoreFactory, LinuxPKCS11KeyStoreFactory(root, module_path=selected_module))

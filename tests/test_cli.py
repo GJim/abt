@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 import tempfile
 import unittest
 from argparse import Namespace
@@ -42,6 +43,11 @@ from abt.mt5.config import (
 )
 from abt.mt5.session import SessionError
 from abt.mt5.output import render
+
+
+def setUpModule() -> None:
+    if sys.platform != "win32":
+        raise unittest.SkipTest("MT5 CLI tests require Windows")
 
 
 class ConfigTests(unittest.TestCase):

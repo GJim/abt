@@ -39,6 +39,23 @@ class FakeKeyStore:
         pass
 
 
+class FakeKeyStoreProvider:
+    def __init__(self) -> None:
+        self.keys: dict[str, FakeKeyStore] = {}
+        self.created: list[str] = []
+        self.opened: list[str] = []
+
+    def create(self, name: str) -> FakeKeyStore:
+        self.created.append(name)
+        key = FakeKeyStore(name)
+        self.keys[name] = key
+        return key
+
+    def open(self, name: str) -> FakeKeyStore:
+        self.opened.append(name)
+        return self.keys.setdefault(name, FakeKeyStore(name))
+
+
 class FakeRotationTransport:
     def __init__(self) -> None:
         self.rotate_result: dict[str, object] = {"worker_id": "worker-123", "certificate": "replacement"}
@@ -54,6 +71,57 @@ class FakeRotationTransport:
 
 
 class WorkerCertificateRotationTests(unittest.TestCase):
+    def test_rotation_creates_replacement_through_provider_create(self) -> None:
+        now = datetime(2026, 8, 20, tzinfo=UTC)
+        with TemporaryDirectory() as directory:
+            identity_path = Path(directory) / "worker.json"
+            save_identity(identity_path, self._identity(), replace=False)
+            provider = FakeKeyStoreProvider()
+
+            with self.assertRaises(WorkerCertificateRotated):
+                maintain_worker_certificate(
+                    identity_path=identity_path,
+                    identity=self._identity(),
+                    worker_id="worker-123",
+                    certificate=self._certificate(now - timedelta(days=16), now + timedelta(days=14)),
+                    current_key=FakeKeyStore("old-key"),
+                    key_store_factory=provider,
+                    transport=FakeRotationTransport(),
+                    now=lambda: now,
+                    error_output=io.StringIO(),
+                )
+
+            self.assertEqual(1, len(provider.created))
+            self.assertTrue(provider.created[0].startswith("old-key-rotation-"))
+            self.assertEqual([], provider.opened)
+
+    def test_retired_cleanup_opens_existing_key_without_creating(self) -> None:
+        now = datetime(2026, 8, 20, tzinfo=UTC)
+        with TemporaryDirectory() as directory:
+            identity_path = Path(directory) / "worker.json"
+            save_identity(identity_path, self._identity(key_name="new-key"), replace=False)
+            state_path = Path(directory) / "worker.state.json"
+            state_path.write_text(
+                json.dumps({"version": 1, "retired_keys": [{"key_name": "old-key", "eligible_at": (now - timedelta(hours=1)).isoformat()}]}),
+                encoding="utf-8",
+            )
+            provider = FakeKeyStoreProvider()
+
+            maintain_worker_certificate(
+                identity_path=identity_path,
+                identity=self._identity(key_name="new-key"),
+                worker_id="worker-123",
+                certificate=self._certificate(now - timedelta(days=1), now + timedelta(days=29)),
+                current_key=FakeKeyStore("new-key"),
+                key_store_factory=provider,
+                transport=FakeRotationTransport(),
+                now=lambda: now,
+                error_output=io.StringIO(),
+            )
+
+            self.assertEqual(["old-key"], provider.opened)
+            self.assertEqual([], provider.created)
+
     def test_rotates_past_half_life_and_persists_cleanup_only_after_identity_switch(self) -> None:
         now = datetime(2026, 8, 20, tzinfo=UTC)
         with TemporaryDirectory() as directory:
@@ -174,7 +242,7 @@ class WorkerCertificateRotationTests(unittest.TestCase):
             )
 
             self.assertEqual("new-key", load_identity(identity_path).key_name)
-            self.assertIn("retired CNG key cleanup failed", errors.getvalue())
+            self.assertIn("retired device-key cleanup failed", errors.getvalue())
             retained = json.loads(state_path.read_text(encoding="utf-8"))["retired_keys"][0]
             self.assertEqual((now + timedelta(days=1)).isoformat(), retained["retry_at"])
 

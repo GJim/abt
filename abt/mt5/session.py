@@ -4,7 +4,10 @@ from contextlib import contextmanager
 from typing import Iterator
 
 import keyring
-import MetaTrader5 as mt5
+try:
+    import MetaTrader5 as mt5
+except ImportError:  # pragma: no cover - Windows-only dependency
+    mt5 = None  # type: ignore[assignment]
 
 from .config import Context
 

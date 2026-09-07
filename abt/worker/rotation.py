@@ -14,7 +14,7 @@ from abt.controlplane.crypto import worker_rotation_payload
 
 from .enrollment import WorkerEnrollmentError
 from .identity import WorkerIdentity, save_identity
-from .keystore import HardwareKeyStore
+from .keystore import HardwareKeyStore, KeyStoreFactory, create_key_store, open_key_store
 
 
 _HALF_LIFE = timedelta(days=15)
@@ -66,7 +66,7 @@ def maintain_worker_certificate(
     worker_id: str,
     certificate: str,
     current_key: HardwareKeyStore,
-    key_store_factory: Callable[[str], HardwareKeyStore],
+    key_store_factory: KeyStoreFactory,
     transport: WorkerRotationTransport,
     now: Callable[[], datetime],
     error_output: TextIO,
@@ -88,7 +88,7 @@ def maintain_worker_certificate(
     replacement_key: HardwareKeyStore | None = None
     became_current = False
     try:
-        replacement_key = key_store_factory(replacement_name)
+        replacement_key = create_key_store(key_store_factory, replacement_name)
         replacement_public_key = replacement_key.public_key_pem()
         challenge = transport.rotation_challenge(identity.controller_url, worker_id, replacement_public_key)
         nonce = _required(challenge, "nonce")
@@ -151,7 +151,7 @@ def _certificate_lifetime(certificate: str) -> tuple[datetime, datetime]:
 def _clean_retired_keys(
     state_path: Path,
     active_key_name: str,
-    key_store_factory: Callable[[str], HardwareKeyStore],
+    key_store_factory: KeyStoreFactory,
     observed_at: datetime,
     error_output: TextIO,
 ) -> None:
@@ -165,7 +165,7 @@ def _clean_retired_keys(
         if key_name == active_key_name or observed_at < eligible_at or observed_at < retry_at:
             retained.append(retired)
             continue
-        key = key_store_factory(key_name)
+        key = open_key_store(key_store_factory, key_name)
         try:
             _delete_key(key)
         except Exception:
@@ -173,7 +173,7 @@ def _clean_retired_keys(
                 {"key_name": key_name, "eligible_at": eligible_at.isoformat(), "retry_at": (observed_at + _RETRY_DELAY).isoformat()}
             )
             changed = True
-            print(f"Worker retired CNG key cleanup failed for {key_name}; retrying in 24 hours.", file=error_output)
+            print(f"Worker retired device-key cleanup failed for {key_name}; retrying in 24 hours.", file=error_output)
         else:
             changed = True
         finally:
@@ -303,7 +303,7 @@ def _required(response: Mapping[str, object], field: str) -> str:
 def _signature(key: HardwareKeyStore, payload: bytes) -> str:
     signature = key.sign(payload)
     if not isinstance(signature, bytes):
-        raise WorkerRotationError("The Windows CNG key returned an invalid signature.")
+        raise WorkerRotationError("The device key returned an invalid signature.")
     return base64.b64encode(signature).decode("ascii")
 
 

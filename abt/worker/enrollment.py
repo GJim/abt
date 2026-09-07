@@ -111,10 +111,10 @@ def register_worker(
         )
         signature = key_store.sign(signed_payload)
         if not isinstance(signature, bytes):
-            raise WorkerEnrollmentError("The Windows CNG key returned an invalid signature.")
+            raise WorkerEnrollmentError("The device key returned an invalid signature.")
         public_key_pem = key_store.public_key_pem()
         if not isinstance(public_key_pem, str) or not public_key_pem:
-            raise WorkerEnrollmentError("The Windows CNG key returned an invalid public key.")
+            raise WorkerEnrollmentError("The device key returned an invalid public key.")
 
         request = {
             "registration_invite": registration_invite,

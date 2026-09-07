@@ -20,7 +20,13 @@ from .identity import (
     pending_identity_path,
     save_identity,
 )
-from .keystore import HardwareKeyStore, WindowsCNGKeyStore
+from .keystore import (
+    HardwareKeyStore,
+    KeyStoreFactory,
+    default_key_store_provider,
+    enroll_key_store,
+    open_key_store,
+)
 from .pair_cell_adapter import PairCellRuntime, PairCellStartupOptions
 from .reconciliation import reconnect_worker_session
 from .rotation import (
@@ -192,6 +198,12 @@ class MetaTrader5Adapter:
     def order_send(self, request: dict[str, object]) -> object:
         return self._mt5.order_send(request)
 
+    def history_deals_get(self, *args: object, **kwargs: object) -> object:
+        history = getattr(self._mt5, "history_deals_get", None)
+        if callable(history):
+            return history(*args, **kwargs)
+        return []
+
     def last_error(self) -> object:
         return self._mt5.last_error()
 
@@ -203,25 +215,28 @@ class MetaTrader5Adapter:
     def shutdown(self) -> None:
         self._mt5.shutdown()
 
+    def close(self) -> None:
+        self.shutdown()
+
 
 def main(
     argv: list[str] | None = None,
     *,
-    mt5_factory: Callable[[], MT5Client] = MetaTrader5Adapter,
+    mt5_factory: Callable[[], MT5Client] | None = None,
     transport_factory: Callable[[], EnrollmentTransport] = HTTPEnrollmentTransport,
-    key_store_factory: Callable[[str], HardwareKeyStore] = WindowsCNGKeyStore,
+    key_store_factory: KeyStoreFactory | None = None,
     password_prompt: Callable[[str], str] | None = None,
     input_prompt: Callable[[str], str] = input,
     output: TextIO | None = None,
     error_output: TextIO | None = None,
     interactive: bool | None = None,
 ) -> int:
-    """Run the native Windows worker registration command."""
+    """Run the native Worker registration command."""
 
     output = output or sys.stdout
     error_output = error_output or sys.stderr
-    if sys.platform != "win32":
-        print("abt-worker is only supported on native Windows.", file=error_output)
+    if sys.platform not in {"win32", "linux"}:
+        print(f"abt-worker is unsupported on {sys.platform}.", file=error_output)
         return 1
 
     parser = _parser()
@@ -253,6 +268,7 @@ def main(
         logging.getLogger("abt").setLevel(logging.DEBUG)
     cleanup_errors: list[Exception] = []
     try:
+        provider = key_store_factory or default_key_store_provider(arguments.config)
         if arguments.command == "reconcile":
             identity = load_identity(arguments.config)
             transport = transport_factory()
@@ -287,8 +303,23 @@ def main(
             registration_invite = _required_prompted(
                 arguments.registration_invite, "Registration invite: ", input_prompt
             )
-        mt5 = mt5_factory()
-        key_store = key_store_factory(identity.key_name)
+        if mt5_factory is not None:
+            mt5 = mt5_factory()
+        elif sys.platform == "linux":
+            from .wine_mt5 import WineMetaTrader5Adapter
+
+            mt5 = WineMetaTrader5Adapter(
+                wine_prefix=getattr(arguments, "wine_prefix", Path.home() / ".mt5"),
+                windows_python=getattr(arguments, "windows_python", r"C:\abt-python313\python.exe"),
+                timeout_seconds=float(getattr(arguments, "bridge_timeout_seconds", 15.0)),
+            )
+        else:
+            mt5 = MetaTrader5Adapter()
+        key_store = (
+            open_key_store(provider, identity.key_name)
+            if arguments.command == "reconcile"
+            else enroll_key_store(provider, identity.key_name)
+        )
         try:
             if arguments.command == "reconcile":
                 _reconcile_with_certificate_maintenance(
@@ -296,7 +327,7 @@ def main(
                     identity=identity,
                     mt5=mt5,
                     key_store=key_store,
-                    key_store_factory=key_store_factory,
+                    key_store_factory=provider,
                     transport_factory=transport_factory,
                     error_output=error_output,
                     pair_cell_config_path=getattr(arguments, "pair_cell_config", None),
@@ -330,6 +361,7 @@ def main(
             finally:
                 _close_safely(transport, cleanup_errors)
         finally:
+            _close_safely(mt5, cleanup_errors)
             _close_safely(key_store, cleanup_errors)
     except KeyboardInterrupt:
         print("Worker reconciliation stopped.", file=error_output)
@@ -359,7 +391,7 @@ def _reconcile_with_certificate_maintenance(
     identity: WorkerIdentity,
     mt5: MT5Client,
     key_store: HardwareKeyStore,
-    key_store_factory: Callable[[str], HardwareKeyStore],
+    key_store_factory: KeyStoreFactory,
     transport_factory: Callable[[], EnrollmentTransport],
     error_output: TextIO,
     pair_cell_config_path: Path | None = None,
@@ -433,7 +465,7 @@ def _reconcile_with_certificate_maintenance(
             except WorkerCertificateRotated:
                 _close(current_key)
                 current_identity = load_identity(identity_path)
-                current_key = key_store_factory(current_identity.key_name)
+                current_key = open_key_store(key_store_factory, current_identity.key_name)
             finally:
                 if "effect_journal" in locals():
                     effect_journal.close()
@@ -445,7 +477,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="abt-worker")
     parser.add_argument("-v", "--verbose", action="store_true", help="show safe failure diagnostics")
     commands = parser.add_subparsers(dest="command")
-    enroll = commands.add_parser("enroll", help="enroll this Windows MT5 worker")
+    enroll = commands.add_parser("enroll", help="enroll this MT5 worker")
     enroll.add_argument("-v", "--verbose", action="store_true", default=argparse.SUPPRESS, help="show safe failure diagnostics")
     enroll.add_argument("--config", type=Path, default=default_identity_path(), help="worker identity configuration path")
     enroll.add_argument(
@@ -457,8 +489,11 @@ def _parser() -> argparse.ArgumentParser:
     enroll.add_argument("--registration-invite", help="one-time worker enrollment invite")
     enroll.add_argument(
         "--key-name",
-        help="persistent Windows CNG key name",
+        help="persistent device-key name",
     )
+    enroll.add_argument("--wine-prefix", type=Path, default=Path.home() / ".mt5", help="Wine prefix directory")
+    enroll.add_argument("--windows-python", default=r"C:\abt-python313\python.exe", help="Windows python path in Wine")
+    enroll.add_argument("--bridge-timeout-seconds", type=float, default=15.0, help="Wine bridge request timeout")
     reconcile = commands.add_parser("reconcile", help="run read-only MT5 reconciliation for an approved worker")
     reconcile.add_argument(
         "-v", "--verbose", action="store_true", default=argparse.SUPPRESS, help="show safe failure diagnostics"
@@ -505,6 +540,9 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="request an explicit rediscovery on this Worker's current route",
     )
+    reconcile.add_argument("--wine-prefix", type=Path, default=Path.home() / ".mt5", help="Wine prefix directory")
+    reconcile.add_argument("--windows-python", default=r"C:\abt-python313\python.exe", help="Windows python path in Wine")
+    reconcile.add_argument("--bridge-timeout-seconds", type=float, default=15.0, help="Wine bridge request timeout")
     return parser
 
 

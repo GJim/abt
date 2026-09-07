@@ -1,0 +1,13 @@
+Source: abt-worker
+Section: utils
+Priority: optional
+Maintainer: GJim <andyzero75@gmail.com>
+Build-Depends: debhelper-compat (= 13), python3, python3-setuptools
+Standards-Version: 4.6.2
+
+Package: abt-worker
+Architecture: amd64
+Depends: ${shlibs:Depends}, ${misc:Depends}, python3 (>= 3.13), libsofthsm2 (>= 2.6.1)
+Description: Native Linux MT5 account worker with PKCS#11 identity
+ Runs abt-worker natively on Linux x86_64 using SoftHSM2 PKCS#11 device
+ identity and Wine MT5 bridge execution.

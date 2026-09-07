@@ -76,7 +76,7 @@ def _send_proof(
     nonce = _required_text(challenge, "nonce")
     signature = key_store.sign(worker_proof_payload(purpose=purpose, worker_id=worker_id, nonce=nonce))
     if not isinstance(signature, bytes):
-        raise WorkerEnrollmentError("The Windows CNG key returned an invalid signature.")
+        raise WorkerEnrollmentError("The device key returned an invalid signature.")
     _send(socket, {"signature": b64encode(signature).decode("ascii")})
 
 
