@@ -2391,6 +2391,99 @@ class LossPolicyTests(PairCellTestCase):
         # 2% of 10000 is 200; the hard cap of 40 wins before any order is sent.
         self.assertEqual(limits.leg_loss_cap_usd, Decimal("40"))
 
+    def test_sl_only_protection_caps_loss_without_a_take_profit_cap(self) -> None:
+        from abt.pair_cell import NO_TAKE_PROFIT, SizingPlan, compute_sl_only
+
+        plan = SizingPlan(
+            universe_generation=1,
+            product_id="EURUSD:x",
+            symbol=SYMBOL,
+            direction="LONG",
+            margin_per_lot="1000",
+            local_max_lots="5",
+            canonical_point="0.00001",
+            point="0.00001",
+            tick_size="0.00001",
+            profit_tick_value="1",
+            loss_tick_value="1",
+            volume_min="0.01",
+            volume_step="0.01",
+            volume_max="50",
+            filling_mode="FOK",
+            minimum_stop_distance="0",
+            usd_per_point_per_lot="1",
+        )
+        # 150 USD over 2 lots at 1 USD/tick is 75 ticks of 0.00001.
+        result = compute_sl_only(
+            entry=Decimal("1.10010"),
+            direction="LONG",
+            volume=Decimal("2"),
+            plan=plan,
+            allowed_loss_usd=Decimal("150"),
+        )
+        assert result is not None
+        self.assertEqual(Decimal(result[0]), Decimal("1.09935"))
+        self.assertEqual(result[1], NO_TAKE_PROFIT)
+
+    def test_trailing_stop_only_advances_favorably_within_the_loss_cap(self) -> None:
+        from abt.pair_cell import SizingPlan, compute_trailing_sl
+
+        plan = SizingPlan(
+            universe_generation=1,
+            product_id="EURUSD:x",
+            symbol=SYMBOL,
+            direction="LONG",
+            margin_per_lot="1000",
+            local_max_lots="5",
+            canonical_point="0.00001",
+            point="0.00001",
+            tick_size="0.00001",
+            profit_tick_value="1",
+            loss_tick_value="1",
+            volume_min="0.01",
+            volume_step="0.01",
+            volume_max="50",
+            filling_mode="FOK",
+            minimum_stop_distance="0",
+            usd_per_point_per_lot="1",
+        )
+        # Profitable: the stop follows one risk distance (75 ticks) behind.
+        advanced = compute_trailing_sl(
+            direction="LONG",
+            fill_price=Decimal("1.10030"),
+            initial_sl=Decimal("1.09955"),
+            current_price=Decimal("1.10130"),
+            plan=plan,
+            volume=Decimal("2"),
+            allowed_loss_usd=Decimal("150"),
+        )
+        self.assertEqual(None if advanced is None else Decimal(advanced), Decimal("1.10055"))
+        # Adverse or flat markets never move the stop.
+        self.assertIsNone(
+            compute_trailing_sl(
+                direction="LONG",
+                fill_price=Decimal("1.10030"),
+                initial_sl=Decimal("1.09955"),
+                current_price=Decimal("1.10020"),
+                plan=plan,
+                volume=Decimal("2"),
+                allowed_loss_usd=Decimal("150"),
+            )
+        )
+        # SHORT mirrors: advance downward only when profitable.
+        short_advanced = compute_trailing_sl(
+            direction="SHORT",
+            fill_price=Decimal("1.10045"),
+            initial_sl=Decimal("1.10120"),
+            current_price=Decimal("1.09960"),
+            plan=plan,
+            volume=Decimal("2"),
+            allowed_loss_usd=Decimal("150"),
+        )
+        self.assertEqual(
+            None if short_advanced is None else Decimal(short_advanced), Decimal("1.10035")
+        )
+
     def test_rough_protection_targets_the_computed_allowance_not_a_constant(self) -> None:
         self.prime()
         self.follower.cell.handle_event(
@@ -2706,18 +2799,28 @@ class ImmediateEntryTests(PairCellTestCase):
         self.assertEqual(Decimal(attempt.leader_rough_sl), Decimal("1.10010") - Decimal("0.00075"))
         self.assertEqual(Decimal(attempt.leader_rough_tp), Decimal("1.10010") + Decimal("0.00075"))
 
-    def test_no_common_protection_boundary_keeps_verified_rough_protection(self) -> None:
+    def test_asymmetric_protection_applies_sl_only_without_a_common_boundary(self) -> None:
+        # The default fixture fills (leader 1.10010, follower 1.10040) admit no
+        # inward common boundary, which used to keep verified rough fallback.
+        # The asymmetric profit-max model needs no common boundary: each leg
+        # is protected independently with an SL-only stop at its allowed loss
+        # and no take-profit cap.
         self.run_entry()
         self.assertEqual(self.leader.cell.handle_event(ClockTickEvent(self.now)).state, "ACTIVE")
         self.assertEqual(self.follower.cell.handle_event(ClockTickEvent(self.now)).state, "ACTIVE")
-        self.assertEqual(self.leader.modify_requests(), [])
-        self.assertEqual(self.follower.modify_requests(), [])
-        self.assertIn(
+        leader_modify = self.leader.modify_requests()[-1]
+        follower_modify = self.follower.modify_requests()[-1]
+        # 150 USD over 2 lots at 1 USD/tick is 75 ticks; 80 USD is 40 ticks.
+        self.assertEqual(Decimal(str(leader_modify["sl"])), Decimal("1.09935"))
+        self.assertEqual(str(leader_modify["tp"]), "0")
+        self.assertEqual(Decimal(str(follower_modify["sl"])), Decimal("1.10080"))
+        self.assertEqual(str(follower_modify["tp"]), "0")
+        self.assertNotIn(
             "protection_rough_fallback",
             [row["event"] for row in self.leader.cell.transition_history()],
         )
 
-    def test_initial_shared_protection_recomputes_each_leg_from_actual_fill(self) -> None:
+    def test_asymmetric_protection_recomputes_each_leg_sl_from_actual_fill(self) -> None:
         self.leader.mt5.fill_price = 1.10010
         self.follower.mt5.fill_price = 1.10035
         self.prime()
@@ -2727,16 +2830,16 @@ class ImmediateEntryTests(PairCellTestCase):
         self.assertEqual(self.follower.cell.handle_event(ClockTickEvent(self.now)).state, "ACTIVE")
         leader_modify = self.leader.modify_requests()[-1]
         follower_modify = self.follower.modify_requests()[-1]
-        self.assertEqual(Decimal(str(leader_modify["sl"])), Decimal("1.10000"))
-        self.assertEqual(Decimal(str(leader_modify["tp"])), Decimal("1.10075"))
+        self.assertEqual(Decimal(str(leader_modify["sl"])), Decimal("1.09935"))
+        self.assertEqual(str(leader_modify["tp"]), "0")
         self.assertEqual(Decimal(str(follower_modify["sl"])), Decimal("1.10075"))
-        self.assertEqual(Decimal(str(follower_modify["tp"])), Decimal("1.10000"))
+        self.assertEqual(str(follower_modify["tp"]), "0")
         self.assertNotIn(
             "protection_rough_fallback",
             [row["event"] for row in self.leader.cell.transition_history()],
         )
 
-    def test_initial_shared_protection_maps_a_short_leader_to_shared_boundaries(self) -> None:
+    def test_asymmetric_protection_maps_a_short_leader_to_sl_only_boundaries(self) -> None:
         self.leader.mt5.fill_price = 1.10045
         self.follower.mt5.fill_price = 1.10010
         self.prime()
@@ -2751,25 +2854,25 @@ class ImmediateEntryTests(PairCellTestCase):
         self.assertEqual(self.follower.cell.handle_event(ClockTickEvent(self.now)).state, "ACTIVE")
         leader_modify = self.leader.modify_requests()[-1]
         follower_modify = self.follower.modify_requests()[-1]
-        self.assertEqual(Decimal(str(leader_modify["sl"])), Decimal("1.10050"))
-        self.assertEqual(Decimal(str(leader_modify["tp"])), Decimal("1.09975"))
-        self.assertEqual(Decimal(str(follower_modify["sl"])), Decimal("1.09975"))
-        self.assertEqual(Decimal(str(follower_modify["tp"])), Decimal("1.10050"))
+        self.assertEqual(Decimal(str(leader_modify["sl"])), Decimal("1.10120"))
+        self.assertEqual(str(leader_modify["tp"]), "0")
+        self.assertEqual(Decimal(str(follower_modify["sl"])), Decimal("1.09970"))
+        self.assertEqual(str(follower_modify["tp"]), "0")
         self.assertNotIn(
             "protection_rough_fallback",
             [row["event"] for row in self.leader.cell.transition_history()],
         )
 
+        # No shared-grid contraction exists anymore: without a favorable move
+        # the leader trails nothing and the follower hedge leg stays static.
+        leader_count = len(self.leader.modify_requests())
+        follower_count = len(self.follower.modify_requests())
         self.tick(seconds=300)
 
-        leader_contraction = self.leader.modify_requests()[-1]
-        follower_contraction = self.follower.modify_requests()[-1]
-        self.assertEqual(Decimal(str(leader_contraction["sl"])), Decimal("1.10046"))
-        self.assertEqual(Decimal(str(leader_contraction["tp"])), Decimal("1.09982"))
-        self.assertEqual(Decimal(str(follower_contraction["sl"])), Decimal("1.09982"))
-        self.assertEqual(Decimal(str(follower_contraction["tp"])), Decimal("1.10046"))
+        self.assertEqual(len(self.leader.modify_requests()), leader_count)
+        self.assertEqual(len(self.follower.modify_requests()), follower_count)
 
-    def test_both_legs_apply_a_common_inward_protection_boundary(self) -> None:
+    def test_both_legs_apply_asymmetric_sl_only_protection(self) -> None:
         self.leader.mt5.fill_price = 1.10030
         self.follower.mt5.fill_price = 1.10050
 
@@ -2779,24 +2882,59 @@ class ImmediateEntryTests(PairCellTestCase):
         self.assertEqual(self.follower.cell.handle_event(ClockTickEvent(self.now)).state, "ACTIVE")
         leader_modify = self.leader.modify_requests()[-1]
         follower_modify = self.follower.modify_requests()[-1]
-        self.assertEqual(Decimal(str(leader_modify["sl"])), Decimal("1.10010"))
-        self.assertEqual(Decimal(str(leader_modify["tp"])), Decimal("1.10085"))
-        self.assertEqual(Decimal(str(follower_modify["sl"])), Decimal("1.10085"))
-        self.assertEqual(Decimal(str(follower_modify["tp"])), Decimal("1.10010"))
+        self.assertEqual(Decimal(str(leader_modify["sl"])), Decimal("1.09955"))
+        self.assertEqual(str(leader_modify["tp"]), "0")
+        self.assertEqual(Decimal(str(follower_modify["sl"])), Decimal("1.10090"))
+        self.assertEqual(str(follower_modify["tp"]), "0")
 
-    def test_common_protection_contracts_inward_after_five_minutes(self) -> None:
+    def test_leader_profit_trail_advances_after_sixty_seconds(self) -> None:
         self.leader.mt5.fill_price = 1.10030
         self.follower.mt5.fill_price = 1.10050
         self.run_entry()
+        self.assertEqual(len(self.leader.modify_requests()), 1)
+        self.assertEqual(len(self.follower.modify_requests()), 1)
 
-        self.tick(seconds=300)
+        # The market runs in the leader LONG direction: the profit leg trails
+        # its stop one full initial risk distance (75 ticks) behind the bid,
+        # while the follower hedge leg never re-applies its static stop.
+        self.feed_quotes(
+            leader_bid="1.10130",
+            leader_ask="1.10140",
+            follower_bid="1.10050",
+            follower_ask="1.10060",
+            sequence=3,
+        )
+        self.tick(seconds=60)
 
         leader_modify = self.leader.modify_requests()[-1]
-        follower_modify = self.follower.modify_requests()[-1]
-        self.assertEqual(Decimal(str(leader_modify["sl"])), Decimal("1.10014"))
-        self.assertEqual(Decimal(str(leader_modify["tp"])), Decimal("1.10079"))
-        self.assertEqual(Decimal(str(follower_modify["sl"])), Decimal("1.10079"))
-        self.assertEqual(Decimal(str(follower_modify["tp"])), Decimal("1.10014"))
+        self.assertEqual(Decimal(str(leader_modify["sl"])), Decimal("1.10055"))
+        self.assertEqual(str(leader_modify["tp"]), "0")
+        self.assertEqual(len(self.follower.modify_requests()), 1)
+        self.assertIn(
+            "profit_trail_applied",
+            [row["event"] for row in self.leader.cell.transition_history()],
+        )
+
+    def test_leader_continues_solo_after_the_follower_hedge_leg_stops_out(self) -> None:
+        self.run_entry()
+        self.assertEqual(self.leader.cell.handle_event(ClockTickEvent(self.now)).state, "ACTIVE")
+
+        # The capped follower leg stops out first while the leader profit leg
+        # is still holding: the leader keeps running solo under its trailing
+        # stop instead of being contained with the loser.
+        self.follower.mt5.positions = []
+        self.follower.cell.handle_event(
+            BrokerSnapshotEvent(orders=[], positions=[], observed_at=self.now)
+        )
+        self.net.pump()
+
+        result = self.leader.cell.handle_event(ClockTickEvent(self.now))
+        self.assertEqual(result.state, "ACTIVE")
+        self.assertEqual(self.leader.close_requests(), [])
+        self.assertIn(
+            "peer_leg_empty_leader_continues_solo",
+            [row["event"] for row in self.leader.cell.transition_history()],
+        )
 
     def test_peer_protection_rejection_rolls_back_the_accepted_leg_to_rough(self) -> None:
         self.leader.mt5.fill_price = 1.10030
@@ -2860,7 +2998,7 @@ class ImmediateEntryTests(PairCellTestCase):
             self.leader.cell.handle_event(ClockTickEvent(self.now)).state, "EMPTY"
         )
 
-    def test_shared_protection_is_not_evaluated_before_pair_confirmation(self) -> None:
+    def test_asymmetric_protection_is_not_evaluated_before_pair_confirmation(self) -> None:
         self.prime()
         self.net.hold_kinds.add("leg_status")
         self.feed_quotes()
@@ -2872,7 +3010,11 @@ class ImmediateEntryTests(PairCellTestCase):
         self.net.release_held()
         self.net.pump()
         self.assertTrue(self.leader.cell.handle_event(ClockTickEvent(self.now)).pair_confirmed)
-        self.assertEqual(self.leader.modify_requests(), [])
+        # Confirmation carries the first SL-only precise revision: a capped
+        # stop with the take-profit cap removed.
+        leader_modify = self.leader.modify_requests()[-1]
+        self.assertEqual(Decimal(str(leader_modify["sl"])), Decimal("1.09935"))
+        self.assertEqual(str(leader_modify["tp"]), "0")
         self.assertEqual(len(self.net.payloads("pair_entry_confirmed", LEADER)), 1)
 
     def test_identical_precise_protection_does_not_trigger_containment(self) -> None:
@@ -3284,91 +3426,95 @@ class EntryResultTests(PairCellTestCase):
 
 
 class RecoveryTests(PairCellTestCase):
+    # NOTE: the leader profit leg no longer contains when the capped follower
+    # hedge leg empties -- it keeps running solo under its trailing stop.  The
+    # containment-recheck paths below are therefore exercised from the follower
+    # side, which still converges when the leader leg empties.
     def test_rejected_containment_cancel_rechecks_broker_before_stopping(self) -> None:
         self.run_entry()
-        self.leader.mt5.orders.append({"ticket": 123, "symbol": SYMBOL})
-        self.leader.mt5.reject_next_cancel_retcode = _REJECTED
-        self.leader.mt5.remove_order_on_rejected_cancel = True
+        self.follower.mt5.orders.append({"ticket": 123, "symbol": SYMBOL})
+        self.follower.mt5.reject_next_cancel_retcode = _REJECTED
+        self.follower.mt5.remove_order_on_rejected_cancel = True
 
-        self.follower.mt5.positions = []
-        self.follower.cell.handle_event(
+        self.leader.mt5.positions = []
+        self.leader.cell.handle_event(
             BrokerSnapshotEvent(orders=[], positions=[], observed_at=self.now)
         )
         self.net.pump()
 
-        result = self.leader.cell.handle_event(ClockTickEvent(self.now))
+        result = self.follower.cell.handle_event(ClockTickEvent(self.now))
 
         self.assertFalse(result.needs_human)
         self.assertEqual(result.state, "EMPTY")
-        self.assertEqual(self.leader.mt5.orders, [])
-        self.assertEqual(self.leader.mt5.positions, [])
+        self.assertEqual(self.follower.mt5.orders, [])
+        self.assertEqual(self.follower.mt5.positions, [])
         self.assertEqual(
-            [request["type"] for request in self.leader.mt5.requests[-2:]],
+            [request["type"] for request in self.follower.mt5.requests[-2:]],
             ["cancel", "close"],
         )
 
     def test_rejected_containment_close_rechecks_broker_before_stopping(self) -> None:
         self.run_entry()
-        self.leader.mt5.reject_next_close_retcode = _REJECTED
-        self.leader.mt5.remove_position_on_rejected_close = True
+        self.follower.mt5.reject_next_close_retcode = _REJECTED
+        self.follower.mt5.remove_position_on_rejected_close = True
 
-        self.follower.mt5.positions = []
-        self.follower.cell.handle_event(
+        self.leader.mt5.positions = []
+        self.leader.cell.handle_event(
             BrokerSnapshotEvent(orders=[], positions=[], observed_at=self.now)
         )
         self.net.pump()
 
-        result = self.leader.cell.handle_event(ClockTickEvent(self.now))
+        result = self.follower.cell.handle_event(ClockTickEvent(self.now))
 
         self.assertFalse(result.needs_human)
         self.assertEqual(result.state, "EMPTY")
-        self.assertEqual(self.leader.mt5.positions, [])
-        self.assertEqual(self.leader.close_requests()[-1]["type"], "close")
+        self.assertEqual(self.follower.mt5.positions, [])
+        self.assertEqual(self.follower.close_requests()[-1]["type"], "close")
 
     def test_rejected_containment_cancel_stops_when_next_snapshot_keeps_the_order(self) -> None:
         self.run_entry()
-        self.leader.mt5.orders.append({"ticket": 123, "symbol": SYMBOL})
-        self.leader.mt5.reject_next_cancel_retcode = _REJECTED
+        self.follower.mt5.orders.append({"ticket": 123, "symbol": SYMBOL})
+        self.follower.mt5.reject_next_cancel_retcode = _REJECTED
 
-        self.follower.mt5.positions = []
-        self.follower.cell.handle_event(
+        self.leader.mt5.positions = []
+        self.leader.cell.handle_event(
             BrokerSnapshotEvent(orders=[], positions=[], observed_at=self.now)
         )
         self.net.pump()
 
-        result = self.leader.cell.handle_event(ClockTickEvent(self.now))
+        result = self.follower.cell.handle_event(ClockTickEvent(self.now))
 
         self.assertTrue(result.needs_human)
         self.assertIn("non-success replay evidence", str(result.needs_human_reason))
         self.assertEqual(
-            [request["type"] for request in self.leader.mt5.requests[-1:]],
+            [request["type"] for request in self.follower.mt5.requests[-1:]],
             ["cancel"],
         )
 
     def test_restart_rechecks_a_rejected_containment_cancel_before_stopping(self) -> None:
         self.run_entry()
-        self.leader.mt5.orders.append({"ticket": 123, "symbol": SYMBOL})
-        self.leader.mt5.reject_next_cancel_retcode = _REJECTED
-        self.leader.mt5.remove_order_on_rejected_cancel = True
+        self.follower.mt5.orders.append({"ticket": 123, "symbol": SYMBOL})
+        self.follower.mt5.reject_next_cancel_retcode = _REJECTED
+        self.follower.mt5.remove_order_on_rejected_cancel = True
 
-        self.follower.mt5.positions = []
-        self.follower.cell.handle_event(
+        self.leader.mt5.positions = []
+        self.leader.cell.handle_event(
             BrokerSnapshotEvent(orders=[], positions=[], observed_at=self.now)
         )
         self.net.pump()
         cancels_before_restart = [
-            request for request in self.leader.mt5.requests if request["type"] == "cancel"
+            request for request in self.follower.mt5.requests if request["type"] == "cancel"
         ]
 
-        result = self.leader.restart().recover()
+        result = self.follower.restart().recover()
 
         self.assertFalse(result.needs_human)
         self.assertEqual(result.state, "EMPTY")
         self.assertEqual(
-            [request for request in self.leader.mt5.requests if request["type"] == "cancel"],
+            [request for request in self.follower.mt5.requests if request["type"] == "cancel"],
             cancels_before_restart,
         )
-        self.assertEqual(self.leader.mt5.positions, [])
+        self.assertEqual(self.follower.mt5.positions, [])
 
     def test_restart_before_any_attempt_restores_readiness_and_the_route(self) -> None:
         self.prime()

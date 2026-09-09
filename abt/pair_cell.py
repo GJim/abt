@@ -1566,67 +1566,108 @@ def compute_protection(
     return str(sl), str(tp)
 
 
-def compute_shared_protection(
-    *,
-    long_fill: Decimal,
-    short_fill: Decimal,
-    volume: Decimal,
-    long_plan: SizingPlan,
-    short_plan: SizingPlan,
-    long_allowed_loss_usd: Decimal,
-    short_allowed_loss_usd: Decimal,
-    upper: Decimal,
-    lower: Decimal,
-) -> tuple[str, str, str, str] | None:
-    """Return executable shared ``(long_sl, long_tp, short_sl, short_tp)``.
+# MT5 encodes "no take profit" as a zero price.  The asymmetric profit-max
+# model (leader maximizes, follower only caps loss) therefore expresses "no
+# TP cap" as this sentinel rather than omitting the field: the broker-write
+# translation requires both SL and TP strings, and broker observations report
+# an absent TP back as 0.0, which compares equal to this value on any tick.
+NO_TAKE_PROFIT = "0"
 
-    The caller supplies the inward-only candidate interval.  This module owns
-    the cross-leg ordering, common tick-grid, stop distance, and SL loss-cap
-    checks so both Workers make the same safety decision from durable facts.
+# How often the leader profit leg may advance its trailing stop.  This is
+# deliberately shorter than the legacy 300s shared-grid contraction cadence:
+# a trailing stop only ever moves favorably, so reacting faster locks profit
+# sooner without ever widening risk.
+_PROFIT_TRAIL_SECONDS = 60.0
+
+
+def compute_sl_only(
+    *,
+    entry: Decimal,
+    direction: Direction,
+    volume: Decimal,
+    plan: SizingPlan,
+    allowed_loss_usd: Decimal,
+) -> tuple[str, str] | None:
+    """SL at the allowed loss with take profit removed.
+
+    The stop distance targets the current computed ``allowed_leg_loss_usd``
+    for that leg (``min(trade_loss_fraction, maximum_loss_per_trade_usd,
+    remaining daily allowance)``), exactly as :func:`compute_protection`
+    does -- only the 1:1 symmetric take-profit cap is dropped so the winning
+    leg can run.  Returns ``(sl, "0")`` or ``None`` when no executable stop
+    exists.
     """
 
-    long_tick = _to_decimal(long_plan.tick_size)
-    short_tick = _to_decimal(short_plan.tick_size)
-    long_stop = _to_decimal(long_plan.minimum_stop_distance)
-    short_stop = _to_decimal(short_plan.minimum_stop_distance)
-    long_loss_value = _to_decimal(long_plan.loss_tick_value)
-    short_loss_value = _to_decimal(short_plan.loss_tick_value)
-    if any(
-        value is None or value <= 0
-        for value in (long_tick, short_tick, long_loss_value, short_loss_value)
-    ) or long_stop is None or short_stop is None:
+    result = compute_protection(
+        entry=entry,
+        direction=direction,
+        volume=volume,
+        plan=plan,
+        allowed_loss_usd=allowed_loss_usd,
+    )
+    if result is None:
         return None
-    assert long_tick is not None and short_tick is not None
-    assert long_stop is not None and short_stop is not None
-    assert long_loss_value is not None and short_loss_value is not None
-    # MT5 tick sizes are terminating decimals.  A common grid is their decimal
-    # least common multiple, not merely the coarser tick, which may not be
-    # executable when a broker uses a non-divisor grid.
-    scale = max(-long_tick.as_tuple().exponent, -short_tick.as_tuple().exponent)
-    long_units = int(long_tick.scaleb(scale))
-    short_units = int(short_tick.scaleb(scale))
-    common_tick = Decimal(math.lcm(long_units, short_units)).scaleb(-scale)
-    upper = _round_to_tick(upper, common_tick, ROUND_FLOOR)
-    lower = _round_to_tick(lower, common_tick, ROUND_CEILING)
-    if lower <= 0 or lower >= upper:
-        return None
-    if not (lower < long_fill < upper and lower < short_fill < upper):
-        return None
+    return result[0], NO_TAKE_PROFIT
+
+
+def compute_trailing_sl(
+    *,
+    direction: Direction,
+    fill_price: Decimal,
+    initial_sl: Decimal,
+    current_price: Decimal,
+    plan: SizingPlan,
+    volume: Decimal,
+    allowed_loss_usd: Decimal,
+) -> str | None:
+    """Advance a profit-leg stop toward the market without widening risk.
+
+    The trail keeps one full initial risk distance from the current exit
+    price (bid for LONG, ask for SHORT): as the market moves favorably the
+    stop follows and locks profit; when the market moves adversely the
+    existing stop is kept.  Returns the new SL string, or ``None`` when no
+    favorable, executable advance exists (including when the candidate would
+    breach the broker minimum stop distance, leave the tick grid, or exceed
+    the leg's allowed loss).
+    """
+
+    tick_size = _to_decimal(plan.tick_size)
+    minimum_stop_distance = _to_decimal(plan.minimum_stop_distance)
+    loss_tick_value = _to_decimal(plan.loss_tick_value)
     if (
-        long_fill - lower < long_stop
-        or upper - long_fill < long_stop
-        or upper - short_fill < short_stop
-        or short_fill - lower < short_stop
+        tick_size is None or tick_size <= 0
+        or minimum_stop_distance is None or minimum_stop_distance < 0
+        or loss_tick_value is None or loss_tick_value <= 0
+        or volume <= 0 or allowed_loss_usd <= 0
     ):
         return None
-    long_loss_ticks = (long_fill - lower) / long_tick
-    short_loss_ticks = (upper - short_fill) / short_tick
-    if (
-        long_loss_ticks * long_loss_value * volume > long_allowed_loss_usd
-        or short_loss_ticks * short_loss_value * volume > short_allowed_loss_usd
-    ):
+    risk_distance = abs(fill_price - initial_sl)
+    if risk_distance <= 0:
         return None
-    return str(lower), str(upper), str(upper), str(lower)
+    if direction == "LONG":
+        if current_price <= fill_price:
+            return None  # no profit to lock yet
+        candidate = _round_to_tick(current_price - risk_distance, tick_size, ROUND_FLOOR)
+        if candidate <= initial_sl:
+            return None  # only advances past the initial stop ever move
+        if current_price - candidate < minimum_stop_distance:
+            return None
+        if candidate <= 0:
+            return None
+    else:
+        if current_price >= fill_price:
+            return None  # no profit to lock yet
+        candidate = _round_to_tick(current_price + risk_distance, tick_size, ROUND_CEILING)
+        if candidate >= initial_sl:
+            return None  # only advances past the initial stop ever move
+        if candidate - current_price < minimum_stop_distance:
+            return None
+        if candidate <= 0:
+            return None
+    loss_ticks = abs(fill_price - candidate) / tick_size
+    if loss_ticks * loss_tick_value * volume > allowed_loss_usd:
+        return None
+    return str(candidate)
 
 
 # --------------------------------------------------------------------------- #
@@ -5792,7 +5833,7 @@ class PairExecutionCell:
                 return "the observed take profit does not match the attached rough protection"
         return None
 
-    # -- pair confirmation and shared protection ------------------------------ #
+    # -- pair confirmation and asymmetric protection ----------------------------- #
 
     def _peer_evidence_state(self) -> tuple[bool, str | None]:
         """``(exact, inconsistency)`` for the peer's self-reported leg evidence."""
@@ -5887,104 +5928,6 @@ class PairExecutionCell:
         self._transition("peer_reported_entry_failed", str(payload.get("reason") or ""))
         self._begin_close("peer_reported_entry_failed")
 
-    def _shared_protection(self, *, contract: bool) -> tuple[str, str] | None:
-        """Plan this Worker's half of an inward-only common protection revision."""
-
-        attempt, leg, peer = self._attempt, self._leg, self._peer_leg
-        if attempt is None or leg is None:
-            return None
-        leader_plan = self._attempt_plan_for_role(attempt, "leader")
-        follower_plan = self._attempt_plan_for_role(attempt, "follower")
-        leader_fill = _to_decimal(leg.fill_price if self._role == "leader" else peer.fill_price)
-        follower_fill = _to_decimal(peer.fill_price if self._role == "leader" else leg.fill_price)
-        volume = _to_decimal(attempt.lots)
-        leader_allowed = _to_decimal(attempt.leader_allowed_loss_usd)
-        follower_allowed = _to_decimal(attempt.follower_allowed_loss_usd)
-        if None in (leader_plan, follower_plan, leader_fill, follower_fill, volume, leader_allowed, follower_allowed):
-            return None
-        assert leader_plan is not None and follower_plan is not None
-        assert leader_fill is not None and follower_fill is not None
-        assert volume is not None and leader_allowed is not None and follower_allowed is not None
-        if contract:
-            local_direction = attempt.direction_of(self._role)
-            current_upper = _to_decimal(
-                leg.precise_tp if local_direction == "LONG" else leg.precise_sl
-            )
-            current_lower = _to_decimal(
-                leg.precise_sl if local_direction == "LONG" else leg.precise_tp
-            )
-            if current_upper is None or current_lower is None:
-                return None
-            upper = min(
-                leader_fill + (current_upper - leader_fill) * Decimal("0.9"),
-                follower_fill + (current_upper - follower_fill) * Decimal("0.9"),
-            )
-            lower = max(
-                leader_fill - (leader_fill - current_lower) * Decimal("0.9"),
-                follower_fill - (follower_fill - current_lower) * Decimal("0.9"),
-            )
-        else:
-            leader_precise = compute_protection(
-                entry=leader_fill,
-                direction=attempt.leader_direction,
-                volume=volume,
-                plan=leader_plan,
-                allowed_loss_usd=leader_allowed,
-            )
-            follower_precise = compute_protection(
-                entry=follower_fill,
-                direction=attempt.follower_direction,
-                volume=volume,
-                plan=follower_plan,
-                allowed_loss_usd=follower_allowed,
-            )
-            if leader_precise is None or follower_precise is None:
-                return None
-            if attempt.leader_direction == "LONG":
-                upper = min(
-                    Decimal(leader_precise[1]),
-                    Decimal(follower_precise[0]),
-                    Decimal(attempt.leader_rough_tp),
-                    Decimal(attempt.follower_rough_sl),
-                )
-                lower = max(
-                    Decimal(leader_precise[0]),
-                    Decimal(follower_precise[1]),
-                    Decimal(attempt.leader_rough_sl),
-                    Decimal(attempt.follower_rough_tp),
-                )
-            else:
-                upper = min(
-                    Decimal(follower_precise[1]),
-                    Decimal(leader_precise[0]),
-                    Decimal(attempt.follower_rough_tp),
-                    Decimal(attempt.leader_rough_sl),
-                )
-                lower = max(
-                    Decimal(follower_precise[0]),
-                    Decimal(leader_precise[1]),
-                    Decimal(attempt.follower_rough_sl),
-                    Decimal(attempt.leader_rough_tp),
-                )
-        leader_is_long = attempt.leader_direction == "LONG"
-        planned = compute_shared_protection(
-            long_fill=leader_fill if leader_is_long else follower_fill,
-            short_fill=follower_fill if leader_is_long else leader_fill,
-            volume=volume,
-            long_plan=leader_plan if leader_is_long else follower_plan,
-            short_plan=follower_plan if leader_is_long else leader_plan,
-            long_allowed_loss_usd=leader_allowed if leader_is_long else follower_allowed,
-            short_allowed_loss_usd=follower_allowed if leader_is_long else leader_allowed,
-            upper=upper,
-            lower=lower,
-        )
-        if planned is None:
-            return None
-        long_sl, long_tp, short_sl, short_tp = planned
-        if attempt.direction_of(self._role) == "LONG":
-            return long_sl, long_tp
-        return short_sl, short_tp
-
     def _freeze_or_fallback_protection(self, reason: str) -> None:
         assert self._leg is not None
         if self._leg.protection_status == "precise":
@@ -5998,7 +5941,7 @@ class PairExecutionCell:
         self._report_leg_status(status, sl=self._leg.observed_sl, tp=self._leg.observed_tp, reason=reason)
 
     def _restore_rough_protection(self, reason: str) -> None:
-        """Rollback an accepted initial shared write when the peer kept rough protection."""
+        """Rollback an accepted initial precise write when the peer kept rough protection."""
 
         attempt, leg = self._attempt, self._leg
         if attempt is None or leg is None or leg.protection_status != "precise":
@@ -6033,8 +5976,8 @@ class PairExecutionCell:
         self._request_broker_read()
         self._report_leg_status("protection_rough_fallback", sl=sl, tp=tp, reason=reason)
 
-    def _restore_previous_shared_protection(self, reason: str) -> None:
-        """Undo a partially accepted contraction before freezing protection."""
+    def _restore_previous_precise_protection(self, reason: str) -> None:
+        """Undo a partially accepted trail revision before freezing protection."""
 
         attempt, leg = self._attempt, self._leg
         if (
@@ -6057,13 +6000,13 @@ class PairExecutionCell:
         try:
             self._journal.prepare(effect_id, payload)
         except EffectJournalError as error:
-            self._transition("shared_protection_restore_failed", str(error))
-            self._begin_close("shared_protection_restore_prepare_failed")
+            self._transition("precise_protection_restore_failed", str(error))
+            self._begin_close("precise_protection_restore_prepare_failed")
             return
         outcome = self._run_broker_write(effect_id, payload, priority="protection")
         if outcome.category != "completed":
-            self._transition("shared_protection_restore_failed", outcome.category)
-            self._begin_close("shared_protection_restore_failed")
+            self._transition("precise_protection_restore_failed", outcome.category)
+            self._begin_close("precise_protection_restore_failed")
             return
         leg.protection_effect_id = effect_id
         leg.precise_sl, leg.precise_tp = sl, tp
@@ -6071,36 +6014,136 @@ class PairExecutionCell:
         leg.previous_precise_tp = None
         leg.protection_status = "frozen"
         self._persist_leg()
-        self._transition("shared_protection_restore_applied", reason)
+        self._transition("precise_protection_restore_applied", reason)
         self._request_broker_read()
         self._report_leg_status("protection_frozen", sl=sl, tp=tp, reason=reason)
 
+    def _asymmetric_precise_protection(self) -> tuple[str, str, str] | None:
+        """This Worker's half of the asymmetric profit-max protection revision.
+
+        Returns ``(sl, tp, kind)`` where ``kind`` is ``"initial"`` for the
+        first SL-only precise revision or ``"trail"`` for a leader trailing
+        advance, or ``None`` when the current protection should simply be
+        held (follower static leg, leader with no favorable advance yet, or
+        no fresh quote to trail from).  ``None`` here is a hold, never a
+        failure: callers only freeze on an ``"initial"`` miss or a broker
+        rejection.
+
+        Model: the leader (edge side) maximizes profit -- SL-only stop at
+        its allowed loss, no take-profit cap, then a trailing stop that only
+        ever moves favorably.  The follower only caps loss -- static SL-only
+        stop at its allowed loss, no take-profit cap, never re-applied.
+        """
+
+        attempt, leg = self._attempt, self._leg
+        if attempt is None or leg is None:
+            return None
+        plan = self._attempt_plan_for_role(attempt, leg.role)
+        fill = _to_decimal(leg.fill_price)
+        allowed = _to_decimal(
+            attempt.leader_allowed_loss_usd if leg.role == "leader" else attempt.follower_allowed_loss_usd
+        )
+        volume = _to_decimal(attempt.lots)
+        if plan is None or fill is None or allowed is None or volume is None:
+            return None
+        direction = attempt.direction_of(leg.role)
+        if leg.protection_status != "precise":
+            initial = compute_sl_only(
+                entry=fill,
+                direction=direction,
+                volume=volume,
+                plan=plan,
+                allowed_loss_usd=allowed,
+            )
+            if initial is None:
+                return None
+            return initial[0], initial[1], "initial"
+        if self._role != "leader":
+            return None  # follower hedge leg is static once precisely protected
+        quote = self._local_quotes.get(attempt.product_id)
+        if quote is None:
+            return None
+        current_price = quote.bid if direction == "LONG" else quote.ask
+        current_sl = _to_decimal(leg.precise_sl)
+        if current_sl is None:
+            return None
+        initial = compute_sl_only(
+            entry=fill,
+            direction=direction,
+            volume=volume,
+            plan=plan,
+            allowed_loss_usd=allowed,
+        )
+        if initial is None:
+            return None
+        advanced = compute_trailing_sl(
+            direction=direction,
+            fill_price=fill,
+            initial_sl=_to_decimal(initial[0]),
+            current_price=current_price,
+            plan=plan,
+            volume=volume,
+            allowed_loss_usd=allowed,
+        )
+        if advanced is None:
+            return None
+        advanced_dec = _to_decimal(advanced)
+        assert advanced_dec is not None
+        if direction == "LONG" and advanced_dec <= current_sl:
+            return None
+        if direction == "SHORT" and advanced_dec >= current_sl:
+            return None
+        return advanced, NO_TAKE_PROFIT, "trail"
+
     def _maybe_apply_precise_protection(self) -> None:
-        """Apply initial shared protection, then contract it every five minutes."""
+        """Apply initial SL-only protection, then trail the leader profit leg."""
 
         attempt, leg = self._attempt, self._leg
         if attempt is None or leg is None or not self._pair_confirmed or self._desired != "ACTIVE":
             return
         initial = leg.protection_status == "rough"
-        contract = (
-            leg.protection_status == "precise"
+        trail_due = (
+            not initial
+            and leg.protection_status == "precise"
+            and self._role == "leader"
             and self._active_since is not None
             and (
                 leg.last_protection_update_at is None
-                or self._now >= _parse_utc(leg.last_protection_update_at) + timedelta(seconds=300)
+                or self._now >= _parse_utc(leg.last_protection_update_at) + timedelta(seconds=_PROFIT_TRAIL_SECONDS)
             )
         )
-        if not initial and not contract:
+        if not initial and not trail_due:
             return
-        protection = self._shared_protection(contract=contract)
-        if protection is None:
-            self._freeze_or_fallback_protection(
-                "no executable shared boundary exists" if initial else "shared protection contraction is no longer executable"
+        computed = self._asymmetric_precise_protection()
+        if computed is None:
+            if initial:
+                self._freeze_or_fallback_protection("no executable asymmetric protection exists")
+            return
+        sl, tp, kind = computed
+        is_trail = kind == "trail"
+        if not is_trail and not initial:
+            return
+        if not is_trail:
+            _LOGGER.info(
+                "Pair Execution Cell asymmetric protection: role=%s ticket=%s sl=%s tp=%s(no cap) "
+                "attempt_id=%s.",
+                leg.role,
+                leg.ticket,
+                sl,
+                tp,
+                attempt.attempt_id,
             )
-            return
-        sl, tp = protection
+        else:
+            _LOGGER.info(
+                "Pair Execution Cell profit trail: role=%s ticket=%s sl %s -> %s attempt_id=%s.",
+                leg.role,
+                leg.ticket,
+                leg.precise_sl,
+                sl,
+                attempt.attempt_id,
+            )
         effect_id = f"{attempt.attempt_id}:{self._worker_id}:protection"
-        if contract:
+        if is_trail:
             effect_id += f":{int(self._now.timestamp())}"
             leg.previous_precise_sl, leg.previous_precise_tp = leg.precise_sl, leg.precise_tp
             self._persist_leg()
@@ -6122,7 +6165,7 @@ class PairExecutionCell:
         try:
             self._journal.prepare(effect_id, payload)
         except EffectJournalError as error:
-            self._freeze_or_fallback_protection(f"shared protection could not be journaled: {error}")
+            self._freeze_or_fallback_protection(f"asymmetric protection could not be journaled: {error}")
             return
         outcome = self._run_broker_write(effect_id, payload, priority="protection")
         if outcome.category == "completed":
@@ -6130,12 +6173,13 @@ class PairExecutionCell:
             leg.last_protection_update_at = _iso(self._now)
             self._persist_leg()
             self._state = "PROTECTING"
-            self._transition("shared_protection_applied", attempt.attempt_id)
-            self._record_timing("shared_protection_applied")
+            event = "profit_trail_applied" if is_trail else "asymmetric_protection_applied"
+            self._transition(event, attempt.attempt_id)
+            self._record_timing(event)
             self._report_leg_status("protection_precise", sl=sl, tp=tp)
             self._request_broker_read()
         else:
-            self._freeze_or_fallback_protection(f"shared protection broker result: {outcome.category}")
+            self._freeze_or_fallback_protection(f"asymmetric protection broker result: {outcome.category}")
 
     def _maybe_declare_active(self) -> None:
         attempt, leg = self._attempt, self._leg
@@ -6256,16 +6300,37 @@ class PairExecutionCell:
         if status == "protection_rough_fallback" and self._leg is not None:
             self._restore_rough_protection("peer retained rough protection")
         elif status == "protection_frozen" and self._leg is not None and self._leg.protection_status == "precise":
-            self._restore_previous_shared_protection("peer stopped further contraction")
+            self._restore_previous_precise_protection("peer stopped further trailing")
             if self._leg.protection_status == "precise":
                 self._leg.protection_status = "frozen"
                 self._persist_leg()
-                self._transition("protection_frozen", "peer stopped further contraction")
+                self._transition("protection_frozen", "peer stopped further trailing")
                 self._report_leg_status("protection_frozen", sl=self._leg.precise_sl, tp=self._leg.precise_tp)
         elif status in ("rejected", "expired_not_started", "protection_failed", "inconsistent", "no_attempt_record"):
             self._begin_close(f"peer_leg_{status}")
             self._maybe_finalize_empty()
         elif status == "empty":
+            if (
+                self._role == "leader"
+                and self._desired == "ACTIVE"
+                and self._leg is not None
+                and not self._leg.empty_verified
+                and self._leg.ticket
+            ):
+                # Asymmetric profit-max model: the follower hedge leg is
+                # loss-capped and expected to stop out when the market runs
+                # in the leader's favor.  The leader profit leg keeps running
+                # solo under its trailing stop instead of being contained
+                # with the capped loser.  The pair finalizes when the leader
+                # leg itself empties (trailing stop, timed exit, blackout).
+                _LOGGER.info(
+                    "Pair Execution Cell peer empty, leader continues solo: "
+                    "attempt_id=%s ticket=%s.",
+                    attempt_id,
+                    self._leg.ticket,
+                )
+                self._transition("peer_leg_empty_leader_continues_solo", attempt_id)
+                return
             self._begin_close("peer_leg_empty")
             self._maybe_finalize_empty()
 

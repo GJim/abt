@@ -3092,7 +3092,9 @@ class FullLifecycleTests(PairingTestCase):
         for mt5 in (leader.mt5, follower.mt5):
             self.assertEqual(0.4, float(cast(float, mt5.positions[0]["volume"])))
             self.assertGreater(float(cast(float, mt5.positions[0]["sl"])), 0.0)
-            self.assertGreater(float(cast(float, mt5.positions[0]["tp"])), 0.0)
+            # Asymmetric profit-max protection: SL-only stops at each leg's
+            # allowed loss with the take-profit cap removed (MT5 reports 0).
+            self.assertEqual(float(cast(float, mt5.positions[0]["tp"])), 0.0)
         # Mirror directions: the leader is LONG against its ask, the follower
         # SHORT against its bid.
         self.assertEqual(FakeMT5.ORDER_TYPE_BUY, leader.mt5.positions[0]["type"])

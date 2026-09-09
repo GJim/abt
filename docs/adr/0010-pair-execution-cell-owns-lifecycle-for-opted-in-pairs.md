@@ -365,11 +365,14 @@ simultaneously enabled for the same pair.
   version is never eligible for a new candidate.
 - Each Worker separately enforces a `America/New_York` calendar-day realized
   -loss budget: `daily_loss_fraction` (default `0.03`) of its own
-  `strategy_budget_usd`, decremented only by realized P&L from closed
-  strategy-owned legs (floating P&L excluded). Each leg's allowed loss is
-  the lower of `trade_loss_fraction` (default `0.02`) of budget,
-  `maximum_loss_per_trade_usd`, and the Worker's own remaining daily
-  allowance; rough take-profit targets the same USD amount 1:1. No entry is
+   `strategy_budget_usd`, decremented only by realized P&L from closed
+   strategy-owned legs (floating P&L excluded). Each leg's allowed loss is
+   the lower of `trade_loss_fraction` (default `0.02`) of budget,
+   `maximum_loss_per_trade_usd`, and the Worker's own remaining daily
+   allowance; rough emergency protection still targets the same USD amount
+   1:1 at entry, but once the pair is confirmed protection becomes
+   asymmetric and profit-maximizing (leader trails without a take-profit
+   cap, follower holds a static stop-only cap -- see below). No entry is
   admitted when either Worker's allowance is exhausted. A Worker also pauses
   new entries and logs a one-time warning when its positive raw remaining
   daily allowance is at or below its local
@@ -418,20 +421,32 @@ simultaneously enabled for the same pair.
   metadata and is not an entry-protocol timeout. Before its timer expires, the
   leader must obtain exact
   broker-observed evidence (ticket, symbol, side, volume, fill price,
-  attached rough SL/TP -- an order receipt alone is never sufficient) for
-  both its own leg and the follower leg. Only once both exact positions are
-  confirmed may the pair apply a shared actual-fill-based grid: LONG TP equals
-  SHORT SL at the inward executable upper boundary, and LONG SL equals SHORT
-  TP at the inward executable lower boundary. The grid never widens the
-  immutable rough values or exceeds either SL leg's allowed loss. If no safe
-  common grid exists, both legs retain verified rough protection and the pair
-  may become `ACTIVE`; a successfully shared grid contracts every 300 seconds
-  to 90 percent of its prior entry-relative distance until a constraint makes
-  a further contraction unsafe, after which it remains frozen.
+   attached rough SL/TP -- an order receipt alone is never sufficient) for
+   both its own leg and the follower leg. Only once both exact positions are
+   confirmed does the pair switch from symmetric rough emergency protection
+   to the asymmetric profit-max model: each leg independently applies an
+   SL-only precise stop recomputed from its actual fill, immutable
+   `allowed_leg_loss_usd`, immutable attempt volume, and attempt-bound sizing
+   plan, with the take-profit cap removed (MT5 zero price). The leader (edge
+   side) is the profit leg -- after its initial SL-only revision it trails
+   its stop at most every 60 seconds, keeping one full initial risk distance
+   from the current exit price and moving only favorably, so winners run
+   while the stop only ever locks profit. The follower is the hedge leg --
+   its SL-only stop is static and never re-applied. If no executable SL-only
+   revision exists, that leg retains verified rough protection and the pair
+   may still become `ACTIVE`.
+- A capped follower leg is expected to stop out when the market runs in the
+   leader's favor. When the leader observes an authenticated peer `empty`
+   while its own profit leg is still holding, it keeps running solo under
+   its trailing stop instead of being contained with the loser; the pair
+   finalizes when the leader leg itself empties (trailing stop, timed exit,
+   blackout, or shutdown). When the leader leg empties first, the follower
+   still converges through ordinary desired-`EMPTY` containment.
 - An attempt is terminal only when both sides are proven safe: either both
-  Workers produce fresh broker-observed empty facts, or both exact
-  positions are broker-observed with verified shared, frozen, or rough-fallback
-  protection. Missed
+   Workers produce fresh broker-observed empty facts, or both exact
+   positions are broker-observed with verified asymmetric-precise, frozen,
+   or rough-fallback protection (a solo-running leader needs only its own
+   empty fact plus the already-recorded peer `empty`). Missed
   confirmation, entry rejection, unknown-after-send outcomes, inconsistent
   evidence, stale quotes, or lost peer-session readiness never abandon an
   attempt outright; each Worker instead converges through its own local

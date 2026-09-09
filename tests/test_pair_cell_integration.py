@@ -578,7 +578,9 @@ class PairExecutionCellEndToEndTests(unittest.TestCase):
         self.assertEqual(0.4, float(cast(float, pair.follower_mt5.positions[0]["volume"])))
         for mt5 in (pair.leader_mt5, pair.follower_mt5):
             self.assertGreater(float(cast(float, mt5.positions[0]["sl"])), 0.0)
-            self.assertGreater(float(cast(float, mt5.positions[0]["tp"])), 0.0)
+            # Asymmetric profit-max protection: SL-only stops with the
+            # take-profit cap removed (MT5 reports 0).
+            self.assertEqual(float(cast(float, mt5.positions[0]["tp"])), 0.0)
 
     def test_the_controller_route_record_carries_no_trader_identity(self) -> None:
         pair = _Pair(self, self.server, Path(self._tmp.name))

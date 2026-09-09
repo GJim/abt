@@ -749,8 +749,11 @@ re-checks the assigned loss against its **current local** allowance at receipt
 and rejects the attempt if the assignment exceeds it.
 
 No entry is allowed when `allowed_leg_loss_usd` is zero or when valid
-broker-native protection cannot be constructed within that amount. Each leg's
-take-profit target is 1:1 with its allowed stop-loss amount in USD.
+broker-native protection cannot be constructed within that amount. Rough
+emergency protection attached at entry is 1:1 with the allowed stop-loss
+amount in USD; once the pair is confirmed, protection becomes asymmetric
+and profit-maximizing (leader trails with no take-profit cap, follower
+holds a static stop-only cap).
 
 `maximum_loss_per_trade_usd` defaults to `40`, the same number as legacy
 `--emergency-stop-loss-usd`, but it is a **deliberate reinterpretation, not the
@@ -878,73 +881,69 @@ If both exact positions are confirmed in time, the leader emits
 before both exact fills exist there is no safe shared boundary, and neither
 leg may ever be naked while waiting for its peer.
 
-After confirmation, each leg first recomputes an independent precise SL/TP
-from its actual fill, immutable `allowed_leg_loss_usd`, immutable attempt
-volume, and attempt-bound sizing plan. The leader then coordinates one
-pair-level protection grid by intersecting those per-leg precise prices with
-the immutable rough grid and both Workers' current point, tick size, and
-stop/freeze constraints. The initial shared upper boundary is the minimum of
-the LONG precise TP, SHORT precise SL, LONG rough TP, and SHORT rough SL. The
-initial shared lower boundary is the maximum of the LONG precise SL, SHORT
-precise TP, LONG rough SL, and SHORT rough TP.
+After confirmation, each leg independently recomputes an SL-only precise
+stop from its actual fill, immutable `allowed_leg_loss_usd`, immutable
+attempt volume, and attempt-bound sizing plan, with the take-profit cap
+removed (MT5 zero price). There is no pair-level shared grid: the leader
+(edge side) is the profit leg and the follower is the loss-capped hedge
+leg.
 
-The upper shared boundary is the LONG take profit and the SHORT stop loss; the
-lower shared boundary is the LONG stop loss and the SHORT take profit. A
-boundary is chosen only when it can be represented exactly on a common
-executable tick grid, is on the correct side of both actual fills, meets both
-Workers' current stop/freeze distances, does not exceed either leg's immutable
-loss allowance, and only moves each original rough boundary inward:
+The leader's initial SL-only revision targets its full allowed loss from
+the actual fill. Afterwards it trails at most every 60 seconds, keeping one
+full initial risk distance from the current exit price (bid for LONG, ask
+for SHORT) and moving only favorably: the stop follows profitable moves to
+lock profit and never widens on adverse moves. A trail revision is a
+separate journaled broker effect that also clears the take-profit cap; it
+must stay on the executable tick grid, respect the current stop/freeze
+distance, and keep the stop's loss within the leg's immutable allowance.
+If no favorable, executable advance exists, the current stop is simply
+held until the next round.
 
-```text
-upper = min(long_precise_tp, short_precise_sl,
-            long_rough_tp, short_rough_sl)
-lower = max(long_precise_sl, short_precise_tp,
-            long_rough_sl, short_rough_tp)
-```
+The follower's SL-only revision is static: it is applied once after
+confirmation and never re-applied. Recomputing from actual fills is still
+mandatory before declaring that no initial SL-only revision exists. In
+particular, adverse entry slippage may make an entry-attached rough SL
+exceed its leg's loss allowance when measured from the actual fill; that
+stale rough SL must be replaced by the inward actual-fill-derived precise
+candidate rather than causing an immediate fallback. The price used as an
+SL must not exceed that Worker's immutable `allowed_leg_loss_usd`; this
+value is a hard maximum loss, not a requirement to target that exact
+amount. Commission, fee, swap, and an additional spread model are outside
+the first version's calculation.
 
-Recomputing from actual fills is mandatory before declaring that no initial
-shared boundary exists. In particular, adverse entry slippage may make an
-entry-attached rough SL exceed its leg's loss allowance when measured from
-the actual fill; that stale rough SL must be replaced by the inward
-actual-fill-derived precise candidate rather than causing an immediate
-fallback. The shared price used as an SL must not exceed that Worker's
-immutable `allowed_leg_loss_usd`; this value is a hard maximum loss, not a
-requirement to target that exact amount. TP is consequently allowed to target
-a smaller gross profit. Commission, fee, swap, and an additional spread model
-are outside the first version's calculation.
-
-Each shared update is a separate journaled broker effect on both exact
-tickets. The pair becomes `ACTIVE` only after both tickets are
-broker-observed with either the same shared protection revision or their
-verified rough fallback. `ACTIVE` therefore publishes one of:
+Each protection update is a separate journaled broker effect on the exact
+ticket it moves. The pair becomes `ACTIVE` only after both tickets are
+broker-observed with either their asymmetric SL-only precise revision or
+their verified rough fallback. `ACTIVE` therefore publishes one of:
 
 ```text
-shared_precise: both legs carry the current shared upper/lower boundaries
+asymmetric_precise: each leg carries its SL-only stop with no take-profit cap
 rough_fallback: both legs still carry the immutable entry-attached rough values
 ```
 
-If no initial inward-only shared boundary exists, the pair remains protected by
-the broker-verified rough values, records an audible `rough_fallback` reason,
-and does not attempt a later contraction for that attempt. A broker rejection,
-unknown receipt, or failed observation while applying that initial update has
-the same outcome only after every leg that already accepted the update is
-journaled back to its immutable rough values and both rollbacks are
-broker-verified. A failed or unverifiable rollback is the only initial-grid
-failure that starts desired-`EMPTY` containment.
+If no initial SL-only revision exists for a leg, the pair remains protected
+by the broker-verified rough values, records an audible `rough_fallback`
+reason, and the follower never attempts a later revision for that attempt
+while the leader may still trail from a valid initial revision. A broker
+rejection, unknown receipt, or failed observation while applying an
+initial update has the same outcome only after every leg that already
+accepted the update is journaled back to its immutable rough values and
+both rollbacks are broker-verified. A failed or unverifiable rollback is
+the only initial-protection failure that starts desired-`EMPTY`
+containment.
 
-While `ACTIVE` with `shared_precise`, the leader schedules a shared update
-every 300 seconds from the durable active time. Each update moves each
-boundary's distance from its corresponding actual fill to 90 percent of the
-previous broker-verified shared revision's distance, rounded only inward on
-the common executable tick grid. Later contractions never recompute a new
-per-leg loss target and never use an unverified requested or externally
-modified broker value as their baseline. They recheck both current quotes and
-stop/freeze constraints before each update. If the next contraction cannot
-meet those constraints, the pair preserves its most recently broker-verified
-shared revision and permanently stops contracting. A partially accepted
-contraction is journaled back to that prior shared revision before this frozen
-state is published; an unverifiable rollback starts containment. The system
-never trails, widens, or otherwise changes a boundary after it is frozen.
+A capped follower leg is expected to stop out when the market runs in the
+leader's favor. When the leader observes an authenticated peer `empty`
+while its own profit leg is still holding, it records
+`peer_leg_empty_leader_continues_solo` and keeps running solo under its
+trailing stop instead of being contained with the loser; the pair
+finalizes when the leader leg itself empties. When the leader leg empties
+first, the follower still converges through ordinary desired-`EMPTY`
+containment. A partially accepted trail revision is journaled back to the
+prior precise revision before the frozen state is published; an
+unverifiable rollback starts containment. The system never widens a stop
+after it is set, and never trails, widens, or otherwise changes a
+boundary after it is frozen.
 
 If MT5 returns `10025 TRADE_RETCODE_NO_CHANGES` for a `modify_sl_tp` effect,
 the effect is a successful idempotent no-op: the requested shared or rough
@@ -1120,7 +1119,7 @@ attribute.
 45. As a strategy operator, I want a Worker to warn and pause new entries when its positive remaining daily-loss allowance reaches the local `daily_loss_warning_threshold_usd` guard (default `$20`), while leaving an already protected pair to exit normally and automatically resuming after the next New York day.
 45. As a strategy operator, I want each Worker to publish a continuous versioned remaining-allowed-leg-loss summary before any signal, so that the leader never assigns a leg more loss than its owner can accept.
 46. As a follower operator, I want to reject an attempt whose assigned loss exceeds my current local remaining allowance, so that a stale summary can never spend more of my daily budget than I have left.
-47. As a strategy operator, I want each leg's precise TP and SL to use equal USD amounts, so that the protection target is 1:1.
+47. As a strategy operator, I want the leader profit leg to carry an SL-only stop with no take-profit cap plus a favorable-only trailing stop, and the follower hedge leg to carry a static SL-only stop, so that one leg maximizes profit while the other only respects the daily and single-trade loss caps.
 48. As a strategy operator, I want stale or excessively skewed quote pairs rejected by the leader, so that delayed market evidence does not become a false edge.
 49. As a strategy operator, I want both mirror directions and all eligible products ranked deterministically by conservative expected edge USD.
 50. As a strategy operator, I want MT5 `10021 No prices` to durably quarantine only the affected product identity while other products continue.
@@ -1608,9 +1607,12 @@ details of the Worker runtime rather than strategy policy.
 - Entry-result tests cover both filled, either rejected, both rejected,
   unknown-after-send, receipt loss, broker delta before receipt, partial fill,
   and inconsistent exact-position evidence.
-- Protection tests prove rough SL/TP is attached to every initial order and
-  precise 1:1 protection is modified only after both exact positions are
-  confirmed.
+- Protection tests prove rough SL/TP is attached to every initial order,
+  asymmetric SL-only precise protection (no take-profit cap) is applied
+  only after both exact positions are confirmed, the leader trails its
+  stop favorably at most every 60 seconds while the follower leg stays
+  static, and the leader keeps running solo after an authenticated peer
+  `empty` instead of being contained with the capped loser.
 - Quarantine tests prove keys are the derived product identity, survive
   restart, do not block other discovered products, and release only by
   authenticated operator action with no unresolved attempt.
@@ -1894,8 +1896,11 @@ these changes pass deterministic and controlled live acceptance.
 - Because there is no attempt-delivery-age guard, the follower window may
   extend to relay delay plus five seconds after the leader's decision. This is
   an explicit latency-over-orphan-risk tradeoff, not a simultaneous deadline.
-- Rough protection bounds the crash and timeout window. Precise protection
-  implements the per-leg USD loss and 1:1 profit target from actual fills.
+- Rough protection bounds the crash and timeout window. Asymmetric precise
+  protection implements the per-leg USD loss cap from actual fills with no
+  take-profit cap, so one leg can maximize profit while the other only
+  respects the loss caps; the leader's trailing stop then locks profit by
+  moving favorably only.
 - `ACTIVE` is broker-observed proof of both exact positions and precise
   protection, not a successful relay acknowledgement.
 - `EMPTY` is fresh broker observation from both accounts, not a successful

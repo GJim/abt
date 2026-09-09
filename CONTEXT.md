@@ -219,7 +219,7 @@ _Avoid_: follower 靜默降級為 shadow、以 follower 設定改寫配對政策
 _Avoid_: 啟動時即建立量規劃、刷新即刪除舊版本
 
 **每帳戶紐約已實現虧損預算（Per-Worker NY Realized-Loss Budget）**:
-每台帳戶工作者依 `America/New_York` 曆日獨立追蹤、只累計已平倉策略腿已實現損益（不含浮動損益）的每日虧損上限；單腿允許損失取 `trade_loss_fraction`、`maximum_loss_per_trade_usd` 與當日剩餘允許額度三者最小值，且停利與該允許損失金額 1:1 對稱。leader 以 `leader_risk`、follower 以 `follower_risk` 各自計算。`maximum_loss_per_trade_usd` 預設 `40` 沿用 legacy `--emergency-stop-loss-usd` 的數值，但語意是**刻意重新詮釋**：此處為送單前的每筆硬性上限（三個上限之一），而非 legacy 的緊急停損觸發；粗略緊急保護以當前計算所得的 `allowed_leg_loss_usd` 為目標，而非固定常數。任一帳戶額度用盡即不得再開新腿，另一帳戶額度不受影響。
+每台帳戶工作者依 `America/New_York` 曆日獨立追蹤、只累計已平倉策略腿已實現損益（不含浮動損益）的每日虧損上限；單腿允許損失取 `trade_loss_fraction`、`maximum_loss_per_trade_usd` 與當日剩餘允許額度三者最小值。進場時的粗略緊急保護仍以該允許損失金額計算對稱 SL/TP；一旦配對確認，保護改為非對稱獲利最大化模型：leader（順 edge 方向）為獲利腿，僅保留按允許損失計算的停損、移除停利上限，並以移動停損跟隨行情鎖定獲利；follower 為避險腿，僅保留按允許損失計算的靜態停損、不設停利上限、不做收斂。follower 觸及停損清空後，leader 不隨之平倉而是繼續單飛，直到自身停損／移動停損、限時退出或休市平倉；leader 清空後才收斂整對。leader 以 `leader_risk`、follower 以 `follower_risk` 各自計算。`maximum_loss_per_trade_usd` 預設 `40` 沿用 legacy `--emergency-stop-loss-usd` 的數值，但語意是**刻意重新詮釋**：此處為送單前的每筆硬性上限（三個上限之一），而非 legacy 的緊急停損觸發；粗略緊急保護以當前計算所得的 `allowed_leg_loss_usd` 為目標，而非固定常數。任一帳戶額度用盡即不得再開新腿，另一帳戶額度不受影響。
 _Avoid_: 視 maximum_loss_per_trade_usd 等同 legacy 緊急停損語意
 
 **立即派遣進場（Immediate Entry Dispatch）**:
