@@ -2343,6 +2343,14 @@ class PairExecutionCell:
         self._peer_proof_wait_started: float | None = None
         self._peer_proof_last_probe: float | None = None
         self._peer_proof_probes_sent = 0
+        # Containment effects whose journal replay already holds a non-success
+        # receipt and were therefore deferred once to the next broker
+        # snapshot.  A second consecutive replay for the same effect means the
+        # ticket genuinely persists and latches NEEDS_HUMAN instead of
+        # deferring forever.  Best-effort memory only: it is cleared with the
+        # attempt, and after a restart the first replay defers once more
+        # before latching.
+        self._replay_deferred: set[str] = set()
         self._active_since: datetime | None = None
         self._state: PairState = "IDLE"
         self._desired: DesiredState = "NONE"
@@ -2972,13 +2980,24 @@ class PairExecutionCell:
             self._clear_resolved_peer_terminal_proof_stop(attempt_id)
 
     def _recover_terminalized_containment_stop(self) -> None:
-        """Clear a rejected containment action only after both-leg terminal proof."""
+        """Clear a rejected containment action only after both-leg terminal proof.
+
+        Matches every containment-effect stop shape this module can persist
+        ("ended rejected", "has non-success replay evidence", "could not be
+        prepared", "has invalid replay evidence", "has no conclusive broker
+        receipt"): all of them are terminally resolved by the same durable
+        `both_empty_verified` proof, which is stronger than the rejected
+        broker action.
+        """
 
         reason = self._needs_human
-        prefix, suffix = "containment effect ", " ended rejected"
-        if not isinstance(reason, str) or not reason.startswith(prefix) or not reason.endswith(suffix):
+        prefix = "containment effect "
+        if not isinstance(reason, str) or not reason.startswith(prefix):
             return
-        effect_id = reason.removeprefix(prefix).removesuffix(suffix)
+        # The effect ID is the first whitespace-delimited token: it never
+        # contains spaces, while every variant appends a human suffix after
+        # it ("ended rejected", "has non-success replay evidence", ...).
+        effect_id = reason.removeprefix(prefix).split(" ")[0]
         attempt_id = effect_id.partition(":")[0]
         if not attempt_id:
             return
@@ -6710,6 +6729,21 @@ class PairExecutionCell:
                 return
             if evidence.get("retcode") in _SUCCESS_RETCODES:
                 self._transition("containment_receipt_recovered", effect_id)
+                self._replay_deferred.discard(effect_id)
+                return
+            if payload.get("type") in ("cancel", "close") and effect_id not in self._replay_deferred:
+                # The journal already holds a non-success receipt for this
+                # exact effect, but that receipt may be stale: the broker may
+                # have closed or cancelled the ticket itself (e.g. a TP/SL
+                # execution racing our containment write, which then rejects
+                # our close as FROZEN and our cancel as INVALID).  Defer to
+                # the next complete broker snapshot exactly like a fresh
+                # rejection: if the ticket is gone the snapshot proves empty
+                # and no human is needed; if it persists the second replay
+                # latches NEEDS_HUMAN below.
+                self._replay_deferred.add(effect_id)
+                self._transition("containment_receipt_reconciliation_pending", effect_id)
+                self._request_broker_read()
                 return
             self._set_needs_human(
                 f"containment effect {effect_id} has non-success replay evidence",
@@ -6768,6 +6802,7 @@ class PairExecutionCell:
         self._peer_proof_wait_started = None
         self._peer_proof_last_probe = None
         self._peer_proof_probes_sent = 0
+        self._replay_deferred.clear()
         self._active_since = None
         self._desired = "NONE"
         self._persist_desired()

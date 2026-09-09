@@ -529,6 +529,9 @@ class _Side:
     def close_requests(self) -> list[dict[str, object]]:
         return [r for r in self.mt5.requests if r["type"] == "close"]
 
+    def cancel_requests(self) -> list[dict[str, object]]:
+        return [r for r in self.mt5.requests if r["type"] == "cancel"]
+
 
 class PairCellTestCase(unittest.TestCase):
     """Shared two-Worker fixture, pairing acceptance, discovery, and bootstrap."""
@@ -3515,6 +3518,116 @@ class RecoveryTests(PairCellTestCase):
             cancels_before_restart,
         )
         self.assertEqual(self.follower.mt5.positions, [])
+
+    def test_replay_rejection_defers_once_then_converges_when_broker_took_the_ticket(self) -> None:
+        # Mirrors the 2026-09-09 XAUUSD incident: the broker executes the TP
+        # order itself while containment races it, so our cancel meets an
+        # already-gone ticket (INVALID). The journal replay of that
+        # non-success receipt must defer to the next snapshot -- which proves
+        # the account empty -- instead of latching NEEDS_HUMAN immediately.
+        self.run_entry()
+        self.follower.mt5.reads_unavailable = True
+        self.follower.mt5.reject_next_cancel_retcode = _REJECTED
+
+        self.leader.mt5.positions = []
+        self.leader.cell.handle_event(
+            BrokerSnapshotEvent(orders=[], positions=[], observed_at=self.now)
+        )
+        self.net.pump()
+
+        stale_orders = [{"ticket": 123, "symbol": SYMBOL}]
+        owned = [dict(self.follower.mt5.positions[0])]
+        # Drive 1: the stale snapshot still shows the ticket; the fresh
+        # cancel is rejected and defers to the next snapshot.
+        result = self.follower.cell.handle_event(
+            BrokerSnapshotEvent(orders=stale_orders, positions=owned, observed_at=self.now)
+        )
+        self.assertFalse(result.needs_human)
+        self.assertEqual(len(self.follower.cancel_requests()), 1)
+        # Drive 2: the ticket is still listed, so this is a replay of the
+        # stored non-success receipt -- but it defers once more instead of
+        # latching, and never resends the effect.
+        result = self.follower.cell.handle_event(
+            BrokerSnapshotEvent(orders=stale_orders, positions=owned, observed_at=self.now)
+        )
+        self.assertFalse(result.needs_human)
+        self.assertEqual(len(self.follower.cancel_requests()), 1)
+        self.assertIn(
+            "containment_receipt_reconciliation_pending",
+            [row["event"] for row in self.follower.cell.transition_history()],
+        )
+        # Drive 3: the broker took the ticket (TP execution); the empty
+        # snapshot converges the pair with no human needed.
+        result = self.follower.cell.handle_event(
+            BrokerSnapshotEvent(orders=[], positions=[], observed_at=self.now)
+        )
+        self.assertFalse(result.needs_human)
+        self.assertEqual(result.state, "EMPTY")
+
+    def test_replay_rejection_latches_when_the_ticket_genuinely_persists(self) -> None:
+        # The deferral is bounded: if the next snapshot still shows the same
+        # ticket, the second consecutive replay latches NEEDS_HUMAN so a
+        # genuinely stuck ticket stays loud.
+        self.run_entry()
+        self.follower.mt5.reads_unavailable = True
+        self.follower.mt5.reject_next_cancel_retcode = _REJECTED
+
+        self.leader.mt5.positions = []
+        self.leader.cell.handle_event(
+            BrokerSnapshotEvent(orders=[], positions=[], observed_at=self.now)
+        )
+        self.net.pump()
+
+        stale_orders = [{"ticket": 123, "symbol": SYMBOL}]
+        owned = [dict(self.follower.mt5.positions[0])]
+        self.follower.cell.handle_event(
+            BrokerSnapshotEvent(orders=stale_orders, positions=owned, observed_at=self.now)
+        )
+        self.follower.cell.handle_event(
+            BrokerSnapshotEvent(orders=stale_orders, positions=owned, observed_at=self.now)
+        )
+        result = self.follower.cell.handle_event(
+            BrokerSnapshotEvent(orders=stale_orders, positions=owned, observed_at=self.now)
+        )
+        self.assertTrue(result.needs_human)
+        self.assertIn("non-success replay evidence", str(result.needs_human_reason))
+        self.assertEqual(len(self.follower.cancel_requests()), 1)
+
+    def test_restart_clears_a_replay_evidence_stop_after_both_empty_verified(self) -> None:
+        # The parked 2026-09-09 worker carries exactly this stop shape; a
+        # restart must clear it once the attempt terminalized both-empty.
+        self.run_entry()
+        self.follower.mt5.reads_unavailable = True
+        self.follower.mt5.reject_next_cancel_retcode = _REJECTED
+
+        self.leader.mt5.positions = []
+        self.leader.cell.handle_event(
+            BrokerSnapshotEvent(orders=[], positions=[], observed_at=self.now)
+        )
+        self.net.pump()
+
+        stale_orders = [{"ticket": 123, "symbol": SYMBOL}]
+        owned = [dict(self.follower.mt5.positions[0])]
+        self.follower.cell.handle_event(
+            BrokerSnapshotEvent(orders=stale_orders, positions=owned, observed_at=self.now)
+        )
+        self.follower.cell.handle_event(
+            BrokerSnapshotEvent(orders=stale_orders, positions=owned, observed_at=self.now)
+        )
+        latched = self.follower.cell.handle_event(
+            BrokerSnapshotEvent(orders=stale_orders, positions=owned, observed_at=self.now)
+        )
+        self.assertTrue(latched.needs_human)
+
+        # The broker then takes the ticket; the attempt terminalizes
+        # both-empty while the stop latch remains (the incident shape).
+        self.follower.cell.handle_event(
+            BrokerSnapshotEvent(orders=[], positions=[], observed_at=self.now)
+        )
+        # A restart recovers the durable terminal proof and clears the stop.
+        result = self.follower.restart().recover()
+        self.assertFalse(result.needs_human)
+        self.assertEqual(result.state, "EMPTY")
 
     def test_restart_before_any_attempt_restores_readiness_and_the_route(self) -> None:
         self.prime()
