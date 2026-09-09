@@ -2940,6 +2940,8 @@ class PairExecutionCell:
         self._db.commit()
 
     def _set_needs_human(self, reason: str, detail: str) -> None:
+        if self._needs_human == reason:
+            return  # already latched for exactly this reason; don't spam history
         self._needs_human = reason
         self._db.execute(
             "INSERT INTO cell_operator_stop (id, reason, updated_at) VALUES (1, ?, ?)"
@@ -4730,6 +4732,15 @@ class PairExecutionCell:
             return
         if envelope.get("to_worker_id") != self._worker_id:
             return
+        # Any authenticated peer envelope on this route proves the peer is
+        # alive and managing its side -- including while it intentionally
+        # withholds terminal proof (e.g. a solo-running leader that keeps its
+        # profit leg open after the follower emptied).  Restart the bounded
+        # terminal-proof window so only genuine peer silence escalates to
+        # NEEDS_HUMAN; periodic probes below still continue while waiting.
+        # The worst quiet wait is therefore bounded by the peer's own exit
+        # horizon (e.g. maximum holding), not by this timeout.
+        self._peer_proof_wait_started = None
         payload = envelope.get("payload")
         if not isinstance(payload, dict):
             return
@@ -6312,8 +6323,9 @@ class PairExecutionCell:
         self._persist_peer_leg()
         self._transition("peer_leg_status", status)
         if status != previous_status:
-            # Only real progress restarts the bounded recovery window; repeated
-            # identical chatter must not extend it forever.
+            # Real progress restarts the probe cadence explicitly; any other
+            # authenticated envelope already restarted the bounded window on
+            # arrival (liveness), so this is just bookkeeping.
             self._peer_proof_wait_started = None
             self._peer_proof_last_probe = None
         if status == "protection_rough_fallback" and self._leg is not None:
@@ -6342,13 +6354,14 @@ class PairExecutionCell:
                 # solo under its trailing stop instead of being contained
                 # with the capped loser.  The pair finalizes when the leader
                 # leg itself empties (trailing stop, timed exit, blackout).
-                _LOGGER.info(
-                    "Pair Execution Cell peer empty, leader continues solo: "
-                    "attempt_id=%s ticket=%s.",
-                    attempt_id,
-                    self._leg.ticket,
-                )
-                self._transition("peer_leg_empty_leader_continues_solo", attempt_id)
+                if previous_status != "empty":
+                    _LOGGER.info(
+                        "Pair Execution Cell peer empty, leader continues solo: "
+                        "attempt_id=%s ticket=%s.",
+                        attempt_id,
+                        self._leg.ticket,
+                    )
+                    self._transition("peer_leg_empty_leader_continues_solo", attempt_id)
                 return
             self._begin_close("peer_leg_empty")
             self._maybe_finalize_empty()
@@ -6562,7 +6575,13 @@ class PairExecutionCell:
         return True
 
     def _await_peer_terminal_proof(self) -> None:
-        """Probe, retransmit, then escalate; never infer a peer ``EMPTY``."""
+        """Probe while waiting; escalate only on genuine peer silence.
+
+        Never infers a peer ``EMPTY``: while authenticated peer envelopes keep
+        arriving (reset by :meth:`_accept_relay_envelope`) this only probes.
+        Escalation fires after the bounded window with no peer evidence at
+        all.
+        """
 
         attempt, leg = self._attempt, self._leg
         if attempt is None or leg is None or not leg.empty_verified:

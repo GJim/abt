@@ -4122,6 +4122,78 @@ class PeerTerminalProofTests(PairCellTestCase):
             [row["event"] for row in self.leader.cell.transition_history()],
         )
 
+    def test_a_live_peer_resets_the_terminal_proof_window(self) -> None:
+        # The 2026-09-09 solo runs parked the follower ~60s after every peer
+        # empty: the leader intentionally withholds terminal proof while it
+        # keeps managing its profit leg. While authenticated peer envelopes
+        # keep arriving, the follower must keep probing without escalating.
+        self.run_entry()
+        self.assertEqual(self.leader.cell.handle_event(ClockTickEvent(self.now)).state, "ACTIVE")
+        self.assertEqual(self.follower.cell.handle_event(ClockTickEvent(self.now)).state, "ACTIVE")
+
+        self.follower.mt5.positions = []
+        self.follower.cell.handle_event(
+            BrokerSnapshotEvent(orders=[], positions=[], observed_at=self.now)
+        )
+        self.net.pump()
+
+        for _ in range(15):
+            self.clock.advance(5.1)
+            self.now += timedelta(seconds=5.1)
+            self.leader.cell.handle_event(ClockTickEvent(self.now))
+            result = self.follower.cell.handle_event(ClockTickEvent(self.now))
+            self.net.pump()
+            self.assertFalse(result.needs_human)
+
+        self.assertIn(
+            "peer_terminal_proof_probe",
+            [row["event"] for row in self.follower.cell.transition_history()],
+        )
+        self.assertNotIn(
+            "close_needs_human",
+            [row["event"] for row in self.follower.cell.transition_history()],
+        )
+        self.assertEqual(len(self.leader.mt5.positions), 1, "the solo profit leg keeps running")
+
+    def test_repeated_peer_empty_reports_log_solo_once(self) -> None:
+        self.run_entry()
+        self.assertEqual(self.leader.cell.handle_event(ClockTickEvent(self.now)).state, "ACTIVE")
+
+        self.follower.mt5.positions = []
+        self.follower.cell.handle_event(
+            BrokerSnapshotEvent(orders=[], positions=[], observed_at=self.now)
+        )
+        self.net.pump()
+        attempt_id = self.last_attempt().attempt_id
+        solo = [
+            row for row in self.leader.cell.transition_history()
+            if row["event"] == "peer_leg_empty_leader_continues_solo"
+        ]
+        self.assertEqual(len(solo), 1)
+
+        for _ in range(2):
+            self.leader.cell.handle_event(
+                RelayEnvelopeReceived(
+                    self._leg_status({"attempt_id": attempt_id, "status": "empty"})
+                )
+            )
+        solo = [
+            row for row in self.leader.cell.transition_history()
+            if row["event"] == "peer_leg_empty_leader_continues_solo"
+        ]
+        self.assertEqual(len(solo), 1, "duplicate empty reports must not re-log solo")
+
+    def test_repeated_identical_stop_latches_only_once(self) -> None:
+        self.run_entry()
+        cell = self.leader.cell
+        cell._set_needs_human("reason-x", "detail-x")
+        cell._set_needs_human("reason-x", "detail-x")
+        cell._set_needs_human("reason-y", "detail-y")
+        latched = [
+            row for row in cell.transition_history() if row["event"] == "close_needs_human"
+        ]
+        self.assertEqual(len(latched), 2, "one transition per distinct reason")
+
     def test_a_truly_unavailable_peer_becomes_loud_rather_than_parking(self) -> None:
         self._enter_and_strand_leader()
         result = self.leader.cell.handle_event(ClockTickEvent(self.now))
@@ -4233,7 +4305,12 @@ class PeerTerminalProofTests(PairCellTestCase):
         self.assertIn("leg_status_request", self.net.kinds(LEADER))
         self.assertIn("empty", [str(p["status"]) for p in self.net.payloads("leg_status", LEADER)])
 
-    def test_repeated_identical_peer_chatter_does_not_extend_the_window(self) -> None:
+    def test_live_peer_chatter_resets_the_terminal_proof_window(self) -> None:
+        # Solo-era contract: any authenticated peer envelope proves liveness,
+        # so even identical chatter restarts the bounded window -- a peer that
+        # explicitly keeps reporting "filled" is holding, not gone. Only total
+        # silence escalates (see test_a_truly_unavailable_peer...). The wait
+        # stays bounded by the peer's own exit horizon (maximum holding).
         self._enter_and_strand_leader()
         attempt_id = self.last_attempt().attempt_id
         chatter = self._leg_status(
@@ -4253,10 +4330,8 @@ class PeerTerminalProofTests(PairCellTestCase):
             self.leader.cell.handle_event(RelayEnvelopeReceived(dict(chatter)))
             result = self.leader.cell.handle_event(ClockTickEvent(self.now))
             self.net.queue.clear()
-            if result.needs_human:
-                break
-        self.assertTrue(result.needs_human)
-        self.assertNotEqual(result.state, "EMPTY")
+        self.assertFalse(result.needs_human)
+        self.assertNotEqual(result.state, "EMPTY", "EMPTY is never inferred from chatter")
 
 
 # --------------------------------------------------------------------------- #
