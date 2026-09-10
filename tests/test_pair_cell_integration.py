@@ -348,20 +348,6 @@ class _LiveServer:
             raw_socket, reconciliation_cursor=authenticated["cursor"], worker_id=worker_id, certificate=certificate
         )
 
-    def claim_execution_mode(self, *, leader_worker_id: str, follower_worker_id: str, mode: str) -> httpx.Response:
-        cookie, csrf = self.admin_session()
-        return httpx.post(
-            f"{self.base_url}/api/admin/pairs/execution-mode",
-            headers={"Cookie": cookie, "X-CSRF-Token": csrf},
-            json={
-                "leader_worker_id": leader_worker_id,
-                "follower_worker_id": follower_worker_id,
-                "trader_id": "trader-1",
-                "mode": mode,
-            },
-            timeout=5,
-        )
-
     def release_pair_quarantine(self, *, route_id: str, symbol: str, reason: str) -> httpx.Response:
         cookie, csrf = self.admin_session()
         return httpx.post(
@@ -633,29 +619,6 @@ class PairExecutionCellEndToEndTests(unittest.TestCase):
         # No route, no partial role assignment, no leaked reservation.
         self.assertIsNone(self.server.app.state.ledger.pair_route_for_worker(pair.leader_id))
         self.assertEqual([], self.server.app.state.ledger.pair_route_reservations_for_worker(pair.leader_id))
-
-    def test_the_legacy_strategy_runtime_blocks_a_pairing_for_the_same_workers(self) -> None:
-        leader_key, leader_id, leader_cert = self.server.approved_worker(910011, "Broker-A")
-        follower_key, follower_id, follower_cert = self.server.approved_worker(910012, "Broker-B")
-        claimed = self.server.claim_execution_mode(
-            leader_worker_id=leader_id, follower_worker_id=follower_id, mode="strategy_runtime"
-        )
-        self.assertEqual(200, claimed.status_code, claimed.text)
-
-        leader_session = self.server.connect_worker_session(leader_key, leader_id, leader_cert)
-        self.addCleanup(leader_session.socket.__exit__, None, None, None)
-        follower_session = self.server.connect_worker_session(follower_key, follower_id, follower_cert)
-        self.addCleanup(follower_session.socket.__exit__, None, None, None)
-
-        follower_session.declare_pair_cell_role(None)
-        self.assertTrue(_await_result(follower_session, "pair_cell_role_result")["accepted"])
-        leader_session.declare_pair_cell_role("leader")
-        self.assertTrue(_await_result(leader_session, "pair_cell_role_result")["accepted"])
-        leader_session.propose_pair_cell_pairing(follower_id)
-        reply = _await_result(leader_session, "pair_cell_pairing_proposal_result")
-
-        self.assertFalse(reply["accepted"])
-        self.assertIsNone(self.server.app.state.ledger.pair_route_for_worker(leader_id))
 
     def test_the_leader_builds_the_canonical_policy_from_the_forwarded_acceptance(self) -> None:
         """The follower's own authored block reaches the leader through the

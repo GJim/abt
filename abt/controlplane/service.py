@@ -82,31 +82,6 @@ class LoginRequest(BaseModel):
     password: str = Field(min_length=20)
 
 
-class PairExecutionModeClaimRequest(BaseModel):
-    """One operator's explicit legacy Strategy Runtime execution-mode claim.
-
-    A ``pair_execution_cell`` claim is deliberately unreachable here: Pair
-    Cell exclusivity is claimed for both Workers inside the pairing
-    reservation transaction and confirmed inside the final route-creation
-    commit, so no administrator surface can create or contradict one.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    leader_worker_id: str = Field(min_length=1)
-    follower_worker_id: str = Field(min_length=1)
-    trader_id: str = Field(min_length=1)
-    mode: Literal["strategy_runtime", "shadow"]
-
-
-class PairExecutionModeReleaseRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    leader_worker_id: str = Field(min_length=1)
-    follower_worker_id: str = Field(min_length=1)
-    mode: Literal["strategy_runtime", "shadow"]
-
-
 class PairQuarantineReleaseRequest(BaseModel):
     """One operator's explicit, audited release of one quarantined product.
 
@@ -804,44 +779,6 @@ def create_app(
             *(connection.websocket.close(code=status.WS_1008_POLICY_VIOLATION) for connection in connections),
             return_exceptions=True,
         )
-        return Response(status_code=status.HTTP_204_NO_CONTENT)
-
-    @app.post("/api/admin/pairs/execution-mode")
-    def claim_pair_execution_mode_route(
-        payload: PairExecutionModeClaimRequest,
-        abt_admin_session: Annotated[str | None, Cookie()] = None,
-        x_csrf_token: Annotated[str | None, Header()] = None,
-    ) -> dict[str, object]:
-        """Explicitly declare one Worker pair's legacy execution-mode owner.
-
-        This is the operator-controlled rollout switch: the legacy Strategy
-        Runtime and a live Pair Execution Cell cannot both hold the same
-        pair. It never creates a pairing -- Pair Execution Cell exclusivity
-        is taken only by the Worker-initiated two-phase pairing workflow.
-        """
-
-        _require_admin(ledger, abt_admin_session, x_csrf_token, require_csrf=True)
-        try:
-            ledger.claim_pair_execution_mode(
-                payload.leader_worker_id, payload.follower_worker_id, payload.mode, payload.trader_id
-            )
-        except LedgerError as error:
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
-        return {"status": "claimed", "mode": payload.mode}
-
-    @app.post("/api/admin/pairs/execution-mode/release", status_code=status.HTTP_204_NO_CONTENT)
-    def release_pair_execution_mode_route(
-        payload: PairExecutionModeReleaseRequest,
-        abt_admin_session: Annotated[str | None, Cookie()] = None,
-        x_csrf_token: Annotated[str | None, Header()] = None,
-    ) -> Response:
-        _require_admin(ledger, abt_admin_session, x_csrf_token, require_csrf=True)
-        try:
-            ledger.release_pair_execution_mode(
-                payload.leader_worker_id, payload.follower_worker_id, payload.mode
-            )
-        except LedgerError as error:
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     @app.post("/api/admin/pairs/quarantine/release")

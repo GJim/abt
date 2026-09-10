@@ -1555,28 +1555,6 @@ class ControlPlaneServiceTests(unittest.TestCase):
             "/api/admin/pairs/route", {route.path for route in self.app.routes if hasattr(route, "path")}
         )
 
-    def test_the_admin_execution_mode_surface_cannot_create_a_pair_cell_claim(self) -> None:
-        """Requirement: Pair Cell exclusivity is claimed only inside the
-        two-phase pairing workflow, never by an administrator."""
-
-        _leader_key, leader_id, _leader_certificate = self._approved_worker(363636, "Broker-A")
-        _follower_key, follower_id, _follower_certificate = self._approved_worker(373737, "Broker-B")
-        login = self.client.post(
-            "/api/admin/login", json={"username": "ABCDEF", "password": "A-secure-admin-password!"}
-        )
-        headers = {"X-CSRF-Token": login.json()["csrf_token"]}
-
-        response = self.client.post(
-            "/api/admin/pairs/execution-mode",
-            headers=headers,
-            json={
-                "leader_worker_id": leader_id, "follower_worker_id": follower_id,
-                "trader_id": "trader-1", "mode": "pair_execution_cell",
-            },
-        )
-
-        self.assertEqual(422, response.status_code)
-
     def test_worker_session_rejects_a_pair_cell_activation_sync_request(self) -> None:
         """Requirement: the controller distributes no Pair Contract, so there
         is nothing for a reconnecting Worker to re-sync."""
@@ -2399,87 +2377,6 @@ class ControlPlaneServiceTests(unittest.TestCase):
         )
 
     # ---- Administrator surfaces that survive ---- #
-
-    def test_admin_pair_execution_mode_switch_is_mutually_exclusive_and_explicit(self) -> None:
-        """Requirement: the legacy Strategy Runtime keeps its own operator
-        switch and its own Trader identity, unchanged."""
-
-        _leader_key, leader_id, _leader_certificate = self._approved_worker(666666, "Broker-A")
-        _follower_key, follower_id, _follower_certificate = self._approved_worker(777777, "Broker-B")
-        trader_enrollment = self.app.state.ledger.create_trader_enrollment(
-            strategy_name="legacy-strategy-runtime",
-            claimed_public_ip="203.0.113.4",
-            public_key_pem="trader-public-key-3",
-        )
-        trader_id = self.app.state.ledger.approve_trader_enrollment(
-            trader_enrollment["registration_id"], "ABCDEF", lambda value, *_: f"certificate:{value}"
-        )
-        login = self.client.post(
-            "/api/admin/login", json={"username": "ABCDEF", "password": "A-secure-admin-password!"}
-        )
-        headers = {"X-CSRF-Token": login.json()["csrf_token"]}
-
-        claim = self.client.post(
-            "/api/admin/pairs/execution-mode",
-            headers=headers,
-            json={
-                "leader_worker_id": leader_id, "follower_worker_id": follower_id,
-                "trader_id": trader_id, "mode": "strategy_runtime",
-            },
-        )
-        self.assertEqual(200, claim.status_code, claim.text)
-
-        blocked = self.client.post(
-            "/api/admin/pairs/execution-mode",
-            headers=headers,
-            json={
-                "leader_worker_id": leader_id, "follower_worker_id": follower_id,
-                "trader_id": "another-trader", "mode": "strategy_runtime",
-            },
-        )
-        self.assertEqual(409, blocked.status_code)
-
-        release = self.client.post(
-            "/api/admin/pairs/execution-mode/release",
-            headers=headers,
-            json={"leader_worker_id": leader_id, "follower_worker_id": follower_id, "mode": "strategy_runtime"},
-        )
-        self.assertEqual(204, release.status_code)
-
-        reserved = self.app.state.ledger.reserve_pair_route_proposal(
-            leader_worker_id=leader_id,
-            follower_worker_id=follower_id,
-            connected_worker_ids={leader_id, follower_id},
-        )
-        self.assertEqual(30, reserved["timeout_seconds"])
-
-    def test_admin_cannot_release_a_pair_cell_execution_mode_claim(self) -> None:
-        """Requirement: a Pair Cell claim is released only by its reservation
-        or its route, so no operator can strand a live route."""
-
-        (
-            _leader_key, leader_id, _leader_certificate,
-            _follower_key, follower_id, _follower_certificate, route_id,
-        ) = self._pair_route(120201, 120202)
-        login = self.client.post(
-            "/api/admin/login", json={"username": "ABCDEF", "password": "A-secure-admin-password!"}
-        )
-        headers = {"X-CSRF-Token": login.json()["csrf_token"]}
-
-        response = self.client.post(
-            "/api/admin/pairs/execution-mode/release",
-            headers=headers,
-            json={
-                "leader_worker_id": leader_id, "follower_worker_id": follower_id,
-                "mode": "pair_execution_cell",
-            },
-        )
-
-        self.assertEqual(422, response.status_code)
-        self.assertIsNotNone(self.app.state.ledger.pair_route(route_id))
-        self.assertIsNotNone(
-            self.app.state.ledger.pair_execution_owner(leader_id, follower_id, "pair_execution_cell")
-        )
 
     def test_admin_release_of_pair_quarantine_requires_admin_auth(self) -> None:
         response = self.client.post(
