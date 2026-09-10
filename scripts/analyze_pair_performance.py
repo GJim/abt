@@ -57,68 +57,38 @@ def parse_log(path: Path) -> dict:
     humans: list[str] = []
     lines = read_records(path)
     for line in lines:
+        # Attempt IDs are 8-char prefixes in the compact vocabulary; they
+        # match across both sides because both truncate the same UUID.
         match = re.search(
-            r"entry signal selected: attempt_id=(\S+) product_id=(\S+) symbol=(\S+)"
-            r" direction=(\S+) lots=(\S+) edge_points=(\S+)",
+            r"evt=entry_selected att=(\S+) sym=(\S+) dir=(\S+) lots=(\S+) edge=(\S+)",
             line,
         )
-        if match is None:
-            match = re.search(
-                r"evt=entry_selected att=(\S+) sym=(\S+) dir=(\S+) lots=(\S+) edge=(\S+)",
-                line,
-            )
-            if match:
-                aid, symbol, direction, lots, edge = match.groups()
-                entries[aid] = {
-                    "symbol": symbol, "direction": direction, "lots": lots,
-                    "edge": edge, "at": line[:19],
-                }
-                continue
         if match:
-            aid, _, symbol, direction, lots, edge = match.groups()
+            aid, symbol, direction, lots, edge = match.groups()
             entries[aid] = {
                 "symbol": symbol, "direction": direction, "lots": lots,
                 "edge": edge, "at": line[:19],
             }
+            continue
         match = re.search(
-            r"entry position observed: attempt_id=(\S+) ticket=(\S+) symbol=(\S+)"
-            r" side=(\S+) volume=(\S+) fill_price=(\S+)",
+            r"evt=entry_filled att=(\S+) tkt=(\S+) sym=(\S+) side=(\S+) vol=(\S+) px=(\S+)",
             line,
         )
-        if match is None:
-            match = re.search(
-                r"evt=entry_filled att=(\S+) tkt=(\S+) sym=(\S+) side=(\S+) vol=(\S+) px=(\S+)",
-                line,
-            )
-            if match:
-                aid = match.group(1)
-                observed[aid] = {"ticket": match.group(2), "side": match.group(4)}
-                if aid in entries:
-                    # The analyzer keys legs by full attempt ID; the log
-                    # carries 8-char prefixes, resolved against entries below.
-                    entries[aid].update({"ticket": match.group(2), "side": match.group(4)})
-                continue
         if match:
             aid = match.group(1)
             observed[aid] = {"ticket": match.group(2), "side": match.group(4)}
             if aid in entries:
                 entries[aid].update({"ticket": match.group(2), "side": match.group(4)})
-        match = re.search(
-            r"realized_pnl_recorded state=\S+ attempt_id=\S* detail=position:([^=]+)=(-?[\d.]+)",
-            line,
-        )
-        if match is None:
-            match = re.search(r"evt=realized_pnl_recorded .*position:([^=\s]+)=(-?[\d.]+)", line)
+            continue
+        match = re.search(r"evt=realized_pnl_recorded .*position:([^=\s]+)=(-?[\d.]+)", line)
         if match:
             realized.append({"ticket": match.group(1), "pnl": float(match.group(2).rstrip(".")), "at": line[:19]})
-        match = re.search(r"event=close_requested state=\S+ attempt_id=(\S+) detail=(.+?)\.", line)
-        if match is None:
-            match = re.search(r"evt=close_requested \S+ att=(\S+) (.+)$", line)
+        match = re.search(r"evt=close_requested \S+ att=(\S+) (.+)$", line)
         if match:
             closes.append({"attempt": match.group(1), "reason": match.group(2).strip()})
-        if "profit_trail_applied" in line and ("evt=" in line or "event=" in line):
+        if "profit_trail_applied" in line:
             trails += 1
-        if "asymmetric_protection_applied" in line and ("evt=" in line or "event=" in line):
+        if "asymmetric_protection_applied" in line:
             asym += 1
         if "peer_leg_empty_leader_continues_solo" in line:
             solos += 1
