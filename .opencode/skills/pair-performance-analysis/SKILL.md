@@ -34,13 +34,15 @@ split by `--cutoff`, and attempt-matched pair nets. Only hand-roll parsing
 when the tool lacks a marker; if you do, record logical lines by rejoining
 wrapped follower lines (a new record starts with a timestamp).
 
-Key markers per side:
-- entries: `entry signal selected` (leader only: symbol, direction, lots, edge_points);
-  fills: `entry position observed` (both sides: attempt_id, ticket).
-- outcomes: `realized_pnl_recorded` (ticket → USD), `close_requested` (reason:
-  `owned_ticket_disappeared` vs `maximum_holding_seconds` vs `peer_leg_empty`).
-- mechanism: `profit_trail_applied`, `asymmetric_protection_applied`,
-  `peer_leg_empty_leader_continues_solo`, `needs_human=True`, `peer session lost`.
+Key markers per side (`pc` = pair cell, `pcr` = relay adapter; every line is
+`evt=<snake_event>` plus short IDs and flat `k=v`, no prose — transition names
+double as log events, so greps and `cell_transitions` share one vocabulary):
+- entries: `evt=entry_selected` (leader only: sym, dir, lots, edge, quote ages/skew);
+  fills: `evt=entry_filled` (both sides: att, tkt).
+- outcomes: `evt=realized_pnl_recorded` (ticket → USD), `evt=close_requested`
+  (reason: `owned_ticket_disappeared` vs `maximum_holding_seconds` vs `peer_leg_empty`).
+- mechanism: `evt=prot_trail` / `evt=prot_asym`, `evt=solo`, `evt=state` (human/host
+  flags), relay `evt=relay_q|relay_ack|relay_rx`.
 
 ## 3. Match pairs and compute
 

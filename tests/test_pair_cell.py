@@ -2981,10 +2981,10 @@ class ImmediateEntryTests(PairCellTestCase):
             self.net.pump()
 
         output = "\n".join(logs.output)
-        self.assertIn("Pair Execution Cell entry signal selected: attempt_id=", output)
-        self.assertIn("phase=mt5_send_started elapsed_ms=", output)
-        self.assertIn("phase=position_observed elapsed_ms=", output)
-        self.assertIn("Pair Execution Cell entry position observed: attempt_id=", output)
+        self.assertIn("evt=entry_selected att=", output)
+        self.assertIn("phase=mt5_send_started ms=", output)
+        self.assertIn("phase=position_observed ms=", output)
+        self.assertIn("evt=entry_filled att=", output)
 
     def test_one_tick_rough_protection_mismatch_still_contains(self) -> None:
         self.prime()

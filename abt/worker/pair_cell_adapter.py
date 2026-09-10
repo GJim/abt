@@ -119,6 +119,17 @@ from .scheduler import DeadlineAwareTraderRpcScheduler, ScheduledTraderRpc, Trad
 
 _LOGGER = logging.getLogger(__name__)
 
+# Relay-adapter log vocabulary, mirroring the cell's `pc` tag: every line
+# starts with `pcr`, then `evt=<snake_case event>`, then short IDs (first 8
+# chars) and flat `k=v` fields with no prose. Direction markers: `q` = queued
+# to peer, `ack` = controller acknowledgement, `rx` = received from peer.
+_RTAG = "pcr"
+
+
+def _short(value: object) -> str:
+    text = "-" if value is None else str(value)
+    return text if len(text) <= 8 else text[:8]
+
 _T = TypeVar("_T")
 
 _MT5_FILLING_FOK_BIT = 1
@@ -801,7 +812,7 @@ class WorkerPairCellRelay:
             try:
                 self._observer(kind, inner)
             except Exception:  # pragma: no cover - observability must never break the relay
-                _LOGGER.warning("Pair Execution Cell relay observer failed.", exc_info=True)
+                _LOGGER.warning("%s evt=relay_observer_fail", _RTAG, exc_info=True)
         wire_payload = {
             "protocol_version": envelope.get("protocol_version", PAIR_CELL_ENVELOPE_VERSION),
             "kind": kind,
@@ -826,10 +837,11 @@ class WorkerPairCellRelay:
             if kind in _STATE_RELAY_KINDS:
                 self._state_relay_request_ids.add(request_id)
                 _LOGGER.debug(
-                    "Pair Execution Cell relay queued: kind=%s request_id=%s target_worker_id=%s.",
+                    "%s evt=relay_q kind=%s rid=%s to=%s",
+                    _RTAG,
                     kind,
-                    request_id,
-                    wire_envelope["to_worker_id"],
+                    _short(request_id),
+                    _short(wire_envelope["to_worker_id"]),
                 )
         except Exception:
             # A relay send never propagates into the cell's decision path: the
@@ -837,7 +849,7 @@ class WorkerPairCellRelay:
             # which removes entry readiness without touching exposure this
             # Worker already owns.
             self.last_send_failed = True
-            _LOGGER.warning("Pair Execution Cell relay send failed.", exc_info=True)
+            _LOGGER.warning("%s evt=relay_send_fail", _RTAG, exc_info=True)
 
     def consume_state_relay_ack(self, request_id: object) -> bool:
         """Whether an acknowledgement belongs to a logged state envelope."""
@@ -1592,10 +1604,11 @@ class PairCellRuntime:
                 )
             self._construct_cell(record)
             _LOGGER.debug(
-                "Pair Execution Cell restored: route_id=%s role=%s peer_worker_id=%s.",
-                record.route_id,
+                "%s evt=restored route=%s role=%s peer=%s",
+                _RTAG,
+                _short(record.route_id),
                 record.role,
-                record.assignment().peer_of(worker_id),
+                _short(record.assignment().peer_of(worker_id)),
             )
 
     # -- observability ------------------------------------------------------ #
@@ -1894,7 +1907,7 @@ class PairCellRuntime:
                 self._pairing_state = "unpaired"
                 self._pairing_reason = "no Pair Execution Cell route exists to unpair"
                 self._exit_after_safe_unpair = True
-                _LOGGER.info("No Pair Execution Cell route exists; the safe-unpair request is already complete.")
+                _LOGGER.info("%s evt=unpair_noop", _RTAG)
                 return
             declared = reply.get("declared_role")
             resolved = reply.get("role")
@@ -2694,7 +2707,7 @@ class PairCellRuntime:
         self._startup_balance = None
         self._pairing_state = "unstarted"
         self._pairing_reason = f"the Pair Execution Cell route was removed ({reason})"
-        _LOGGER.info("The Pair Execution Cell route was removed: %s.", reason)
+        _LOGGER.info("%s evt=route_removed why=%s", _RTAG, reason)
         if self._options.unpair and reason in {"safe_unpair", "safe_unpair_completed_while_offline"}:
             self._exit_after_safe_unpair = True
 
@@ -2745,9 +2758,8 @@ class PairCellRuntime:
                 # attempt is terminal, so this is a contradiction: say so
                 # loudly and keep every piece of the attempt's evidence.
                 _LOGGER.error(
-                    "%s unresolved attempt(s) survive route removal; their durable evidence and"
-                    " desired state are kept intact so local containment still has exact facts"
-                    " to converge from.",
+                    "%s evt=route_removed_contradiction n=%s unresolved attempt(s) kept with evidence",
+                    _RTAG,
                     unresolved,
                 )
             else:
@@ -2756,7 +2768,7 @@ class PairCellRuntime:
                         connection.execute(f"DELETE FROM {table}")  # noqa: S608 - fixed literal names
             connection.commit()
         except sqlite3.Error:  # pragma: no cover - defensive
-            _LOGGER.warning("Could not clear route-scoped Pair Execution Cell state.", exc_info=True)
+            _LOGGER.warning("%s evt=state_clear_fail", _RTAG, exc_info=True)
         finally:
             connection.close()
 
@@ -2831,10 +2843,7 @@ class PairCellRuntime:
             lambda: self._refresh_locally(observed_at),
         )
         if ran is not True:
-            _LOGGER.debug(
-                "Pair Execution Cell catalog refresh was not admitted by the MT5 scheduler: cycle=%s.",
-                cycle,
-            )
+            _LOGGER.debug("%s evt=catalog_skip cycle=%s", _RTAG, cycle)
         return ran is True
 
     def _refresh_locally(self, observed_at: datetime) -> bool:
@@ -2861,15 +2870,11 @@ class PairCellRuntime:
             self._catalog_entries = entries
             self._catalog_generation += 1
             _LOGGER.debug(
-                "Pair Execution Cell catalog refreshed: generation=%s entries=%s.",
-                self._catalog_generation,
-                len(entries),
+                "%s evt=catalog gen=%s n=%s changed=1", _RTAG, self._catalog_generation, len(entries)
             )
         elif entries is not None:
             _LOGGER.debug(
-                "Pair Execution Cell catalog refresh found no change: generation=%s entries=%s.",
-                self._catalog_generation,
-                len(entries),
+                "%s evt=catalog gen=%s n=%s changed=0", _RTAG, self._catalog_generation, len(entries)
             )
         self._calibrate()
         return True
@@ -2908,9 +2913,7 @@ class PairCellRuntime:
             return None
         self._fed_catalog_generation = self._catalog_generation
         _LOGGER.debug(
-            "Pair Execution Cell submitted local catalog to discovery: generation=%s entries=%s.",
-            self._catalog_generation,
-            len(entries),
+            "%s evt=catalog_submit gen=%s n=%s", _RTAG, self._catalog_generation, len(entries)
         )
         return cell.handle_event(LocalCatalogEvent(entries=entries, observed_at=observed_at))
 
@@ -2950,8 +2953,9 @@ class PairCellRuntime:
                 self._relay is not None and self._relay.consume_state_relay_ack(request_id)
             ):
                 _LOGGER.debug(
-                    "Pair Execution Cell relay acknowledgement: request_id=%s accepted=%s%s.",
-                    request_id if isinstance(request_id, str) else "-",
+                    "%s evt=relay_ack rid=%s ok=%s%s",
+                    _RTAG,
+                    _short(request_id) if isinstance(request_id, str) else "-",
                     accepted,
                     f" reason={reason}" if not accepted and isinstance(reason, str) else "",
                 )
@@ -2966,9 +2970,10 @@ class PairCellRuntime:
                 kind = inner.get("kind")
                 if kind in _STATE_RELAY_KINDS:
                     _LOGGER.debug(
-                        "Pair Execution Cell relay received: kind=%s source_worker_id=%s.",
+                        "%s evt=relay_rx kind=%s from=%s",
+                        _RTAG,
                         kind,
-                        inner.get("from_worker_id"),
+                        _short(inner.get("from_worker_id")),
                     )
                 result = self._cell.handle_event(RelayEnvelopeReceived(inner))
         if self._cell is not None:
@@ -3049,8 +3054,9 @@ class PairCellRuntime:
             return
         self._peer_session_connected = connected
         _LOGGER.debug(
-            "Pair Execution Cell peer session %s: %s.",
-            "connected" if connected else "disconnected",
+            "%s evt=peer_session %s why=%s",
+            _RTAG,
+            "up" if connected else "down",
             reason,
         )
 
@@ -3079,19 +3085,19 @@ class PairCellRuntime:
             return
         self._last_state_diagnostic = snapshot
         _LOGGER.debug(
-            "Pair Execution Cell state: route_id=%s route_state=%s universe_generation=%s "
-            "state=%s desired=%s attempt_id=%s ready=%s reason=%s policy_accepted=%s "
-            "plan_set_version=%s pair_confirmed=%s needs_human=%s needs_human_reason=%s admission=%s.",
-            status.route_id,
+            "%s evt=state route=%s rstate=%s gen=%s st=%s des=%s att=%s ready=%s why=%s "
+            "pol=%s plan=%s pair=%s human=%s hwhy=%s adm=%s",
+            _RTAG,
+            _short(status.route_id),
             status.route_state,
             status.universe_generation,
             status.state,
             status.desired_state,
-            status.attempt_id or "-",
+            _short(status.attempt_id) if status.attempt_id else "-",
             status.ready,
             status.ready_reason,
             status.policy_accepted,
-            status.plan_set_version or "-",
+            _short(status.plan_set_version) if status.plan_set_version else "-",
             status.pair_confirmed,
             status.needs_human,
             status.needs_human_reason or "-",
@@ -3182,7 +3188,7 @@ class PairCellRuntime:
             # broker-verified empty; this retries quietly.
             return None
         self._published_policy = True
-        _LOGGER.info("The Pair Execution Cell leader adopted strategy policy %s.", policy.policy_version)
+        _LOGGER.info("%s evt=policy_adopted %s", _RTAG, _short(policy.policy_version))
         return result
 
     def _apply_quarantine_release(

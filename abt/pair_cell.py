@@ -85,6 +85,18 @@ from .worker.scheduler import (
 
 _LOGGER = logging.getLogger(__name__)
 
+# Log vocabulary for humans and agents: every cell line starts with the `pc`
+# tag, then `evt=<snake_case event>`, then short IDs (`att`/`route` are the
+# first 8 chars; the DB keeps full values), then flat `k=v` fields with no
+# prose and no trailing periods. Transition event names double as log events
+# so log greps and `cell_transitions` queries share one vocabulary.
+_TAG = "pc"
+
+
+def _short_id(value: object) -> str:
+    text = "-" if value is None else str(value)
+    return text if len(text) <= 8 else text[:8]
+
 
 class PairExecutionCellError(RuntimeError):
     """Raised for malformed policy, route, discovery, or event input."""
@@ -2702,13 +2714,18 @@ class PairExecutionCell:
             (None if self._attempt is None else self._attempt.attempt_id, event, detail, _iso(self._now)),
         )
         self._db.commit()
-        _LOGGER.debug(
-            "Pair Execution Cell transition: event=%s state=%s attempt_id=%s detail=%s.",
-            event,
-            self._state,
-            None if self._attempt is None else self._attempt.attempt_id,
-            detail or "-",
-        )
+        if not event.startswith("timing:"):
+            logged = detail or "-"
+            if len(logged) > 64:
+                logged = logged[:61] + "..."
+            _LOGGER.debug(
+                "%s evt=%s st=%s att=%s %s",
+                _TAG,
+                event,
+                self._state,
+                _short_id(None if self._attempt is None else self._attempt.attempt_id),
+                logged,
+            )
 
     def _record_timing(self, key: str) -> None:
         self._last_timing[key] = _iso(self._now)
@@ -2716,13 +2733,13 @@ class PairExecutionCell:
         if key == "attempt_persisted":
             self._attempt_timing_origin = self._monotonic()
         origin = self._attempt_timing_origin
-        elapsed = "-" if origin is None else f"{(self._monotonic() - origin) * 1000:.1f}"
+        elapsed = "-" if origin is None else f"{(self._monotonic() - origin) * 1000:.0f}"
         _LOGGER.debug(
-            "Pair Execution Cell attempt timing: attempt_id=%s phase=%s elapsed_ms=%s observed_at=%s.",
-            None if self._attempt is None else self._attempt.attempt_id,
+            "%s evt=time att=%s phase=%s ms=%s",
+            _TAG,
+            _short_id(None if self._attempt is None else self._attempt.attempt_id),
             key,
             elapsed,
-            _iso(self._now),
         )
 
     def transition_history(self) -> list[dict[str, object]]:
@@ -4930,7 +4947,7 @@ class PairExecutionCell:
             detail = (
                 f"remaining=${remaining}; threshold=${self._daily_loss_warning_threshold_usd}"
             )
-            _LOGGER.warning("Pair Execution Cell daily-loss warning: %s.", detail)
+            _LOGGER.warning("%s evt=daily_loss_warn %s.", _TAG, detail)
             self._transition("daily_loss_warning_started", detail)
         else:
             self._transition("daily_loss_warning_cleared", f"remaining=${remaining}")
@@ -5181,11 +5198,9 @@ class PairExecutionCell:
             confirmation_timeout_seconds=policy.follower_confirmation_timeout_seconds,
         )
         _LOGGER.debug(
-            "Pair Execution Cell entry signal selected: attempt_id=%s product_id=%s symbol=%s "
-            "direction=%s lots=%s edge_points=%s local_quote_age_ms=%.1f peer_quote_age_ms=%.1f "
-            "quote_skew_ms=%.1f decision_at=%s.",
-            attempt.attempt_id,
-            product_id,
+            "%s evt=entry_selected att=%s sym=%s dir=%s lots=%s edge=%s qage=%.0f/%.0f skew=%.0f",
+            _TAG,
+            _short_id(attempt.attempt_id),
             attempt.symbol,
             leader_direction,
             lots,
@@ -5193,7 +5208,6 @@ class PairExecutionCell:
             leader_quote.age_seconds(self._now) * 1000,
             follower_quote.age_seconds(self._now) * 1000,
             calibrated_skew_seconds(leader_quote, follower_quote) * 1000,
-            _iso(self._now),
         )
         # 1. durably persist the immutable attempt and the prepared local effect
         self._attempt = attempt
@@ -5736,18 +5750,14 @@ class PairExecutionCell:
             self._transition("entry_filled_observed", leg.ticket)
             self._record_timing("position_observed")
             _LOGGER.debug(
-                "Pair Execution Cell entry position observed: attempt_id=%s ticket=%s symbol=%s "
-                "side=%s volume=%s fill_price=%s broker_entry_time=%s broker_entry_time_msc=%s "
-                "observation_at=%s.",
-                attempt.attempt_id,
+                "%s evt=entry_filled att=%s tkt=%s sym=%s side=%s vol=%s px=%s",
+                _TAG,
+                _short_id(attempt.attempt_id),
                 leg.ticket,
                 symbol,
                 direction,
                 leg.observed_volume,
                 leg.fill_price,
-                position.get("time", "-"),
-                position.get("time_msc", "-"),
-                _iso(event.observed_at),
             )
             inconsistent = self._own_evidence_inconsistency()
             if inconsistent is not None:
@@ -6155,22 +6165,23 @@ class PairExecutionCell:
             return
         if not is_trail:
             _LOGGER.info(
-                "Pair Execution Cell asymmetric protection: role=%s ticket=%s sl=%s tp=%s(no cap) "
-                "attempt_id=%s.",
+                "%s evt=prot_asym role=%s tkt=%s sl=%s tp=%s att=%s",
+                _TAG,
                 leg.role,
                 leg.ticket,
                 sl,
                 tp,
-                attempt.attempt_id,
+                _short_id(attempt.attempt_id),
             )
         else:
             _LOGGER.info(
-                "Pair Execution Cell profit trail: role=%s ticket=%s sl %s -> %s attempt_id=%s.",
+                "%s evt=prot_trail role=%s tkt=%s sl=%s>%s att=%s",
+                _TAG,
                 leg.role,
                 leg.ticket,
                 leg.precise_sl,
                 sl,
-                attempt.attempt_id,
+                _short_id(attempt.attempt_id),
             )
         effect_id = f"{attempt.attempt_id}:{self._worker_id}:protection"
         if is_trail:
@@ -6356,9 +6367,9 @@ class PairExecutionCell:
                 # leg itself empties (trailing stop, timed exit, blackout).
                 if previous_status != "empty":
                     _LOGGER.info(
-                        "Pair Execution Cell peer empty, leader continues solo: "
-                        "attempt_id=%s ticket=%s.",
-                        attempt_id,
+                        "%s evt=solo att=%s tkt=%s",
+                        _TAG,
+                        _short_id(attempt_id),
                         self._leg.ticket,
                     )
                     self._transition("peer_leg_empty_leader_continues_solo", attempt_id)
