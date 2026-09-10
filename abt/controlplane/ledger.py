@@ -368,333 +368,6 @@ class ControlLedger:
             )
         return enrollment
 
-    def create_trader_enrollment(
-        self, *, strategy_name: str, claimed_public_ip: str, public_key_pem: str
-    ) -> dict[str, Any]:
-        now = _utc_now()
-        registration_id = str(uuid4())
-        with self._transaction():
-            self._connection.execute(
-                """
-                INSERT INTO trader_enrollments
-                    (registration_id, strategy_name, claimed_public_ip, public_key_pem, attestation_provider, status, created_at, expires_at)
-                VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)
-                """,
-                [registration_id, strategy_name, claimed_public_ip, public_key_pem, "CNG", now, now + timedelta(minutes=15)],
-            )
-            self._event("trader_enrollment_requested", {"registration_id": registration_id, "strategy_name": strategy_name})
-        return {"registration_id": registration_id, "expires_at": now + timedelta(minutes=15)}
-
-    def pending_trader_enrollments(self) -> list[dict[str, Any]]:
-        now = _utc_now()
-        with self._transaction():
-            self._connection.execute(
-                "UPDATE trader_enrollments SET status = 'expired' WHERE status = 'pending' AND expires_at <= ?",
-                [now],
-            )
-            rows = self._connection.execute(
-                """
-                SELECT registration_id, strategy_name, claimed_public_ip, created_at, expires_at
-                FROM trader_enrollments WHERE status = 'pending' ORDER BY created_at
-                """
-            ).fetchall()
-        return [
-            {
-                "registration_id": row[0],
-                "strategy_name": row[1],
-                "claimed_public_ip": row[2],
-                "created_at": row[3],
-                "expires_at": row[4],
-            }
-            for row in rows
-        ]
-
-    def traders(self) -> list[dict[str, Any]]:
-        with self._lock:
-            rows = self._connection.execute(
-                """SELECT trader_id, registration_id, strategy_name, status, approved_at, revoked_at
-                   FROM traders ORDER BY approved_at DESC"""
-            ).fetchall()
-        return [
-            {
-                "trader_id": row[0],
-                "registration_id": row[1],
-                "strategy_name": row[2],
-                "status": row[3],
-                "approved_at": row[4],
-                "revoked_at": row[5],
-            }
-            for row in rows
-        ]
-
-    def approve_trader_enrollment(
-        self,
-        registration_id: str,
-        approved_by: str,
-        issue_certificate: Callable[[str, str, str], str],
-    ) -> str:
-        now = _utc_now()
-        with self._transaction():
-            row = self._connection.execute(
-                """
-                SELECT strategy_name, public_key_pem, status, expires_at
-                FROM trader_enrollments WHERE registration_id = ?
-                """,
-                [registration_id],
-            ).fetchone()
-            if row is None:
-                raise LedgerError("Trader enrollment does not exist.")
-            strategy_name, public_key_pem, enrollment_status, expires_at = row
-            if enrollment_status != "pending" or now >= expires_at:
-                raise LedgerError("Trader enrollment is no longer pending.")
-            trader_id = str(uuid4())
-            certificate = issue_certificate(trader_id, strategy_name, public_key_pem)
-            self._connection.execute(
-                """
-                INSERT INTO traders (trader_id, registration_id, strategy_name, certificate, status, approved_at)
-                VALUES (?, ?, ?, ?, 'active', ?)
-                """,
-                [trader_id, registration_id, strategy_name, certificate, now],
-            )
-            self._connection.execute(
-                """
-                UPDATE trader_enrollments
-                SET status = 'approved', approved_by = ?, approved_at = ?
-                WHERE registration_id = ?
-                """,
-                [approved_by, now, registration_id],
-            )
-            event_id = self._event(
-                "trader_enrollment_approved",
-                {"registration_id": registration_id, "trader_id": trader_id, "approved_by": approved_by},
-            )
-            return trader_id
-
-    def reject_trader_enrollment(self, registration_id: str, rejected_by: str) -> None:
-        with self._transaction():
-            changed = self._connection.execute(
-                """
-                UPDATE trader_enrollments SET status = 'rejected', approved_by = ?, approved_at = ?
-                WHERE registration_id = ? AND status = 'pending' AND expires_at > ?
-                RETURNING registration_id
-                """,
-                [rejected_by, _utc_now(), registration_id, _utc_now()],
-            ).fetchone()
-            if changed is None:
-                raise LedgerError("Trader enrollment is no longer pending.")
-            self._event(
-                "trader_enrollment_rejected",
-                {"registration_id": registration_id, "rejected_by": rejected_by},
-            )
-
-    def active_trader_for_enrollment(self, registration_id: str) -> ActiveTrader:
-        return self._active_trader(
-            """
-            SELECT t.trader_id, t.registration_id, t.strategy_name, t.certificate, e.public_key_pem
-            FROM traders t JOIN trader_enrollments e ON e.registration_id = t.registration_id
-            WHERE t.registration_id = ? AND t.status = 'active'
-            """,
-            [registration_id],
-        )
-
-    def trader_enrollment_status(self, registration_id: str) -> str:
-        """Return the current status for a Trader's external enrollment identifier."""
-
-        with self._lock:
-            row = self._connection.execute(
-                "SELECT status FROM trader_enrollments WHERE registration_id = ?", [registration_id]
-            ).fetchone()
-        if row is None:
-            raise LedgerError("Trader enrollment does not exist.")
-        return str(row[0])
-
-    def active_trader(self, trader_id: str) -> ActiveTrader:
-        return self._active_trader(
-            """
-            SELECT t.trader_id, t.registration_id, t.strategy_name, t.certificate, e.public_key_pem
-            FROM traders t JOIN trader_enrollments e ON e.registration_id = t.registration_id
-            WHERE t.trader_id = ? AND t.status = 'active'
-            """,
-            [trader_id],
-        )
-
-    def _active_trader(self, query: str, parameters: list[str]) -> ActiveTrader:
-        with self._lock:
-            row = self._connection.execute(query, parameters).fetchone()
-        if row is None:
-            raise LedgerError("Trader is not active.")
-        return ActiveTrader(*row)
-
-    def revoke_trader(self, trader_id: str, revoked_by: str) -> None:
-        with self._transaction():
-            changed = self._connection.execute(
-                """
-                UPDATE traders SET status = 'revoked', revoked_at = ?
-                WHERE trader_id = ? AND status = 'active'
-                RETURNING trader_id
-                """,
-                [_utc_now(), trader_id],
-            ).fetchone()
-            if changed is None:
-                raise LedgerError("Trader is not active.")
-            self._event("trader_certificate_revoked", {"trader_id": trader_id, "revoked_by": revoked_by})
-
-    def rotate_trader_certificate(
-        self, trader_id: str, public_key_pem: str, issue_certificate: Callable[[str, str, str], str]
-    ) -> str:
-        """Replace an active Trader's key only after the service verified both proofs."""
-
-        with self._transaction():
-            row = self._connection.execute(
-                "SELECT registration_id, strategy_name FROM traders WHERE trader_id = ? AND status = 'active'", [trader_id]
-            ).fetchone()
-            if row is None:
-                raise LedgerError("Trader is not active.")
-            registration_id, strategy_name = row
-            predecessor = self.active_trader(trader_id)
-            certificate = issue_certificate(trader_id, strategy_name, public_key_pem)
-            self._connection.execute(
-                """
-                INSERT INTO certificate_overlaps (role, identity_id, certificate, public_key_pem, expires_at)
-                VALUES ('trader', ?, ?, ?, ?)
-                """,
-                [trader_id, predecessor.certificate, predecessor.public_key_pem, _utc_now() + timedelta(hours=1)],
-            )
-            self._connection.execute(
-                "UPDATE trader_enrollments SET public_key_pem = ? WHERE registration_id = ?",
-                [public_key_pem, registration_id],
-            )
-            self._connection.execute("UPDATE traders SET certificate = ? WHERE trader_id = ?", [certificate, trader_id])
-            self._event(
-                "trader_certificate_rotated",
-                {"trader_id": trader_id},
-            )
-            return certificate
-
-    def trader_for_certificate(self, trader_id: str, certificate: str) -> ActiveTrader:
-        trader = self.active_trader(trader_id)
-        if certificate == trader.certificate:
-            return trader
-        with self._lock:
-            row = self._connection.execute(
-                """
-                SELECT public_key_pem FROM certificate_overlaps
-                WHERE role = 'trader' AND identity_id = ? AND certificate = ? AND expires_at > ?
-                """,
-                [trader_id, certificate, _utc_now()],
-            ).fetchone()
-        if row is None:
-            raise LedgerError("Trader certificate is no longer active.")
-        return replace(trader, certificate=certificate, public_key_pem=row[0])
-
-    def open_trader_session(self, trader_id: str) -> str:
-        session_id = str(uuid4())
-        now = _utc_now()
-        with self._transaction():
-            self._connection.execute(
-                """INSERT INTO trader_sessions (session_id, trader_id, status, last_valid_signal_at, opened_at)
-                   VALUES (?, ?, 'connected', ?, ?)""",
-                [session_id, trader_id, now, now],
-            )
-            self._event("trader_session_authenticated", {"trader_id": trader_id, "session_id": session_id})
-        return session_id
-
-    def record_trader_signal(self, session_id: str) -> None:
-        with self._transaction():
-            self._connection.execute(
-                "UPDATE trader_sessions SET status = 'connected', last_valid_signal_at = ? WHERE session_id = ?",
-                [_utc_now(), session_id],
-            )
-
-    def sweep_stale_trader_sessions(self) -> int:
-        """Durably mark every disconnected/silent Trader session stale."""
-
-        with self._transaction():
-            now = _utc_now()
-            changed = self._connection.execute(
-                """UPDATE trader_sessions SET status = 'stale', stale_at = ?
-                   WHERE status = 'connected' AND last_valid_signal_at <= ?
-                   RETURNING trader_id, session_id""",
-                [now, now - timedelta(minutes=5)],
-            ).fetchall()
-            for trader_id, session_id in changed:
-                self._event("trader_session_stale", {"trader_id": trader_id, "session_id": session_id})
-            return len(changed)
-
-    def record_trader_relay(
-        self, trader_id: str, request_id: str, worker_id: str, envelope: dict[str, Any]
-    ) -> dict[str, Any]:
-        """Record an opaque end-to-end envelope without interpreting its trading payload."""
-
-        canonical = json.dumps(envelope, separators=(",", ":"), sort_keys=True, allow_nan=False)
-        envelope_hash = _hash(canonical)
-        with self._transaction():
-            self.active_trader(trader_id)
-            self.active_worker(worker_id)
-            existing = self._connection.execute(
-                """SELECT envelope_hash, status, outcome FROM trader_worker_relay
-                   WHERE trader_id = ? AND request_id = ?""",
-                [trader_id, request_id],
-            ).fetchone()
-            if existing is not None:
-                if existing[0] != envelope_hash:
-                    raise LedgerError("Trader relay request ID was reused with a different envelope.")
-                return {
-                    "status": existing[1],
-                    "outcome": None if existing[2] is None else json.loads(existing[2]),
-                    "dispatch": existing[1] == "recorded",
-                }
-            event_id = self._event(
-                "trader_worker_relay_recorded",
-                {
-                    "trader_id": trader_id,
-                    "worker_id": worker_id,
-                    "request_id": request_id,
-                    "envelope": envelope,
-                },
-            )
-            self._connection.execute(
-                """INSERT INTO trader_worker_relay
-                   (trader_id, request_id, worker_id, envelope_hash, envelope, status, requested_event_id, requested_at)
-                   VALUES (?, ?, ?, ?, ?, 'recorded', ?, ?)""",
-                [trader_id, request_id, worker_id, envelope_hash, canonical, event_id, _utc_now()],
-            )
-            return {"status": "recorded", "outcome": None, "dispatch": True}
-
-    def complete_trader_relay(
-        self, trader_id: str, request_id: str, outcome: dict[str, Any]
-    ) -> dict[str, Any]:
-        """Persist an opaque Worker outcome before relaying it to the Strategy Runtime."""
-
-        canonical = json.dumps(outcome, separators=(",", ":"), sort_keys=True, allow_nan=False)
-        with self._transaction():
-            row = self._connection.execute(
-                """SELECT worker_id, status, outcome FROM trader_worker_relay
-                   WHERE trader_id = ? AND request_id = ?""",
-                [trader_id, request_id],
-            ).fetchone()
-            if row is None:
-                raise LedgerError("Trader relay request does not exist.")
-            if row[1] == "completed":
-                if row[2] != canonical:
-                    raise LedgerError("Trader relay request already has a different outcome.")
-                return json.loads(row[2])
-            event_id = self._event(
-                "trader_worker_relay_completed",
-                {
-                    "trader_id": trader_id,
-                    "worker_id": row[0],
-                    "request_id": request_id,
-                    "outcome": outcome,
-                },
-            )
-            self._connection.execute(
-                """UPDATE trader_worker_relay SET status = 'completed', outcome = ?,
-                   completed_event_id = ?, completed_at = ?
-                   WHERE trader_id = ? AND request_id = ?""",
-                [canonical, event_id, _utc_now(), trader_id, request_id],
-            )
-            return outcome
 
     def record_worker_fact_audit(self, worker_id: str, envelope: dict[str, Any]) -> int:
         """Append an immutable opaque Worker fact without reducing trading state."""
@@ -736,71 +409,6 @@ class ControlLedger:
             )
             return audit_event_id
 
-    def worker_relay_resume(
-        self, worker_id: str, recovery_epoch: str | None, event_id: int
-    ) -> dict[str, Any]:
-        """Return immutable Worker envelopes after a cursor or report a stream gap."""
-
-        with self._lock:
-            latest = self._connection.execute(
-                """SELECT recovery_epoch FROM worker_relay_facts
-                   WHERE worker_id = ? ORDER BY recorded_at DESC LIMIT 1""",
-                [worker_id],
-            ).fetchone()
-            if latest is None:
-                return {"status": "resumed", "recovery_epoch": recovery_epoch or "", "facts": []}
-            latest_epoch = str(latest[0])
-            if recovery_epoch is not None and recovery_epoch != latest_epoch:
-                return {"status": "gap", "recovery_epoch": latest_epoch, "facts": []}
-            rows = self._connection.execute(
-                """SELECT event_id, envelope FROM worker_relay_facts
-                   WHERE worker_id = ? AND recovery_epoch = ? AND event_id > ?
-                   ORDER BY event_id""",
-                [worker_id, latest_epoch, event_id],
-            ).fetchall()
-            minimum = self._connection.execute(
-                """SELECT MIN(event_id) FROM worker_relay_facts
-                   WHERE worker_id = ? AND recovery_epoch = ?""",
-                [worker_id, latest_epoch],
-            ).fetchone()[0]
-        if minimum is not None and event_id + 1 < int(minimum):
-            return {"status": "gap", "recovery_epoch": latest_epoch, "facts": []}
-        return {
-            "status": "resumed",
-            "recovery_epoch": latest_epoch,
-            "facts": [json.loads(row[1]) for row in rows],
-        }
-
-    def acknowledge_worker_fact(
-        self,
-        trader_id: str,
-        worker_id: str,
-        recovery_epoch: str,
-        event_id: int,
-    ) -> None:
-        with self._transaction():
-            self.active_trader(trader_id)
-            self._connection.execute(
-                """INSERT INTO trader_worker_fact_cursors
-                   (trader_id, worker_id, recovery_epoch, event_id, acknowledged_at)
-                   VALUES (?, ?, ?, ?, ?)
-                   ON CONFLICT(trader_id, worker_id) DO UPDATE SET
-                     recovery_epoch = excluded.recovery_epoch,
-                     event_id = excluded.event_id,
-                     acknowledged_at = excluded.acknowledged_at
-                   WHERE excluded.recovery_epoch != trader_worker_fact_cursors.recovery_epoch
-                      OR excluded.event_id > trader_worker_fact_cursors.event_id""",
-                [trader_id, worker_id, recovery_epoch, event_id, _utc_now()],
-            )
-            self._event(
-                "trader_worker_fact_acknowledged",
-                {
-                    "trader_id": trader_id,
-                    "worker_id": worker_id,
-                    "recovery_epoch": recovery_epoch,
-                    "event_id": event_id,
-                },
-            )
 
     def record_worker_connection_audit(self, worker_id: str, source: str, reason: str) -> int:
         with self._transaction():
@@ -822,29 +430,6 @@ class ControlLedger:
     # attempt projection, parses no payload, and derives neither broker
     # emptiness nor attempt terminality.
 
-    def claim_pair_execution_mode(
-        self, leader_worker_id: str, follower_worker_id: str, mode: str, trader_id: str | None = None
-    ) -> None:
-        """Enforce that a Worker pair has exactly one live *authorized* owner.
-
-        This is the legacy Strategy Runtime's rollout/authorization control,
-        not lifecycle coordination: ``strategy_runtime`` and
-        ``pair_execution_cell`` are mutually exclusive for the same pair,
-        while ``shadow`` may run alongside either.
-
-        A ``pair_execution_cell`` claim is deliberately *not* reachable here.
-        It is taken for both Workers inside the pairing reservation
-        transaction and confirmed inside the final route-creation
-        compare-and-swap, so no operator or Trader surface can create,
-        contradict, or strand one.
-        """
-
-        if mode == "pair_execution_cell":
-            raise LedgerError(
-                "A Pair Execution Cell execution-mode claim is taken only by the two-phase pairing workflow."
-            )
-        with self._transaction():
-            self._claim_pair_execution_mode_locked(leader_worker_id, follower_worker_id, mode, trader_id)
 
     def _claim_pair_execution_mode_locked(
         self, leader_worker_id: str, follower_worker_id: str, mode: str, trader_id: str | None
@@ -888,22 +473,6 @@ class ControlLedger:
             },
         )
 
-    def release_pair_execution_mode(self, leader_worker_id: str, follower_worker_id: str, mode: str) -> None:
-        """Release a legacy Strategy Runtime or shadow execution-mode claim.
-
-        A ``pair_execution_cell`` claim is owned by the pairing workflow and
-        is released only when its reservation is released or its route is
-        removed, so it can never be dropped out from under a live route.
-        """
-
-        if mode == "pair_execution_cell":
-            raise LedgerError(
-                "A Pair Execution Cell execution-mode claim is released only by its reservation or route."
-            )
-        with self._transaction():
-            self._release_pair_execution_mode_locked(
-                leader_worker_id, follower_worker_id, mode, reason="explicit_release"
-            )
 
     def _release_pair_execution_mode_locked(
         self, leader_worker_id: str, follower_worker_id: str, mode: str, *, reason: str
@@ -1906,42 +1475,6 @@ class ControlLedger:
             },
         )
 
-    def acknowledge_trader_events(
-        self, trader_id: str, cursor: int, connection_cursor: int, delivered_event_ids: set[int]
-    ) -> None:
-        if cursor < connection_cursor or (cursor != connection_cursor and cursor not in delivered_event_ids):
-            raise LedgerError("Trader event ACK cursor was not delivered by this session.")
-        with self._transaction():
-            required = self._connection.execute(
-                """SELECT event_id FROM trader_events
-                   WHERE trader_id = ? AND event_id > ? AND event_id <= ? ORDER BY event_id""",
-                [trader_id, connection_cursor, cursor],
-            ).fetchall()
-            if any(event_id not in delivered_event_ids for (event_id,) in required):
-                raise LedgerError("Trader event ACK cursor would skip an unseen event.")
-            self._connection.execute(
-                """INSERT INTO trader_event_cursors (trader_id, cursor, acknowledged_at) VALUES (?, ?, ?)
-                   ON CONFLICT (trader_id) DO UPDATE SET cursor = greatest(trader_event_cursors.cursor, excluded.cursor),
-                       acknowledged_at = excluded.acknowledged_at""",
-                [trader_id, cursor, _utc_now()],
-            )
-
-    def trader_event_cursor(self, trader_id: str) -> int:
-        with self._lock:
-            row = self._connection.execute(
-                "SELECT cursor FROM trader_event_cursors WHERE trader_id = ?", [trader_id]
-            ).fetchone()
-        return 0 if row is None else int(row[0])
-
-    def trader_events_after(self, trader_id: str, cursor: int) -> list[dict[str, Any]]:
-        with self._lock:
-            rows = self._connection.execute(
-                """SELECT e.event_id, e.event_type, e.payload, e.occurred_at FROM trader_events te
-                   JOIN events e ON e.event_id = te.event_id
-                   WHERE te.trader_id = ? AND e.event_id > ? ORDER BY e.event_id""",
-                [trader_id, cursor],
-            ).fetchall()
-        return [{"event_id": row[0], "event_type": row[1], "payload": json.loads(row[2]), "occurred_at": row[3]} for row in rows]
 
     def issue_enrollment_challenge(self) -> tuple[str, datetime]:
         challenge = secrets.token_urlsafe(32)
@@ -2132,18 +1665,6 @@ class ControlLedger:
                 raise LedgerError("Worker does not exist.")
             self._event(event_type, {"worker_id": worker_id, "session_id": session_id, **details})
 
-    def trader_active_workers(self) -> list[dict[str, Any]]:
-        """Return the non-sensitive identities and live status of active Workers."""
-
-        return [
-            {
-                "worker_id": worker["worker_id"],
-                "server": worker["server"],
-                "connectivity": worker["connectivity"],
-            }
-            for worker in self.worker_reconciliation()
-            if worker["connectivity"] != "revoked"
-        ]
 
     def record_worker_heartbeat(self, worker_id: str) -> None:
         with self._transaction():
@@ -2440,51 +1961,6 @@ class ControlLedger:
                     used_at TIMESTAMPTZ,
                     revoked_at TIMESTAMPTZ
                 );
-                CREATE TABLE IF NOT EXISTS trader_sessions (
-                    session_id VARCHAR PRIMARY KEY,
-                    trader_id VARCHAR NOT NULL,
-                    status VARCHAR NOT NULL,
-                    last_valid_signal_at TIMESTAMPTZ NOT NULL,
-                    opened_at TIMESTAMPTZ NOT NULL,
-                    stale_at TIMESTAMPTZ
-                );
-                CREATE TABLE IF NOT EXISTS trader_commands (
-                    trader_id VARCHAR NOT NULL,
-                    command_id VARCHAR NOT NULL,
-                    payload_hash VARCHAR NOT NULL,
-                    result JSON NOT NULL,
-                    created_at TIMESTAMPTZ NOT NULL,
-                    PRIMARY KEY (trader_id, command_id)
-                );
-                CREATE TABLE IF NOT EXISTS trader_worker_requests (
-                    trader_id VARCHAR NOT NULL,
-                    request_id VARCHAR NOT NULL,
-                    worker_id VARCHAR NOT NULL,
-                    kind VARCHAR NOT NULL,
-                    payload_hash VARCHAR NOT NULL,
-                    payload JSON NOT NULL,
-                    status VARCHAR NOT NULL,
-                    result JSON,
-                    requested_event_id BIGINT NOT NULL,
-                    completed_event_id BIGINT,
-                    requested_at TIMESTAMPTZ NOT NULL,
-                    completed_at TIMESTAMPTZ,
-                    PRIMARY KEY (trader_id, request_id)
-                );
-                CREATE TABLE IF NOT EXISTS trader_worker_relay (
-                    trader_id VARCHAR NOT NULL,
-                    request_id VARCHAR NOT NULL,
-                    worker_id VARCHAR NOT NULL,
-                    envelope_hash VARCHAR NOT NULL,
-                    envelope JSON NOT NULL,
-                    status VARCHAR NOT NULL,
-                    outcome JSON,
-                    requested_event_id BIGINT NOT NULL,
-                    completed_event_id BIGINT,
-                    requested_at TIMESTAMPTZ NOT NULL,
-                    completed_at TIMESTAMPTZ,
-                    PRIMARY KEY (trader_id, request_id)
-                );
                 CREATE TABLE IF NOT EXISTS worker_relay_facts (
                     worker_id VARCHAR NOT NULL,
                     recovery_epoch VARCHAR NOT NULL,
@@ -2494,44 +1970,6 @@ class ControlLedger:
                     audit_event_id BIGINT NOT NULL,
                     recorded_at TIMESTAMPTZ NOT NULL,
                     PRIMARY KEY (worker_id, recovery_epoch, event_id)
-                );
-                CREATE TABLE IF NOT EXISTS trader_worker_fact_cursors (
-                    trader_id VARCHAR NOT NULL,
-                    worker_id VARCHAR NOT NULL,
-                    recovery_epoch VARCHAR NOT NULL,
-                    event_id BIGINT NOT NULL,
-                    acknowledged_at TIMESTAMPTZ NOT NULL,
-                    PRIMARY KEY (trader_id, worker_id)
-                );
-                CREATE TABLE IF NOT EXISTS trader_events (
-                    trader_id VARCHAR NOT NULL,
-                    event_id BIGINT PRIMARY KEY
-                );
-                CREATE TABLE IF NOT EXISTS trader_event_cursors (
-                    trader_id VARCHAR PRIMARY KEY,
-                    cursor BIGINT NOT NULL,
-                    acknowledged_at TIMESTAMPTZ NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS trader_enrollments (
-                    registration_id VARCHAR PRIMARY KEY,
-                    strategy_name VARCHAR NOT NULL,
-                    claimed_public_ip VARCHAR NOT NULL,
-                    public_key_pem VARCHAR NOT NULL,
-                    attestation_provider VARCHAR NOT NULL DEFAULT 'unverified',
-                    status VARCHAR NOT NULL,
-                    created_at TIMESTAMPTZ NOT NULL,
-                    expires_at TIMESTAMPTZ NOT NULL,
-                    approved_by VARCHAR,
-                    approved_at TIMESTAMPTZ
-                );
-                CREATE TABLE IF NOT EXISTS traders (
-                    trader_id VARCHAR PRIMARY KEY,
-                    registration_id VARCHAR UNIQUE NOT NULL,
-                    strategy_name VARCHAR NOT NULL,
-                    certificate VARCHAR NOT NULL,
-                    status VARCHAR NOT NULL,
-                    approved_at TIMESTAMPTZ NOT NULL,
-                    revoked_at TIMESTAMPTZ
                 );
                 CREATE TABLE IF NOT EXISTS enrollment_challenges (
                     challenge_hash VARCHAR PRIMARY KEY,
@@ -2683,17 +2121,17 @@ class ControlLedger:
                 "product_pair_worker_compatibility_checks",
                 "product_pair_worker_exclusions",
                 "product_pair_retests",
+                "trader_enrollments",
+                "traders",
+                "trader_sessions",
+                "trader_commands",
+                "trader_worker_requests",
+                "trader_worker_relay",
+                "trader_worker_fact_cursors",
+                "trader_events",
+                "trader_event_cursors",
             ):
                 self._connection.execute(f"DROP TABLE IF EXISTS {table}")
-            self._connection.execute(
-                "ALTER TABLE trader_enrollments ADD COLUMN IF NOT EXISTS approved_by VARCHAR"
-            )
-            self._connection.execute(
-                "ALTER TABLE trader_enrollments ADD COLUMN IF NOT EXISTS approved_at TIMESTAMPTZ"
-            )
-            self._connection.execute(
-                "ALTER TABLE trader_enrollments ADD COLUMN IF NOT EXISTS attestation_provider VARCHAR DEFAULT 'unverified'"
-            )
             self._migrate_alert_enrollment_reference()
 
     def _table_columns(self, table_name: str) -> set[str]:

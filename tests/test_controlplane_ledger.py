@@ -31,15 +31,7 @@ class ControlLedgerTests(unittest.TestCase):
         session = self.ledger.authenticate_admin("ABCDEF", "long-admin-password")
         self.assertEqual("ABCDEF", self.ledger.validate_session(session.token, session.csrf_token, require_csrf=True))
 
-    def test_controller_records_relay_envelopes_without_interpreting_trading_payload(self) -> None:
-        enrollment = self.ledger.create_trader_enrollment(
-            strategy_name="realtime-arbitrage",
-            claimed_public_ip="203.0.113.4",
-            public_key_pem="public-key",
-        )
-        trader_id = self.ledger.approve_trader_enrollment(
-            enrollment["registration_id"], "ABCDEF", lambda value, *_: f"certificate:{value}"
-        )
+    def test_controller_records_worker_facts_without_interpreting_payload(self) -> None:
         challenge, _ = self.ledger.issue_enrollment_challenge()
         worker_enrollment = self.ledger.create_enrollment(
             login=123456,
@@ -53,50 +45,6 @@ class ControlLedgerTests(unittest.TestCase):
         worker_id = self.ledger.approve_enrollment(
             worker_enrollment.enrollment_id, "ABCDEF", lambda value, *_: f"certificate:{value}"
         )
-        envelope = {
-            "type": "worker_effect_requested",
-            "protocol_version": 1,
-            "trader_id": trader_id,
-            "worker_id": worker_id,
-            "runtime_command_id": "command-1",
-            "request_id": "request-1",
-            "effect_id": "effect-1",
-            "expires_at": "2026-08-28T08:00:00+00:00",
-            "payload_hash": "opaque-to-controller",
-            "correlation": {"purpose": "entry"},
-            "payload": {"future_protocol_operation": {"controller_must_not_parse": True}},
-        }
-
-        admitted = self.ledger.record_trader_relay(
-            trader_id, "request-1", worker_id, envelope
-        )
-        redispatch = self.ledger.record_trader_relay(
-            trader_id, "request-1", worker_id, envelope
-        )
-        outcome = {
-            "type": "worker_effect_outcome",
-            "request_id": "request-1",
-            "worker_id": worker_id,
-            "accepted": True,
-        }
-        completed = self.ledger.complete_trader_relay(trader_id, "request-1", outcome)
-        replay = self.ledger.record_trader_relay(
-            trader_id, "request-1", worker_id, envelope
-        )
-
-        self.assertTrue(admitted["dispatch"])
-        self.assertTrue(redispatch["dispatch"])
-        self.assertIsNone(redispatch["outcome"])
-        self.assertEqual(outcome, completed)
-        self.assertFalse(replay["dispatch"])
-        self.assertEqual(outcome, replay["outcome"])
-        self.ledger.acknowledge_worker_fact(trader_id, worker_id, "epoch-1", 8)
-        self.ledger.acknowledge_worker_fact(trader_id, worker_id, "epoch-1", 7)
-        cursor = self.ledger._connection.execute(
-            "SELECT event_id FROM trader_worker_fact_cursors WHERE trader_id = ? AND worker_id = ?",
-            [trader_id, worker_id],
-        ).fetchone()
-        self.assertEqual(8, cursor[0])
 
         first_fact = {
             "type": "worker_snapshot",
@@ -118,17 +66,14 @@ class ControlLedgerTests(unittest.TestCase):
         }
         self.ledger.record_worker_fact_audit(worker_id, first_fact)
         self.ledger.record_worker_fact_audit(worker_id, second_fact)
+        duplicate = self.ledger.record_worker_fact_audit(worker_id, second_fact)
 
-        resumed = self.ledger.worker_relay_resume(worker_id, "epoch-1", 4)
-        gap = self.ledger.worker_relay_resume(worker_id, "old-epoch", 4)
-        self.ledger.acknowledge_worker_fact(trader_id, worker_id, "epoch-1", 5)
-
-        self.assertEqual([second_fact], resumed["facts"])
-        self.assertEqual("gap", gap["status"])
-        self.assertTrue(any(
-            event["event_type"] == "trader_worker_fact_acknowledged"
-            for event in self.ledger.events()
-        ))
+        self.assertEqual(0, duplicate)
+        self.assertEqual(5, self.ledger.reconciliation_cursor(worker_id))
+        with self.assertRaises(LedgerError):
+            self.ledger.record_worker_fact_audit(
+                worker_id, {**second_fact, "future_payload": {"tampered": True}}
+            )
         for name in (
             "accept_trader_intent",
             "begin_hedged_entry_command",
@@ -248,21 +193,6 @@ class ControlLedgerTests(unittest.TestCase):
         with self.assertRaisesRegex(LedgerError, "no longer active"):
             self.ledger.consume_registration_invite(invite, "trader")
 
-    def test_trader_ack_cannot_skip_an_event_unseen_by_this_connection(self) -> None:
-        with self.ledger._transaction():
-            first_event = self.ledger._event("intent_accepted", {})
-            second_event = self.ledger._event("intent_accepted", {})
-            self.ledger._connection.execute(
-                "INSERT INTO trader_events (trader_id, event_id) VALUES (?, ?), (?, ?)",
-                ["trader-123", first_event, "trader-123", second_event],
-            )
-
-        with self.assertRaisesRegex(LedgerError, "skip an unseen event"):
-            self.ledger.acknowledge_trader_events("trader-123", second_event, 0, {second_event})
-
-        self.ledger.acknowledge_trader_events("trader-123", second_event, 0, {first_event, second_event})
-        self.assertEqual(second_event, self.ledger.trader_event_cursor("trader-123"))
-
     def test_registration_invite_can_be_revoked_only_before_use(self) -> None:
         invite = self.ledger.create_registration_invite("ABCDEF", "worker")
 
@@ -290,14 +220,10 @@ class PairExecutionCellLedgerTests(unittest.TestCase):
         self._directory.cleanup()
 
     def _active_trader(self) -> str:
-        enrollment = self.ledger.create_trader_enrollment(
-            strategy_name="legacy-strategy-runtime",
-            claimed_public_ip="203.0.113.4",
-            public_key_pem="public-key",
-        )
-        return self.ledger.approve_trader_enrollment(
-            enrollment["registration_id"], "ABCDEF", lambda value, *_: f"certificate:{value}"
-        )
+        # No trader enrollment surface remains; tests that need a Trader
+        # identity value (stale-row guards, anti-trader envelope checks) use
+        # this opaque fixture string directly.
+        return "trader-fixture"
 
     def _active_worker(self, login: int, server: str) -> str:
         challenge, _ = self.ledger.issue_enrollment_challenge()
@@ -613,8 +539,8 @@ class PairExecutionCellLedgerTests(unittest.TestCase):
 
         third = self._active_worker(333333, "Broker-C")
         fourth = self._active_worker(444444, "Broker-D")
-        self.ledger.claim_pair_execution_mode(self.worker_a, third, "strategy_runtime", self.trader_id)
-        self.ledger.claim_pair_execution_mode(self.worker_b, fourth, "strategy_runtime", self.trader_id)
+        self.ledger._claim_pair_execution_mode_locked(self.worker_a, third, "strategy_runtime", self.trader_id)
+        self.ledger._claim_pair_execution_mode_locked(self.worker_b, fourth, "strategy_runtime", self.trader_id)
 
         for leader, follower in ((self.worker_a, self.worker_b), (self.worker_b, self.worker_a)):
             with self.subTest(leader=leader):
@@ -627,11 +553,11 @@ class PairExecutionCellLedgerTests(unittest.TestCase):
 
     def test_releasing_the_legacy_claim_lets_the_pair_form(self) -> None:
         third = self._active_worker(333333, "Broker-C")
-        self.ledger.claim_pair_execution_mode(self.worker_a, third, "strategy_runtime", self.trader_id)
+        self.ledger._claim_pair_execution_mode_locked(self.worker_a, third, "strategy_runtime", self.trader_id)
         with self.assertRaises(LedgerError):
             self._pair()
 
-        self.ledger.release_pair_execution_mode(self.worker_a, third, "strategy_runtime")
+        self.ledger._release_pair_execution_mode_locked(self.worker_a, third, "strategy_runtime", reason="test")
         route = self._pair()
 
         self.assertEqual("ACTIVE", route["state"])
@@ -641,7 +567,7 @@ class PairExecutionCellLedgerTests(unittest.TestCase):
         Execution Cell. The legacy Strategy Runtime claim still carries and
         still requires its Trader."""
 
-        self.ledger.claim_pair_execution_mode(
+        self.ledger._claim_pair_execution_mode_locked(
             self.worker_a, self.worker_b, "strategy_runtime", self.trader_id
         )
 
@@ -650,29 +576,23 @@ class PairExecutionCellLedgerTests(unittest.TestCase):
         self.assertEqual(self.trader_id, owner["trader_id"])
         self.assertEqual("strategy_runtime", owner["owner_kind"])
         with self.assertRaisesRegex(LedgerError, "requires its Trader identity"):
-            self.ledger.claim_pair_execution_mode(self.worker_a, self.worker_b, "strategy_runtime")
+            self.ledger._claim_pair_execution_mode_locked(self.worker_a, self.worker_b, "strategy_runtime", None)
 
     def test_a_shadow_owner_may_run_alongside_a_live_owner(self) -> None:
-        self.ledger.claim_pair_execution_mode(
+        self.ledger._claim_pair_execution_mode_locked(
             self.worker_a, self.worker_b, "strategy_runtime", self.trader_id
         )
 
-        self.ledger.claim_pair_execution_mode(self.worker_a, self.worker_b, "shadow", self.trader_id)
+        self.ledger._claim_pair_execution_mode_locked(self.worker_a, self.worker_b, "shadow", self.trader_id)
 
     def test_no_caller_outside_the_pairing_workflow_may_claim_or_release_pair_cell_mode(self) -> None:
         """Requirement: Pair Cell exclusivity is taken in the reservation and
-        confirmed in the final commit. There is no operator or Trader surface
+        confirmed in the final commit. No operator or Trader surface exists
         that can create one or drop one out from under a live route."""
 
-        with self.assertRaisesRegex(LedgerError, "two-phase pairing workflow"):
-            self.ledger.claim_pair_execution_mode(
-                self.worker_a, self.worker_b, "pair_execution_cell", None
-            )
+        self.assertFalse(hasattr(self.ledger, "claim_pair_execution_mode"))
+        self.assertFalse(hasattr(self.ledger, "release_pair_execution_mode"))
         self._pair()
-        with self.assertRaisesRegex(LedgerError, "released only by its reservation or route"):
-            self.ledger.release_pair_execution_mode(
-                self.worker_a, self.worker_b, "pair_execution_cell"
-            )
         self.assertIsNotNone(
             self.ledger.pair_execution_owner(self.worker_a, self.worker_b, "pair_execution_cell")
         )
@@ -813,7 +733,7 @@ class PairExecutionCellLedgerTests(unittest.TestCase):
             follower_worker_id=self.worker_b,
             connected_worker_ids={self.worker_a, self.worker_b},
         )
-        self.ledger.claim_pair_execution_mode(self.worker_b, third, "strategy_runtime", self.trader_id)
+        self.ledger._claim_pair_execution_mode_locked(self.worker_b, third, "strategy_runtime", self.trader_id)
 
         with self.assertRaisesRegex(LedgerError, "legacy Strategy Runtime"):
             self.ledger.create_pair_route(

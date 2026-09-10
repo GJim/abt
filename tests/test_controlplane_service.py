@@ -32,9 +32,6 @@ from abt.controlplane.crypto import (
     ProofError,
     device_certificate_payload,
     enrollment_payload,
-    trader_certificate_payload,
-    trader_proof_payload,
-    trader_rotation_payload,
     worker_rotation_payload,
     worker_proof_payload,
 )
@@ -42,13 +39,10 @@ from abt.controlplane.ledger import LedgerError
 from abt.controlplane.secrets import SecretStore, SecretStoreError
 from abt.trader_protocol import MAX_PAIR_RELAY_ENVELOPE_BYTES, PAIR_CELL_CONTROL_MESSAGE_TYPES
 from abt.controlplane.service import (
-    _broadcast_trader_worker_stream,
     _delete_expired_pending_secrets,
     _is_authoritative_worker_session,
     _request_pair_cell_quarantine_release,
-    _TraderSessionConnection,
     _WorkerSessionConnection,
-    _trader_market_subscription,
     _validate_worker_stream_envelope,
     _worker_fact_envelope,
     create_app,
@@ -93,51 +87,6 @@ class TraderMarketSubscriptionTests(unittest.TestCase):
                 "worker-1",
             ),
         )
-
-    def test_relays_opaque_worker_stream_by_subscription(self) -> None:
-        class Socket:
-            def __init__(self) -> None:
-                self.messages: list[dict[str, object]] = []
-
-            async def send_json(self, message: dict[str, object]) -> None:
-                self.messages.append(message)
-
-        selected_socket = Socket()
-        all_socket = Socket()
-        ignored_socket = Socket()
-        selected = _TraderSessionConnection(selected_socket, {"worker-1"})  # type: ignore[arg-type]
-        all_workers = _TraderSessionConnection(all_socket, None)  # type: ignore[arg-type]
-        ignored = _TraderSessionConnection(ignored_socket, {"worker-2"})  # type: ignore[arg-type]
-
-        envelope = {
-            "type": "live_state_snapshot",
-            "future_payload": {"controller_must_not_interpret": [1, "opaque"]},
-        }
-        _validate_worker_stream_envelope(envelope)
-        asyncio.run(
-            _broadcast_trader_worker_stream(
-                {"trader-1": {selected, all_workers}, "trader-2": {ignored}},
-                "worker-1",
-                envelope,
-            )
-        )
-
-        expected = {
-            "type": "worker_stream",
-            "worker_id": "worker-1",
-            "envelope": envelope,
-        }
-        self.assertEqual([expected], selected_socket.messages)
-        self.assertEqual([expected], all_socket.messages)
-        self.assertEqual([], ignored_socket.messages)
-
-    def test_accepts_wildcard_or_nonempty_worker_ids_only(self) -> None:
-        self.assertIsNone(_trader_market_subscription(["*"]))
-        self.assertEqual({"worker-1", "worker-2"}, _trader_market_subscription(["worker-1", "worker-2"]))
-        for value in ([], ["*", "worker-1"], [""]):
-            with self.assertRaises(ValueError):
-                _trader_market_subscription(value)
-
 
 class PairCellQuarantineReleaseRequestHelperTests(unittest.TestCase):
     """Focused, non-websocket coverage of the correlated request/response
@@ -244,24 +193,6 @@ class MemoryCertificateIssuer:
             self._key.public_key().verify(signature, payload, ec.ECDSA(hashes.SHA256()))
         except (InvalidSignature, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
             raise ProofError("The device certificate signature is invalid.") from error
-
-    def issue_trader(self, *, trader_id: str, strategy_name: str, public_key_pem: str) -> str:
-        issued_at = datetime.now(UTC)
-        payload = trader_certificate_payload(
-            trader_id=trader_id,
-            strategy_name=strategy_name,
-            public_key_pem=public_key_pem,
-            issued_at=issued_at,
-            expires_at=issued_at + timedelta(days=30),
-        )
-        return json.dumps(
-            {
-                "payload": base64.b64encode(payload).decode("ascii"),
-                "signature": base64.b64encode(self._key.sign(payload, ec.ECDSA(hashes.SHA256()))).decode("ascii"),
-            },
-            separators=(",", ":"),
-            sort_keys=True,
-        )
 
 
 class ControlPlaneServiceTests(unittest.TestCase):
@@ -463,132 +394,6 @@ class ControlPlaneServiceTests(unittest.TestCase):
         self.assertTrue(issued.json()["invite"])
         self.assertNotIn("invite", self.client.get("/api/admin/registration-invites").json()[0])
 
-    def test_trader_enrollment_accepts_a_trader_invite_and_p256_proof_without_attestation(self) -> None:
-        private_key = ec.generate_private_key(ec.SECP256R1())
-        public_key_pem = private_key.public_key().public_bytes(
-            serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
-        ).decode("utf-8")
-        invite = self.app.state.ledger.create_registration_invite("ABCDEF", "trader")
-        payload = json.dumps(
-            {"claimed_public_ip": "203.0.113.4", "registration_invite": invite, "strategy_name": "mean-reversion"},
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
-        signature = private_key.sign(payload, ec.ECDSA(hashes.SHA256()))
-
-        response = self.client.post(
-            "/api/traders/enrollments",
-            json={
-                "registration_invite": invite,
-                "strategy_name": "mean-reversion",
-                "claimed_public_ip": "203.0.113.4",
-                "public_key_pem": public_key_pem,
-                "proof_signature": base64.b64encode(signature).decode("ascii"),
-            },
-        )
-
-        self.assertEqual(201, response.status_code)
-        self.assertTrue(response.json()["registration_id"])
-
-    def test_administrator_approval_issues_a_30_day_trader_certificate(self) -> None:
-        private_key = ec.generate_private_key(ec.SECP256R1())
-        public_key_pem = private_key.public_key().public_bytes(
-            serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
-        ).decode("utf-8")
-        invite = self.app.state.ledger.create_registration_invite("ABCDEF", "trader")
-        payload = json.dumps(
-            {"claimed_public_ip": "203.0.113.4", "registration_invite": invite, "strategy_name": "mean-reversion"},
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
-        enrollment = self.client.post(
-            "/api/traders/enrollments",
-            json={
-                "registration_invite": invite,
-                "strategy_name": "mean-reversion",
-                "claimed_public_ip": "203.0.113.4",
-                "public_key_pem": public_key_pem,
-                "proof_signature": base64.b64encode(private_key.sign(payload, ec.ECDSA(hashes.SHA256()))).decode("ascii"),
-            },
-        )
-        login = self.client.post(
-            "/api/admin/login",
-            json={"username": "ABCDEF", "password": "A-secure-admin-password!"},
-        )
-
-        approval = self.client.post(
-            f"/api/admin/traders/enrollments/{enrollment.json()['registration_id']}/approve",
-            headers={"X-CSRF-Token": login.json()["csrf_token"]},
-        )
-
-        self.assertEqual(200, approval.status_code)
-        self.assertIn("trader_id", approval.json())
-        claims = json.loads(base64.b64decode(json.loads(approval.json()["certificate"])["payload"]))
-        self.assertEqual(approval.json()["trader_id"], claims["trader_id"])
-        self.assertEqual(30, (datetime.fromisoformat(claims["expires_at"]) - datetime.fromisoformat(claims["issued_at"])).days)
-        replacement_key = ec.generate_private_key(ec.SECP256R1())
-        replacement_public_key_pem = replacement_key.public_key().public_bytes(
-            serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
-        ).decode("utf-8")
-        challenge = self.client.post(
-            "/api/traders/certificates/rotation-challenge",
-            json={
-                "trader_id": approval.json()["trader_id"],
-                "public_key_pem": replacement_public_key_pem,
-            },
-        )
-        self.assertEqual(200, challenge.status_code)
-        rotation_payload = trader_rotation_payload(
-            trader_id=approval.json()["trader_id"],
-            replacement_public_key_pem=replacement_public_key_pem,
-            nonce=challenge.json()["nonce"],
-        )
-        rotated = self.client.post(
-            "/api/traders/certificates/rotate",
-            json={
-                "trader_id": approval.json()["trader_id"],
-                "public_key_pem": replacement_public_key_pem,
-                "old_key_signature": base64.b64encode(private_key.sign(rotation_payload, ec.ECDSA(hashes.SHA256()))).decode("ascii"),
-                "replacement_key_signature": base64.b64encode(
-                    replacement_key.sign(rotation_payload, ec.ECDSA(hashes.SHA256()))
-                ).decode("ascii"),
-            },
-        )
-        self.assertEqual(200, rotated.status_code)
-        self.assertEqual(replacement_public_key_pem, self.app.state.ledger.active_trader(approval.json()["trader_id"]).public_key_pem)
-        with self.client.websocket_connect("/api/traders/session") as old_key_session:
-            old_key_session.send_json(
-                {"trader_id": approval.json()["trader_id"], "certificate": approval.json()["certificate"]}
-            )
-            old_challenge = old_key_session.receive_json()
-            old_proof = private_key.sign(
-                trader_proof_payload(
-                    purpose=old_challenge["purpose"], trader_id=old_challenge["trader_id"], nonce=old_challenge["nonce"]
-                ),
-                ec.ECDSA(hashes.SHA256()),
-            )
-            old_key_session.send_json({"signature": base64.b64encode(old_proof).decode("ascii")})
-            self.assertEqual("authenticated", old_key_session.receive_json()["type"])
-
-        with self.app.state.ledger._transaction():
-            self.app.state.ledger._connection.execute(
-                "UPDATE certificate_overlaps SET expires_at = ? WHERE role = 'trader' AND identity_id = ?",
-                [datetime.now(UTC) - timedelta(seconds=1), approval.json()["trader_id"]],
-            )
-        with self.client.websocket_connect("/api/traders/session") as old_key_session:
-            old_key_session.send_json(
-                {"trader_id": approval.json()["trader_id"], "certificate": approval.json()["certificate"]}
-            )
-            with self.assertRaises(WebSocketDisconnect):
-                old_key_session.receive_json()
-        self.assertIn(
-            "trader_certificate_rotated",
-            [event["event_type"] for event in self.app.state.ledger.events()],
-        )
-        events = self.client.get("/api/admin/events")
-        self.assertEqual(200, events.status_code)
-        self.assertIn("trader_certificate_rotated", [event["event_type"] for event in events.json()["items"]])
-
     def test_worker_rotation_requires_both_proofs_and_preserves_one_hour_overlap(self) -> None:
         old_key, worker_id, old_certificate = self._approved_worker(987654, "Broker-Rotation")
         replacement_key = ec.generate_private_key(ec.SECP256R1())
@@ -680,57 +485,16 @@ class ControlPlaneServiceTests(unittest.TestCase):
         self.assertEqual(200, events.status_code)
         self.assertIn("worker_certificate_rotated", [event["event_type"] for event in events.json()["items"]])
 
-    def test_worker_and_trader_reject_invalid_registration_invites(self) -> None:
+    def test_worker_rejects_invalid_registration_invites(self) -> None:
         private_key = ec.generate_private_key(ec.SECP256R1())
         public_key_pem = private_key.public_key().public_bytes(
             serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
         ).decode("utf-8")
         worker_invite = self.app.state.ledger.create_registration_invite("ABCDEF", "worker")
-        trader_payload = json.dumps(
-            {"claimed_public_ip": "203.0.113.4", "registration_invite": worker_invite, "strategy_name": "strategy"},
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
-        trader_signature = base64.b64encode(private_key.sign(trader_payload, ec.ECDSA(hashes.SHA256()))).decode("ascii")
-        self.assertEqual(
-            409,
-            self.client.post(
-                "/api/traders/enrollments",
-                json={
-                    "registration_invite": worker_invite,
-                    "strategy_name": "strategy",
-                    "claimed_public_ip": "203.0.113.4",
-                    "public_key_pem": public_key_pem,
-                    "proof_signature": trader_signature,
-                },
-            ).status_code,
-        )
 
         login = self.client.post(
             "/api/admin/login", json={"username": "ABCDEF", "password": "A-secure-admin-password!"}
         )
-        self.assertEqual([], self.client.get("/api/admin/traders/enrollments").json())
-        self.assertEqual(
-            422,
-            self.client.post("/api/traders/enrollments", json={}).status_code,
-        )
-        used_invite = self.app.state.ledger.create_registration_invite("ABCDEF", "trader")
-        used_payload = json.dumps(
-            {"claimed_public_ip": "203.0.113.5", "registration_invite": used_invite, "strategy_name": "other"},
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
-        used_signature = base64.b64encode(private_key.sign(used_payload, ec.ECDSA(hashes.SHA256()))).decode("ascii")
-        request = {
-            "registration_invite": used_invite,
-            "strategy_name": "other",
-            "claimed_public_ip": "203.0.113.5",
-            "public_key_pem": public_key_pem,
-            "proof_signature": used_signature,
-        }
-        self.assertEqual(201, self.client.post("/api/traders/enrollments", json=request).status_code)
-        self.assertEqual(409, self.client.post("/api/traders/enrollments", json=request).status_code)
-        self.assertEqual(1, len(self.client.get("/api/admin/traders/enrollments").json()))
         self.app.state.ledger.revoke_registration_invite(worker_invite, "ABCDEF")
         account_info = {"login": 123456, "server": "Broker-Demo"}
         terminal_info = {"name": "MetaTrader 5"}
@@ -2065,16 +1829,8 @@ class ControlPlaneServiceTests(unittest.TestCase):
         leader_key, leader_id, leader_certificate = self._approved_worker(120091, "Broker-A")
         follower_key, follower_id, follower_certificate = self._approved_worker(120092, "Broker-B")
         _third_key, third_id, _third_certificate = self._approved_worker(120093, "Broker-C")
-        trader_enrollment = self.app.state.ledger.create_trader_enrollment(
-            strategy_name="legacy-strategy-runtime",
-            claimed_public_ip="203.0.113.4",
-            public_key_pem="trader-public-key-exclusivity",
-        )
-        trader_id = self.app.state.ledger.approve_trader_enrollment(
-            trader_enrollment["registration_id"], "ABCDEF", lambda value, *_: f"certificate:{value}"
-        )
-        self.app.state.ledger.claim_pair_execution_mode(
-            follower_id, third_id, "strategy_runtime", trader_id
+        self.app.state.ledger._claim_pair_execution_mode_locked(
+            follower_id, third_id, "strategy_runtime", "trader-1"
         )
 
         with self.client.websocket_connect("/api/worker/session") as leader_socket:
@@ -2093,7 +1849,7 @@ class ControlPlaneServiceTests(unittest.TestCase):
         self.assertIn("legacy Strategy Runtime", refused["reason"])
         owner = self.app.state.ledger.pair_execution_owner(follower_id, third_id, "strategy_runtime")
         assert owner is not None
-        self.assertEqual(trader_id, owner["trader_id"])
+        self.assertEqual("trader-1", owner["trader_id"])
 
     def test_a_reconnecting_worker_syncs_its_authoritative_route_and_role(self) -> None:
         """Requirement: a Worker that reconnects and finds itself already on
