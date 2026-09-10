@@ -3,7 +3,6 @@ import type { FormEvent } from 'react'
 import { Link, useLocation, useNavigate } from 'react-router-dom'
 import { AuditEventsPage } from './AuditEventsPage'
 import { RegistrationInvitesPage } from './RegistrationInvitesPage'
-import { TraderManagementPage } from './TraderManagementPage'
 import { WorkerManagementPage } from './WorkerManagementPage'
 import './App.css'
 import './Console.css'
@@ -60,7 +59,7 @@ export type InterventionItem =
     alert: WorkerAlert
   }
 
-type ConsolePage = 'main' | 'workers' | 'invites' | 'traders' | 'audit'
+type ConsolePage = 'main' | 'workers' | 'invites' | 'audit'
 
 function App() {
   const location = useLocation()
@@ -282,7 +281,6 @@ function App() {
           <Link aria-current={page === 'main' ? 'page' : undefined} to="/">Overview</Link>
           <Link aria-current={page === 'workers' ? 'page' : undefined} to="/workers">Workers</Link>
           <Link aria-current={page === 'invites' ? 'page' : undefined} to="/registration-invites">Registration invites</Link>
-          <Link aria-current={page === 'traders' ? 'page' : undefined} to="/traders">Traders</Link>
           <Link aria-current={page === 'audit' ? 'page' : undefined} to="/audit">Audit events</Link>
         </nav>
         <button disabled={isSigningOut} onClick={() => void signOut()} type="button">
@@ -302,14 +300,12 @@ function App() {
           />
         ) : page === 'invites' ? (
           <RegistrationInvitesPage csrfToken={csrfToken} />
-        ) : page === 'traders' ? (
-          <TraderManagementPage csrfToken={csrfToken} />
         ) : page === 'audit' ? (
           <AuditEventsPage csrfToken={csrfToken} />
         ) : (
           <section aria-labelledby="overview-heading">
             <h1 id="overview-heading">Control-plane overview</h1>
-            <p>The controller authenticates and connects Strategy Runtimes and Workers. Trading lifecycle is not operated here.</p>
+            <p>The controller authenticates and connects Workers. Trading lifecycle is not operated here.</p>
             <dl className="console-summary-grid">
               <div><dt>Workers</dt><dd>{workers.length}</dd></div>
               <div><dt>Connected</dt><dd>{workers.filter((worker) => worker.connectivity === 'connected').length}</dd></div>
@@ -326,7 +322,6 @@ function App() {
 function readConsolePage(pathname: string): ConsolePage {
   if (pathname === '/workers') return 'workers'
   if (pathname === '/registration-invites') return 'invites'
-  if (pathname === '/traders') return 'traders'
   if (pathname === '/audit') return 'audit'
   return 'main'
 }

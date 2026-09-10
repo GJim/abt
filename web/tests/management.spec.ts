@@ -20,7 +20,6 @@ test('management navigation exposes only control-plane responsibilities', async 
     'Overview',
     'Workers',
     'Registration invites',
-    'Traders',
     'Audit events',
   ])
   await expect(page.getByText('Trading lifecycle is not operated here.')).toBeVisible()
@@ -87,31 +86,6 @@ test('administrator can approve a Worker registration', async ({ page }) => {
 
   await page.getByRole('button', { name: 'Approve registration for 12345678 on Broker-Demo' }).click()
   await expect(page.getByRole('heading', { name: 'Pending registrations' })).toHaveCount(0)
-})
-
-test('administrator can manage Strategy Runtime identities', async ({ page }) => {
-  await mockLoggedOut(page)
-  await mockManagementData(page)
-  await page.route('**/api/admin/traders/enrollments', async (route) => {
-    await route.fulfill({
-      contentType: 'application/json',
-      body: JSON.stringify([{
-        registration_id: 'registration-1',
-        strategy_name: 'realtime-arbitrage',
-        claimed_public_ip: '203.0.113.10',
-        created_at: '2026-08-28T00:00:00Z',
-        expires_at: '2026-08-28T00:15:00Z',
-      }]),
-    })
-  })
-  await page.route('**/api/admin/traders', async (route) => {
-    await route.fulfill({ contentType: 'application/json', body: '[]' })
-  })
-  await signIn(page)
-  await page.getByRole('link', { name: 'Traders' }).click()
-
-  await expect(page.getByRole('heading', { name: 'Pending enrollment review' })).toBeVisible()
-  await expect(page.getByText('realtime-arbitrage')).toBeVisible()
 })
 
 test('administrator can view opaque audit events', async ({ page }) => {

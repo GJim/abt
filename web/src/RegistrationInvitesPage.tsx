@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react'
 
 type RegistrationInvite = {
   invite_id: string
-  role: 'trader' | 'worker'
+  role: 'worker'
   issued_by: string
   issued_at: string
   expires_at: string
@@ -83,7 +83,6 @@ export function RegistrationInvitesPage({ csrfToken }: { csrfToken: string }) {
         <label>Role
           <select value={role} onChange={(event) => setRole(event.target.value as RegistrationInvite['role'])}>
             <option value="worker">Worker</option>
-            <option value="trader">Trader</option>
           </select>
         </label>{' '}
         <button type="button" onClick={() => void issue()}>Issue invite</button>
