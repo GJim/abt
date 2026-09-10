@@ -1586,9 +1586,8 @@ def compute_protection(
 NO_TAKE_PROFIT = "0"
 
 # How often the leader profit leg may advance its trailing stop.  This is
-# deliberately shorter than the legacy 300s shared-grid contraction cadence:
-# a trailing stop only ever moves favorably, so reacting faster locks profit
-# sooner without ever widening risk.
+# A trailing stop only ever moves favorably, so reacting at this cadence locks
+# profit sooner without ever widening risk.
 _PROFIT_TRAIL_SECONDS = 60.0
 
 
