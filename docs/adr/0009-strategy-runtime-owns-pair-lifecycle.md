@@ -1,5 +1,11 @@
 # Strategy Runtime Owns Pair Lifecycle
 
+> **Retired 2026-09-10.** The Strategy Runtime (`strategy/realtime_arbitrage.py`,
+> `abt/trader/*`) and its Trader control-plane surfaces have been removed; the
+> Pair Execution Cell owns every live pair's lifecycle (see ADR-0010). This
+> record is kept for history. ADR-0008's Worker-side invariants were never
+> superseded and still hold.
+
 The realtime strategy and Trader execution orchestration will remain one
 durable Strategy Runtime until their lifecycle has stabilized. This
 deliberately reverses the earlier controller-owned protected-pair split:

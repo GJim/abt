@@ -66,7 +66,7 @@
 _Avoid_: 反向訂單
 
 **主控台**:
-公開網路上的身分、授權、通訊轉送與稽核平面；它連接策略執行體與帳戶工作者，但不擁有或推導配對反向避險生命週期。
+公開網路上的身分、授權、通訊轉送與稽核平面；它連接配對執行單元與帳戶工作者，但不擁有或推導配對反向避險生命週期。
 _Avoid_: 配對執行器
 
 **主控台 Web 服務**:
@@ -91,7 +91,7 @@ _Avoid_: 配對執行器
 帳戶工作者以 broker observation 作事實持久維護的單一帳戶安全狀態；routine uncertain effect 以觀測後的新補償 effect 收斂，不以盲目重送處理。它不推導另一個帳戶或完整配對的狀態。
 
 **已驗證受保護配對**:
-策略執行體已用兩個帳戶工作者的當前事實確認 ticket、方向、數量及 SL/TP 均符合相同 pair revision 的開放避險。
+配對 leader 已用兩個帳戶工作者的當前事實確認 ticket、方向、數量及 SL/TP 均符合相同 pair revision 的開放避險。
 _Avoid_: 已完成復原帳戶
 
 **進場資格與減曝險權限**:
@@ -99,14 +99,14 @@ _Avoid_: 已完成復原帳戶
 _Avoid_: 通用 operation 權限
 
 **受保護配對指令**:
-策略執行體為配對反向避險持久化的開倉、保護更新或平倉意圖。平倉指令宣告兩腿的 desired state 為 `EMPTY`，不是要求重送特定 broker close；策略執行體以 Worker effect journal 與新的 broker observation 判斷收斂。
-_Avoid_: 配對的逐腿 Trader worker operation
+配對執行單元為配對反向避險持久化的開倉、保護更新或平倉意圖。平倉指令宣告兩腿的 desired state 為 `EMPTY`，不是要求重送特定 broker close；配對執行單元以 Worker effect journal 與新的 broker observation 判斷收斂。
+_Avoid_: 配對的逐腿獨立操作
 
 **Worker effect journal**:
 帳戶工作者本機 SQLite/WAL 的 broker write 證據簿。每個 effect 在 MT5 write 前寫入 `prepared`，緊接 send 前寫入 `send_started`，receipt 或 broker observation 後保存證據。`send_started` effect 永遠不得以相同 effect ID 重送。
 
 **工作者信任邊界**:
-帳戶工作者僅在原生 Windows 的 CNG keystore 保存不可匯出的裝置私鑰；沒有受支援 CNG keystore 的主機不得成為工作者。MT5 憑證由 OpenBao 集中管理。工作者只接受已釘選主控台公開驗證金鑰所簽署、帶有交易者指令 ID 與期限的指令；工作者以裝置憑證及 challenge-response 向主控台證明身分，並必須持久去重該指令。
+帳戶工作者僅在原生 Windows 的 CNG keystore 保存不可匯出的裝置私鑰；沒有受支援 CNG keystore 的主機不得成為工作者。MT5 憑證由 OpenBao 集中管理。工作者只接受已釘選主控台公開驗證金鑰所簽署、帶有嘗試 ID 與期限的配對 relay 封包；工作者以裝置憑證及 challenge-response 向主控台證明身分，並必須持久去重該指令。
 
 **裝置憑證**:
 主控台簽發的工作者身分證明，綁定單一 worker ID、交易帳戶、ECDSA P-256 公鑰與有效期限；私鑰只保存於工作者本機硬體/OS keystore，主控台可撤銷該憑證以阻斷其後續連線。憑證有效期為 30 天，工作者以有效舊私鑰簽署輪替請求並生成新 key pair；主控台只在舊憑證未撤銷時簽發新憑證，短重疊期後舊憑證失效。
@@ -127,22 +127,22 @@ _Avoid_: 配對的逐腿 Trader worker operation
 工作者以已登入 MT5 的 `account_info` 註冊時在本機等待批准畫面顯示並提交至主控台的短期 8 位數人工比對碼；管理員必須將其與待批准申請的觀測來源、實際 broker 帳戶資訊比對後才可簽發裝置憑證。它只證明人工配對，不得作為帳戶身分或網路來源的唯一證據。
 
 **生命週期時間權威**:
-策略執行體的單調時鐘裁決配對期限，帳戶工作者在 broker send 前以指令絕對期限作最後安全檢查；各主機必須同步受信任 UTC 時間來源，broker 時間只作事件證據。
+配對 leader 的單調時鐘裁決配對期限，帳戶工作者在 broker send 前以指令絕對期限作最後安全檢查；各主機必須同步受信任 UTC 時間來源，broker 時間只作事件證據。
 
 **限時同步配對退出**:
-已驗證受保護配對超過其持久化最大持有時間後，由策略執行體依兩個帳戶工作者的當前報價、近期自然波動及 broker stop/freeze constraints 建立的近市價退出走廊。兩腿以相同 normalized market movement 為目標，不保證相同 broker fill；若只剩一腿，策略執行體保留 15 秒 orphan grace，逾時只 market-close 剩餘 owned ticket，若兩腿在走廊 armed 後 30 秒仍存在則並行 market-close。所有期限、targets、effects 與 observation evidence 必須 durable，重啟不得重新起算。
+已驗證受保護配對超過其持久化最大持有時間（`maximum_holding_seconds`）後，兩台帳戶工作者各自將 desired state 改為 `EMPTY` 並收斂。follower 先清空時，leader 不隨之平倉而是繼續單飛，直到自身停損／移動停損、限時退出或休市平倉；所有期限與收斂證據必須 durable，重啟不得重新起算。
 
 **失聯安全平倉**:
-一個帳戶工作者無法經主控台 relay 與策略執行體保持有效通訊超過心跳寬限時間後，停止新進場並依本機 broker observation 進入帳戶復原生命週期。已受 broker SL/TP 保護的曝險不因短暫失聯盲目重送或修改，重連後必須重新觀測。
+一個帳戶工作者無法經主控台 relay 與配對對側保持有效通訊超過心跳寬限時間後，停止新進場並依本機 broker observation 進入帳戶復原生命週期。已受 broker SL/TP 保護的曝險不因短暫失聯盲目重送或修改，重連後必須重新觀測。
 
 **撤銷安全平倉**:
 撤銷工作者裝置憑證是緊急安全事件；工作者收到撤銷或無法再建立有效工作階段後，依本機帳戶復原生命週期停止新進場並處理未受保護曝險。主控台只執行身分撤銷與通知，不選擇 broker 操作。
 
 **策略風險權責**:
-策略執行體獨自決定活躍配對數、名目曝險、保證金使用量與損失上限；主控台不另設這些聚合風險硬上限，也不推導配對生命週期。
+配對的 leader 帳戶工作者透過 canonical 政策獨自決定活躍配對數、名目曝險、保證金使用量與損失上限；主控台不另設這些聚合風險硬上限，也不推導配對生命週期。
 
 **策略執行體（Strategy Runtime）**:
-以單一交易者身分運行策略決策與配對執行的持久程序；它擁有配對反向避險的完整生命週期，並以本地 durable state 在重啟後從帳戶工作者事實恢復。已配對進入配對執行單元的配對不適用本節；其生命週期改由持久配對路由指定的 leader 帳戶工作者擁有。
+已退役。原為以單一交易者身分運行策略決策與配對執行的持久程序；其生命週期擁有權已全面移交配對執行單元，本詞條僅供解讀歷史文件（ADR-0009、舊 spec）時對照。
 _Avoid_: 獨立 Trader Execution 服務、無狀態策略腳本
 
 **配對執行單元（Pair Execution Cell）**:
@@ -162,7 +162,7 @@ _Avoid_: 浮點文字完全相等、以寬鬆價格容差接受不同 tick
 _Avoid_: 管理員核准配對、配對合約核發、人工接受步驟、保留與建路由合併為單一 CAS
 
 **配對保留（Pairing Reservation）**:
-兩階段配對流程的第一階段：主控台以單一原子 transaction 產生唯一 `proposal_id` 並同時保留 leader 與 follower 兩台工作者，成功條件為雙方皆已驗證連線、未出現於任何其他路由或保留、無衝突的 live strategy runtime 擁有權，且可為雙方取得 `pair_execution_cell` 執行模式互斥。保留帶 30 秒配對保留逾時，該逾時純屬配對控制中繼資料，不是交易租約或 TTL，不 fence 任何 effect、嘗試或既有路由。主控台於保留成立後才轉送提議。follower 拒絕、逾時、任一方斷線或最終 transaction 失敗都會完整釋放保留，不留下路由、角色指派、執行模式主張或工作者本機配對狀態。兩個 leader 選中同一 follower 時，敗方於保留階段即取得決定性衝突並可立即重新列表。
+兩階段配對流程的第一階段：主控台以單一原子 transaction 產生唯一 `proposal_id` 並同時保留 leader 與 follower 兩台工作者，成功條件為雙方皆已驗證連線、未出現於任何其他路由或保留、無衝突的 live 執行模式擁有權，且可為雙方取得 `pair_execution_cell` 執行模式互斥。保留帶 30 秒配對保留逾時，該逾時純屬配對控制中繼資料，不是交易租約或 TTL，不 fence 任何 effect、嘗試或既有路由。主控台於保留成立後才轉送提議。follower 拒絕、逾時、任一方斷線或最終 transaction 失敗都會完整釋放保留，不留下路由、角色指派、執行模式主張或工作者本機配對狀態。兩個 leader 選中同一 follower 時，敗方於保留階段即取得決定性衝突並可立即重新列表。
 _Avoid_: 配對租約、以保留逾時視為交易期限
 
 **配對接受載荷（Pairing Acceptance Payload）**:
@@ -184,7 +184,7 @@ _Avoid_: 配對租約、管理員授權路由、以撤銷代替解除配對、�
 _Avoid_: 單一訊息解除配對、以撤銷代替解除配對、無狀態版本綁定的聲明
 
 **初始相容商品探索（Initial Compatible Product Discovery）**:
-路由建立後、任何報價處理之前，兩台帳戶工作者經不透明 relay 交換版本化商品目錄與規格摘要以決定共同可交易宇宙的階段；主控台全程不解讀這些摘要。取交集前先對各自目錄套用 `trade_mode == 4`（完全交易）前置條件，與 `strategy/realtime_arbitrage.py` 一致；`trade_mode` 缺失、非整數或為布林值時該目錄視為無效，而非僅略過該符號。候選為兩份已過濾目錄的精確符號名稱交集（不做後綴正規化）；`trade_calc_mode`、`contract_size`、`volume_min`、`volume_step`、`allowed_directions` 任一不相等即排除，必須同時允許 LONG 與 SHORT，填單模式取雙方共有 FOK，否則共有 IOC，否則排除；base/profit 幣別、digits、point 與 trade tick size 不要求相等。錄取商品的 canonical 執行 point 取雙方較大值、共同 volume_max 取較小值，商品識別由精確符號名稱與 canonical 相容摘要雜湊決定性衍生。任一目錄不可得或無效、或無任何相容符號時探索失敗且不進場。
+路由建立後、任何報價處理之前，兩台帳戶工作者經不透明 relay 交換版本化商品目錄與規格摘要以決定共同可交易宇宙的階段；主控台全程不解讀這些摘要。取交集前先對各自目錄套用 `trade_mode == 4`（完全交易）前置條件，與配對執行單元既有規則一致；`trade_mode` 缺失、非整數或為布林值時該目錄視為無效，而非僅略過該符號。候選為兩份已過濾目錄的精確符號名稱交集（不做後綴正規化）；`trade_calc_mode`、`contract_size`、`volume_min`、`volume_step`、`allowed_directions` 任一不相等即排除，必須同時允許 LONG 與 SHORT，填單模式取雙方共有 FOK，否則共有 IOC，否則排除；base/profit 幣別、digits、point 與 trade tick size 不要求相等。錄取商品的 canonical 執行 point 取雙方較大值、共同 volume_max 取較小值，商品識別由精確符號名稱與 canonical 相容摘要雜湊決定性衍生。任一目錄不可得或無效、或無任何相容符號時探索失敗且不進場。
 _Avoid_: 已建置商品宇宙、等名即相容、刷新時自動擴充宇宙、交集後才過濾 trade_mode
 
 **宇宙世代（Universe Generation）**:
@@ -230,50 +230,20 @@ _Avoid_: arm/commit、進場提交授權
 配對嘗試只有在雙方都被證明安全後才是 terminal：兩台帳戶工作者各自在自己本地啟動、彼此獨立的單調確認計時器內取得雙方 exact broker 部位證據並套用精確保護後宣告 `ACTIVE`；或任一方計時器到期、拒單、送單結果未知、報價過期或 peer session 遺失時，各自僅以自身 durable effect 與新鮮 broker 事實收斂至 desired `EMPTY`，並盡力通知對側加速其收斂。逾時、報價過期或就緒條件消失都不得直接遺棄嘗試，也不得假設對側已完成或尚未送單。
 
 **部署模式開關**:
-每配對的執行模式（`strategy_runtime`、`pair_execution_cell` 或 `shadow`）；配對執行單元的執行模式預設為 live，`shadow` 需明確選擇。主控台強制同一配對的 `strategy_runtime` 與 `pair_execution_cell` 互斥存在，避免兩個生命週期擁有者同時啟用。配對執行單元的互斥主張在配對保留 transaction 中同時為**兩台**工作者取得，並於最終建立路由的 transaction 再次確認；其 owner kind 固定為 `pair_execution_cell` 且不帶 `trader_id`，legacy 策略執行體則保留自身交易者身分。安全解除配對移除路由時同時釋放雙方主張。
+每配對的執行模式（`pair_execution_cell` 或 `shadow`，預設 live）；`shadow` 需明確選擇。配對執行單元的互斥主張在配對保留 transaction 中同時為**兩台**工作者取得，並於最終建立路由的 transaction 再次確認；其 owner kind 固定為 `pair_execution_cell` 且不帶 `trader_id`。安全解除配對移除路由時同時釋放雙方主張。
 
 **影子模式**:
 配對執行單元執行完整的候選排名與立即派遣進場決策路徑（報價一致性、就緒狀態、edge 決策），但以模擬 ticket 與模擬成交價取代真正的 `order_send`，不寫入 Worker effect journal 也不送出任何 broker 寫入；用於在正式切換前比較新舊路徑的候選決策與遙測。
 _Avoid_: arm 模擬
 
-**交易者指令 ID**:
-策略執行體為每次配對生命週期變更建立的唯一識別碼；策略執行體與帳戶工作者以指令 ID、effect ID 與 payload hash 持久去重，主控台只轉送並稽核。
-
-**交易者（Trader）**:
-策略執行體向主控台證明並用來存取帳戶工作者的獨立服務身分；每個部署實例使用獨立憑證，策略名稱僅作為可稽核註記，不構成授權身分。
-
-**Trader worker operation**:
-策略執行體經主控台 relay 對單一明確指定工作者發起的 broker 寫入。主控台只驗證身分、路由及 envelope，帳戶工作者以 operation ID、payload hash 與 Worker effect journal 持久去重並防止 `send_started` operation 重送。
-
-**Trader broker read**:
-交易者經主控台向單一明確指定工作者發起的即時唯讀查詢；包含 account info、symbol info、historical ticks、目前掛單與目前持倉。回應只來自已連線工作者的當前 MT5 session，主控台不得以自己的持久資料替代。historical ticks 每批最多 1,000 筆，交易者自行拆解及串接大型查詢。
-
-**交易者 WSS 工作階段**:
-已批准交易者以其裝置憑證和私鑰證明身分後，與主控台建立的持久雙向 relay 通道；策略執行體與帳戶工作者的 versioned envelopes 經此路由。中斷後以最後 ACK cursor 至少一次重送，接收端以來源身分與不可變 event ID 去重。
-
-**交易者註冊**:
-尚未授權的交易者以新生成、不可匯出的 Windows CNG P-256 公鑰及其簽署證明，經 API 聲明策略名稱與公開 IP 的程序；註冊需要管理員預先簽發、一次且短期有效的 invite，主控台分配 registration ID，管理員依該聲明 IP、策略名稱與金鑰指紋審核後決定是否簽發交易者裝置憑證。待審核註冊在 15 分鐘後過期，拒絕與過期的 registration ID 均不得重用；交易者必須重新註冊。公開 IP 是交易者的宣告資料，不保存或比對 Cloudflare 觀測來源。交易者註冊不使用 MT5 證據或人工配對碼。
-
 **註冊 Invite**:
 管理員在管理站為 worker 或 Trader 簽發的角色綁定、一次性 enrollment 授權；自簽發起 60 分鐘有效，成功使用時立即消耗並開始 15 分鐘待審核 registration。管理員可撤銷未使用 invite；使用、過期與撤銷後均不可復原。切換至 invite 規則時，所有尚未批准且未使用 invite 的 worker registration 立即過期，已批准 worker 不受影響。完整值只在建立時顯示一次，控制平面帳本只保存其雜湊、目標角色、到期與使用或撤銷狀態，並為簽發與使用留下稽核事件。
 
-**交易者裝置憑證**:
-主控台簽發的交易者部署身分證明，綁定單一 trader ID、不可匯出的 Windows CNG ECDSA P-256 公鑰與有效期限；私鑰只能保存在 Windows CNG keystore。憑證有效期為 30 天，交易者以有效舊私鑰簽署輪替請求並生成新 key pair；主控台只在舊憑證未撤銷時簽發新憑證。
-
-**交易者憑證撤銷**:
-主控台撤銷交易者裝置憑證後立即終止其 WSS 工作階段並拒絕新 relay 請求；撤銷不替策略執行體選擇、取消或平倉任何 broker 操作。
-
-**策略啟動對帳**:
-策略執行體啟動或重啟後，以本地 durable state 與兩個帳戶工作者的當前掛單、持倉及 effect evidence 重建未終結配對的程序；完成前不得建立新曝險。
-
 **外部變動**:
-未對應帳戶工作者已知 effect 的訂單、持倉或保護價格變更；帳戶工作者必須立即回報，策略執行體據此更新完整配對 desired state，主控台只保留 relay audit copy。
+未對應帳戶工作者已知 effect 的訂單、持倉或保護價格變更；帳戶工作者必須立即回報，配對 leader 據此更新完整配對 desired state，主控台只保留 relay audit copy。
 
 **人工復歸**:
 帳戶工作者無法自動恢復時，由 Worker operator 在本機執行的 break-glass 程序；主控台只記錄身分與 audit，不提供取消、平倉或配對操作。
-
-**配對事件紀錄**:
-策略執行體持久保存的配對生命週期狀態轉換紀錄，包含交易者指令 ID、兩腿 broker facts、決策原因與時間戳；主控台可保存不參與交易判斷的 immutable relay audit copy。
 
 **控制平面備份**:
 主控台 DuckDB ledger 與 OpenBao Raft 的可恢復快照，在本機每小時建立並自動輪替保留最近 24 份；每次裝置憑證批准、撤銷或輪替等 PKI 變更後必須立即建立加密快照。管理員每週至少一次手動將加密備份保存至異地，異地復原點目標因此為一週。
@@ -281,68 +251,15 @@ _Avoid_: arm 模擬
 **控制平面帳本**:
 主控台以 DuckDB 保存身分、授權、連線、relay delivery 與不可變 audit；它不是交易指令、broker facts 或配對生命週期的權威。單一 ASGI process 擁有所有讀寫，REST、WSS 與本機 CLI 寫入必須經同一序列化 transaction writer。
 
-**主方向平台**:
-被策略執行體選定為承載方向性訂單的平台。
-_Avoid_: 主平台
-
-**避險平台**:
-被策略執行體選定為承載與主方向平台相反方向訂單的平台；其訂單不會觸發新的獨立配對反向避險。
-
-**平台選定**:
-策略執行體在配對進場前選出主方向平台與避險平台的決策；一經選定，該配對反向避險的生命週期內不得更換平台。
-
-**平台合格性**:
-平台選定前的硬性判定：兩個交易帳戶皆已授權、連線健康、目標商品可交易、報價未過期、能遵守帳戶操作規範，且各自有足夠保證金；任一條件不成立時不得建立配對。
-
-**跨伺服器商品配對**:
-一個無方向的商品關係，由兩個交易伺服器各自的一個精確名稱商品組成，可建立相反等值曝險。策略執行體從兩個帳戶工作者的當前商品目錄與規格判斷相容性、方向、填單模式與 sizing；主控台不建立或管理商品配對。
-_Avoid_: Mapping
-
-**交易成本排序**:
-在全部通過平台合格性的候選組合中，策略執行體依該次交易的預期全成本選擇組合；排序須可重現且可解釋。
-
 **市價單**:
 以當時可得市場價格立即執行的訂單；其成本排序以即時 bid/ask 價差與報價新鮮度為核心。
-
-**限價單**:
-僅在指定價格或更有利價格成交的訂單；第一版只支援此類訂價單，並以預期成交機率與預期成本排序，未成交或到期屬正常結果。
-_Avoid_: 訂價單
-
-**雙限價進場**:
-在主方向平台與避險平台同時掛出相反方向限價單的進場方式。FOK 進場只有兩腿皆全額成交時建立配對反向避險；IOC 進場依部分成交淨額處置建立已匹配的成交量。
-
-**首成交腿**:
-雙限價進場中最先被 broker facts 確認成交的訂單；無論位於主方向平台或避險平台，均會啟動另一腿的可容忍時間。
 
 **Fill-or-Kill（FOK）**:
 要求訂單一次全額成交，否則完全不成交的填單模式；使用 FOK 的雙限價進場兩腿均須全額成交。若即時對帳仍發現部分成交，視為可補救的 broker 異常，依 IOC 的取消、對帳與未避險差額平倉順序處置。
 
-**IOC 部分成交淨額處置**:
-IOC 進場後，策略執行體以兩腿實際成交量依商品配對比例換算可匹配量，保留較小量為已避險配對，先取消剩餘訂單並重新觀測，再以市價平掉未避險差額。不進行 IOC 補單；任何 broker 結果不確定時依 Worker effect evidence 與新 observation 恢復。
-
 **成交權威**:
 決定意圖訂單實際成交量的即時對帳快照；broker 送單回覆只證明接受或掛單，不能作為成交事實。
 _Avoid_: 送單成交量、回執成交量
-
-**執行識別碼**:
-策略執行體在 dispatch 前持久化的不可變 execution identity；它不得寫入 broker comment 或 magic number。帳戶工作者以 effect ID、broker ticket 與 observation 建立執行證據，無法唯一確認時不得猜測或重送。
-_Avoid_: ticket 配對、價格時間猜測
-
-**不確定恢復結果**:
-取消或市價平倉因斷線而未取得 broker 結果的狀態；該次交易參與的 worker 必須凍結，並在帳戶清空與人工解凍前拒絕任何新交易命令。
-_Avoid_: 立即重試
-
-**進場到期時間**:
-策略執行體為一個配對進場指定的絕對失效時間；帳戶工作者在 broker send 前執行最後期限檢查，到期後策略執行體依當前 broker facts 處理未成交訂單。
-
-**配對保護出場**:
-在兩腿持倉上各自設定 broker 代管的停損與停利。任一腿因保護價格平倉時，帳戶工作者回報 broker fact，策略執行體將完整配對 desired state 改為 `EMPTY`。
-
-**單腿成交逾時**:
-配對進場中只有一腿被 broker facts 證明成交，且另一腿未在策略執行體允許時間內成交的狀態；策略執行體依風險規則與當前 Worker facts 選擇補救或將 desired state 改為 `EMPTY`。
-
-**不完整進場**:
-配對進場中一腿 effect 可能已建立曝險、另一腿卻未能建立的狀態；策略執行體必須以 Worker effect evidence 與新 broker observation 收斂，不得重送未知結果。
 
 **交易帳戶**:
 由一台帳戶工作者獨佔連線並下單的 MT5 帳戶，以已驗證的 MT5 login 與 server 識別；一個帳戶只能唯一綁定一台活躍帳戶工作者。第一版同時支援模擬帳戶與實盤帳戶。
@@ -350,9 +267,6 @@ _Avoid_: 測試帳戶
 
 **平台操作規範**:
 交易平台對下單、取消與修改等操作所施加的頻率或行為限制；遵守此規範優先於為消除些微未避險曝險而頻繁操作。
-
-**帳戶操作規範**:
-附屬於單一交易帳戶、可審核的操作規範，定義各類操作的最小間隔、滑動視窗上限、冷卻時間與拒絕後退避；主控台必須在送出操作前強制執行。
 
 **未避險曝險**:
 配對反向避險中，兩腿已成交的反向等值量不一致時，超出可配對等值量的部分。

@@ -48,45 +48,12 @@ Enrollment output reports `pending_approval` until an administrator approves
 the worker. Existing identity configuration is protected; use
 `abt-worker enroll --replace-config` only to replace it deliberately.
 
-## Trader enrollment and event connection
-
-On native Windows, `abt-trader enroll` prompts for omitted controller URL,
-registration invite, strategy name, and a confirmed public-IP declaration. It
-uses `https://api.ipify.org` only when `--public-ip` is omitted. The invite,
-device private key, and Trader certificate are never written to disk.
-
-```powershell
-abt-trader enroll
-abt-trader connect
-abt-trader connect --worker-id <worker-id>
-```
-
-`connect` is a foreground authenticated connection diagnostic. The realtime
-arbitrage Strategy Runtime opens the same authenticated transport in-process;
-it does not launch `abt-trader` as a child process. Existing Trader identity
-configuration is protected; use
-`abt-trader enroll --replace-config` only for deliberate replacement.
-
 The controller exposes Worker identity and connectivity for selection, then
-routes versioned request, outcome, and Worker-fact envelopes without
-interpreting their trading payloads. Pair policy, execution, verification,
-recovery, and close convergence are durable Strategy Runtime responsibilities.
-The management console has no pair, analysis, intent, order, position, or
-emergency-trading operations.
-
-### NZDUSD cross-arbitrage simulation
-
-`scripts\simulate_nzdusd_arbitrage.py` is a read-only historical simulator for
-two exported NZDUSD tick CSV files. It permits one hedged pair at a time,
-requires a qualifying edge to clear before re-entry, applies a 2% per-trade
-loss stop and a 3% per-account daily loss stop, and stops both legs when either
-account reaches a limit. It never submits broker operations.
-
-```powershell
-uv run python scripts\simulate_nzdusd_arbitrage.py `
-  --audacity-csv results\nzdusd_ticks_<window>_audacity.csv `
-  --ftmo-csv results\nzdusd_ticks_<window>_ftmo.csv
-```
+relays opaque versioned envelopes without interpreting their trading payloads.
+Pair policy, execution, verification, recovery, and close convergence are
+durable Pair Execution Cell responsibilities owned by the pair's leader
+Worker. The management console has no pair, analysis, intent, order, position,
+or emergency-trading operations.
 
 The defaults simulate US$5,000 per account, a 0.2-pip entry edge, and 0.1 lot
 per leg. The script uses NZDUSD margin estimates from the current AudaCity

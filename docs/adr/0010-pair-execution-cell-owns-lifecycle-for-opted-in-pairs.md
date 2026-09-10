@@ -1,5 +1,12 @@
 # Pair Execution Cell Owns Lifecycle for Opted-In Pairs
 
+> **Retired as "opted-in" 2026-09-10:** there are no non-cell pairs anymore.
+> The Strategy Runtime, the `strategy_runtime` execution-mode claim path, the
+> admin execution-mode surface, and all Trader control-plane surfaces have been
+> removed, so the cell owns *every* live pair's lifecycle unconditionally. The
+> "legacy Strategy Runtime" mutual-exclusion guards below now only defend
+> against stale ledger rows, and "shadow" remains the sole alternative mode.
+
 Supersedes ADR-0009's lifecycle-owner placement, but only for Worker pairs
 running the Pair Execution Cell execution mode. ADR-0009's Strategy Runtime
 remains the lifecycle owner for every pair that is not paired into a cell, and
@@ -15,11 +22,12 @@ Worker-performed product discovery. It records the **specified** design,
 including the two-phase pairing workflow, `route_id` and `universe_generation`,
 the `UNPAIRING` route state, role-specific configuration authority, and the
 Pairing Acceptance payload. The pairing, discovery, policy-construction,
-configuration-default, and `trader_id`-removal parts of that design are not yet
+configuration-default, and `trader_id`-removal parts of that design are all
 implemented in `abt.pair_cell`, `abt.worker.pair_cell_adapter`,
-`abt.controlplane.ledger`, or `abt.controlplane.service`; see "What changed
+`abt.controlplane.ledger`, and `abt.controlplane.service` (completed before
+the 2026-09-10 retirement above); see "What changed
 since the original decision" and the specification's Migration and Removal
-section. Because this ADR already describes the target, implementation
+section for the history. Because this ADR already describes the target, implementation
 verifies it against the shipped code rather than rewriting it afterwards.
 
 ## Context
