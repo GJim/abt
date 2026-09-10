@@ -41,10 +41,10 @@ def retrieve_mt5_password(
     certificate_url = _worker_endpoint(controller_url, "/api/worker/certificate")
     with connect(certificate_url) as socket:
         _send(socket, {"enrollment_id": enrollment_id})
-        challenge = _message(socket)
+        challenge = _message(socket, timeout=30.0)
         worker_id = _required_text(challenge, "worker_id")
         _send_proof(socket, key_store, challenge, "certificate_delivery", worker_id)
-        delivery = _message(socket)
+        delivery = _message(socket, timeout=30.0)
         if _required_text(delivery, "worker_id") != worker_id:
             raise WorkerEnrollmentError("The controller returned an invalid device certificate.")
         certificate = _required_text(delivery, "certificate")
@@ -52,9 +52,9 @@ def retrieve_mt5_password(
     credentials_url = _worker_endpoint(controller_url, "/api/worker/credentials")
     with connect(credentials_url) as socket:
         _send(socket, {"worker_id": worker_id, "certificate": certificate})
-        challenge = _message(socket)
+        challenge = _message(socket, timeout=30.0)
         _send_proof(socket, key_store, challenge, "password_request", worker_id)
-        return _required_text(_message(socket), "password")
+        return _required_text(_message(socket, timeout=30.0), "password")
 
 
 def _worker_endpoint(controller_url: str, endpoint: str) -> str:

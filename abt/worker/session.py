@@ -8,6 +8,7 @@ from statistics import median
 from collections.abc import Callable
 from datetime import UTC, datetime
 from dataclasses import dataclass, field
+from time import monotonic
 from typing import Protocol, Self, cast
 from uuid import uuid4
 from zoneinfo import ZoneInfo
@@ -43,6 +44,16 @@ from .scheduler import DeadlineAwareTraderRpcScheduler, ScheduledTraderRpc, Trad
 
 
 _LOGGER = logging.getLogger(__name__)
+#: Bounded wait for a controller reply on the worker session. A half-open
+#: TCP connection (e.g. a dropped Wi-Fi that never sends FIN/RST) would
+#: otherwise block ``recv`` forever and freeze the whole reconciliation loop,
+#: including local pair-cell protection. Expiry surfaces as
+#: ``WorkerSessionDisconnected`` via ``_raise_closed_connection`` and triggers
+#: the existing reconnect backoff.
+_HEARTBEAT_TIMEOUT_SECONDS = 15.0
+_LIVE_STATE_TIMEOUT_SECONDS = 15.0
+_RESPONSE_TIMEOUT_SECONDS = 30.0
+_HANDSHAKE_TIMEOUT_SECONDS = 30.0
 _MAX_PAIR_RELAY_ACKS = 128
 #: Pairing control traffic is small, bursty and entirely superseded by the
 #: next authoritative route read, so its inboxes are bounded rather than
@@ -114,7 +125,7 @@ class AuthenticatedWorkerSession:
     def request_password(self) -> str:
         try:
             _send(self.socket, {"type": "password_request"})
-            response = self._response()
+            response = self._response(timeout=_RESPONSE_TIMEOUT_SECONDS)
             if response.get("type") != "password":
                 raise WorkerEnrollmentError("The controller returned an invalid worker response.")
             return _required_text(response, "password")
@@ -154,7 +165,7 @@ class AuthenticatedWorkerSession:
                 raise WorkerEnrollmentError("The Worker reconciliation message is invalid.")
             outgoing = {"type": "worker_fact", "cursor": cursor, "envelope": envelope}
             _send(self.socket, outgoing)
-            response = self._response()
+            response = self._response(timeout=_RESPONSE_TIMEOUT_SECONDS)
             if response.get("type") != "accepted" or response.get("cursor") != cursor:
                 raise WorkerEnrollmentError("The controller rejected worker reconciliation.")
             self.reconciliation_cursor = cursor
@@ -164,7 +175,7 @@ class AuthenticatedWorkerSession:
     def send_live_state(self, message: dict[str, object]) -> None:
         try:
             _send(self.socket, message)
-            if self._response() != {"type": "live_state_accepted"}:
+            if self._response(timeout=_LIVE_STATE_TIMEOUT_SECONDS) != {"type": "live_state_accepted"}:
                 raise WorkerEnrollmentError("The controller rejected worker live state.")
         except Exception as error:
             _raise_closed_connection(error, "live-state publication")
@@ -172,7 +183,7 @@ class AuthenticatedWorkerSession:
     def heartbeat(self) -> bool:
         try:
             _send(self.socket, {"type": "heartbeat"})
-            response = self._response()
+            response = self._response(timeout=_HEARTBEAT_TIMEOUT_SECONDS)
             return response == {"type": "heartbeat_ack"}
         except Exception as error:
             _raise_closed_connection(error, "heartbeat")
@@ -180,7 +191,7 @@ class AuthenticatedWorkerSession:
     def send_recovery_state(self, state: str, reason: str) -> None:
         try:
             _send(self.socket, {"type": "recovery_state", "state": state, "reason": reason})
-            response = self._response()
+            response = self._response(timeout=_RESPONSE_TIMEOUT_SECONDS)
             if response != {"type": "accepted", "state": state}:
                 raise WorkerEnrollmentError("The controller rejected the worker recovery state.")
         except Exception as error:
@@ -189,14 +200,21 @@ class AuthenticatedWorkerSession:
     def send_recovery_sync(self, journal: list[dict[str, object]]) -> None:
         try:
             _send(self.socket, {"type": "recovery_sync", "epoch": self.recovery_epoch, "journal": journal})
-            if self._response() != {"type": "recovery_sync_accepted", "epoch": self.recovery_epoch}:
+            if self._response(timeout=_RESPONSE_TIMEOUT_SECONDS) != {"type": "recovery_sync_accepted", "epoch": self.recovery_epoch}:
                 raise WorkerEnrollmentError("The controller rejected Worker recovery sync.")
         except Exception as error:
             _raise_closed_connection(error, "recovery sync")
 
-    def _response(self) -> dict[str, object]:
+    def _response(self, *, timeout: float | None = _RESPONSE_TIMEOUT_SECONDS) -> dict[str, object]:
+        deadline = None if timeout is None else monotonic() + timeout
         while True:
-            response = _message(self.socket)
+            if deadline is not None:
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("timed out while waiting for controller response")
+            else:
+                remaining = None
+            response = _message(self.socket, timeout=remaining)
             response_type = response.get("type")
             if response_type == "worker_relay":
                 self._queue_worker_relay(response)
@@ -1171,10 +1189,10 @@ def open_authenticated_worker_session(
     try:
         with connect(_worker_endpoint(controller_url, "/api/worker/certificate")) as certificate_socket:
             _send(certificate_socket, {"enrollment_id": enrollment_id})
-            challenge = _message(certificate_socket)
+            challenge = _message(certificate_socket, timeout=_HANDSHAKE_TIMEOUT_SECONDS)
             worker_id = _required_text(challenge, "worker_id")
             _send_proof(certificate_socket, key_store, challenge, "certificate_delivery", worker_id)
-            delivery = _message(certificate_socket)
+            delivery = _message(certificate_socket, timeout=_HANDSHAKE_TIMEOUT_SECONDS)
             if _required_text(delivery, "worker_id") != worker_id:
                 raise WorkerEnrollmentError("The controller returned an invalid device certificate.")
             certificate = _required_text(delivery, "certificate")
@@ -1187,9 +1205,9 @@ def open_authenticated_worker_session(
     try:
         socket.__enter__()
         _send(socket, {"worker_id": worker_id, "certificate": certificate})
-        challenge = _message(socket)
+        challenge = _message(socket, timeout=_HANDSHAKE_TIMEOUT_SECONDS)
         _send_proof(socket, key_store, challenge, "worker_session", worker_id)
-        authenticated = _message(socket)
+        authenticated = _message(socket, timeout=_HANDSHAKE_TIMEOUT_SECONDS)
         cursor = authenticated.get("cursor") if isinstance(authenticated, dict) else None
         if (
             not isinstance(cursor, int)

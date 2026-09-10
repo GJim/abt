@@ -534,6 +534,20 @@ def _run_reconciliation_with_relay(
             if maintenance is not None and observed_at >= next_maintenance:
                 maintenance()
                 next_maintenance = observed_at + timedelta(days=1)
+            if pair_cell is not None:
+                # Local protection first: advance the cell on local MT5
+                # evidence before any blocking network call, so a half-open
+                # connection can never starve trailing/protection. The pump
+                # at the bottom of this iteration is kept so relay messages
+                # received in this same iteration still turn around with
+                # minimum latency (quote/readiness/snapshot work inside pump
+                # is interval-gated, so the extra call is cheap).
+                pair_cell.pump(observed_at)
+                if bool(getattr(pair_cell, "should_exit", False)):
+                    return
+                if graceful_shutdown.requested and pair_cell.shutdown_complete:
+                    _LOGGER.info("Pair Execution Cell graceful shutdown completed.")
+                    return
             if observed_at >= next_reconciliation:
                 reconciliation.poll(observed_at)
                 next_reconciliation = observed_at + timedelta(minutes=1)
