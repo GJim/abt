@@ -759,53 +759,6 @@ class ControlPlaneServiceTests(unittest.TestCase):
             )
         self.assertEqual("connected", self.client.get("/api/admin/workers").json()[0]["connectivity"])
 
-    def test_operations_dashboard_requires_an_admin_and_classifies_current_operational_state(self) -> None:
-        self.assertEqual(401, self.client.get("/api/admin/operations-dashboard").status_code)
-
-        pending_enrollment_id = self._create_pending_enrollment()
-        _private_key, worker_id, _certificate = self._approved_worker(654321, "Broker-Live")
-        self.assertEqual(
-            200,
-            self.client.post(
-                "/api/admin/login", json={"username": "ABCDEF", "password": "A-secure-admin-password!"}
-            ).status_code,
-        )
-
-        response = self.client.get("/api/admin/operations-dashboard")
-
-        self.assertEqual(200, response.status_code)
-        dashboard = response.json()
-        self.assertNotIn("paired_trade_lifecycle", dashboard)
-        self.assertNotIn("product_pairs", dashboard)
-        enrollment_alert = next(
-            alert for alert in dashboard["alerts"] if alert["alert_type"] == "worker_enrollment_pending_approval"
-        )
-        self.assertEqual("intervention_required", enrollment_alert["category"])
-        self.assertEqual("administrator_approval_required", enrollment_alert["classification_reason"])
-        self.assertEqual(pending_enrollment_id, enrollment_alert["enrollment_id"])
-        self.assertEqual("intervention_required", dashboard["pending_enrollments"][0]["category"])
-        self.assertEqual("approval_required", dashboard["pending_enrollments"][0]["classification_reason"])
-        enrollment_intervention = next(
-            item for item in dashboard["interventions"] if item["item_type"] == "pending_enrollment"
-        )
-        self.assertEqual(
-            {
-                "item_type": "pending_enrollment",
-                "item_id": pending_enrollment_id,
-                "category": "intervention_required",
-                "reason": "approval_required",
-            },
-            {
-                key: value
-                for key, value in enrollment_intervention.items()
-                if key in {"item_type", "item_id", "category", "reason"}
-            },
-        )
-        worker = next(worker for worker in dashboard["workers"] if worker["worker_id"] == worker_id)
-        self.assertEqual("intervention_required", worker["category"])
-        self.assertEqual("worker_stale", worker["classification_reason"])
-        self.assertEqual(UTC, datetime.fromisoformat(dashboard["generated_at"]).tzinfo)
-
     def test_enrollment_does_not_apply_a_client_ip_rate_limit(self) -> None:
         private_key = ec.generate_private_key(ec.SECP256R1())
         public_key_pem = private_key.public_key().public_bytes(
@@ -2754,16 +2707,6 @@ class _LiveCatalogAnalysisHarness:
         )
         self._case.assertEqual(200, response.status_code)
         return response.json()["items"]
-
-    def list_alerts(self) -> list[dict[str, object]]:
-        session_cookie, _csrf = self._admin_session()
-        response = httpx.get(
-            f"{self._base_url}/api/admin/alerts",
-            headers={"Cookie": session_cookie},
-            timeout=5,
-        )
-        self._case.assertEqual(200, response.status_code)
-        return response.json()
 
     def respond_to_catalog_analysis(
         self,

@@ -359,13 +359,6 @@ class ControlLedger:
                 "worker_enrollment_requested",
                 {"enrollment_id": enrollment.enrollment_id, "login": login, "server": server},
             )
-            self._alert(
-                None,
-                "high",
-                "worker_enrollment_pending_approval",
-                "administrator_approval_required",
-                enrollment_id=enrollment.enrollment_id,
-            )
         return enrollment
 
 
@@ -1687,7 +1680,6 @@ class ControlLedger:
                 [_utc_now(), worker_id],
             )
             self._event("worker_certificate_revoked", {"worker_id": worker_id, "revoked_by": revoked_by})
-            self._alert(worker_id, "high", "certificate_revoked", "administrator_revocation")
 
     def worker_reconciliation(self) -> list[dict[str, Any]]:
         now = _utc_now()
@@ -1710,21 +1702,6 @@ class ControlLedger:
                     }
                 )
         return result
-
-    def alerts(self) -> list[dict[str, Any]]:
-        with self._lock:
-            rows = self._connection.execute(
-                """
-                SELECT alert_id, worker_id, enrollment_id, priority, alert_type, reason, occurred_at
-                FROM alerts
-                ORDER BY alert_id
-                """
-            ).fetchall()
-        return [
-            {"alert_id": row[0], "worker_id": row[1], "enrollment_id": row[2], "priority": row[3], "alert_type": row[4],
-             "reason": row[5], "occurred_at": row[6]}
-            for row in rows
-        ]
 
     def reconciliation_cursor(self, worker_id: str) -> int:
         with self._lock:
@@ -1888,23 +1865,6 @@ class ControlLedger:
         assert row is not None
         return int(row[0])
 
-    def _alert(
-        self,
-        worker_id: str | None,
-        priority: str,
-        alert_type: str,
-        reason: str,
-        *,
-        enrollment_id: str | None = None,
-    ) -> None:
-        self._connection.execute(
-            """
-            INSERT INTO alerts (worker_id, enrollment_id, priority, alert_type, reason, occurred_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            [worker_id, enrollment_id, priority, alert_type, reason, _utc_now()],
-        )
-
     def _initialize(self) -> None:
         with self._lock:
             self._connection.execute(
@@ -2003,16 +1963,6 @@ class ControlLedger:
                     payload JSON NOT NULL,
                     occurred_at TIMESTAMPTZ NOT NULL
                 );
-                CREATE SEQUENCE IF NOT EXISTS alerts_sequence START 1;
-                CREATE TABLE IF NOT EXISTS alerts (
-                    alert_id BIGINT PRIMARY KEY DEFAULT nextval('alerts_sequence'),
-                    worker_id VARCHAR,
-                    enrollment_id VARCHAR,
-                    priority VARCHAR NOT NULL,
-                    alert_type VARCHAR NOT NULL,
-                    reason VARCHAR NOT NULL,
-                    occurred_at TIMESTAMPTZ NOT NULL
-                );
                 CREATE TABLE IF NOT EXISTS pair_execution_owners (
                     pair_key VARCHAR NOT NULL,
                     mode VARCHAR NOT NULL,
@@ -2086,7 +2036,6 @@ class ControlLedger:
                     WHERE status = 'pending' AND registration_invite_hash IS NULL
                     """
                 )
-            self._connection.execute("ALTER TABLE alerts DROP COLUMN IF EXISTS product_pair_id")
             self._connection.execute("ALTER TABLE enrollments DROP COLUMN IF EXISTS pairing_code")
             self._connection.execute(
                 "ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS password_secret_deleted_at TIMESTAMPTZ"
@@ -2132,7 +2081,6 @@ class ControlLedger:
                 "trader_event_cursors",
             ):
                 self._connection.execute(f"DROP TABLE IF EXISTS {table}")
-            self._migrate_alert_enrollment_reference()
 
     def _table_columns(self, table_name: str) -> set[str]:
         return {
@@ -2226,19 +2174,6 @@ class ControlLedger:
             """DELETE FROM pair_execution_owners WHERE mode = 'pair_execution_cell'
                AND pair_key NOT IN (SELECT pair_key FROM pair_routes)"""
         )
-
-    def _migrate_alert_enrollment_reference(self) -> None:
-        columns = {
-            row[1]
-            for row in self._connection.execute("PRAGMA table_info('alerts')").fetchall()
-        }
-        if "enrollment_id" not in columns:
-            self._connection.execute("ALTER TABLE alerts ADD COLUMN enrollment_id VARCHAR")
-        worker_column = next(
-            row for row in self._connection.execute("PRAGMA table_info('alerts')").fetchall() if row[1] == "worker_id"
-        )
-        if worker_column[3]:
-            self._connection.execute("ALTER TABLE alerts ALTER worker_id DROP NOT NULL")
 
     def _transaction(self):
         return _Transaction(self._lock, self._connection)

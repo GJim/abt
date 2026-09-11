@@ -67,7 +67,6 @@ export function WorkerManagementPage({
                 <p>{item.reason}</p>
                 <time dateTime={item.occurredAt}>{formatDateTime(item.occurredAt)}</time>
               </div>
-              {'alert' in item ? <a href={`#worker-${item.alert.worker_id ?? ''}`}>Review worker</a> : null}
             </li>
           ))}
         </ul>

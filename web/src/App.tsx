@@ -31,32 +31,13 @@ export type AccountWorker = {
   last_seen_at: string | null
 }
 
-export type WorkerAlert = {
-  alert_id: number
-  worker_id: string | null
-  enrollment_id?: string | null
-  priority: string
-  alert_type: string
-  reason: string
-  occurred_at: string
-}
-
-export type InterventionItem =
-  | {
+export type InterventionItem = {
     id: string
     kind: string
     reason: string
     occurredAt: string
     priorityRank: number
     enrollment: Enrollment
-  }
-  | {
-    id: string
-    kind: string
-    reason: string
-    occurredAt: string
-    priorityRank: number
-    alert: WorkerAlert
   }
 
 type ConsolePage = 'main' | 'workers' | 'invites' | 'audit'
@@ -70,7 +51,6 @@ function App() {
   const [csrfToken, setCsrfToken] = useState<string | null>(null)
   const [enrollments, setEnrollments] = useState<Enrollment[]>([])
   const [workers, setWorkers] = useState<AccountWorker[]>([])
-  const [alerts, setAlerts] = useState<WorkerAlert[]>([])
   const [processingEnrollmentId, setProcessingEnrollmentId] = useState<string | null>(null)
   const [isRestoringSession, setIsRestoringSession] = useState(true)
   const [isSigningIn, setIsSigningIn] = useState(false)
@@ -81,7 +61,6 @@ function App() {
     setCsrfToken(null)
     setEnrollments([])
     setWorkers([])
-    setAlerts([])
     setError(message)
   }, [])
 
@@ -89,7 +68,6 @@ function App() {
     const responses = await Promise.all([
       fetch('/api/admin/enrollments', { credentials: 'same-origin' }),
       fetch('/api/admin/workers', { credentials: 'same-origin' }),
-      fetch('/api/admin/alerts', { credentials: 'same-origin' }),
     ])
     if (responses.some((response) => response.status === 401)) {
       endSession('Your session has expired. Please sign in again.')
@@ -98,15 +76,14 @@ function App() {
     if (responses.some((response) => !response.ok)) {
       throw new Error('Control-plane identity and Worker data could not be loaded.')
     }
-    const [enrollmentPayload, workerPayload, alertPayload] = await Promise.all(
+    const [enrollmentPayload, workerPayload] = await Promise.all(
       responses.map((response) => response.json()),
     )
-    if (!Array.isArray(enrollmentPayload) || !Array.isArray(workerPayload) || !Array.isArray(alertPayload)) {
+    if (!Array.isArray(enrollmentPayload) || !Array.isArray(workerPayload)) {
       throw new Error('The control plane returned invalid management data.')
     }
     setEnrollments(enrollmentPayload as Enrollment[])
     setWorkers(workerPayload as AccountWorker[])
-    setAlerts(alertPayload as WorkerAlert[])
   }, [endSession])
 
   useEffect(() => {
@@ -154,19 +131,11 @@ function App() {
       priorityRank: 1,
       enrollment,
     }))
-    const workerAlerts = alerts.map((alert) => ({
-      id: `alert-${alert.alert_id}`,
-      kind: alert.alert_type,
-      reason: alert.reason,
-      occurredAt: alert.occurred_at,
-      priorityRank: alert.priority === 'high' ? 0 : 2,
-      alert,
-    }))
-    return [...pending, ...workerAlerts].sort(
+    return [...pending].sort(
       (first, second) => first.priorityRank - second.priorityRank
         || second.occurredAt.localeCompare(first.occurredAt),
     )
-  }, [alerts, enrollments])
+  }, [enrollments])
 
   async function signIn(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
@@ -310,7 +279,6 @@ function App() {
               <div><dt>Workers</dt><dd>{workers.length}</dd></div>
               <div><dt>Connected</dt><dd>{workers.filter((worker) => worker.connectivity === 'connected').length}</dd></div>
               <div><dt>Pending registrations</dt><dd>{enrollments.length}</dd></div>
-              <div><dt>Open alerts</dt><dd>{alerts.length}</dd></div>
             </dl>
           </section>
         )}

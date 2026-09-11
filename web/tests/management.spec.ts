@@ -145,16 +145,13 @@ async function mockSession(page: Page) {
 
 async function mockManagementData(
   page: Page,
-  overrides: { events?: object[]; enrollments?: object[]; workers?: object[]; alerts?: object[] } = {},
+  overrides: { events?: object[]; enrollments?: object[]; workers?: object[] } = {},
 ) {
   await page.route('**/api/admin/enrollments', async (route) => {
     await route.fulfill({ contentType: 'application/json', body: JSON.stringify(overrides.enrollments ?? []) })
   })
   await page.route('**/api/admin/workers', async (route) => {
     await route.fulfill({ contentType: 'application/json', body: JSON.stringify(overrides.workers ?? []) })
-  })
-  await page.route('**/api/admin/alerts', async (route) => {
-    await route.fulfill({ contentType: 'application/json', body: JSON.stringify(overrides.alerts ?? []) })
   })
   await page.route('**/api/admin/events?**', async (route) => {
     const events = overrides.events ?? []
