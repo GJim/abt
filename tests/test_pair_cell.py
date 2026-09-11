@@ -2487,6 +2487,90 @@ class LossPolicyTests(PairCellTestCase):
             None if short_advanced is None else Decimal(short_advanced), Decimal("1.10035")
         )
 
+    def test_solo_lock_prefers_breakeven_then_half_risk_then_hold(self) -> None:
+        from abt.pair_cell import SizingPlan, compute_solo_lock_sl
+
+        plan = SizingPlan(
+            universe_generation=1,
+            product_id="EURUSD:x",
+            symbol=SYMBOL,
+            direction="LONG",
+            margin_per_lot="1000",
+            local_max_lots="5",
+            canonical_point="0.00001",
+            point="0.00001",
+            tick_size="0.00001",
+            profit_tick_value="1",
+            loss_tick_value="1",
+            volume_min="0.01",
+            volume_step="0.01",
+            volume_max="50",
+            filling_mode="FOK",
+            minimum_stop_distance="0",
+            usd_per_point_per_lot="1",
+        )
+        # Profitable: breakeven is executable and tightens.
+        locked = compute_solo_lock_sl(
+            direction="LONG",
+            fill_price=Decimal("1.10010"),
+            initial_sl=Decimal("1.09935"),
+            current_sl=Decimal("1.09935"),
+            current_price=Decimal("1.10050"),
+            plan=plan,
+        )
+        self.assertEqual(None if locked is None else Decimal(locked), Decimal("1.10010"))
+        # Breakeven blocked by minimum distance: falls back to half-risk.
+        plan_far = SizingPlan(
+            universe_generation=1,
+            product_id="EURUSD:x",
+            symbol=SYMBOL,
+            direction="LONG",
+            margin_per_lot="1000",
+            local_max_lots="5",
+            canonical_point="0.00001",
+            point="0.00001",
+            tick_size="0.00001",
+            profit_tick_value="1",
+            loss_tick_value="1",
+            volume_min="0.01",
+            volume_step="0.01",
+            volume_max="50",
+            filling_mode="FOK",
+            minimum_stop_distance="0.00050",
+            usd_per_point_per_lot="1",
+        )
+        locked = compute_solo_lock_sl(
+            direction="LONG",
+            fill_price=Decimal("1.10010"),
+            initial_sl=Decimal("1.09935"),
+            current_sl=Decimal("1.09935"),
+            current_price=Decimal("1.10030"),
+            plan=plan_far,
+        )
+        # breakeven needs 0.00020 < 0.00050: blocked; half (1.09972) keeps
+        # 0.00058 distance: executable.
+        self.assertEqual(None if locked is None else Decimal(locked), Decimal("1.09972"))
+        # Thin profit where even half-risk is too close: hold, never widen.
+        locked = compute_solo_lock_sl(
+            direction="LONG",
+            fill_price=Decimal("1.10010"),
+            initial_sl=Decimal("1.09935"),
+            current_sl=Decimal("1.09935"),
+            current_price=Decimal("1.09980"),
+            plan=plan_far,
+        )
+        self.assertIsNone(locked)
+        # SHORT mirrors around the fill.
+        locked = compute_solo_lock_sl(
+            direction="SHORT",
+            fill_price=Decimal("1.10040"),
+            initial_sl=Decimal("1.10115"),
+            current_sl=Decimal("1.10115"),
+            current_price=Decimal("1.09960"),
+            plan=plan,
+        )
+        self.assertEqual(None if locked is None else Decimal(locked), Decimal("1.10040"))
+
     def test_rough_protection_targets_the_computed_allowance_not_a_constant(self) -> None:
         self.prime()
         self.follower.cell.handle_event(
@@ -2890,7 +2974,7 @@ class ImmediateEntryTests(PairCellTestCase):
         self.assertEqual(Decimal(str(follower_modify["sl"])), Decimal("1.10090"))
         self.assertEqual(str(follower_modify["tp"]), "0")
 
-    def test_leader_profit_trail_advances_after_sixty_seconds(self) -> None:
+    def test_leader_profit_trail_advances_after_five_minutes(self) -> None:
         self.leader.mt5.fill_price = 1.10030
         self.follower.mt5.fill_price = 1.10050
         self.run_entry()
@@ -2898,8 +2982,9 @@ class ImmediateEntryTests(PairCellTestCase):
         self.assertEqual(len(self.follower.modify_requests()), 1)
 
         # The market runs in the leader LONG direction: the profit leg trails
-        # its stop one full initial risk distance (75 ticks) behind the bid,
-        # while the follower hedge leg never re-applies its static stop.
+        # its stop one full initial risk distance (75 ticks) behind the bid.
+        # Advances smaller than _SOLO_TRAIL_MIN_STEP_TICKS are held; the
+        # follower hedge leg only trails on its own favorable move.
         self.feed_quotes(
             leader_bid="1.10130",
             leader_ask="1.10140",
@@ -2907,7 +2992,7 @@ class ImmediateEntryTests(PairCellTestCase):
             follower_ask="1.10060",
             sequence=3,
         )
-        self.tick(seconds=60)
+        self.tick(seconds=300)
 
         leader_modify = self.leader.modify_requests()[-1]
         self.assertEqual(Decimal(str(leader_modify["sl"])), Decimal("1.10055"))
@@ -2924,7 +3009,17 @@ class ImmediateEntryTests(PairCellTestCase):
 
         # The capped follower leg stops out first while the leader profit leg
         # is still holding: the leader keeps running solo under its trailing
-        # stop instead of being contained with the loser.
+        # stop instead of being contained with the loser.  Solo entry applies
+        # one immediate lock (breakeven, else half-risk), so the survivor may
+        # sit in PROTECTING rather than ACTIVE while still holding.
+        self.feed_quotes(
+            leader_bid="1.10050",
+            leader_ask="1.10060",
+            follower_bid="1.10050",
+            follower_ask="1.10060",
+            sequence=3,
+        )
+        self.tick()
         self.follower.mt5.positions = []
         self.follower.cell.handle_event(
             BrokerSnapshotEvent(orders=[], positions=[], observed_at=self.now)
@@ -2932,11 +3027,48 @@ class ImmediateEntryTests(PairCellTestCase):
         self.net.pump()
 
         result = self.leader.cell.handle_event(ClockTickEvent(self.now))
-        self.assertEqual(result.state, "ACTIVE")
+        self.assertIn(result.state, ("ACTIVE", "PROTECTING"))
         self.assertEqual(self.leader.close_requests(), [])
         self.assertIn(
             "peer_leg_empty_leader_continues_solo",
             [row["event"] for row in self.leader.cell.transition_history()],
+        )
+        self.assertIn(
+            "solo_lock_applied",
+            [row["event"] for row in self.leader.cell.transition_history()],
+        )
+
+    def test_follower_continues_solo_after_the_leader_leg_stops_out(self) -> None:
+        self.run_entry()
+        self.assertEqual(self.follower.cell.handle_event(ClockTickEvent(self.now)).state, "ACTIVE")
+
+        # Dual-solo contract: either leg may outlive the peer.  The follower
+        # keeps running under its own trailing stop with one immediate solo
+        # lock instead of being contained with the empty leader leg.
+        self.feed_quotes(
+            leader_bid="1.10000",
+            leader_ask="1.10010",
+            follower_bid="1.09950",
+            follower_ask="1.09960",
+            sequence=3,
+        )
+        self.tick()
+        self.leader.mt5.positions = []
+        self.leader.cell.handle_event(
+            BrokerSnapshotEvent(orders=[], positions=[], observed_at=self.now)
+        )
+        self.net.pump()
+
+        result = self.follower.cell.handle_event(ClockTickEvent(self.now))
+        self.assertIn(result.state, ("ACTIVE", "PROTECTING"))
+        self.assertEqual(self.follower.close_requests(), [])
+        self.assertIn(
+            "peer_leg_empty_follower_continues_solo",
+            [row["event"] for row in self.follower.cell.transition_history()],
+        )
+        self.assertIn(
+            "solo_lock_applied",
+            [row["event"] for row in self.follower.cell.transition_history()],
         )
 
     def test_peer_protection_rejection_rolls_back_the_accepted_leg_to_rough(self) -> None:
@@ -3429,10 +3561,11 @@ class EntryResultTests(PairCellTestCase):
 
 
 class RecoveryTests(PairCellTestCase):
-    # NOTE: the leader profit leg no longer contains when the capped follower
-    # hedge leg empties -- it keeps running solo under its trailing stop.  The
-    # containment-recheck paths below are therefore exercised from the follower
-    # side, which still converges when the leader leg empties.
+    # NOTE: either leg may keep running solo after the peer empties, but only
+    # as a winner (own exit price strictly beyond fill).  Flat or adverse
+    # legs still contain with the peer, so the containment-recheck paths below
+    # -- which run at flat harness quotes -- are still exercised from the
+    # follower side when the leader leg empties.
     def test_rejected_containment_cancel_rechecks_broker_before_stopping(self) -> None:
         self.run_entry()
         self.follower.mt5.orders.append({"ticket": 123, "symbol": SYMBOL})
@@ -4127,10 +4260,19 @@ class PeerTerminalProofTests(PairCellTestCase):
         # empty: the leader intentionally withholds terminal proof while it
         # keeps managing its profit leg. While authenticated peer envelopes
         # keep arriving, the follower must keep probing without escalating.
+        # Solo is winner-only, so run the leader quote profitable first.
         self.run_entry()
         self.assertEqual(self.leader.cell.handle_event(ClockTickEvent(self.now)).state, "ACTIVE")
         self.assertEqual(self.follower.cell.handle_event(ClockTickEvent(self.now)).state, "ACTIVE")
 
+        self.feed_quotes(
+            leader_bid="1.10050",
+            leader_ask="1.10060",
+            follower_bid="1.10050",
+            follower_ask="1.10060",
+            sequence=3,
+        )
+        self.tick()
         self.follower.mt5.positions = []
         self.follower.cell.handle_event(
             BrokerSnapshotEvent(orders=[], positions=[], observed_at=self.now)
@@ -4159,6 +4301,16 @@ class PeerTerminalProofTests(PairCellTestCase):
         self.run_entry()
         self.assertEqual(self.leader.cell.handle_event(ClockTickEvent(self.now)).state, "ACTIVE")
 
+        # Winner-only solo: run the leader quote profitable before the peer
+        # empties so the survivor path (not containment) is exercised.
+        self.feed_quotes(
+            leader_bid="1.10050",
+            leader_ask="1.10060",
+            follower_bid="1.10050",
+            follower_ask="1.10060",
+            sequence=3,
+        )
+        self.tick()
         self.follower.mt5.positions = []
         self.follower.cell.handle_event(
             BrokerSnapshotEvent(orders=[], positions=[], observed_at=self.now)
