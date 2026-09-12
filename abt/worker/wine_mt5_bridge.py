@@ -11,6 +11,18 @@ try:
     from .wine_mt5_protocol import PROTOCOL_VERSION, ProtocolError, read_frame, write_frame
 except ImportError:  # Executed directly by Windows Python under Wine.
     from wine_mt5_protocol import PROTOCOL_VERSION, ProtocolError, read_frame, write_frame
+    try:  # Protocol is already imported; drop the script dir so siblings never shadow stdlib.
+        import os as _os
+
+        _bridge_dir = _os.path.normcase(_os.path.abspath(_os.path.dirname(__file__)))
+        sys.path = [
+            _entry
+            for _entry in sys.path
+            if _os.path.normcase(_os.path.abspath(_entry or ".")) != _bridge_dir
+        ]
+        del _os, _bridge_dir
+    except Exception:
+        pass
 
 
 REQUEST_FIELDS = {"version", "id", "operation", "params"}

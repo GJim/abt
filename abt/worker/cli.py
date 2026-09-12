@@ -12,7 +12,7 @@ import httpx
 
 from .enrollment import EnrollmentTransport, MT5Client, WorkerEnrollmentError, register_worker
 from .effect_journal import WorkerEffectJournal
-from .inspect import (
+from .symbols_inspect import (
     InspectError,
     allowed_products,
     edge_searchable_products,

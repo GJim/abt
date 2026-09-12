@@ -18,7 +18,7 @@ from abt.worker.cli import (
     main,
 )
 from abt.worker.enrollment import WorkerEnrollmentError
-from abt.worker.inspect import (
+from abt.worker.symbols_inspect import (
     allowed_products,
     edge_searchable_products,
     excluded_products,
