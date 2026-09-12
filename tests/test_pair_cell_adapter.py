@@ -1565,6 +1565,52 @@ class WorkerInitiatedPairingTests(PairingTestCase):
         )
         self.assertEqual([FOLLOWER], selected)
 
+    def test_a_refused_proposal_logs_its_reason_and_relists(self) -> None:
+        """A dead proposal must say why it died instead of looking like the
+        selection was ignored and silently prompting again."""
+
+        def select(followers: Sequence[Mapping[str, object]]) -> str | None:
+            return str(followers[0]["worker_id"])
+
+        follower = self.worker(FOLLOWER, bid=1.10100, ask=1.10110, balance=4_000.0)
+        self.controller.refuse_next_proposal = "the follower is busy"
+        leader = self.worker(
+            LEADER,
+            options=PairCellStartupOptions(role="leader", interactive=True, select_follower=select),
+        )
+        with self.assertLogs("abt.worker.pair_cell_adapter", level="WARNING") as logs:
+            self.assertTrue(
+                pump_until(
+                    [leader, follower],
+                    lambda: leader.runtime.enabled and follower.runtime.enabled,
+                    rounds=60,
+                ),
+                "the pair never paired after the refusal",
+            )
+        self.assertTrue(
+            any(
+                "did not become a route" in message and "the follower is busy" in message
+                for message in logs.output
+            ),
+            logs.output,
+        )
+
+    def test_a_follower_refusal_logs_its_reason(self) -> None:
+        worker = self.worker(FOLLOWER)
+        with self.assertLogs("abt.worker.pair_cell_adapter", level="WARNING") as logs:
+            worker.runtime._answer_pairing_proposal(
+                {"proposal_id": "proposal-9", "leader_worker_id": LEADER}
+            )
+        self.assertTrue(
+            any(
+                "Refused Pair Execution Cell pairing proposal proposal-9" in message
+                and "calibration" in message
+                for message in logs.output
+            ),
+            logs.output,
+        )
+        self.assertIn("refused proposal proposal-9", worker.runtime.pairing_diagnostic)
+
     def test_a_follower_refuses_when_it_is_not_broker_verified_empty(self) -> None:
         follower = self.worker(FOLLOWER, bid=1.10100, ask=1.10110, balance=4_000.0)
         follower.mt5.positions.append({"ticket": 4242, "symbol": SYMBOL, "type": 0, "volume": 1.0})

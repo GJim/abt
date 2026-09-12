@@ -1930,6 +1930,13 @@ class PairCellRuntime:
         if self._options.follower_worker_id or not self._options.interactive:
             self._idle_unpaired(reason)
             return
+        # The re-listing loop below is silent by itself: say why this proposal
+        # died, or the next prompt looks like the selection was ignored.
+        _LOGGER.warning(
+            "The pairing proposal did not become a route (%s);"
+            " listing available followers again.",
+            reason,
+        )
         self._pairing_state = "selecting"
 
     def _handle_control_result(self, reply: Mapping[str, object]) -> None:
@@ -2239,6 +2246,11 @@ class PairCellRuntime:
             _LOGGER.warning("The pairing decision could not be sent.", exc_info=True)
             return
         self._pairing_reason = f"refused proposal {proposal_id}: {reason}"
+        _LOGGER.warning(
+            "Refused Pair Execution Cell pairing proposal %s: %s.",
+            proposal_id,
+            reason,
+        )
 
     def _follower_refusal_reason(self) -> str | None:
         """Automatic acceptance, gated only on local, current broker evidence."""
