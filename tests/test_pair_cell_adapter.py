@@ -181,6 +181,11 @@ class FakeMT5:
         self.reject = False
         #: MT5 ``10021 TRADE_RETCODE_PRICE_OFF``, the durable quarantine trigger.
         self.price_off = False
+        #: Simulate broker-side stop-loss fills when True (default False): a
+        #: position whose stop is touched by current prices is removed with an
+        #: exit deal, exactly as a live broker would fill it. The cell never
+        #: closes on a stop touch by itself; it observes the broker-side fill.
+        self.stop_fills = False
         self._next_ticket = 5000
 
     # -- reads ------------------------------------------------------------- #
@@ -195,7 +200,41 @@ class FakeMT5:
         return [dict(order) for order in self.orders]
 
     def positions_get(self) -> object:
+        if self.stop_fills:
+            self._fill_touched_stops()
         return [dict(position) for position in self.positions]
+
+    def _fill_touched_stops(self) -> None:
+        """Remove positions whose stop-loss is touched, with an exit deal.
+
+        A live broker fills a touched stop on its own; the cell never closes
+        on a stop touch by itself, it observes the broker-side fill. This
+        simulation is opt-in per test so flat-price flows are unaffected.
+        """
+
+        kept: list[dict[str, object]] = []
+        for position in self.positions:
+            try:
+                stop = float(position.get("sl") or 0.0)
+            except (TypeError, ValueError):
+                stop = 0.0
+            prices = self.prices.get(str(position.get("symbol")))
+            touched = (
+                stop
+                and prices is not None
+                and (
+                    (position["type"] == self.ORDER_TYPE_BUY and prices[0] <= stop)
+                    or (position["type"] == self.ORDER_TYPE_SELL and prices[1] >= stop)
+                )
+            )
+            if touched:
+                ticket = position["ticket"]
+                self.deals_by_position.setdefault(ticket, []).append(
+                    {"entry": 1, "profit": self._realized(position)}
+                )
+                continue
+            kept.append(position)
+        self.positions = kept
 
     def symbols_get(self) -> object:
         if not self.catalog_available:
@@ -3054,6 +3093,35 @@ class FullLifecycleTests(PairingTestCase):
         follower.mt5.prices[SYMBOL] = leader.mt5.prices[SYMBOL]
         pump_until([leader, follower], lambda: False, rounds=40)
         leader.runtime.request_close("timed_exit")
+        # The leader empties on its own close while the profitable follower
+        # leg keeps running solo under its trailing stop instead of
+        # containing with the peer.
+        self.assertTrue(
+            pump_until([leader, follower], lambda: not leader.mt5.positions, rounds=100),
+            "the leader never closed on its own timed exit",
+        )
+        assert follower.runtime.cell is not None
+        self.assertIn(
+            "peer_leg_empty_follower_continues_solo",
+            [row["event"] for row in follower.runtime.cell.transition_history()],
+        )
+        # Drive the market favorably past the trail cadence: the first
+        # trailing adjustment must tighten the solo stop.
+        follower.mt5.prices[SYMBOL] = (1.09900, 1.09910)
+        self.clock.advance(301.0)
+        self.assertTrue(
+            pump_until(
+                [leader, follower],
+                lambda: bool(follower.mt5.positions)
+                and abs(float(follower.mt5.positions[0]["sl"]) - 1.10010) < 1e-9,
+                rounds=20,
+            ),
+            "the solo leg never trailed its stop",
+        )
+        # Return to flat with broker stop fills enabled: the touched stop
+        # fills broker-side and the cell observes the empty account.
+        follower.mt5.stop_fills = True
+        follower.mt5.prices[SYMBOL] = leader.mt5.prices[SYMBOL]
         self.assertTrue(
             pump_until(
                 [leader, follower],
