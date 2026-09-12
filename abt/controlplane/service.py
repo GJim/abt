@@ -439,15 +439,28 @@ def create_app(
         return response
 
     @app.post("/api/admin/enrollments/{enrollment_id}/approve")
-    def approve_enrollment(
+    async def approve_enrollment(
         enrollment_id: str,
         abt_admin_session: Annotated[str | None, Cookie()] = None,
         x_csrf_token: Annotated[str | None, Header()] = None,
     ) -> dict[str, str]:
         username = _require_admin(ledger, abt_admin_session, x_csrf_token, require_csrf=True)
+        predecessors: list[str] = []
         try:
             if certificate_issuer is None:
                 raise SecretStoreError("The device certificate issuer is unavailable.")
+            try:
+                login, server = ledger.pending_enrollment_account(enrollment_id)
+            except LedgerError:
+                login, server = None, None
+            if login is not None:
+                predecessors = ledger.active_worker_ids_for_account(login, server)
+                for predecessor_id in predecessors:
+                    if worker_connections.get(predecessor_id):
+                        raise LedgerError(
+                            "The previous worker for this MT5 account is still connected;"
+                            " disconnect it before migrating."
+                        )
             result = {
                 "worker_id": ledger.approve_enrollment(
                     enrollment_id,
@@ -461,6 +474,22 @@ def create_app(
                 )
             }
             _create_pki_backup(backup_manager)
+            stale_connections = [
+                connection
+                for predecessor_id in predecessors
+                for connection in worker_connections.pop(predecessor_id, set())
+            ]
+            if stale_connections:
+                await asyncio.gather(
+                    *(
+                        connection.websocket.close(
+                            code=status.WS_1008_POLICY_VIOLATION,
+                            reason="Superseded by a newer enrollment for this MT5 account.",
+                        )
+                        for connection in stale_connections
+                    ),
+                    return_exceptions=True,
+                )
             return result
         except (LedgerError, SecretStoreError) as error:
             _LOGGER.warning("Worker enrollment approval failed for %s: %s", enrollment_id, error)

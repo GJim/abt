@@ -219,6 +219,14 @@ class ControlPlaneServiceTests(unittest.TestCase):
         self.assertEqual(200, approval.status_code)
         self.assertIn("worker_id", approval.json())
 
+    def test_admin_can_migrate_an_unpaired_account_to_a_new_enrollment(self) -> None:
+        _, first_worker_id, _ = self._approved_worker(123456, "Broker-Demo")
+        _, second_worker_id, _ = self._approved_worker(123456, "Broker-Demo")
+        self.assertNotEqual(first_worker_id, second_worker_id)
+        workers = {item["worker_id"]: item for item in self.client.get("/api/admin/workers").json()}
+        self.assertEqual("revoked", workers[first_worker_id]["connectivity"])
+        self.assertEqual("stale", workers[second_worker_id]["connectivity"])
+
     def test_rejects_an_enrollment_without_a_valid_p256_proof(self) -> None:
         response = self.client.post(
             "/api/enrollments",

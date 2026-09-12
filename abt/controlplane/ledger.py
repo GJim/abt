@@ -1386,6 +1386,33 @@ class ControlLedger:
         if consumed is None:
             raise LedgerError("Enrollment challenge is invalid, expired, or already used.")
 
+    def active_worker_ids_for_account(self, login: int, server: str) -> list[str]:
+        """Every active worker currently bound to one MT5 account.
+
+        The narrowed migration scope keeps the one-active-worker invariant:
+        at most one entry is expected, but a list is returned so approval
+        can supersede whatever it finds atomically.
+        """
+
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT worker_id FROM workers WHERE login = ? AND server = ? AND status = 'active'",
+                [login, server],
+            ).fetchall()
+        return [str(row[0]) for row in rows]
+
+    def pending_enrollment_account(self, enrollment_id: str) -> tuple[int, str]:
+        """The MT5 account a pending enrollment wants to bind."""
+
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT login, server FROM enrollments WHERE enrollment_id = ? AND status = 'pending'",
+                [enrollment_id],
+            ).fetchone()
+        if row is None:
+            raise LedgerError("Enrollment is no longer pending.")
+        return int(row[0]), str(row[1])
+
     def approve_enrollment(
         self,
         enrollment_id: str,
@@ -1406,12 +1433,45 @@ class ControlLedger:
             login, server, public_key_pem, status, expires_at = row
             if status != "pending" or now >= expires_at:
                 raise LedgerError("Enrollment is no longer pending.")
-            active = self._connection.execute(
-                "SELECT worker_id FROM workers WHERE login = ? AND server = ? AND status = 'active'",
-                [login, server],
-            ).fetchone()
-            if active is not None:
-                raise LedgerError("This MT5 account already has an active worker.")
+            predecessors = [
+                str(found[0])
+                for found in self._connection.execute(
+                    "SELECT worker_id FROM workers WHERE login = ? AND server = ? AND status = 'active'",
+                    [login, server],
+                ).fetchall()
+            ]
+            for predecessor_id in predecessors:
+                if (
+                    self._connection.execute(
+                        "SELECT 1 FROM pair_routes WHERE leader_worker_id = ? OR follower_worker_id = ?",
+                        [predecessor_id, predecessor_id],
+                    ).fetchone()
+                    is not None
+                ):
+                    raise LedgerError(
+                        "This MT5 account is currently paired; safe-unpair before migrating it."
+                    )
+                if (
+                    self._connection.execute(
+                        """SELECT 1 FROM pair_route_reservations
+                           WHERE leader_worker_id = ? OR follower_worker_id = ?""",
+                        [predecessor_id, predecessor_id],
+                    ).fetchone()
+                    is not None
+                ):
+                    raise LedgerError(
+                        "This MT5 account holds a live pairing reservation; retry approval once it lapses."
+                    )
+            superseded: list[str] = []
+            if predecessors:
+                self._connection.execute(
+                    """
+                    UPDATE workers SET status = 'revoked', revoked_at = ?
+                    WHERE login = ? AND server = ? AND status = 'active'
+                    """,
+                    [now, login, server],
+                )
+                superseded = predecessors
             worker_id = str(uuid4())
             certificate = issue_certificate(worker_id, login, server, public_key_pem)
             self._connection.execute(
@@ -1425,9 +1485,26 @@ class ControlLedger:
                 "UPDATE enrollments SET status = 'approved', approved_by = ?, approved_at = ? WHERE enrollment_id = ?",
                 [approved_by, now, enrollment_id],
             )
+            for predecessor_id in superseded:
+                self._event(
+                    "worker_superseded",
+                    {
+                        "worker_id": predecessor_id,
+                        "login": login,
+                        "server": server,
+                        "superseded_by": worker_id,
+                        "superseding_enrollment_id": enrollment_id,
+                        "approved_by": approved_by,
+                    },
+                )
             self._event(
                 "worker_enrollment_approved",
-                {"enrollment_id": enrollment_id, "worker_id": worker_id, "approved_by": approved_by},
+                {
+                    "enrollment_id": enrollment_id,
+                    "worker_id": worker_id,
+                    "approved_by": approved_by,
+                    "superseded_worker_ids": superseded,
+                },
             )
             return worker_id
 
