@@ -56,6 +56,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 import json
 import logging
+import math
 from hashlib import sha256
 import os
 from pathlib import Path
@@ -67,12 +68,14 @@ from uuid import uuid4
 
 from ..pair_cell import (
     PROTOCOL_VERSION as PAIR_CELL_ENVELOPE_VERSION,
-    DEFAULT_ALLOW_LIVE,
     DEFAULT_DAILY_LOSS_WARNING_THRESHOLD_USD,
+    DEFAULT_STRATEGY_BUDGET_USD,
     LOCAL_SETTING_KEYS,
+    RELAY_HANDLING_WINDOW_SECONDS,
     REQUIRED_ACCOUNT_CURRENCY,
     SHARED_POLICY_KEYS,
     WORKER_RISK_KEYS,
+    _SIZING_REFRESH_SECONDS,
     BrokerClockCalibration,
     BrokerSnapshotEvent,
     CatalogEntry,
@@ -87,7 +90,6 @@ from ..pair_cell import (
     PairResult,
     PairingAcceptance,
     PeerSessionEvent,
-    QuarantineReleaseEvent,
     ReadinessFactsEvent,
     RealizedPnLEvent,
     RelayEnvelopeReceived,
@@ -96,7 +98,7 @@ from ..pair_cell import (
     RouteMetadataEvent,
     RouteState,
     WorkerRiskLimits,
-    _parse_utc,
+    _resolve_unified_budget,
     build_pairing_acceptance,
     canonical_policy_from_acceptance,
     default_worker_risk_limits,
@@ -179,7 +181,10 @@ PAIR_CELL_CONFIG_KEYS = frozenset(WORKER_RISK_KEYS) | frozenset(SHARED_POLICY_KE
 
 #: Durable cell tables whose rows belong to **one pairing**.  They are cleared
 #: when a route is removed, because the next pairing must start from a clean
-#: route, policy, universe and plan set.
+#: route, policy, universe and plan set.  The per-product status tables
+#: (suspend reasons, discovery exclusions) describe one pairing's universe
+#: generations, so they are cleared with it; durable quarantine has its own
+#: table and outlives every pairing.
 ROUTE_SCOPED_TABLES = (
     "cell_route",
     "cell_pairing_acceptance",
@@ -188,6 +193,8 @@ ROUTE_SCOPED_TABLES = (
     "cell_plan_version",
     "cell_sizing_plans",
     "cell_peer_sizing_plans",
+    "cell_product_suspend",
+    "cell_discovery_excluded",
     "cell_operator_stop",
 )
 #: Attempt evidence, cleared **as one set** and only once every attempt is
@@ -259,10 +266,6 @@ class PairCellWorkerSession(Protocol):
 
     def drain_pair_relay_acks(self) -> list[dict[str, object]]: ...
 
-    def drain_pair_cell_quarantine_releases(self) -> list[dict[str, object]]: ...
-
-    def send_pair_cell_quarantine_release_result(self, *, request_id: str, symbol: str, outcome: str) -> None: ...
-
     def drain_pair_cell_results(self) -> list[dict[str, object]]: ...
 
     def drain_pair_cell_pushes(self) -> list[dict[str, object]]: ...
@@ -307,7 +310,7 @@ class PairCellConfig:
     the role this Worker actually receives:
 
     * a **follower** file may set only its own four risk tunables and its own
-      ``allow_live`` guard; and
+      warning threshold; and
     * a **leader** file may additionally set the shared, leader-authored
       policy values.
 
@@ -319,7 +322,6 @@ class PairCellConfig:
     raw: Mapping[str, object]
     risk_overrides: Mapping[str, object]
     shared_policy: Mapping[str, object]
-    allow_live: bool = DEFAULT_ALLOW_LIVE
     daily_loss_warning_threshold_usd: str = DEFAULT_DAILY_LOSS_WARNING_THRESHOLD_USD
     source: str = "<defaults>"
 
@@ -344,7 +346,6 @@ def default_pair_cell_config() -> PairCellConfig:
         raw={},
         risk_overrides={},
         shared_policy={},
-        allow_live=DEFAULT_ALLOW_LIVE,
         daily_loss_warning_threshold_usd=DEFAULT_DAILY_LOSS_WARNING_THRESHOLD_USD,
     )
 
@@ -354,7 +355,7 @@ def load_pair_cell_config(path: Path | None) -> PairCellConfig:
 
     An absent file is the ordinary deployment: the runtime synthesizes the
     documented defaults (``live`` mode, the startup broker balance as
-    ``strategy_budget_usd``, ``allow_live = true`` and the documented risk and
+    ``strategy_budget_usd``, and the documented risk and
     shared-policy numbers) and the cell is available.  A present but malformed
     or over-reaching file is an explicit startup configuration error.
     """
@@ -388,11 +389,6 @@ def parse_pair_cell_config(raw: object, *, source: object = "<memory>") -> PairC
             f"The Pair Execution Cell configuration is invalid: {source}: "
             f"unknown settings {', '.join(unknown)}."
         )
-    allow_live = values.get("allow_live", DEFAULT_ALLOW_LIVE)
-    if not isinstance(allow_live, bool):
-        raise WorkerEnrollmentError(
-            f"The Pair Execution Cell configuration is invalid: {source}: allow_live must be a boolean."
-        )
     threshold = values.get("daily_loss_warning_threshold_usd", DEFAULT_DAILY_LOSS_WARNING_THRESHOLD_USD)
     try:
         if isinstance(threshold, bool):
@@ -407,11 +403,33 @@ def parse_pair_cell_config(raw: object, *, source: object = "<memory>") -> PairC
         ) from error
     risk_overrides = {key: values[key] for key in WORKER_RISK_KEYS if key in values}
     shared_policy = {key: values[key] for key in SHARED_POLICY_KEYS if key in values}
+    # Fail on unusable leader-authored numbers now rather than at pairing time.
+    # ``strategy_budget_usd`` is "0" for the automatic base (each leg uses its
+    # own frozen startup balance) or a positive USD amount unifying both legs.
+    if _resolve_unified_budget(shared_policy.get("strategy_budget_usd", DEFAULT_STRATEGY_BUDGET_USD)) is None:
+        raise WorkerEnrollmentError(
+            f"The Pair Execution Cell configuration is invalid: {source}: "
+            "strategy_budget_usd must be '0' or a positive USD amount."
+        )
+    for key, default in (
+        ("sizing_refresh_seconds", _SIZING_REFRESH_SECONDS),
+        ("relay_handling_timeout_seconds", RELAY_HANDLING_WINDOW_SECONDS),
+    ):
+        candidate = shared_policy.get(key, default)
+        if (
+            isinstance(candidate, bool)
+            or not isinstance(candidate, (int, float))
+            or not math.isfinite(candidate)
+            or candidate <= 0
+        ):
+            raise WorkerEnrollmentError(
+                f"The Pair Execution Cell configuration is invalid: {source}: "
+                f"{key} must be a positive number of seconds."
+            )
     config = PairCellConfig(
         raw=values,
         risk_overrides=risk_overrides,
         shared_policy=shared_policy,
-        allow_live=allow_live,
         daily_loss_warning_threshold_usd=threshold_text,
         source=str(source),
     )
@@ -1644,7 +1662,7 @@ class PairCellRuntime:
 
     @property
     def should_exit(self) -> bool:
-        """Whether an invoked ``--pair-cell-unpair`` completed safely."""
+        """Whether an invoked safe unpair completed and the Worker may exit."""
 
         return self._exit_after_safe_unpair
 
@@ -1752,6 +1770,30 @@ class PairCellRuntime:
         self._pairing_state = "selecting"
         self._proposal_attempts = 0
         return True
+
+    def request_quarantine_release(self, symbol: str, *, reason: str = "") -> dict[str, object] | None:
+        """Propose releasing one symbol's quarantine to the peer Worker.
+
+        Freezing a symbol is this Worker's own responsibility: the proposal
+        travels as an opaque relay envelope and both sides adopt the same
+        release marker, each applying it only while its own attempt is
+        terminal.  Returns the proposal or ``None`` when this Worker is not
+        on a route; raises when this side cannot release right now.
+        """
+
+        cell = self._cell
+        if cell is None:
+            self._pairing_reason = "this Worker is not on a Pair Execution Cell route"
+            return None
+        return cell.request_quarantine_release(symbol, reason=reason)
+
+    def quarantine_release_status(self, proposal_id: str) -> dict[str, object] | None:
+        """One release proposal's observable outcome: pending, applied, or rejected."""
+
+        cell = self._cell
+        if cell is None:
+            return None
+        return cell.quarantine_release_status(proposal_id)
 
     def _send_unpair_command(self, action: str) -> bool:
         record = self._durable_route
@@ -2552,7 +2594,6 @@ class PairCellRuntime:
                 local_risk_limits=limits,
                 effect_journal=self._effect_journal,
                 scheduler=self._session.trader_rpc_scheduler,
-                allow_live=self._config.allow_live,
                 daily_loss_warning_threshold_usd=self._config.daily_loss_warning_threshold_usd,
                 serve_foreign_scheduler_item=self._serve_foreign_scheduler_item,
                 dispatch_foreign_scheduler_outcome=self._session.dispatch_scheduler_outcome,
@@ -2614,7 +2655,7 @@ class PairCellRuntime:
         if self._options.cancel_unpair:
             self.cancel_safe_unpair()
         if self._options.rediscover:
-            self.request_rediscovery(actor="startup", reason="--pair-cell-rediscover")
+            self.request_rediscovery(actor="startup", reason="startup rediscovery")
 
     def _feed_route_metadata(self, view: Mapping[str, object] | None) -> PairResult | None:
         """Hand the controller's record to the cell, which arbitrates agreement."""
@@ -2920,26 +2961,19 @@ class PairCellRuntime:
     # -- per-loop pumping ----------------------------------------------------- #
 
     def drain_relay(self) -> PairResult | None:
-        """Process every already-queued pairing message, quarantine release,
-        relay ack, and opaque relay envelope now.
+        """Process every already-queued pairing message, relay ack, and opaque
+        relay envelope now.
 
         Called every iteration of the Worker's receive loop (not gated by a
         polling interval): immediate attempt delivery is this feature's
         latency-critical path, and pairing replies must not wait a whole
-        polling cycle either.
+        polling cycle either.  Quarantine release travels as an ordinary
+        opaque relay envelope between the two Workers; the controller never
+        pushes one.
         """
 
         self._drain_control()
         result: PairResult | None = None
-        for release in self._session.drain_pair_cell_quarantine_releases():
-            outcome = self._apply_quarantine_release(release)
-            if outcome is None:
-                continue
-            request_id, symbol, applied, release_result = outcome
-            result = release_result or result
-            self._session.send_pair_cell_quarantine_release_result(
-                request_id=request_id, symbol=symbol, outcome="applied" if applied else "rejected"
-            )
         for ack in self._session.drain_pair_relay_acks():
             request_id = ack.get("request_id")
             accepted = ack.get("accepted") is True
@@ -3157,9 +3191,10 @@ class PairCellRuntime:
         """Leader-only: compose and adopt the one canonical policy.
 
         ``follower_risk`` is copied **verbatim** from the follower's Pairing
-        Acceptance payload; there is no path here that lets the leader
-        recompute, clamp, rescale or substitute the follower's numbers.  A
-        missing or unusable payload simply means no policy is published.
+        Acceptance payload except for the sizing base when this leader sets a
+        unified ``strategy_budget_usd``; every other tunable still passes
+        through untouched, and a missing or unusable payload simply means no
+        policy is published.
         """
 
         cell, limits = self._cell, self._limits
@@ -3190,149 +3225,6 @@ class PairCellRuntime:
         self._published_policy = True
         _LOGGER.info("%s evt=policy_adopted %s", _RTAG, _short(policy.policy_version))
         return result
-
-    def _apply_quarantine_release(
-        self, release: Mapping[str, object]
-    ) -> tuple[str, str, bool, PairResult | None] | None:
-        try:
-            request_id = cast(str, release["request_id"])
-            symbol = cast(str, release["symbol"])
-        except KeyError:
-            _LOGGER.warning("Received a malformed Pair Execution Cell quarantine-release request.", exc_info=True)
-            return None
-        if self._cell is None:
-            # A product quarantine is durable, route-independent, Worker-local
-            # state that outlives any pairing, so "this Worker is not routed"
-            # is *not* evidence that there is nothing to release.  Reporting
-            # applied here would tell the operator a release succeeded while a
-            # quarantine that only the cell may lift is still in force.
-            outstanding = self._durable_quarantined_products(symbol)
-            if not outstanding:
-                return request_id, symbol, True, None  # genuinely nothing to release
-            _LOGGER.warning(
-                "Refusing a quarantine release for %s while this Worker is not on a Pair"
-                " Execution Cell route: %s remain quarantined and only the cell may lift them"
-                " with their release marker and audit intact. Retry once this Worker is routed.",
-                symbol,
-                ", ".join(outstanding),
-            )
-            return request_id, symbol, False, None
-        result: PairResult | None = None
-        try:
-            observed_at = _parse_utc(cast(str, release["observed_at"]))
-            actor = cast(str, release["actor"])
-            reason = cast(str, release["reason"])
-        except (KeyError, ValueError, PairExecutionCellError):
-            _LOGGER.warning("Received an invalid Pair Execution Cell quarantine-release request.", exc_info=True)
-            return request_id, symbol, False, None
-        applied = True
-        for product_id in self._release_targets(symbol):
-            result = self._cell.handle_event(
-                QuarantineReleaseEvent(
-                    product_id=product_id, actor=actor, reason=reason, observed_at=observed_at
-                )
-            )
-            if self._cell.quarantine_release_marker(product_id) != observed_at.isoformat():
-                applied = False
-        return request_id, symbol, applied, result
-
-    def _durable_quarantined_products(self, symbol: str) -> tuple[str, ...]:
-        """Quarantined identities for one symbol, read without a cell.
-
-        Read-only on purpose: lifting a quarantine writes a release marker and
-        a release audit row that only :class:`~abt.pair_cell.PairExecutionCell`
-        owns, and reproducing that here would fork the rule that decides
-        whether a later re-quarantine of the same product is suppressed.
-
-        The key column is discovered rather than assumed, because a database
-        written by an earlier build keys the quarantine by ``symbol`` while the
-        current one keys it by the derived ``product_id``.  Every outcome other
-        than "this database provably holds no quarantine" is conservative: an
-        unreadable file, an unrecognised shape, or a failed read all report the
-        symbol as still quarantined, so an operator is told to retry instead of
-        being told a release succeeded that never ran.
-        """
-
-        if not self._db_path.exists():
-            return ()  # nothing has ever been quarantined here
-        try:
-            connection = sqlite3.connect(self._db_path)
-        except sqlite3.Error:
-            _LOGGER.warning(
-                "Could not open %s to check for a durable quarantine of %s.",
-                self._db_path,
-                symbol,
-                exc_info=True,
-            )
-            return (symbol,)
-        try:
-            present = {
-                str(row[0])
-                for row in connection.execute(
-                    "SELECT name FROM sqlite_master WHERE type = 'table'"
-                ).fetchall()
-            }
-            if "cell_product_quarantine" not in present:
-                return ()
-            columns = [
-                str(row[1])
-                for row in connection.execute("PRAGMA table_info(cell_product_quarantine)").fetchall()
-            ]
-            key = next((column for column in ("product_id", "symbol") if column in columns), None)
-            if key is None:
-                _LOGGER.warning(
-                    "The durable quarantine table in %s has no recognised key column %s;"
-                    " treating %s as still quarantined.",
-                    self._db_path,
-                    columns,
-                    symbol,
-                )
-                return (symbol,)
-            rows = connection.execute(
-                f"SELECT {key} FROM cell_product_quarantine ORDER BY {key}"  # noqa: S608 - fixed column names
-            ).fetchall()
-        except sqlite3.Error:
-            _LOGGER.warning(
-                "Could not read the durable quarantine of %s from %s.",
-                symbol,
-                self._db_path,
-                exc_info=True,
-            )
-            return (symbol,)
-        finally:
-            connection.close()
-        return tuple(
-            str(row[0])
-            for row in rows
-            if str(row[0]) == symbol or str(row[0]).startswith(f"{symbol}:")
-        )
-
-    def _release_targets(self, symbol: str) -> tuple[str, ...]:
-        """An operator releases a *symbol*; the cell quarantines a *product*.
-
-        Targets are resolved from the discovered universe **and** from the
-        durable quarantine itself, because a quarantine outlives any universe:
-        it survives restart, rediscovery and re-pairing, so a release must
-        still reach it while this pair has not (yet) installed a universe that
-        happens to contain the symbol.  A value that is already a derived
-        product identity is honored directly, so an operator can name either.
-        """
-
-        cell = self._cell
-        if cell is None:
-            return (symbol,)
-        universe = cell.discovered_universe()
-        targets = {
-            product.product_id
-            for product in (() if universe is None else universe.products)
-            if product.symbol == symbol
-        }
-        targets |= {
-            product_id
-            for product_id in cell.quarantined_products()
-            if product_id == symbol or product_id.startswith(f"{symbol}:")
-        }
-        return tuple(sorted(targets)) or (symbol,)
 
     def _read_quotes(self, observed_at: datetime) -> tuple[LocalQuoteEvent, ...]:
         """Only genuinely new market evidence becomes a quote event.

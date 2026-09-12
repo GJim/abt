@@ -59,7 +59,7 @@ discovery, unpair, and crash races are reproducible without a live broker.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_EVEN
 from hashlib import sha256
@@ -126,6 +126,12 @@ RELAY_HANDLING_WINDOW_SECONDS = 5.0
 # so a dropped request or a leader restart mid-attempt can never strand it.
 REDISCOVERY_RETRY_SECONDS = 5.0
 REDISCOVERY_TIMEOUT_SECONDS = 30.0
+# A worker-initiated quarantine release is one bounded round trip.  The
+# initiating Worker resends its idempotent proposal on this cadence and gives
+# up at the deadline; a lost acknowledgement is healed by retrying with a new
+# proposal, which converges both Workers onto the newest marker.
+RELEASE_PROPOSAL_RETRY_SECONDS = 5.0
+RELEASE_PROPOSAL_TIMEOUT_SECONDS = 30.0
 # The MT5 `trade_mode` that means full trading; discovery applies it to each
 # catalog *before* the intersection, exactly as `strategy/realtime_arbitrage`.
 FULL_TRADING_MODE = 4
@@ -208,6 +214,38 @@ def _positive_text(value: object) -> str | None:
     if number is None or number <= 0:
         return None
     return decimal_text(number)
+
+
+def _resolve_unified_budget(value: object) -> str | None:
+    """Canonical unified budget: ``"0"`` means each leg uses its own balance.
+
+    Returns the canonical decimal spelling, ``"0"`` for the automatic base, or
+    ``None`` when the value is neither zero nor a positive USD amount.
+    """
+
+    number = _to_decimal(value)
+    if number is None or number < 0:
+        return None
+    if number == 0:
+        return "0"
+    return decimal_text(number)
+
+
+def _risk_with_unified_budget(authored: WorkerRiskLimits, unified_budget: str) -> WorkerRiskLimits:
+    """The risk block a canonical policy must carry for one leg.
+
+    Every tunable stays exactly as its Worker authored it; only the sizing
+    base is replaced when the leader sets a unified ``strategy_budget_usd``.
+    With the ``"0"`` automatic base the authored block passes through
+    untouched, so all existing verbatim and drift checks behave as before.
+    """
+
+    resolved = _resolve_unified_budget(unified_budget)
+    if resolved is None or resolved == "0":
+        return authored
+    if _to_decimal(authored.strategy_budget_usd) == _to_decimal(resolved):
+        return authored
+    return replace(authored, strategy_budget_usd=resolved)
 
 
 def _parse_ny_time(value: str, field_name: str) -> time:
@@ -510,7 +548,7 @@ _RISK_FIELDS = (
 )
 
 DEFAULT_MODE: ExecutionMode = "live"
-DEFAULT_ALLOW_LIVE = True
+DEFAULT_STRATEGY_BUDGET_USD = "0"
 DEFAULT_ENTRY_EDGE_POINTS = "4"
 DEFAULT_MAXIMUM_MARGIN_FRACTION = "0.10"
 DEFAULT_DAILY_LOSS_FRACTION = "0.03"
@@ -528,10 +566,13 @@ REQUIRED_ACCOUNT_CURRENCY = "USD"
 #: Shared policy values.  Only the leader may author any of these.
 SHARED_POLICY_KEYS = (
     "mode",
+    "strategy_budget_usd",
     "entry_edge_points",
     "quote_max_age_seconds",
     "quote_max_skew_seconds",
     "follower_confirmation_timeout_seconds",
+    "sizing_refresh_seconds",
+    "relay_handling_timeout_seconds",
     "trading_blackout_start_ny",
     "trading_blackout_end_ny",
     "maximum_holding_seconds",
@@ -544,7 +585,7 @@ WORKER_RISK_KEYS = (
     "maximum_loss_per_trade_usd",
 )
 #: Worker-local, non-policy settings.
-LOCAL_SETTING_KEYS = ("allow_live", "daily_loss_warning_threshold_usd")
+LOCAL_SETTING_KEYS = ("daily_loss_warning_threshold_usd",)
 #: Keys that belong to pairing and discovery, never to operator configuration.
 FORBIDDEN_CONFIG_KEYS = (
     "route",
@@ -560,10 +601,13 @@ def default_shared_policy_values() -> dict[str, object]:
 
     return {
         "mode": DEFAULT_MODE,
+        "strategy_budget_usd": DEFAULT_STRATEGY_BUDGET_USD,
         "entry_edge_points": DEFAULT_ENTRY_EDGE_POINTS,
         "quote_max_age_seconds": DEFAULT_QUOTE_MAX_AGE_SECONDS,
         "quote_max_skew_seconds": DEFAULT_QUOTE_MAX_SKEW_SECONDS,
         "follower_confirmation_timeout_seconds": DEFAULT_FOLLOWER_CONFIRMATION_TIMEOUT_SECONDS,
+        "sizing_refresh_seconds": _SIZING_REFRESH_SECONDS,
+        "relay_handling_timeout_seconds": RELAY_HANDLING_WINDOW_SECONDS,
         "trading_blackout_start_ny": DEFAULT_TRADING_BLACKOUT_START_NY,
         "trading_blackout_end_ny": DEFAULT_TRADING_BLACKOUT_END_NY,
         "maximum_holding_seconds": DEFAULT_MAXIMUM_HOLDING_SECONDS,
@@ -820,7 +864,9 @@ class StrategyPolicy:
 
     Shared decision rules are authored by the leader alone.  ``leader_risk`` is
     the leader's own block; ``follower_risk`` is a verbatim copy of the
-    follower's Pairing Acceptance payload.  There is no product filter here:
+    follower's Pairing Acceptance payload, except for the budget when the
+    leader sets a unified ``strategy_budget_usd`` (see
+    :func:`canonical_policy_from_acceptance`).  There is no product filter here:
     the eligible universe comes from Initial Compatible Product Discovery.
     """
 
@@ -831,10 +877,13 @@ class StrategyPolicy:
     leader_risk: WorkerRiskLimits
     follower_risk: WorkerRiskLimits
     follower_confirmation_timeout_seconds: float = DEFAULT_FOLLOWER_CONFIRMATION_TIMEOUT_SECONDS
+    sizing_refresh_seconds: float = _SIZING_REFRESH_SECONDS
+    relay_handling_timeout_seconds: float = RELAY_HANDLING_WINDOW_SECONDS
     maximum_holding_seconds: float | None = None
     trading_blackout_start_ny: str = DEFAULT_TRADING_BLACKOUT_START_NY
     trading_blackout_end_ny: str = DEFAULT_TRADING_BLACKOUT_END_NY
     mode: ExecutionMode = DEFAULT_MODE
+    strategy_budget_usd: str = DEFAULT_STRATEGY_BUDGET_USD
 
     def __post_init__(self) -> None:
         if not self.policy_version:
@@ -845,6 +894,8 @@ class StrategyPolicy:
             "quote_max_age_seconds",
             "quote_max_skew_seconds",
             "follower_confirmation_timeout_seconds",
+            "sizing_refresh_seconds",
+            "relay_handling_timeout_seconds",
         ):
             value = getattr(self, name)
             if (
@@ -857,6 +908,11 @@ class StrategyPolicy:
         for name in ("leader_risk", "follower_risk"):
             if not isinstance(getattr(self, name), WorkerRiskLimits):
                 raise PairExecutionCellError(f"{name} must be a WorkerRiskLimits.")
+        if _resolve_unified_budget(self.strategy_budget_usd) is None:
+            raise PairExecutionCellError(
+                "strategy_budget_usd must be '0' (each leg uses its own startup balance)"
+                " or a positive USD amount."
+            )
         if self.maximum_holding_seconds is not None and (
             not math.isfinite(self.maximum_holding_seconds)
             or not 0 < self.maximum_holding_seconds <= _MAXIMUM_HOLDING_SECONDS
@@ -882,15 +938,18 @@ class StrategyPolicy:
     def plan_retention_seconds(self) -> float:
         """How long a superseded plan version stays valid for validation only."""
 
-        return self.follower_confirmation_timeout_seconds + RELAY_HANDLING_WINDOW_SECONDS
+        return self.follower_confirmation_timeout_seconds + self.relay_handling_timeout_seconds
 
     def canonical(self) -> dict[str, object]:
         return {
             "policy_version": self.policy_version,
+            "strategy_budget_usd": self.strategy_budget_usd,
             "entry_edge_points": self.entry_edge_points,
             "quote_max_age_seconds": self.quote_max_age_seconds,
             "quote_max_skew_seconds": self.quote_max_skew_seconds,
             "follower_confirmation_timeout_seconds": self.follower_confirmation_timeout_seconds,
+            "sizing_refresh_seconds": self.sizing_refresh_seconds,
+            "relay_handling_timeout_seconds": self.relay_handling_timeout_seconds,
             "maximum_holding_seconds": self.maximum_holding_seconds,
             "trading_blackout_start_ny": self.trading_blackout_start_ny,
             "trading_blackout_end_ny": self.trading_blackout_end_ny,
@@ -920,6 +979,12 @@ def _policy_from_canonical(value: Mapping[str, object]) -> StrategyPolicy:
         follower_confirmation_timeout_seconds=float(
             cast(float, value["follower_confirmation_timeout_seconds"])
         ),
+        sizing_refresh_seconds=float(
+            cast(float, value.get("sizing_refresh_seconds", _SIZING_REFRESH_SECONDS))
+        ),
+        relay_handling_timeout_seconds=float(
+            cast(float, value.get("relay_handling_timeout_seconds", RELAY_HANDLING_WINDOW_SECONDS))
+        ),
         maximum_holding_seconds=cast(float | None, value.get("maximum_holding_seconds")),
         trading_blackout_start_ny=cast(
             str, value["trading_blackout_start_ny"]
@@ -928,6 +993,7 @@ def _policy_from_canonical(value: Mapping[str, object]) -> StrategyPolicy:
             str, value["trading_blackout_end_ny"]
         ),
         mode=cast(ExecutionMode, value.get("mode", DEFAULT_MODE)),
+        strategy_budget_usd=str(value.get("strategy_budget_usd", DEFAULT_STRATEGY_BUDGET_USD)),
     )
 
 
@@ -940,8 +1006,12 @@ def canonical_policy_from_acceptance(
 ) -> StrategyPolicy:
     """Compose the one canonical policy: leader-authored shared plus two blocks.
 
-    ``follower_risk`` is taken verbatim from ``acceptance``; there is no path
-    through this function that lets the leader author the follower's numbers.
+    ``follower_risk`` is taken verbatim from ``acceptance`` except for the
+    sizing base when the leader sets a unified ``strategy_budget_usd``: with
+    the ``"0"`` automatic base each leg keeps its own frozen startup balance,
+    while a positive amount replaces the base of *both* legs.  Every other
+    tunable still passes through untouched, so the follower's verification
+    below stays a strict check rather than a trust assumption.
     """
 
     values = default_shared_policy_values()
@@ -949,16 +1019,25 @@ def canonical_policy_from_acceptance(
         if key not in SHARED_POLICY_KEYS:
             raise PairExecutionCellError(f"'{key}' is not a shared, leader-authored policy value.")
         values[key] = value
+    unified_budget = _resolve_unified_budget(values["strategy_budget_usd"])
+    if unified_budget is None:
+        raise PairExecutionCellError(
+            "strategy_budget_usd must be '0' (each leg uses its own startup balance)"
+            " or a positive USD amount."
+        )
     return StrategyPolicy(
         policy_version=policy_version,
+        strategy_budget_usd=unified_budget,
         entry_edge_points=str(values["entry_edge_points"]),
         quote_max_age_seconds=float(cast(float, values["quote_max_age_seconds"])),
         quote_max_skew_seconds=float(cast(float, values["quote_max_skew_seconds"])),
-        leader_risk=leader_risk,
-        follower_risk=acceptance.risk_limits(),
+        leader_risk=_risk_with_unified_budget(leader_risk, unified_budget),
+        follower_risk=_risk_with_unified_budget(acceptance.risk_limits(), unified_budget),
         follower_confirmation_timeout_seconds=float(
             cast(float, values["follower_confirmation_timeout_seconds"])
         ),
+        sizing_refresh_seconds=float(cast(float, values["sizing_refresh_seconds"])),
+        relay_handling_timeout_seconds=float(cast(float, values["relay_handling_timeout_seconds"])),
         maximum_holding_seconds=cast(float | None, values["maximum_holding_seconds"]),
         trading_blackout_start_ny=cast(str, values["trading_blackout_start_ny"]),
         trading_blackout_end_ny=cast(str, values["trading_blackout_end_ny"]),
@@ -2282,7 +2361,6 @@ class PairExecutionCell:
         local_risk_limits: WorkerRiskLimits,
         effect_journal: WorkerEffectJournal,
         scheduler: DeadlineAwareTraderRpcScheduler,
-        allow_live: bool = DEFAULT_ALLOW_LIVE,
         daily_loss_warning_threshold_usd: str = DEFAULT_DAILY_LOSS_WARNING_THRESHOLD_USD,
         monotonic: Callable[[], float] = _time.monotonic,
         serve_foreign_scheduler_item: Callable[[ScheduledTraderRpc], None] | None = None,
@@ -2307,9 +2385,7 @@ class PairExecutionCell:
         is never enforced directly: the accepted canonical policy's copy for
         this role is.
 
-        ``allow_live`` is a Worker-local, non-policy safety guard.  A follower
-        with ``allow_live=False`` refuses a ``live`` canonical policy outright
-        rather than silently running shadow against a live leader.
+        Live versus shadow is decided solely by the canonical policy ``mode``.
         """
 
         if not worker_id:
@@ -2328,7 +2404,6 @@ class PairExecutionCell:
         self._relay = relay
         self._mt5 = mt5
         self._declared_limits = local_risk_limits
-        self._allow_live = bool(allow_live)
         threshold = _to_decimal(daily_loss_warning_threshold_usd)
         if threshold is None or threshold < 0:
             raise PairExecutionCellError(
@@ -2371,6 +2446,7 @@ class PairExecutionCell:
         self._catalog_version = 0
         self._universe: DiscoveredUniverse | None = None
         self._staged_universe: DiscoveredUniverse | None = None
+        self._staged_excluded: tuple[tuple[str, str], ...] = ()
         self._pending_universe: DiscoveredUniverse | None = None
         self._discovery_reason = "no catalog summary has been exchanged yet"
         self._rediscovery_pending = False
@@ -2380,6 +2456,8 @@ class PairExecutionCell:
         self._rediscovery_reason = ""
         self._rediscovery_started_at: datetime | None = None
         self._rediscovery_last_sent_at: datetime | None = None
+        self._release_proposals: dict[str, dict[str, object]] = {}
+        self._release_outcomes: dict[str, dict[str, object]] = {}
         self._serving_rediscovery_request_id: str | None = None
         self._answered_rediscovery: tuple[str, tuple[str, dict[str, object]]] | None = None
         self._plans: dict[tuple[str, Direction], SizingPlan] = {}
@@ -2556,6 +2634,20 @@ class PairExecutionCell:
             CREATE TABLE IF NOT EXISTS cell_product_release_marker (
                 product_id TEXT PRIMARY KEY,
                 marker TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS cell_product_suspend (
+                product_id TEXT PRIMARY KEY,
+                symbol TEXT NOT NULL,
+                universe_generation INTEGER NOT NULL,
+                reason TEXT NOT NULL,
+                recorded_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS cell_discovery_excluded (
+                universe_generation INTEGER NOT NULL,
+                symbol TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                recorded_at TEXT NOT NULL,
+                PRIMARY KEY (universe_generation, symbol)
             );
             CREATE TABLE IF NOT EXISTS cell_transitions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -3171,7 +3263,8 @@ class PairExecutionCell:
 
         if self._role != "leader":
             raise PairExecutionCellError("Only the leader supplies the canonical strategy policy.")
-        if not policy.risk_of("leader").matches(self._declared_limits):
+        expected_leader = _risk_with_unified_budget(self._declared_limits, policy.strategy_budget_usd)
+        if not policy.risk_of("leader").matches(expected_leader):
             raise PairExecutionCellError(
                 "Policy refused: its leader risk configuration does not match this Worker's declaration."
             )
@@ -3180,7 +3273,10 @@ class PairExecutionCell:
             raise PairExecutionCellError(
                 "Policy refused: no Pairing Acceptance payload has been received from the follower."
             )
-        if not policy.follower_risk.is_verbatim_copy_of(acceptance.risk_limits()):
+        expected_follower = _risk_with_unified_budget(
+            acceptance.risk_limits(), policy.strategy_budget_usd
+        )
+        if not policy.follower_risk.is_verbatim_copy_of(expected_follower):
             raise PairExecutionCellError(
                 "Policy refused: follower_risk is not a verbatim copy of the Pairing Acceptance payload."
             )
@@ -3655,10 +3751,11 @@ class PairExecutionCell:
             # across two generations whenever the follower refuses, while the
             # specification says a failed rediscovery leaves the previous one.
             self._staged_universe = universe
+            self._staged_excluded = outcome.excluded
             self._transition("universe_staged", f"generation={generation}")
             self._relay.send(self._envelope("universe", answer))
             return
-        self._install_universe(universe)
+        self._install_universe(universe, outcome.excluded)
         self._rediscovery_pending = False
         self._rediscovery_failure = None
         self._relay.send(self._envelope("universe", answer))
@@ -3674,7 +3771,8 @@ class PairExecutionCell:
             self._transition("staged_universe_acknowledgement_ignored", str(generation))
             return
         self._staged_universe = None
-        self._install_universe(staged)
+        self._install_universe(staged, self._staged_excluded)
+        self._staged_excluded = ()
         self._rediscovery_pending = False
         self._rediscovery_failure = None
         self._rediscovery_started_at = None
@@ -3687,6 +3785,7 @@ class PairExecutionCell:
             "staged_universe_discarded", f"generation={self._staged_universe.universe_generation}"
         )
         self._staged_universe = None
+        self._staged_excluded = ()
 
     def _finish_rediscovery(self, reason: str) -> None:
         """Leader-only: record the failed attempt and release both sides."""
@@ -3723,7 +3822,11 @@ class PairExecutionCell:
             current = max(current, self._universe.universe_generation)
         return current + 1
 
-    def _install_universe(self, universe: DiscoveredUniverse) -> None:
+    def _install_universe(
+        self,
+        universe: DiscoveredUniverse,
+        excluded: tuple[tuple[str, str], ...] = (),
+    ) -> None:
         self._db.execute(
             "INSERT INTO cell_universe (universe_generation, route_id, payload, installed_at)"
             " VALUES (?, ?, ?, ?) ON CONFLICT(universe_generation) DO UPDATE SET"
@@ -3736,6 +3839,11 @@ class PairExecutionCell:
                 _iso(self._now),
             ),
         )
+        self._persist_discovery_excluded(universe.universe_generation, excluded)
+        # Suspend reasons belong to the previous generation's refresh cycle;
+        # the new generation has no refresh yet, so the table must not keep
+        # claiming them.
+        self._db.execute("DELETE FROM cell_product_suspend")
         self._db.commit()
         self._universe = universe
         self._discovery_reason = ""
@@ -3836,7 +3944,7 @@ class PairExecutionCell:
                 "the published universe does not match this Worker's own compatibility result"
             )
             return
-        self._install_universe(universe)
+        self._install_universe(universe, outcome.excluded)
         self._acknowledge_universe(universe)
         self._rediscovery_pending = False
         self._rediscovery_failure = None
@@ -3920,6 +4028,19 @@ class PairExecutionCell:
 
     def suspended_products(self) -> dict[str, str]:
         return dict(self._suspended_products)
+
+    def discovery_excluded_symbols(self) -> tuple[tuple[str, str], ...]:
+        """Never-admitted symbols and reasons from the installed discovery run."""
+
+        generation = self.universe_generation()
+        if generation is None:
+            return ()
+        rows = self._db.execute(
+            "SELECT symbol, reason FROM cell_discovery_excluded"
+            " WHERE universe_generation = ? ORDER BY symbol",
+            (generation,),
+        ).fetchall()
+        return tuple((str(symbol), str(reason)) for symbol, reason in rows)
 
     def remaining_allowance_summary(self) -> RemainingAllowanceSummary:
         return RemainingAllowanceSummary(
@@ -4016,9 +4137,10 @@ class PairExecutionCell:
         """Why the local declaration and the accepted canonical copy disagree."""
 
         limits = self._limits
-        if limits is None:
+        if limits is None or self._policy is None:
             return None
-        if limits.matches(self._declared_limits):
+        expected = _risk_with_unified_budget(self._declared_limits, self._policy.strategy_budget_usd)
+        if limits.matches(expected):
             return None
         return "the local risk configuration does not match the accepted canonical policy"
 
@@ -4135,7 +4257,14 @@ class PairExecutionCell:
         missing = quoted - {product_id for product_id, _ in self._plans}
         if missing and quoted != self._last_plan_quote_set:
             return True
-        return (self._now - self._plans_refreshed_at).total_seconds() >= _SIZING_REFRESH_SECONDS
+        # The rebuild cadence is leader-authored shared policy, so both legs
+        # agree on it; without a policy yet, fall back to the module default.
+        refresh_seconds = (
+            self._policy.sizing_refresh_seconds
+            if self._policy is not None
+            else _SIZING_REFRESH_SECONDS
+        )
+        return (self._now - self._plans_refreshed_at).total_seconds() >= refresh_seconds
 
     def _refresh_sizing_plans(self) -> None:
         """Rebuild every discovered product/direction plan; suspend failures.
@@ -4268,6 +4397,7 @@ class PairExecutionCell:
                 ),
             )
             self._plan_index[plan.version] = plan
+        self._persist_suspended_products(generation, suspended)
         self._db.commit()
         self._plans, self._suspended_products = plans, suspended
         self._plans_refreshed_at = self._now
@@ -4275,6 +4405,52 @@ class PairExecutionCell:
         self._purge_expired_plan_versions(policy)
         self._recompute_plan_version()
         self._transition("sizing_plans_refreshed", self._plan_set_version)
+
+    def _persist_suspended_products(
+        self, generation: int, suspended: dict[str, str]
+    ) -> None:
+        """Persist this refresh's suspend reasons for offline inspection.
+
+        Joins the caller's transaction: a second terminal reading the database
+        while this Worker runs sees either the whole previous refresh or the
+        whole new one, never a half-written set.
+        """
+
+        universe = self._universe
+        self._db.execute("DELETE FROM cell_product_suspend")
+        recorded_at = _iso(self._now)
+        for product_id, reason in sorted(suspended.items()):
+            product = universe.product(product_id) if universe is not None else None
+            self._db.execute(
+                "INSERT INTO cell_product_suspend (product_id, symbol, universe_generation,"
+                " reason, recorded_at) VALUES (?, ?, ?, ?, ?)",
+                (
+                    product_id,
+                    product.symbol if product is not None else "",
+                    generation,
+                    reason,
+                    recorded_at,
+                ),
+            )
+
+    def _persist_discovery_excluded(
+        self, generation: int, excluded: tuple[tuple[str, str], ...]
+    ) -> None:
+        """Persist one discovery run's never-admitted symbols and their reasons.
+
+        Runs inside the universe-install transaction.  A new generation
+        replaces the previous run's rows: they describe a superseded
+        compatibility result, not history worth keeping beside the universe.
+        """
+
+        self._db.execute("DELETE FROM cell_discovery_excluded")
+        recorded_at = _iso(self._now)
+        for symbol, reason in sorted(excluded):
+            self._db.execute(
+                "INSERT INTO cell_discovery_excluded (universe_generation, symbol,"
+                " reason, recorded_at) VALUES (?, ?, ?, ?)",
+                (generation, symbol, reason, recorded_at),
+            )
 
     def _purge_expired_plan_versions(self, policy: StrategyPolicy) -> None:
         """Retention is bounded: a superseded version expires once unreferenced."""
@@ -4835,6 +5011,10 @@ class PairExecutionCell:
             self._serve_rediscovery_request(payload)
         elif kind == "rediscovery_result":
             self._accept_rediscovery_result(payload)
+        elif kind == "quarantine_release_proposal":
+            self._accept_release_proposal(payload)
+        elif kind == "quarantine_release_response":
+            self._accept_release_response(payload)
         elif kind == "reseed_request":
             self._accept_reseed_request(payload)
         elif kind == "pairing_acceptance":
@@ -4895,15 +5075,6 @@ class PairExecutionCell:
         if policy.hash != declared:
             self._send_policy_ack(declared, False, "policy hash does not match its content")
             return
-        if policy.mode == "live" and not self._allow_live:
-            # A refusal, never an override: this Worker stays paired, safe, and
-            # idle rather than silently running shadow against a live leader.
-            reason = "allow_live is false and the canonical policy mode is live"
-            self._policy_refusal = reason
-            self._last_published_readiness = None
-            self._transition("policy_refused", reason)
-            self._send_policy_ack(policy.hash, False, reason)
-            return
         if self._policy is not None and self._policy.hash == policy.hash:
             self._send_policy_ack(policy.hash, True, "policy already durably accepted")
             return
@@ -4913,7 +5084,9 @@ class PairExecutionCell:
                 policy.hash, False, "this Worker has no frozen Pairing Acceptance payload"
             )
             return
-        if not policy.follower_risk.is_verbatim_copy_of(acceptance.risk_limits()):
+        if not policy.follower_risk.is_verbatim_copy_of(
+            _risk_with_unified_budget(acceptance.risk_limits(), policy.strategy_budget_usd)
+        ):
             self._send_policy_ack(
                 policy.hash,
                 False,
@@ -4973,6 +5146,7 @@ class PairExecutionCell:
             self._maybe_install_pending_universe()
         self._update_daily_loss_warning()
         self._enforce_rediscovery_deadline()
+        self._enforce_release_proposal_deadline()
         if self._refresh_due():
             self._refresh_sizing_plans()
         self._enforce_exit_policy()
@@ -6685,8 +6859,9 @@ class PairExecutionCell:
             self._db.commit()
 
     def _release_product_quarantine(self, event: QuarantineReleaseEvent) -> None:
-        if self._attempt is not None and self._state not in ("EMPTY", "IDLE", "NEEDS_HUMAN"):
-            self._transition("product_quarantine_release_rejected", f"{event.product_id}: unresolved attempt")
+        blocked = self._release_blocked()
+        if blocked is not None:
+            self._transition("product_quarantine_release_rejected", f"{event.product_id}: {blocked}")
             return
         self._db.execute(
             "INSERT INTO cell_product_release_marker (product_id, marker) VALUES (?, ?)"
@@ -6715,6 +6890,265 @@ class PairExecutionCell:
             "SELECT marker FROM cell_product_release_marker WHERE product_id = ?", (product_id,)
         ).fetchone()
         return None if row is None else str(row[0])
+
+    # -- worker-initiated quarantine release (peer-coordinated) ---------------- #
+    #
+    # Freezing a symbol is this Worker's own responsibility: the controller
+    # never decides it, it only forwards these opaque envelopes.  Both Workers
+    # must still adopt the *same* release marker, or a later quarantine the
+    # peer propagates would carry a marker this side no longer recognises and
+    # be refused.  So a release is a bounded two-phase round trip: the
+    # initiating Worker proposes one marker, the peer applies it and
+    # acknowledges, and only then does the initiator apply it locally.  A lost
+    # acknowledgement is healed by retrying with a fresh proposal, which
+    # converges both sides onto the newest marker.
+
+    def request_quarantine_release(self, symbol: str, *, reason: str = "") -> dict[str, object]:
+        """Propose releasing one symbol's quarantine to the peer Worker.
+
+        Returns the proposal (``proposal_id``, ``symbol``, ``product_ids``,
+        ``marker``).  Raises when this side is not releasable right now; the
+        peer answers asynchronously through the relay.
+        """
+
+        if not isinstance(symbol, str) or not symbol:
+            raise PairExecutionCellError("A quarantine release requires a symbol.")
+        if not isinstance(reason, str):
+            raise PairExecutionCellError("A quarantine release requires a text reason.")
+        blocked = self._release_blocked()
+        if blocked is not None:
+            raise PairExecutionCellError(f"A quarantine release is refused: {blocked}.")
+        targets = self._release_target_product_ids(symbol)
+        marker = _iso(self._now)
+        proposal_id = uuid4().hex
+        proposal: dict[str, object] = {
+            "proposal_id": proposal_id,
+            "symbol": symbol,
+            "product_ids": list(targets),
+            "marker": marker,
+            "actor": self._worker_id,
+            "reason": reason,
+            "requested_at": self._now,
+            "last_sent_at": self._now,
+        }
+        self._release_proposals[proposal_id] = proposal
+        self._send_release_proposal(proposal)
+        self._transition("quarantine_release_proposed", f"{symbol} marker={marker}")
+        return {
+            "proposal_id": proposal_id,
+            "symbol": symbol,
+            "product_ids": targets,
+            "marker": marker,
+        }
+
+    def quarantine_release_status(self, proposal_id: str) -> dict[str, object] | None:
+        """One proposal's observable outcome: pending, applied, or rejected."""
+
+        if proposal_id in self._release_proposals:
+            return {"state": "pending", "proposal_id": proposal_id}
+        outcome = self._release_outcomes.get(proposal_id)
+        return dict(outcome) if outcome is not None else None
+
+    def _release_blocked(self) -> str | None:
+        if self._attempt is not None and self._state not in ("EMPTY", "IDLE", "NEEDS_HUMAN"):
+            return "unresolved attempt"
+        return None
+
+    def _release_target_product_ids(self, symbol: str) -> tuple[str, ...]:
+        """An operator releases a *symbol*; the cell quarantines a *product*."""
+
+        universe = self._universe
+        targets = {
+            product.product_id
+            for product in (() if universe is None else universe.products)
+            if product.symbol == symbol
+        }
+        targets |= {
+            product_id
+            for product_id in self.quarantined_products()
+            if product_id == symbol or product_id.startswith(f"{symbol}:")
+        }
+        return tuple(sorted(targets))
+
+    def _send_release_proposal(self, proposal: Mapping[str, object]) -> None:
+        self._relay.send(
+            self._envelope(
+                "quarantine_release_proposal",
+                {
+                    "proposal_id": proposal["proposal_id"],
+                    "symbol": proposal["symbol"],
+                    "marker": proposal["marker"],
+                    "actor": proposal["actor"],
+                    "reason": proposal["reason"],
+                },
+            )
+        )
+
+    def _send_release_response(
+        self, proposal_id: str, *, ok: bool, reason: str, applied: list[str]
+    ) -> None:
+        self._relay.send(
+            self._envelope(
+                "quarantine_release_response",
+                {
+                    "proposal_id": proposal_id,
+                    "ok": ok,
+                    "reason": reason,
+                    "applied": applied,
+                    "worker_id": self._worker_id,
+                },
+            )
+        )
+
+    def _accept_release_proposal(self, payload: Mapping[str, object]) -> None:
+        proposal_id = payload.get("proposal_id")
+        symbol = payload.get("symbol")
+        marker_text = payload.get("marker")
+        actor = payload.get("actor")
+        reason = payload.get("reason")
+        if (
+            not isinstance(proposal_id, str)
+            or not proposal_id
+            or not isinstance(symbol, str)
+            or not symbol
+            or not isinstance(marker_text, str)
+            or not isinstance(actor, str)
+            or not actor
+            or not isinstance(reason, str)
+        ):
+            return
+        try:
+            marker_at = _parse_utc(marker_text)
+        except PairExecutionCellError:
+            return
+        fresh: list[str] = []
+        for product_id in self._release_target_product_ids(symbol):
+            stored = self._release_marker(product_id)
+            if stored is not None:
+                try:
+                    stale = _parse_utc(stored) >= marker_at
+                except PairExecutionCellError:
+                    stale = False
+                if stale:
+                    continue
+            fresh.append(product_id)
+        blocked = self._release_blocked()
+        if blocked is not None:
+            self._send_release_response(proposal_id, ok=False, reason=blocked, applied=[])
+            self._transition("quarantine_release_proposal_rejected", f"{symbol}: {blocked}")
+            return
+        applied: list[str] = []
+        for product_id in fresh:
+            was_quarantined = product_id in self.quarantined_products()
+            self._release_product_quarantine(
+                QuarantineReleaseEvent(
+                    product_id=product_id, actor=actor, reason=reason, observed_at=marker_at
+                )
+            )
+            if not was_quarantined or self._marker_matches(product_id, marker_at):
+                applied.append(product_id)
+        self._send_release_response(proposal_id, ok=True, reason="", applied=applied)
+        self._transition("quarantine_release_proposal_applied", f"{symbol} marker={marker_text}")
+
+    def _accept_release_response(self, payload: Mapping[str, object]) -> None:
+        proposal_id = payload.get("proposal_id")
+        if not isinstance(proposal_id, str):
+            return
+        proposal = self._release_proposals.get(proposal_id)
+        if proposal is None:
+            return
+        ok = payload.get("ok") is True
+        reason = payload.get("reason")
+        reason_text = reason if isinstance(reason, str) else ""
+        peer_applied = payload.get("applied")
+        peer_products = (
+            [str(item) for item in peer_applied]
+            if isinstance(peer_applied, list)
+            else []
+        )
+        if not ok:
+            self._record_release_outcome(
+                proposal, state="rejected", reason=reason_text or "the peer refused the release",
+                applied=[], peer_applied=peer_products,
+            )
+            return
+        try:
+            marker_at = _parse_utc(cast(str, proposal["marker"]))
+        except PairExecutionCellError:
+            self._record_release_outcome(
+                proposal, state="rejected", reason="the local proposal marker is unreadable",
+                applied=[], peer_applied=peer_products,
+            )
+            return
+        applied: list[str] = []
+        for product_id in self._release_target_product_ids(cast(str, proposal["symbol"])):
+            was_quarantined = product_id in self.quarantined_products()
+            self._release_product_quarantine(
+                QuarantineReleaseEvent(
+                    product_id=product_id,
+                    actor=cast(str, proposal["actor"]),
+                    reason=cast(str, proposal["reason"]),
+                    observed_at=marker_at,
+                )
+            )
+            if not was_quarantined or self._marker_matches(product_id, marker_at):
+                applied.append(product_id)
+        self._record_release_outcome(
+            proposal, state="applied", reason="", applied=applied, peer_applied=peer_products
+        )
+
+    def _marker_matches(self, product_id: str, marker_at: datetime) -> bool:
+        stored = self._release_marker(product_id)
+        if stored is None:
+            return False
+        try:
+            return _parse_utc(stored) == marker_at
+        except PairExecutionCellError:
+            return False
+
+    def _record_release_outcome(
+        self,
+        proposal: Mapping[str, object],
+        *,
+        state: str,
+        reason: str,
+        applied: list[str],
+        peer_applied: list[str],
+    ) -> None:
+        proposal_id = cast(str, proposal["proposal_id"])
+        self._release_outcomes[proposal_id] = {
+            "state": state,
+            "proposal_id": proposal_id,
+            "symbol": proposal["symbol"],
+            "marker": proposal["marker"],
+            "reason": reason,
+            "applied": applied,
+            "peer_applied": peer_applied,
+        }
+        while len(self._release_outcomes) > 64:
+            self._release_outcomes.pop(next(iter(self._release_outcomes)))
+        del self._release_proposals[proposal_id]
+        self._transition(f"quarantine_release_{state}", f"{proposal['symbol']}: {reason or state}")
+
+    def _enforce_release_proposal_deadline(self) -> None:
+        """Resend an unanswered proposal on cadence; give up at the deadline."""
+
+        if not self._release_proposals:
+            return
+        for proposal_id, proposal in list(self._release_proposals.items()):
+            requested_at = cast(datetime, proposal["requested_at"])
+            last_sent_at = cast(datetime, proposal["last_sent_at"])
+            if (self._now - requested_at).total_seconds() >= RELEASE_PROPOSAL_TIMEOUT_SECONDS:
+                self._record_release_outcome(
+                    proposal, state="rejected",
+                    reason="the peer did not answer before the deadline",
+                    applied=[], peer_applied=[],
+                )
+                continue
+            if (self._now - last_sent_at).total_seconds() < RELEASE_PROPOSAL_RETRY_SECONDS:
+                continue
+            proposal["last_sent_at"] = self._now
+            self._send_release_proposal(proposal)
 
     # -- desired-EMPTY containment -------------------------------------------- #
 

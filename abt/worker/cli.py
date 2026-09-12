@@ -4,7 +4,7 @@ import argparse
 import logging
 import sys
 from collections.abc import Callable, Mapping, Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TextIO
 
@@ -12,6 +12,13 @@ import httpx
 
 from .enrollment import EnrollmentTransport, MT5Client, WorkerEnrollmentError, register_worker
 from .effect_journal import WorkerEffectJournal
+from .inspect import (
+    InspectError,
+    allowed_products,
+    edge_searchable_products,
+    excluded_products,
+    snapshot_symbols,
+)
 from .identity import (
     WorkerIdentity,
     default_identity_path,
@@ -27,8 +34,8 @@ from .keystore import (
     enroll_key_store,
     open_key_store,
 )
-from .pair_cell_adapter import PairCellRuntime, PairCellStartupOptions
-from .reconciliation import reconnect_worker_session
+from .pair_cell_adapter import PairCellRuntime, PairCellStartupOptions, PairExecutionCellError
+from .reconciliation import AccountMismatchError, reconnect_worker_session
 from .rotation import (
     WorkerCertificateExpired,
     WorkerCertificateRotated,
@@ -241,7 +248,12 @@ def main(
 
     parser = _parser()
     arguments = parser.parse_args(argv)
-    if arguments.command not in {"enroll", "reconcile"}:
+    if arguments.command == "symbols":
+        return _run_symbols(arguments, output=output, error_output=error_output)
+    if arguments.command == "quarantine" and getattr(arguments, "quarantine_action", None) != "release":
+        print("Worker quarantine inspection failed: unknown action.", file=error_output)
+        return 1
+    if arguments.command not in {"enroll", "reconcile", "unpair", "rediscover", "quarantine"}:
         parser.error("a command is required")
     if arguments.command == "reconcile":
         try:
@@ -269,7 +281,7 @@ def main(
     cleanup_errors: list[Exception] = []
     try:
         provider = key_store_factory or default_key_store_provider(arguments.config)
-        if arguments.command == "reconcile":
+        if arguments.command in {"reconcile", "unpair", "rediscover", "quarantine"}:
             identity = load_identity(arguments.config)
             transport = transport_factory()
             try:
@@ -317,7 +329,7 @@ def main(
             mt5 = MetaTrader5Adapter()
         key_store = (
             open_key_store(provider, identity.key_name)
-            if arguments.command == "reconcile"
+            if arguments.command in {"reconcile", "unpair", "rediscover", "quarantine"}
             else enroll_key_store(provider, identity.key_name)
         )
         try:
@@ -332,6 +344,62 @@ def main(
                     error_output=error_output,
                     pair_cell_config_path=getattr(arguments, "pair_cell_config", None),
                     pair_cell_options=pair_cell_options,
+                )
+                return 0
+            if arguments.command == "unpair":
+                _reconcile_with_certificate_maintenance(
+                    identity_path=arguments.config,
+                    identity=identity,
+                    mt5=mt5,
+                    key_store=key_store,
+                    key_store_factory=provider,
+                    transport_factory=transport_factory,
+                    error_output=error_output,
+                    pair_cell_config_path=getattr(arguments, "pair_cell_config", None),
+                    pair_cell_options=pair_cell_options,
+                    run_reconciliation=_one_shot_run(
+                        done=_UnpairCompletion(),
+                        timeout_seconds=float(arguments.timeout),
+                        output=output,
+                    ),
+                )
+                return 0
+            if arguments.command == "rediscover":
+                _reconcile_with_certificate_maintenance(
+                    identity_path=arguments.config,
+                    identity=identity,
+                    mt5=mt5,
+                    key_store=key_store,
+                    key_store_factory=provider,
+                    transport_factory=transport_factory,
+                    error_output=error_output,
+                    pair_cell_config_path=getattr(arguments, "pair_cell_config", None),
+                    pair_cell_options=pair_cell_options,
+                    run_reconciliation=_one_shot_run(
+                        done=_RediscoverCompletion(reason=arguments.reason or ""),
+                        timeout_seconds=float(arguments.timeout),
+                        output=output,
+                    ),
+                )
+                return 0
+            if arguments.command == "quarantine":
+                _reconcile_with_certificate_maintenance(
+                    identity_path=arguments.config,
+                    identity=identity,
+                    mt5=mt5,
+                    key_store=key_store,
+                    key_store_factory=provider,
+                    transport_factory=transport_factory,
+                    error_output=error_output,
+                    pair_cell_config_path=getattr(arguments, "pair_cell_config", None),
+                    pair_cell_options=pair_cell_options,
+                    run_reconciliation=_one_shot_run(
+                        done=_QuarantineReleaseCompletion(
+                            symbol=arguments.symbol, reason=arguments.reason or ""
+                        ),
+                        timeout_seconds=float(arguments.timeout),
+                        output=output,
+                    ),
                 )
                 return 0
             transport = transport_factory()
@@ -367,13 +435,13 @@ def main(
         print("Worker reconciliation stopped.", file=error_output)
         return 130
     except WorkerEnrollmentError as error:
-        operation = "reconciliation" if arguments.command == "reconcile" else "registration"
+        operation = _operation_name(arguments.command)
         print(f"Worker {operation} failed: {error}", file=error_output)
         if arguments.verbose:
             _print_diagnostic(error, error_output)
         return 1
     except Exception as error:
-        operation = "reconciliation" if arguments.command == "reconcile" else "registration"
+        operation = _operation_name(arguments.command)
         print(f"Worker {operation} failed.", file=error_output)
         if arguments.verbose:
             _print_diagnostic(error, error_output)
@@ -396,6 +464,7 @@ def _reconcile_with_certificate_maintenance(
     error_output: TextIO,
     pair_cell_config_path: Path | None = None,
     pair_cell_options: PairCellStartupOptions = PairCellStartupOptions(),
+    run_reconciliation: Callable[..., None] | None = None,
 ) -> None:
     current_identity = identity
     current_key = key_store
@@ -434,8 +503,8 @@ def _reconcile_with_certificate_maintenance(
                 effect_journal = WorkerEffectJournal(identity_path.with_suffix(".effects.sqlite"))
                 pair_cell_db_path = identity_path.with_suffix(".paircell.sqlite")
                 pair_cell_config_path = pair_cell_config_path or identity_path.with_suffix(".paircell.json")
-                reconnect_worker_session(
-                    open_session=lambda: open_authenticated_worker_session(
+                reconnect_kwargs: dict[str, object] = {
+                    "open_session": lambda: open_authenticated_worker_session(
                         controller_url=current_identity.controller_url,
                         enrollment_id=current_identity.enrollment_id,
                         key_store=current_key,
@@ -443,12 +512,12 @@ def _reconcile_with_certificate_maintenance(
                             certificate, now=lambda: datetime.now(UTC)
                         ),
                     ),
-                    mt5=mt5,
-                    login=current_identity.login,
-                    server=current_identity.server,
-                    maintenance=maintain,
-                    effect_journal=effect_journal,
-                    pair_cell_factory=lambda mt5_client, session, journal, login, server: PairCellRuntime(
+                    "mt5": mt5,
+                    "login": current_identity.login,
+                    "server": current_identity.server,
+                    "maintenance": maintain,
+                    "effect_journal": effect_journal,
+                    "pair_cell_factory": lambda mt5_client, session, journal, login, server: PairCellRuntime(
                         worker_id=getattr(session, "worker_id", ""),
                         db_path=pair_cell_db_path,
                         session=session,  # type: ignore[arg-type]
@@ -460,7 +529,10 @@ def _reconcile_with_certificate_maintenance(
                         config_path=pair_cell_config_path,
                         options=pair_cell_options,
                     ),
-                )
+                }
+                if run_reconciliation is not None:
+                    reconnect_kwargs["run_reconciliation"] = run_reconciliation
+                reconnect_worker_session(**reconnect_kwargs)  # type: ignore[arg-type]
                 return
             except WorkerCertificateRotated:
                 _close(current_key)
@@ -471,6 +543,259 @@ def _reconcile_with_certificate_maintenance(
                     effect_journal.close()
     finally:
         _close(current_key)
+
+
+def _operation_name(command: str | None) -> str:
+    return {
+        "enroll": "registration",
+        "reconcile": "reconciliation",
+        "unpair": "unpair request",
+        "rediscover": "policy rediscovery",
+        "quarantine": "quarantine release",
+    }.get(command or "", "worker")
+
+
+class _UnpairCompletion:
+    """One-shot completion: send the unpair request once, then wait for removal."""
+
+    def __init__(self) -> None:
+        self._sent = False
+        self._ever_routed = False
+        self._route_id: str | None = None
+
+    def __call__(self, runtime: PairCellRuntime, result: object) -> str | None:
+        route_id = runtime.route_id
+        if route_id is None:
+            if self._ever_routed:
+                return f"Route {self._route_id} was removed; the safe unpair is complete."
+            return "This Worker is not on a Pair Execution Cell route; nothing to unpair."
+        self._ever_routed = True
+        self._route_id = route_id
+        if not self._sent:
+            if not runtime.request_safe_unpair():
+                raise WorkerEnrollmentError("The Pair Execution Cell unpair command could not be sent.")
+            self._sent = True
+        return None
+
+
+class _RediscoverCompletion:
+    """One-shot completion: request one rediscovery, then wait for a new generation."""
+
+    def __init__(self, *, reason: str = "") -> None:
+        self._reason = reason
+        self._requested = False
+        self._generation: int | None = None
+
+    def __call__(self, runtime: PairCellRuntime, result: object) -> str | None:
+        if runtime.cell is None:
+            if runtime.pairing_diagnostic:
+                raise WorkerEnrollmentError(
+                    f"Policy rediscovery cannot start: {runtime.pairing_diagnostic}"
+                )
+            return None
+        generation = runtime.universe_generation()
+        if not self._requested:
+            if runtime.request_rediscovery(actor="cli", reason=self._reason) is None:
+                raise WorkerEnrollmentError(
+                    runtime.pairing_diagnostic or "Policy rediscovery cannot start on this route."
+                )
+            self._requested = True
+            self._generation = generation
+            return None
+        failure = getattr(result, "rediscovery_failure", None)
+        if isinstance(failure, str) and failure:
+            raise WorkerEnrollmentError(f"Policy rediscovery failed: {failure}")
+        if generation is not None and generation != self._generation:
+            return (
+                f"Rediscovery complete on route {runtime.route_id}:"
+                f" universe generation {self._generation} -> {generation}."
+            )
+        return None
+
+
+class _QuarantineReleaseCompletion:
+    """One-shot completion: propose one symbol's release, then wait for the outcome."""
+
+    def __init__(self, *, symbol: str, reason: str = "") -> None:
+        self._symbol = symbol
+        self._reason = reason
+        self._proposal_id: str | None = None
+
+    def __call__(self, runtime: PairCellRuntime, result: object) -> str | None:
+        if runtime.cell is None:
+            if runtime.pairing_diagnostic:
+                raise WorkerEnrollmentError(
+                    f"Quarantine release cannot start: {runtime.pairing_diagnostic}"
+                )
+            return None
+        if self._proposal_id is None:
+            try:
+                proposal = runtime.request_quarantine_release(self._symbol, reason=self._reason)
+            except PairExecutionCellError as error:
+                raise WorkerEnrollmentError(f"Quarantine release is refused: {error}") from error
+            if proposal is None:
+                raise WorkerEnrollmentError(
+                    runtime.pairing_diagnostic or "Quarantine release cannot start on this route."
+                )
+            proposal_id = proposal.get("proposal_id")
+            if not isinstance(proposal_id, str) or not proposal_id:
+                raise WorkerEnrollmentError("Quarantine release cannot start on this route.")
+            self._proposal_id = proposal_id
+            return None
+        status = runtime.quarantine_release_status(self._proposal_id)
+        if status is None:
+            raise WorkerEnrollmentError("Quarantine release cannot start on this route.")
+        state = status.get("state")
+        if state == "pending":
+            return None
+        if state == "applied":
+            applied = status.get("applied") or []
+            peer_applied = status.get("peer_applied") or []
+            return (
+                f"Quarantine release applied for {self._symbol} on route {runtime.route_id}:"
+                f" local={list(applied)} peer={list(peer_applied)}."
+            )
+        raise WorkerEnrollmentError(
+            f"Quarantine release rejected: {status.get('reason') or 'the release did not take effect'}."
+        )
+
+
+def _one_shot_run(
+    *,
+    done: Callable[[PairCellRuntime, object], str | None],
+    timeout_seconds: float,
+    output: TextIO,
+    poll_seconds: float = 0.5,
+    now: Callable[[], datetime] = lambda: datetime.now(UTC),
+) -> Callable[..., None]:
+    """Build a bounded ``run_reconciliation`` that performs one action and returns."""
+
+    def run(
+        *,
+        mt5: MT5Client,
+        session: object,
+        login: int,
+        server: str,
+        sleep: Callable[[float], None],
+        maintenance: Callable[[], None] | None,
+        effect_journal: WorkerEffectJournal | None,
+        pair_cell_factory: Callable[..., PairCellRuntime],
+        graceful_shutdown: object = None,
+    ) -> None:
+        request_password = getattr(session, "request_password", None)
+        initialize = getattr(mt5, "initialize", None)
+        login_mt5 = getattr(mt5, "login", None)
+        if not callable(request_password) or not callable(initialize) or not callable(login_mt5):
+            raise WorkerEnrollmentError("The one-shot command requires an authenticated MT5 session.")
+        if not initialize():
+            raise WorkerEnrollmentError("Unable to initialize the local MT5 terminal.")
+        if not login_mt5(login, password=request_password(), server=server):
+            raise WorkerEnrollmentError("The local MT5 login was not accepted.")
+        raw_account = mt5.account_info()
+        if isinstance(raw_account, Mapping):
+            account = dict(raw_account)
+        else:
+            as_dict = getattr(raw_account, "_asdict", None)
+            account = dict(as_dict()) if callable(as_dict) else {}
+        if account.get("login") != login or account.get("server") != server:
+            raise AccountMismatchError("The local MT5 account does not match the approved worker binding.")
+        runtime = pair_cell_factory(mt5, session, effect_journal, login, server)
+        deadline = now() + timedelta(seconds=timeout_seconds)
+        last_result: object = None
+        try:
+            while True:
+                if maintenance is not None:
+                    maintenance()
+                last_result = runtime.pump(now())
+                message = done(runtime, last_result)
+                if message is not None:
+                    print(message, file=output)
+                    return
+                if now() >= deadline:
+                    raise WorkerEnrollmentError(
+                        f"The command timed out after {timeout_seconds:g} seconds:"
+                        f" {runtime.pairing_diagnostic or 'the route is not converging'}."
+                    )
+                sleep(poll_seconds)
+        finally:
+            runtime.close()
+
+    return run
+
+
+def _run_symbols(arguments: argparse.Namespace, *, output: TextIO, error_output: TextIO) -> int:
+    """Inspect durable symbols state offline, without any session or broker."""
+
+    view = getattr(arguments, "symbols_view", None)
+    db_path = arguments.config.with_suffix(".paircell.sqlite")
+    try:
+        snapshot = snapshot_symbols(db_path)
+    except InspectError as error:
+        print(f"Worker symbols inspection failed: {error}", file=error_output)
+        return 1
+    if view == "allowed":
+        products = allowed_products(snapshot)
+        if not products:
+            print("No allowed symbols: no frozen universe or everything is quarantined.", file=output)
+            return 0
+        generation = snapshot.universe.universe_generation if snapshot.universe else "?"
+        print(f"Allowed symbols (universe generation {generation}, quarantine excluded):", file=output)
+        for product in products:
+            print(f"  {product.symbol} product_id={product.product_id}", file=output)
+        return 0
+    if view == "frozen":
+        frozen = snapshot.frozen
+        route = frozen.route if frozen is not None else {}
+        budget = frozen.budget if frozen is not None else {}
+        acceptance = frozen.acceptance if frozen is not None else {}
+        policy = snapshot.policy
+        universe = snapshot.universe
+        print(f"Route: {route.get('route_id', '-')} role={route.get('role', '-')}"
+              f" leader={route.get('leader_worker_id', '-')}"
+              f" follower={route.get('follower_worker_id', '-')}"
+              f" state={route.get('state', '-')}", file=output)
+        print(f"Frozen budget: {budget.get('startup_balance_usd', '-')}"
+              f" {budget.get('account_currency', '')}"
+              f" proposal={budget.get('proposal_id', '-')}"
+              f" role={budget.get('role', '-')}", file=output)
+        print(f"Frozen acceptance: proposal={acceptance.get('proposal_id', '-')}"
+              f" payload_hash={acceptance.get('payload_hash', '-')}", file=output)
+        if policy is not None:
+            print(f"Policy: hash={policy.policy_hash} mode={policy.mode}"
+                  f" strategy_budget_usd={policy.strategy_budget_usd}"
+                  f" leader_budget={policy.leader_budget_usd}"
+                  f" follower_budget={policy.follower_budget_usd}", file=output)
+        else:
+            print("Policy: none accepted yet", file=output)
+        if universe is not None:
+            print(f"Universe: generation={universe.universe_generation}"
+                  f" products={len(universe.products)} route={universe.route_id}", file=output)
+        else:
+            print("Universe: none discovered yet", file=output)
+        return 0
+    if view == "edge":
+        plans = edge_searchable_products(snapshot)
+        if not plans:
+            print("No edge-searchable symbols in the last persisted state.", file=output)
+            return 0
+        print("Edge-searchable symbols (last persisted current plans, quarantine excluded):", file=output)
+        for plan in plans:
+            directions = ",".join(plan.directions)
+            lots = ",".join(plan.local_max_lots)
+            print(f"  {plan.symbol} product_id={plan.product_id}"
+                  f" directions={directions} local_max_lots={lots}", file=output)
+        return 0
+    if view == "excluded":
+        rows = excluded_products(snapshot)
+        if not rows:
+            print("No excluded symbols: every universe product has a current plan.", file=output)
+            return 0
+        print("Excluded symbols (last persisted state):", file=output)
+        for row in rows:
+            print(f"  {row['symbol']} product_id={row['product_id']}: {row['reason']}", file=output)
+        return 0
+    print(f"Worker symbols inspection failed: unknown view {view!r}.", file=error_output)
+    return 1
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -504,7 +829,7 @@ def _parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help=(
-            "optional Pair Execution Cell tunables file (risk tunables, allow_live, and -- for a"
+            "optional Pair Execution Cell tunables file (risk tunables and -- for a"
             " leader -- shared policy); absent means the documented defaults are synthesized"
         ),
     )
@@ -525,24 +850,87 @@ def _parser() -> argparse.ArgumentParser:
             " instead of choosing from the controller's available-follower list"
         ),
     )
-    reconcile.add_argument(
-        "--pair-cell-unpair",
-        action="store_true",
-        help="request a safe unpair of this Worker's current Pair Execution Cell route",
-    )
-    reconcile.add_argument(
-        "--pair-cell-cancel-unpair",
-        action="store_true",
-        help="cancel an in-progress safe unpair and return this route to normal operation",
-    )
-    reconcile.add_argument(
-        "--pair-cell-rediscover",
-        action="store_true",
-        help="request an explicit rediscovery on this Worker's current route",
-    )
     reconcile.add_argument("--wine-prefix", type=Path, default=Path.home() / ".mt5", help="Wine prefix directory")
     reconcile.add_argument("--windows-python", default=r"C:\abt-python313\python.exe", help="Windows python path in Wine")
     reconcile.add_argument("--bridge-timeout-seconds", type=float, default=15.0, help="Wine bridge request timeout")
+    unpair = commands.add_parser(
+        "unpair",
+        help="request a safe unpair of this Worker's current Pair Execution Cell route and wait until it is removed",
+    )
+    unpair.add_argument("-v", "--verbose", action="store_true", default=argparse.SUPPRESS, help="show safe failure diagnostics")
+    unpair.add_argument("--config", type=Path, default=default_identity_path(), help="worker identity configuration path")
+    unpair.add_argument(
+        "--pair-cell-config",
+        type=Path,
+        default=None,
+        help="optional Pair Execution Cell tunables file; absent means the documented defaults are synthesized",
+    )
+    unpair.add_argument(
+        "--timeout", type=float, default=300.0, help="seconds to wait for the route to be removed"
+    )
+    unpair.add_argument("--wine-prefix", type=Path, default=Path.home() / ".mt5", help="Wine prefix directory")
+    unpair.add_argument("--windows-python", default=r"C:\abt-python313\python.exe", help="Windows python path in Wine")
+    unpair.add_argument("--bridge-timeout-seconds", type=float, default=15.0, help="Wine bridge request timeout")
+    rediscover = commands.add_parser(
+        "rediscover",
+        help="request an explicit product rediscovery on this Worker's current route and wait for a new generation",
+    )
+    rediscover.add_argument("-v", "--verbose", action="store_true", default=argparse.SUPPRESS, help="show safe failure diagnostics")
+    rediscover.add_argument("--config", type=Path, default=default_identity_path(), help="worker identity configuration path")
+    rediscover.add_argument(
+        "--pair-cell-config",
+        type=Path,
+        default=None,
+        help="optional Pair Execution Cell tunables file; absent means the documented defaults are synthesized",
+    )
+    rediscover.add_argument("--reason", default="", help="operator reason recorded with the rediscovery request")
+    rediscover.add_argument(
+        "--timeout", type=float, default=120.0, help="seconds to wait for the new universe generation"
+    )
+    rediscover.add_argument("--wine-prefix", type=Path, default=Path.home() / ".mt5", help="Wine prefix directory")
+    rediscover.add_argument("--windows-python", default=r"C:\abt-python313\python.exe", help="Windows python path in Wine")
+    rediscover.add_argument("--bridge-timeout-seconds", type=float, default=15.0, help="Wine bridge request timeout")
+    quarantine = commands.add_parser(
+        "quarantine",
+        help="worker-owned product quarantine actions, coordinated peer-to-peer over the opaque relay",
+    )
+    quarantine.add_argument("-v", "--verbose", action="store_true", default=argparse.SUPPRESS, help="show safe failure diagnostics")
+    quarantine.add_argument("--config", type=Path, default=default_identity_path(), help="worker identity configuration path")
+    quarantine_actions = quarantine.add_subparsers(dest="quarantine_action")
+    release = quarantine_actions.add_parser(
+        "release",
+        help="propose releasing one symbol's quarantine to the peer with one shared marker and wait for the outcome",
+    )
+    release.add_argument("--config", type=Path, default=default_identity_path(), help="worker identity configuration path")
+    release.add_argument(
+        "--pair-cell-config",
+        type=Path,
+        default=None,
+        help="optional Pair Execution Cell tunables file; absent means the documented defaults are synthesized",
+    )
+    release.add_argument("--symbol", required=True, help="quarantined symbol to release (or a derived product identity)")
+    release.add_argument("--reason", default="", help="operator reason recorded with the release proposal")
+    release.add_argument(
+        "--timeout", type=float, default=60.0, help="seconds to wait for the peer acknowledgement"
+    )
+    release.add_argument("--wine-prefix", type=Path, default=Path.home() / ".mt5", help="Wine prefix directory")
+    release.add_argument("--windows-python", default=r"C:\abt-python313\python.exe", help="Windows python path in Wine")
+    release.add_argument("--bridge-timeout-seconds", type=float, default=15.0, help="Wine bridge request timeout")
+    symbols = commands.add_parser(
+        "symbols",
+        help="inspect durable Pair Execution Cell symbols state offline, without any session or broker",
+    )
+    symbols.add_argument("-v", "--verbose", action="store_true", default=argparse.SUPPRESS, help="show safe failure diagnostics")
+    symbols.add_argument("--config", type=Path, default=default_identity_path(), help="worker identity configuration path")
+    symbols_views = symbols.add_subparsers(dest="symbols_view")
+    for view, view_help in (
+        ("allowed", "frozen universe products that are not quarantined"),
+        ("frozen", "the frozen route, budget, acceptance, policy and universe records"),
+        ("edge", "last persisted current sizing plans on non-quarantined products"),
+        ("excluded", "quarantined products and universe products without a current plan"),
+    ):
+        view_parser = symbols_views.add_parser(view, help=view_help)
+        view_parser.add_argument("--config", type=Path, default=default_identity_path(), help="worker identity configuration path")
     return parser
 
 
@@ -580,12 +968,6 @@ def _pair_cell_startup_options(
         raise WorkerEnrollmentError(
             "--follower-worker-id is leader only; pass --pair-cell-role leader to use it."
         )
-    if getattr(arguments, "pair_cell_unpair", False) and getattr(
-        arguments, "pair_cell_cancel_unpair", False
-    ):
-        raise WorkerEnrollmentError(
-            "--pair-cell-unpair and --pair-cell-cancel-unpair cannot be requested together."
-        )
     selector = None
     if role == "leader" and follower_worker_id is None and interactive:
         selector = lambda followers: _select_follower(  # noqa: E731 - a tiny bound closure
@@ -596,9 +978,6 @@ def _pair_cell_startup_options(
         follower_worker_id=follower_worker_id,
         interactive=interactive,
         select_follower=selector,
-        unpair=bool(getattr(arguments, "pair_cell_unpair", False)),
-        cancel_unpair=bool(getattr(arguments, "pair_cell_cancel_unpair", False)),
-        rediscover=bool(getattr(arguments, "pair_cell_rediscover", False)),
     )
 
 

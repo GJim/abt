@@ -348,18 +348,6 @@ class _LiveServer:
             raw_socket, reconciliation_cursor=authenticated["cursor"], worker_id=worker_id, certificate=certificate
         )
 
-    def release_pair_quarantine(self, *, route_id: str, symbol: str, reason: str) -> httpx.Response:
-        cookie, csrf = self.admin_session()
-        return httpx.post(
-            f"{self.base_url}/api/admin/pairs/quarantine/release",
-            headers={"Cookie": cookie, "X-CSRF-Token": csrf},
-            json={"route_id": route_id, "symbol": symbol, "reason": reason},
-            # Release is correlated/acknowledged: the server awaits a
-            # ``pair_cell_quarantine_release_result`` from each connected
-            # Worker before replying.
-            timeout=20,
-        )
-
 
 def _drive(
     *,
@@ -374,6 +362,7 @@ def _drive(
     stop: threading.Event,
     results: list,
     holder: list,
+    actions: list,
 ) -> None:
     """Construct this Worker's durable adapters and pump loop entirely
     within this thread: sqlite connections are thread-affine, matching the
@@ -404,6 +393,14 @@ def _drive(
     holder.append(runtime)
     try:
         while not stop.is_set():
+            # Test-driven operator actions run on this Worker's own thread:
+            # the cell's sqlite connection is thread-affine.
+            while actions:
+                action = actions.pop(0)
+                try:
+                    action(runtime)
+                except Exception:
+                    return
             try:
                 for _ in range(10):
                     if not session.receive_worker_relay(timeout=0.02):
@@ -455,6 +452,8 @@ class _Pair:
         self.follower_results: list = []
         self.leader_holder: list = []
         self.follower_holder: list = []
+        self.leader_actions: list = []
+        self.follower_actions: list = []
         selected = named_follower if named_follower is not None else (
             self.follower_id if follower_worker_id_known else None
         )
@@ -468,6 +467,7 @@ class _Pair:
                     # No role at all: an omitted role means available follower.
                     options=PairCellStartupOptions(),
                     stop=self.stop, results=self.follower_results, holder=self.follower_holder,
+                    actions=self.follower_actions,
                 ),
                 daemon=True,
             ),
@@ -479,6 +479,7 @@ class _Pair:
                     config=leader_config,
                     options=PairCellStartupOptions(role="leader", follower_worker_id=selected),
                     stop=self.stop, results=self.leader_results, holder=self.leader_holder,
+                    actions=self.leader_actions,
                 ),
                 daemon=True,
             ),
@@ -587,7 +588,7 @@ class PairExecutionCellEndToEndTests(unittest.TestCase):
         owner = ledger.pair_execution_owner(pair.leader_id, pair.follower_id, "pair_execution_cell")
         assert owner is not None
         self.assertEqual("pair_execution_cell", owner["owner_kind"])
-        self.assertIsNone(owner["trader_id"])
+        self.assertNotIn("trader_id", owner)
 
     def test_there_is_no_administrator_route_creation_surface(self) -> None:
         cookie, csrf = self.server.admin_session()
@@ -661,7 +662,10 @@ class PairExecutionCellEndToEndTests(unittest.TestCase):
         self.assertEqual("10000", leader_risk.strategy_budget_usd)
         self.assertEqual("40", leader_risk.maximum_loss_per_trade_usd)
 
-    def test_an_operator_quarantine_release_is_addressed_by_route_id(self) -> None:
+    def test_a_worker_initiated_quarantine_release_applies_on_both_sides(self) -> None:
+        """Freezing a symbol is each Worker's own job: one side proposes a
+        release over the opaque relay and both adopt the same marker."""
+
         pair = _Pair(self, self.server, Path(self._tmp.name), leader_config=LEADER_CONFIG)
         self.assertTrue(
             pair.wait_for(
@@ -672,18 +676,61 @@ class PairExecutionCellEndToEndTests(unittest.TestCase):
             ),
             "the two Workers never paired",
         )
-        route_id = cast(str, cast(PairCellRuntime, pair.leader).route_id)
-        response = self.server.release_pair_quarantine(
-            route_id=route_id, symbol=SYMBOL, reason="operator release"
+        product_id = f"{SYMBOL}:0123456789abcdef"
+        receipt = json.dumps({"retcode": 10021, "source": "operator drill"})
+        for worker_id in (pair.leader_id, pair.follower_id):
+            connection = sqlite3.connect(Path(self._tmp.name) / f"{worker_id}.paircell.sqlite")
+            try:
+                connection.execute(
+                    "INSERT INTO cell_product_quarantine (product_id, offending_worker_id,"
+                    " attempt_id, universe_generation, receipt, quarantined_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?)",
+                    (product_id, worker_id, "attempt-1", 1, receipt, "2026-09-12T00:00:00+00:00"),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+        proposals: list = []
+        pair.leader_actions.append(
+            lambda runtime: proposals.append(
+                runtime.request_quarantine_release(SYMBOL, reason="operator release")
+            )
         )
+        self.assertTrue(
+            pair.wait_for(
+                lambda: self._quarantined(pair.leader_id) == ()
+                and self._quarantined(pair.follower_id) == (),
+                seconds=30,
+            ),
+            "the worker-initiated release never applied on both sides",
+        )
+        self.assertEqual(1, len(proposals))
+        assert proposals[0] is not None
+        leader_marker = self._release_marker(pair.leader_id, product_id)
+        self.assertTrue(leader_marker)
+        self.assertEqual(leader_marker, self._release_marker(pair.follower_id, product_id))
         pair.shutdown()
-        self.assertEqual(200, response.status_code, response.text)
-        body = response.json()
-        self.assertEqual("released", body["status"])
-        self.assertEqual(route_id, body["route_id"])
-        self.assertEqual("applied", body["leader_outcome"])
-        self.assertEqual("applied", body["follower_outcome"])
-        self.assertNotIn("trader_id", body)
+
+    def _quarantined(self, worker_id: str) -> tuple:
+        connection = sqlite3.connect(Path(self._tmp.name) / f"{worker_id}.paircell.sqlite")
+        try:
+            return tuple(
+                str(row[0])
+                for row in connection.execute("SELECT product_id FROM cell_product_quarantine").fetchall()
+            )
+        finally:
+            connection.close()
+
+    def _release_marker(self, worker_id: str, product_id: str) -> str | None:
+        connection = sqlite3.connect(Path(self._tmp.name) / f"{worker_id}.paircell.sqlite")
+        try:
+            row = connection.execute(
+                "SELECT marker FROM cell_product_release_marker WHERE product_id = ?",
+                (product_id,),
+            ).fetchone()
+        finally:
+            connection.close()
+        return None if row is None else str(row[0])
 
     def test_a_safe_unpair_removes_the_route_over_the_live_controller(self) -> None:
         """Both Workers prove safety from their own fresh local evidence and

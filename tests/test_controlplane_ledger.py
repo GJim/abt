@@ -169,19 +169,49 @@ class ControlLedgerTests(unittest.TestCase):
                 enrollment.enrollment_id, "ABCDEF", lambda worker_id, *_: f"certificate:{worker_id}"
             )
 
-    def test_registration_invite_is_role_bound_and_single_use(self) -> None:
-        invite = self.ledger.create_registration_invite("ABCDEF", "trader")
+    def test_registration_invite_is_worker_only_role_bound_and_single_use(self) -> None:
+        with self.assertRaisesRegex(LedgerError, "invalid"):
+            self.ledger.create_registration_invite("ABCDEF", "trader")
 
-        self.assertEqual("trader", self.ledger.consume_registration_invite(invite, "trader"))
+        invite = self.ledger.create_registration_invite("ABCDEF", "worker")
+
+        self.assertEqual("worker", self.ledger.consume_registration_invite(invite, "worker"))
         with self.assertRaisesRegex(LedgerError, "already used"):
-            self.ledger.consume_registration_invite(invite, "trader")
+            self.ledger.consume_registration_invite(invite, "worker")
 
         worker_invite = self.ledger.create_registration_invite("ABCDEF", "worker")
         with self.assertRaisesRegex(LedgerError, "role"):
             self.ledger.consume_registration_invite(worker_invite, "trader")
 
+    def test_a_legacy_trader_invite_is_expired_on_open(self) -> None:
+        """A trader-role invite smuggled into an existing ledger dies on open
+        rather than surviving as a usable credential."""
+
+        invite = self.ledger.create_registration_invite("ABCDEF", "worker")
+        self.ledger.close()
+        path = Path(self._directory.name) / "ledger.duckdb"
+        connection = duckdb.connect(str(path))
+        try:
+            connection.execute(
+                "INSERT INTO registration_invites (invite_hash, role, issued_by, issued_at, expires_at, status)"
+                " VALUES ('deadbeef', 'trader', 'ABCDEF', CURRENT_TIMESTAMP,"
+                " CURRENT_TIMESTAMP + INTERVAL 1 HOUR, 'active')"
+            )
+        finally:
+            connection.close()
+
+        self.ledger = ControlLedger(path)
+
+        self.assertEqual(
+            "expired",
+            self.ledger._connection.execute(
+                "SELECT status FROM registration_invites WHERE invite_hash = 'deadbeef'"
+            ).fetchone()[0],
+        )
+        self.assertEqual("worker", self.ledger.consume_registration_invite(invite, "worker"))
+
     def test_registration_invite_list_exposes_an_opaque_revoke_handle_not_the_secret(self) -> None:
-        invite = self.ledger.create_registration_invite("ABCDEF", "trader")
+        invite = self.ledger.create_registration_invite("ABCDEF", "worker")
 
         record = self.ledger.registration_invites()[0]
         self.assertEqual({"invite_id", "role", "issued_by", "issued_at", "expires_at", "status", "used_at", "revoked_at"}, set(record))
@@ -191,7 +221,7 @@ class ControlLedgerTests(unittest.TestCase):
 
         self.assertEqual("revoked", self.ledger.registration_invites()[0]["status"])
         with self.assertRaisesRegex(LedgerError, "no longer active"):
-            self.ledger.consume_registration_invite(invite, "trader")
+            self.ledger.consume_registration_invite(invite, "worker")
 
     def test_registration_invite_can_be_revoked_only_before_use(self) -> None:
         invite = self.ledger.create_registration_invite("ABCDEF", "worker")
@@ -436,7 +466,7 @@ class PairExecutionCellLedgerTests(unittest.TestCase):
         owner = self.ledger.pair_execution_owner(self.worker_a, self.worker_b, "pair_execution_cell")
         assert owner is not None
         self.assertEqual("pair_execution_cell", owner["owner_kind"])
-        self.assertIsNone(owner["trader_id"])
+        self.assertNotIn("trader_id", owner)
 
     def test_two_leaders_selecting_the_same_follower_produce_one_deterministic_conflict(self) -> None:
         """Requirement: exactly one winner and one deterministic conflict,
@@ -533,57 +563,54 @@ class PairExecutionCellLedgerTests(unittest.TestCase):
                 connected_worker_ids={self.worker_a, "no-such-worker"},
             )
 
-    def test_a_live_legacy_strategy_runtime_blocks_the_pairing_for_either_worker(self) -> None:
-        """Requirement: a pairing is rejected at phase one if either Worker's
-        pair is still held live by the legacy Strategy Runtime."""
+    def test_a_live_execution_claim_on_an_overlapping_pair_blocks_the_pairing(self) -> None:
+        """Requirement: a pairing is rejected at phase one if either Worker
+        already holds a live execution claim for a different pair."""
 
         third = self._active_worker(333333, "Broker-C")
         fourth = self._active_worker(444444, "Broker-D")
-        self.ledger._claim_pair_execution_mode_locked(self.worker_a, third, "strategy_runtime", self.trader_id)
-        self.ledger._claim_pair_execution_mode_locked(self.worker_b, fourth, "strategy_runtime", self.trader_id)
+        self.ledger._claim_pair_execution_mode_locked(self.worker_a, third, "pair_execution_cell")
+        self.ledger._claim_pair_execution_mode_locked(self.worker_b, fourth, "pair_execution_cell")
 
         for leader, follower in ((self.worker_a, self.worker_b), (self.worker_b, self.worker_a)):
             with self.subTest(leader=leader):
-                with self.assertRaisesRegex(LedgerError, "legacy Strategy Runtime"):
+                with self.assertRaisesRegex(LedgerError, "another pair"):
                     self.ledger.reserve_pair_route_proposal(
                         leader_worker_id=leader,
                         follower_worker_id=follower,
                         connected_worker_ids={leader, follower},
                     )
 
-    def test_releasing_the_legacy_claim_lets_the_pair_form(self) -> None:
+    def test_releasing_the_overlapping_claim_lets_the_pair_form(self) -> None:
         third = self._active_worker(333333, "Broker-C")
-        self.ledger._claim_pair_execution_mode_locked(self.worker_a, third, "strategy_runtime", self.trader_id)
+        self.ledger._claim_pair_execution_mode_locked(self.worker_a, third, "pair_execution_cell")
         with self.assertRaises(LedgerError):
             self._pair()
 
-        self.ledger._release_pair_execution_mode_locked(self.worker_a, third, "strategy_runtime", reason="test")
+        self.ledger._release_pair_execution_mode_locked(self.worker_a, third, "pair_execution_cell", reason="test")
         route = self._pair()
 
         self.assertEqual("ACTIVE", route["state"])
 
-    def test_the_legacy_strategy_runtime_keeps_its_own_trader_identity(self) -> None:
-        """Requirement: removing ``trader_id`` is scoped to the Pair
-        Execution Cell. The legacy Strategy Runtime claim still carries and
-        still requires its Trader."""
+    def test_the_removed_strategy_runtime_mode_is_rejected(self) -> None:
+        """Requirement: execution ownership is Worker-pair scoped only.  The
+        legacy ``strategy_runtime`` mode no longer exists, with or without a
+        Trader identity."""
 
-        self.ledger._claim_pair_execution_mode_locked(
-            self.worker_a, self.worker_b, "strategy_runtime", self.trader_id
+        with self.assertRaisesRegex(LedgerError, "Invalid Pair Execution Cell execution mode"):
+            self.ledger._claim_pair_execution_mode_locked(
+                self.worker_a, self.worker_b, "strategy_runtime"
+            )
+        self.assertIsNone(
+            self.ledger.pair_execution_owner(self.worker_a, self.worker_b, "strategy_runtime")
         )
-
-        owner = self.ledger.pair_execution_owner(self.worker_a, self.worker_b, "strategy_runtime")
-        assert owner is not None
-        self.assertEqual(self.trader_id, owner["trader_id"])
-        self.assertEqual("strategy_runtime", owner["owner_kind"])
-        with self.assertRaisesRegex(LedgerError, "requires its Trader identity"):
-            self.ledger._claim_pair_execution_mode_locked(self.worker_a, self.worker_b, "strategy_runtime", None)
 
     def test_a_shadow_owner_may_run_alongside_a_live_owner(self) -> None:
         self.ledger._claim_pair_execution_mode_locked(
-            self.worker_a, self.worker_b, "strategy_runtime", self.trader_id
+            self.worker_a, self.worker_b, "pair_execution_cell"
         )
 
-        self.ledger._claim_pair_execution_mode_locked(self.worker_a, self.worker_b, "shadow", self.trader_id)
+        self.ledger._claim_pair_execution_mode_locked(self.worker_a, self.worker_b, "shadow")
 
     def test_no_caller_outside_the_pairing_workflow_may_claim_or_release_pair_cell_mode(self) -> None:
         """Requirement: Pair Cell exclusivity is taken in the reservation and
@@ -733,9 +760,9 @@ class PairExecutionCellLedgerTests(unittest.TestCase):
             follower_worker_id=self.worker_b,
             connected_worker_ids={self.worker_a, self.worker_b},
         )
-        self.ledger._claim_pair_execution_mode_locked(self.worker_b, third, "strategy_runtime", self.trader_id)
+        self.ledger._claim_pair_execution_mode_locked(self.worker_b, third, "pair_execution_cell")
 
-        with self.assertRaisesRegex(LedgerError, "legacy Strategy Runtime"):
+        with self.assertRaisesRegex(LedgerError, "another pair"):
             self.ledger.create_pair_route(
                 proposal_id=str(reservation["proposal_id"]),
                 connected_worker_ids={self.worker_a, self.worker_b},
@@ -1521,73 +1548,14 @@ class PairExecutionCellLedgerTests(unittest.TestCase):
                 payload_hash="hash-8",
             )
 
-    # ---- Quarantine release ---- #
+    # ---- Quarantine release is worker-owned: no controller surface ---- #
 
-    def test_release_pair_quarantine_records_an_audit_event_and_returns_the_push_payload(self) -> None:
-        route = self._pair()
+    def test_the_ledger_offers_no_quarantine_release_surface(self) -> None:
+        """Freezing a symbol is each Worker's own job: the ledger neither
+        authorizes nor audits releases anymore."""
 
-        release = self.ledger.release_pair_quarantine(
-            route_id=str(route["route_id"]),
-            symbol="EURUSD",
-            actor="alice",
-            reason="broker confirmed the symbol is tradable again",
-        )
-
-        self.assertEqual(route["route_id"], release["route_id"])
-        self.assertEqual(self.worker_a, release["leader_worker_id"])
-        self.assertEqual(self.worker_b, release["follower_worker_id"])
-        self.assertEqual("EURUSD", release["symbol"])
-        self.assertNotIn("trader_id", release)
-        self.assertTrue(any(
-            event["event_type"] == "pair_quarantine_release_requested"
-            and event["payload"]["route_id"] == route["route_id"]
-            and event["payload"]["symbol"] == "EURUSD"
-            and event["payload"]["actor"] == "alice"
-            and "trader_id" not in event["payload"]
-            for event in self.ledger.events()
-        ))
-
-    def test_release_pair_quarantine_requires_a_live_route(self) -> None:
-        with self.assertRaisesRegex(LedgerError, "live Worker route"):
-            self.ledger.release_pair_quarantine(
-                route_id="no-such-route", symbol="EURUSD", actor="alice", reason="operator review"
-            )
-
-    def test_release_pair_quarantine_requires_both_workers_to_be_authenticated(self) -> None:
-        route = self._pair()
-        self.ledger.revoke_worker(self.worker_b, "ABCDEF")
-
-        with self.assertRaises(LedgerError):
-            self.ledger.release_pair_quarantine(
-                route_id=str(route["route_id"]),
-                symbol="EURUSD",
-                actor="alice",
-                reason="operator review",
-            )
-
-    def test_record_pair_quarantine_release_outcome_audits_the_result_unconditionally(self) -> None:
-        for leader_outcome, follower_outcome, applied in (
-            ("applied", "rejected", False),
-            ("applied", "applied", True),
-        ):
-            with self.subTest(applied=applied):
-                self.ledger.record_pair_quarantine_release_outcome(
-                    route_id="route-1",
-                    symbol="EURUSD",
-                    actor="alice",
-                    leader_outcome=leader_outcome,
-                    follower_outcome=follower_outcome,
-                    applied=applied,
-                )
-
-                self.assertTrue(any(
-                    event["event_type"] == "pair_quarantine_release_outcome"
-                    and event["payload"]["leader_outcome"] == leader_outcome
-                    and event["payload"]["follower_outcome"] == follower_outcome
-                    and event["payload"]["applied"] is applied
-                    and "trader_id" not in event["payload"]
-                    for event in self.ledger.events()
-                ))
+        self.assertFalse(hasattr(self.ledger, "release_pair_quarantine"))
+        self.assertFalse(hasattr(self.ledger, "record_pair_quarantine_release_outcome"))
 
     # ---- Schema and migration ---- #
 
@@ -1607,20 +1575,22 @@ class PairExecutionCellLedgerTests(unittest.TestCase):
 
     def test_no_pair_route_column_carries_a_trader_identity(self) -> None:
         """Requirement: ``trader_id`` is removed from the ``pair_routes``
-        schema and from the Pair Cell path of the ownership records."""
+        schema and from the ownership records entirely."""
 
         route_columns = {
             str(row[1]) for row in self.ledger._connection.execute("PRAGMA table_info('pair_routes')").fetchall()
         }
+        owner_columns = {
+            str(row[1])
+            for row in self.ledger._connection.execute("PRAGMA table_info('pair_execution_owners')").fetchall()
+        }
         self._pair()
 
         self.assertNotIn("trader_id", route_columns)
-        self.assertEqual(
-            [(None,)],
-            self.ledger._connection.execute(
-                "SELECT trader_id FROM pair_execution_owners WHERE mode = 'pair_execution_cell'"
-            ).fetchall(),
-        )
+        self.assertNotIn("trader_id", owner_columns)
+        owner = self.ledger.pair_execution_owner(self.worker_a, self.worker_b, "pair_execution_cell")
+        assert owner is not None
+        self.assertNotIn("trader_id", owner)
 
 
 class PairExecutionCellLedgerMigrationTests(unittest.TestCase):
@@ -1695,8 +1665,13 @@ class PairExecutionCellLedgerMigrationTests(unittest.TestCase):
         try:
             owner = ledger.pair_execution_owner("worker-a", "worker-b", "pair_execution_cell")
             assert owner is not None
-            self.assertIsNone(owner["trader_id"])
+            self.assertNotIn("trader_id", owner)
             self.assertEqual("pair_execution_cell", owner["owner_kind"])
+            owner_columns = {
+                str(row[1])
+                for row in ledger._connection.execute("PRAGMA table_info('pair_execution_owners')").fetchall()
+            }
+            self.assertNotIn("trader_id", owner_columns)
         finally:
             ledger.close()
 
@@ -1718,7 +1693,10 @@ class PairExecutionCellLedgerMigrationTests(unittest.TestCase):
         finally:
             ledger.close()
 
-    def test_a_legacy_strategy_runtime_claim_keeps_its_trader_identity(self) -> None:
+    def test_a_legacy_strategy_runtime_claim_is_dropped_by_the_migration(self) -> None:
+        """Nothing can claim or honor the removed mode anymore, so a stale
+        legacy row must not survive to block those Workers from pairing."""
+
         self._write_legacy_schema(rows=[])
         connection = duckdb.connect(str(self.path))
         connection.execute(
@@ -1729,9 +1707,13 @@ class PairExecutionCellLedgerMigrationTests(unittest.TestCase):
 
         ledger = ControlLedger(self.path)
         try:
-            owner = ledger.pair_execution_owner("worker-e", "worker-f", "strategy_runtime")
-            assert owner is not None
-            self.assertEqual("trader-9", owner["trader_id"])
+            self.assertIsNone(ledger.pair_execution_owner("worker-e", "worker-f", "strategy_runtime"))
+            self.assertEqual(
+                [],
+                ledger._connection.execute(
+                    "SELECT pair_key FROM pair_execution_owners WHERE mode = 'strategy_runtime'"
+                ).fetchall(),
+            )
         finally:
             ledger.close()
 

@@ -651,8 +651,6 @@ class FakeSession:
         self.pushes: list[dict[str, object]] = []
         self.relay_inbox: list[dict[str, object]] = []
         self.relay_acks: list[dict[str, object]] = []
-        self.quarantine_releases: list[dict[str, object]] = []
-        self.quarantine_results: list[dict[str, object]] = []
         self.control_messages: list[dict[str, object]] = []
         self.sent_envelopes: list[dict[str, object]] = []
         controller.register(self, login=login, server=server)
@@ -677,15 +675,6 @@ class FakeSession:
     def drain_pair_relay_acks(self) -> list[dict[str, object]]:
         acks, self.relay_acks = self.relay_acks, []
         return acks
-
-    def drain_pair_cell_quarantine_releases(self) -> list[dict[str, object]]:
-        releases, self.quarantine_releases = self.quarantine_releases, []
-        return releases
-
-    def send_pair_cell_quarantine_release_result(self, *, request_id: str, symbol: str, outcome: str) -> None:
-        self.quarantine_results.append(
-            {"request_id": request_id, "symbol": symbol, "outcome": outcome}
-        )
 
     # -- pairing control plane ---------------------------------------------- #
 
@@ -870,7 +859,6 @@ class PairCellConfigurationTests(unittest.TestCase):
         config = load_pair_cell_config(self.directory / "missing.json")
         self.assertEqual({}, dict(config.risk_overrides))
         self.assertEqual({}, dict(config.shared_policy))
-        self.assertTrue(config.allow_live)
         self.assertEqual("20", config.daily_loss_warning_threshold_usd)
         limits = worker_risk_limits(StartupBalance(amount_usd="2500"), config)
         self.assertEqual("2500", limits.strategy_budget_usd)
@@ -896,9 +884,10 @@ class PairCellConfigurationTests(unittest.TestCase):
         with self.assertRaises(WorkerEnrollmentError):
             parse_pair_cell_config({"leader_volume": "1"})
 
-    def test_allow_live_must_be_a_boolean(self) -> None:
-        with self.assertRaises(WorkerEnrollmentError):
-            parse_pair_cell_config({"allow_live": "false"})
+    def test_legacy_allow_live_key_is_now_an_unknown_setting(self) -> None:
+        with self.assertRaises(WorkerEnrollmentError) as raised:
+            parse_pair_cell_config({"allow_live": False})
+        self.assertIn("allow_live", str(raised.exception))
 
     def test_daily_loss_warning_threshold_is_a_local_non_negative_usd_setting(self) -> None:
         config = parse_pair_cell_config({"daily_loss_warning_threshold_usd": "12.50"})
@@ -911,20 +900,22 @@ class PairCellConfigurationTests(unittest.TestCase):
 
     def test_a_follower_permissible_file_is_valid_for_either_role(self) -> None:
         config = parse_pair_cell_config(
-            {"maximum_margin_fraction": "0.2", "daily_loss_fraction": "0.01", "allow_live": False}
+            {"maximum_margin_fraction": "0.2", "daily_loss_fraction": "0.01"}
         )
         self.assertIsNone(config.role_authority_error("follower"))
         self.assertIsNone(config.role_authority_error("leader"))
-        self.assertFalse(config.allow_live)
         self.assertFalse(config.declares_shared_policy)
 
     def test_a_follower_file_may_not_set_shared_policy(self) -> None:
         for key, value in (
             ("mode", "shadow"),
+            ("strategy_budget_usd", "5000"),
             ("entry_edge_points", "9"),
             ("quote_max_age_seconds", 2.0),
             ("quote_max_skew_seconds", 2.0),
             ("follower_confirmation_timeout_seconds", 9.0),
+            ("sizing_refresh_seconds", 600.0),
+            ("relay_handling_timeout_seconds", 9.0),
             ("trading_blackout_start_ny", "16:30"),
             ("trading_blackout_end_ny", "18:30"),
             ("maximum_holding_seconds", 60.0),
@@ -946,6 +937,34 @@ class PairCellConfigurationTests(unittest.TestCase):
         with self.assertRaises(WorkerEnrollmentError):
             parse_pair_cell_config({"maximum_margin_fraction": "-1"})
 
+    def test_a_unified_budget_must_be_zero_or_a_positive_usd_amount(self) -> None:
+        config = parse_pair_cell_config({"strategy_budget_usd": "5000"})
+        self.assertTrue(config.declares_shared_policy)
+        self.assertEqual("5000", config.shared_policy["strategy_budget_usd"])
+        config = parse_pair_cell_config({"strategy_budget_usd": "0"})
+        self.assertEqual("0", config.shared_policy["strategy_budget_usd"])
+        for bad in ("-1", "abc", "", True):
+            with self.subTest(bad=bad):
+                with self.assertRaises(WorkerEnrollmentError):
+                    parse_pair_cell_config({"strategy_budget_usd": bad})
+
+    def test_timing_cadences_must_be_positive_seconds(self) -> None:
+        config = parse_pair_cell_config(
+            {"sizing_refresh_seconds": 600.0, "relay_handling_timeout_seconds": 9.0}
+        )
+        self.assertEqual(600.0, config.shared_policy["sizing_refresh_seconds"])
+        self.assertEqual(9.0, config.shared_policy["relay_handling_timeout_seconds"])
+        for key, bad in (
+            ("sizing_refresh_seconds", 0),
+            ("sizing_refresh_seconds", -60.0),
+            ("sizing_refresh_seconds", "hourly"),
+            ("relay_handling_timeout_seconds", 0.0),
+            ("relay_handling_timeout_seconds", True),
+        ):
+            with self.subTest(key=key, bad=bad):
+                with self.assertRaises(WorkerEnrollmentError):
+                    parse_pair_cell_config({key: bad})
+
     def test_a_malformed_file_is_a_startup_error(self) -> None:
         path = self.directory / "pair.json"
         path.write_text("{not json", encoding="utf-8")
@@ -954,10 +973,9 @@ class PairCellConfigurationTests(unittest.TestCase):
 
     def test_a_present_file_is_loaded_from_disk(self) -> None:
         path = self.directory / "pair.json"
-        path.write_text(json.dumps({"entry_edge_points": "7", "allow_live": False}), encoding="utf-8")
+        path.write_text(json.dumps({"entry_edge_points": "7"}), encoding="utf-8")
         config = load_pair_cell_config(path)
         self.assertEqual({"entry_edge_points": "7"}, dict(config.shared_policy))
-        self.assertFalse(config.allow_live)
 
 
 class StartupBalanceTests(unittest.TestCase):
@@ -1918,28 +1936,51 @@ class DiscoveryLifecycleTests(PairingTestCase):
             "rediscovery refused", cast(str, leader.runtime.cell.last_rediscovery_failure())
         )
 
-    def test_quarantine_release_is_keyed_on_the_derived_product_identity(self) -> None:
-        leader, follower = self._discovered()
-        assert leader.runtime.cell is not None
-        universe = leader.runtime.cell.discovered_universe()
-        assert universe is not None
-        product_id = universe.products[0].product_id
-        self.assertEqual((product_id,), leader.runtime._release_targets(SYMBOL))
-        leader.session.quarantine_releases.append(
-            {
-                "request_id": "release-1",
-                "symbol": SYMBOL,
-                "actor": "admin",
-                "reason": "manual",
-                "observed_at": self.clock().isoformat(),
-            }
+    def test_worker_initiated_release_is_keyed_on_the_derived_product_identity(self) -> None:
+        """Freezing a symbol is each Worker's own job: the leader proposes a
+        release over the opaque relay and both sides adopt one shared marker."""
+
+        leader, follower = self.paired()
+        leader.mt5.price_off = True
+        self.assertTrue(
+            pump_until(
+                [leader, follower], lambda: bool(leader.runtime.quarantined_products()), rounds=400
+            ),
+            "no product was quarantined by the PRICE_OFF entry",
         )
-        leader.runtime.drain_relay()
+        quarantined = leader.runtime.quarantined_products()
+        self.assertEqual(1, len(quarantined))
+        product_id = quarantined[0]
+        self.assertTrue(product_id.startswith(f"{SYMBOL}:"))
+        leader.mt5.price_off = False
+        follower.mt5.prices[SYMBOL] = leader.mt5.prices[SYMBOL]
+        self.assertTrue(
+            pump_until(
+                [leader, follower],
+                lambda: not leader.mt5.positions and not follower.mt5.positions,
+                rounds=200,
+            )
+        )
+        proposal = leader.runtime.request_quarantine_release(SYMBOL, reason="operator release")
+        assert proposal is not None
+        proposal_id = cast(str, proposal["proposal_id"])
+        self.assertTrue(
+            pump_until(
+                [leader, follower],
+                lambda: not leader.runtime.quarantined_products()
+                and not follower.runtime.quarantined_products(),
+                rounds=120,
+            ),
+            "the worker-initiated release never applied on both sides",
+        )
+        status = leader.runtime.quarantine_release_status(proposal_id)
+        assert status is not None
+        self.assertEqual("applied", status["state"])
+        assert leader.runtime.cell is not None and follower.runtime.cell is not None
         self.assertEqual(
-            [{"request_id": "release-1", "symbol": SYMBOL, "outcome": "applied"}],
-            leader.session.quarantine_results,
+            leader.runtime.cell.quarantine_release_marker(product_id),
+            follower.runtime.cell.quarantine_release_marker(product_id),
         )
-        _ = follower
 
     def test_superseded_sizing_plan_versions_are_retained_for_in_flight_attempts(self) -> None:
         leader, follower = self._discovered()
@@ -2079,33 +2120,27 @@ class SafeUnpairTests(PairingTestCase):
 
 
 # --------------------------------------------------------------------------- #
-# Mode authority and the follower's fail-closed allow_live guard
+# Mode authority: live versus shadow is decided solely by the canonical mode
 # --------------------------------------------------------------------------- #
 
 
 class ModeAuthorityTests(PairingTestCase):
-    def test_a_follower_with_allow_live_false_refuses_the_default_live_policy(self) -> None:
-        leader, follower = self.paired(
-            follower_config=parse_pair_cell_config({"allow_live": False})
+    def test_a_follower_accepts_the_default_live_policy(self) -> None:
+        leader, follower = self.paired()
+        self.assertTrue(
+            pump_until(
+                [leader, follower],
+                lambda: follower.runtime.enforced_risk_limits() is not None,
+                rounds=160,
+            ),
+            f"the follower never accepted the live policy "
+            f"({follower.results[-1] if follower.results else None})",
         )
-        pump_until([leader, follower], lambda: False, rounds=120)
-        # It stays paired, safe and idle: it never rewrites the policy and
-        # never silently runs shadow against a live leader.
-        self.assertTrue(follower.runtime.enabled)
-        self.assertIsNone(follower.runtime.enforced_risk_limits())
-        self.assertFalse(cast(object, follower.results[-1]).ready)  # type: ignore[attr-defined]
-        self.assertIn(
-            "allow_live", cast(object, follower.results[-1]).ready_reason  # type: ignore[attr-defined]
-        )
-        # And the leader originates nothing against a follower that has not
-        # accepted.
-        self.assertEqual([], leader.mt5.positions)
-        self.assertEqual([], follower.mt5.positions)
+        self.assertIsNotNone(follower.runtime.enforced_risk_limits())
 
-    def test_a_leader_authored_shadow_policy_resolves_the_disagreement(self) -> None:
+    def test_a_leader_authored_shadow_policy_is_accepted(self) -> None:
         leader, follower = self.paired(
             leader_config=parse_pair_cell_config({"mode": "shadow"}),
-            follower_config=parse_pair_cell_config({"allow_live": False}),
         )
         self.assertTrue(
             pump_until(
@@ -2117,6 +2152,34 @@ class ModeAuthorityTests(PairingTestCase):
             f"({follower.results[-1] if follower.results else None})",
         )
         self.assertIsNotNone(follower.runtime.enforced_risk_limits())
+
+
+class UnifiedBudgetAdapterTests(PairingTestCase):
+    def test_a_leader_unified_budget_applies_to_both_legs(self) -> None:
+        leader, follower = self.paired(
+            leader_config=parse_pair_cell_config({"strategy_budget_usd": "5000"}),
+        )
+        self.assertTrue(
+            pump_until(
+                [leader, follower],
+                lambda: follower.runtime.enforced_risk_limits() is not None,
+                rounds=160,
+            ),
+            f"the follower never accepted the unified-budget policy "
+            f"({follower.results[-1] if follower.results else None})",
+        )
+        leader_limits = leader.runtime.enforced_risk_limits()
+        follower_limits = follower.runtime.enforced_risk_limits()
+        self.assertIsNotNone(leader_limits)
+        self.assertIsNotNone(follower_limits)
+        assert leader_limits is not None and follower_limits is not None
+        self.assertEqual("5000", leader_limits.strategy_budget_usd)
+        self.assertEqual("5000", follower_limits.strategy_budget_usd)
+        # Non-budget tunables still come from each Worker's own file.
+        self.assertEqual(
+            leader_limits.maximum_margin_fraction,
+            leader.runtime.declared_risk_limits().maximum_margin_fraction,  # type: ignore[union-attr]
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -2296,20 +2359,17 @@ class DurablePersistenceTests(PairingTestCase):
         # product identity, so re-pairing does not clear it ...
         self.assertNotEqual(original, leader.runtime.route_id)
         self.assertIn(product_id, leader.runtime.quarantined_products())
-        # ... and only an explicit authenticated operator release does.
-        leader.session.quarantine_releases.append(
-            {
-                "request_id": "release-1",
-                "symbol": SYMBOL,
-                "actor": "admin",
-                "reason": "operator release",
-                "observed_at": self.clock().isoformat(),
-            }
-        )
-        leader.runtime.drain_relay()
-        self.assertEqual(
-            [{"request_id": "release-1", "symbol": SYMBOL, "outcome": "applied"}],
-            leader.session.quarantine_results,
+        # ... and only an explicit worker-initiated release does.
+        proposal = leader.runtime.request_quarantine_release(SYMBOL, reason="operator release")
+        assert proposal is not None
+        self.assertTrue(
+            pump_until(
+                [leader, follower],
+                lambda: not leader.runtime.quarantined_products()
+                and not follower.runtime.quarantined_products(),
+                rounds=120,
+            ),
+            "the worker-initiated release never applied on both sides",
         )
         self.assertNotIn(product_id, leader.runtime.quarantined_products())
 
@@ -2687,9 +2747,12 @@ class DurablePersistenceTests(PairingTestCase):
             connection.close()
         return 0 if row is None else int(row[0])
 
-    # -- (2) an unpaired Worker never falsely reports a release applied ------- #
+    # -- (2) a release needs a route: the peer adopts the same marker ------- #
 
-    def test_an_unpaired_worker_refuses_a_release_it_cannot_actually_apply(self) -> None:
+    def test_an_unpaired_worker_cannot_release_without_a_route(self) -> None:
+        """Release coordination travels the opaque relay, so an unrouted
+        Worker cannot propose one -- even with a quarantine still in force."""
+
         leader, follower = self.paired()
         leader.mt5.price_off = True
         self.assertTrue(
@@ -2700,14 +2763,6 @@ class DurablePersistenceTests(PairingTestCase):
         )
         product_id = leader.runtime.quarantined_products()[0]
         leader.mt5.price_off = False
-        follower.mt5.prices[SYMBOL] = leader.mt5.prices[SYMBOL]
-        self.assertTrue(
-            pump_until(
-                [leader, follower],
-                lambda: not leader.mt5.positions and not follower.mt5.positions,
-                rounds=200,
-            )
-        )
         original = cast(str, leader.runtime.route_id)
         self.controller.refuse_next_proposal = "not now"
         self.assertTrue(leader.runtime.request_safe_unpair())
@@ -2719,127 +2774,21 @@ class DurablePersistenceTests(PairingTestCase):
         pump_until([leader, follower], lambda: False, rounds=10)
         self.assertFalse(leader.runtime.enabled)
 
-        leader.session.quarantine_releases.append(
-            {
-                "request_id": "release-unpaired",
-                "symbol": SYMBOL,
-                "actor": "admin",
-                "reason": "operator release",
-                "observed_at": self.clock().isoformat(),
-            }
-        )
-        leader.runtime.drain_relay()
-        # The quarantine is still in force, so the release is reported
-        # rejected and the operator can retry rather than being told it worked.
-        self.assertEqual(
-            [{"request_id": "release-unpaired", "symbol": SYMBOL, "outcome": "rejected"}],
-            leader.session.quarantine_results,
-        )
-        self.assertIn(product_id, self._durable_quarantine(leader))
-
-    def test_an_unpaired_worker_with_nothing_quarantined_reports_applied(self) -> None:
-        worker = self.worker(FOLLOWER)
-        pump_until([worker], lambda: worker.runtime.pairing_state == "available", rounds=6)
-        worker.session.quarantine_releases.append(
-            {
-                "request_id": "release-noop",
-                "symbol": SYMBOL,
-                "actor": "admin",
-                "reason": "operator release",
-                "observed_at": self.clock().isoformat(),
-            }
-        )
-        worker.runtime.drain_relay()
-        self.assertEqual(
-            [{"request_id": "release-noop", "symbol": SYMBOL, "outcome": "applied"}],
-            worker.session.quarantine_results,
-        )
-
-    def _durable_quarantine(self, worker: Worker) -> tuple[str, ...]:
-        connection = sqlite3.connect(worker.db_path)
+        self.assertIsNone(leader.runtime.request_quarantine_release(SYMBOL, reason="retry"))
+        self.assertIn("route", leader.runtime.pairing_diagnostic)
+        # The quarantine itself outlives the route in durable state.
+        connection = sqlite3.connect(leader.db_path)
         try:
-            return tuple(
-                str(row[0])
-                for row in connection.execute("SELECT product_id FROM cell_product_quarantine")
-            )
+            rows = connection.execute("SELECT product_id FROM cell_product_quarantine").fetchall()
         finally:
             connection.close()
+        self.assertIn(product_id, [str(row[0]) for row in rows])
 
-    # -- legacy durable state must fail closed, never falsely succeed -------- #
-
-    def _legacy_quarantine_database(
-        self, worker_id: str, *, columns: str, row: tuple
-    ) -> Path:
-        """A quarantine table as an earlier build wrote it, keyed by symbol."""
-
-        db_path = self.directory / f"{worker_id}.paircell.sqlite"
-        connection = sqlite3.connect(db_path)
-        try:
-            connection.execute(f"CREATE TABLE cell_product_quarantine ({columns})")
-            connection.execute(
-                "INSERT INTO cell_product_quarantine VALUES (" + ",".join("?" * len(row)) + ")",
-                row,
-            )
-            connection.commit()
-        finally:
-            connection.close()
-        return db_path
-
-    def _release_outcome(self, worker: Worker) -> str:
-        worker.session.quarantine_releases.append(
-            {
-                "request_id": "release-legacy",
-                "symbol": SYMBOL,
-                "actor": "admin",
-                "reason": "operator release",
-                "observed_at": self.clock().isoformat(),
-            }
-        )
-        worker.runtime.drain_relay()
-        return cast(str, worker.session.quarantine_results[-1]["outcome"])
-
-    def test_a_legacy_symbol_keyed_quarantine_is_still_found_while_unpaired(self) -> None:
-        """A database from an earlier build keys the quarantine by symbol."""
-
-        self._legacy_quarantine_database(
-            FOLLOWER,
-            columns="symbol TEXT PRIMARY KEY, offending_worker_id TEXT, attempt_id TEXT,"
-            " receipt TEXT, quarantined_at TEXT",
-            row=(SYMBOL, FOLLOWER, "attempt-1", "{}", "2024-01-02T14:00:00+00:00"),
-        )
+    def test_an_unpaired_worker_with_nothing_quarantined_still_needs_a_route(self) -> None:
         worker = self.worker(FOLLOWER)
         pump_until([worker], lambda: worker.runtime.pairing_state == "available", rounds=6)
-        self.assertFalse(worker.runtime.enabled)
-        # The new ``product_id`` column is simply absent; that must never be
-        # read as "nothing is quarantined".
-        self.assertEqual("rejected", self._release_outcome(worker))
-
-    def test_a_legacy_quarantine_for_another_symbol_still_releases(self) -> None:
-        self._legacy_quarantine_database(
-            FOLLOWER,
-            columns="symbol TEXT PRIMARY KEY, offending_worker_id TEXT, attempt_id TEXT,"
-            " receipt TEXT, quarantined_at TEXT",
-            row=("GBPUSD", FOLLOWER, "attempt-1", "{}", "2024-01-02T14:00:00+00:00"),
-        )
-        worker = self.worker(FOLLOWER)
-        pump_until([worker], lambda: worker.runtime.pairing_state == "available", rounds=6)
-        self.assertEqual("applied", self._release_outcome(worker))
-
-    def test_an_unrecognised_quarantine_shape_never_reports_applied(self) -> None:
-        self._legacy_quarantine_database(
-            FOLLOWER,
-            columns="instrument TEXT PRIMARY KEY, quarantined_at TEXT",
-            row=(SYMBOL, "2024-01-02T14:00:00+00:00"),
-        )
-        worker = self.worker(FOLLOWER)
-        pump_until([worker], lambda: worker.runtime.pairing_state == "available", rounds=6)
-        self.assertEqual("rejected", self._release_outcome(worker))
-
-    def test_an_unreadable_database_never_reports_a_release_applied(self) -> None:
-        (self.directory / f"{FOLLOWER}.paircell.sqlite").write_bytes(b"this is not a database")
-        worker = self.worker(FOLLOWER)
-        pump_until([worker], lambda: worker.runtime.pairing_state == "available", rounds=6)
-        self.assertEqual("rejected", self._release_outcome(worker))
+        self.assertIsNone(worker.runtime.request_quarantine_release(SYMBOL, reason="retry"))
+        self.assertIn("route", worker.runtime.pairing_diagnostic)
 
     def test_an_unopenable_durable_database_fails_the_cell_closed(self) -> None:
         """Schema creation or migration failing must not kill the Worker."""

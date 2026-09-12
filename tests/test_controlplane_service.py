@@ -41,7 +41,6 @@ from abt.trader_protocol import MAX_PAIR_RELAY_ENVELOPE_BYTES, PAIR_CELL_CONTROL
 from abt.controlplane.service import (
     _delete_expired_pending_secrets,
     _is_authoritative_worker_session,
-    _request_pair_cell_quarantine_release,
     _WorkerSessionConnection,
     _validate_worker_stream_envelope,
     _worker_fact_envelope,
@@ -87,76 +86,6 @@ class TraderMarketSubscriptionTests(unittest.TestCase):
                 "worker-1",
             ),
         )
-
-class PairCellQuarantineReleaseRequestHelperTests(unittest.TestCase):
-    """Focused, non-websocket coverage of the correlated request/response
-    helper itself: it must return exactly what the Worker reports, and it
-    must never turn "we don't know" (a timeout or a disconnect) into a false
-    "applied"."""
-
-    @staticmethod
-    def _release() -> dict[str, object]:
-        return {
-            "symbol": "EURUSD",
-            "actor": "alice",
-            "reason": "broker confirmed the symbol is tradable again",
-            "observed_at": "2024-01-01T00:00:00+00:00",
-        }
-
-    def test_returns_the_workers_own_reported_outcome(self) -> None:
-        connection = _WorkerSessionConnection(websocket=None)  # type: ignore[arg-type]
-
-        async def _drive() -> str:
-            task = asyncio.ensure_future(
-                _request_pair_cell_quarantine_release(connection, self._release(), request_id="req-1")
-            )
-            await asyncio.sleep(0)  # allow the request to be enqueued
-            queued = connection.outbound.get_nowait()
-            self.assertEqual("req-1", queued.request_id)
-            queued.future.set_result(
-                {"type": "pair_cell_quarantine_release_result", "request_id": "req-1", "symbol": "EURUSD", "outcome": "rejected"}
-            )
-            return await task
-
-        self.assertEqual("rejected", asyncio.run(_drive()))
-
-    def test_a_timeout_is_reported_as_unknown_never_applied(self) -> None:
-        connection = _WorkerSessionConnection(websocket=None)  # type: ignore[arg-type]
-        with patch.object(
-            controlplane_service, "_request_worker_relay", side_effect=asyncio.TimeoutError()
-        ):
-            outcome = asyncio.run(
-                _request_pair_cell_quarantine_release(connection, self._release(), request_id="req-1")
-            )
-
-        self.assertEqual("unknown", outcome)
-
-    def test_a_mid_flight_disconnect_is_reported_as_unknown_never_applied(self) -> None:
-        connection = _WorkerSessionConnection(websocket=None)  # type: ignore[arg-type]
-        with patch.object(
-            controlplane_service, "_request_worker_relay", side_effect=LedgerError("Worker disconnected.")
-        ):
-            outcome = asyncio.run(
-                _request_pair_cell_quarantine_release(connection, self._release(), request_id="req-1")
-            )
-
-        self.assertEqual("unknown", outcome)
-
-    def test_a_malformed_or_unexpected_reply_is_reported_as_unknown(self) -> None:
-        connection = _WorkerSessionConnection(websocket=None)  # type: ignore[arg-type]
-
-        async def _drive() -> str:
-            task = asyncio.ensure_future(
-                _request_pair_cell_quarantine_release(connection, self._release(), request_id="req-1")
-            )
-            await asyncio.sleep(0)
-            queued = connection.outbound.get_nowait()
-            queued.future.set_result({"type": "pair_cell_quarantine_release_result", "request_id": "req-1", "symbol": "EURUSD"})
-            return await task
-
-        self.assertEqual("unknown", asyncio.run(_drive()))
-
-
 
 class MemoryCertificateIssuer:
     def __init__(self) -> None:
@@ -377,7 +306,7 @@ class ControlPlaneServiceTests(unittest.TestCase):
         self.assertEqual(204, logout_response.status_code)
         self.assertEqual(401, self.client.get("/api/admin/events").status_code)
 
-    def test_administrator_can_issue_a_registration_invite_once(self) -> None:
+    def test_administrator_can_issue_a_worker_registration_invite_once(self) -> None:
         login = self.client.post(
             "/api/admin/login",
             json={"username": "ABCDEF", "password": "A-secure-admin-password!"},
@@ -386,13 +315,27 @@ class ControlPlaneServiceTests(unittest.TestCase):
         issued = self.client.post(
             "/api/admin/registration-invites",
             headers={"X-CSRF-Token": login.json()["csrf_token"]},
-            json={"role": "trader"},
+            json={"role": "worker"},
         )
 
         self.assertEqual(201, issued.status_code)
-        self.assertEqual("trader", issued.json()["role"])
+        self.assertEqual("worker", issued.json()["role"])
         self.assertTrue(issued.json()["invite"])
         self.assertNotIn("invite", self.client.get("/api/admin/registration-invites").json()[0])
+
+    def test_a_trader_registration_invite_is_rejected(self) -> None:
+        login = self.client.post(
+            "/api/admin/login",
+            json={"username": "ABCDEF", "password": "A-secure-admin-password!"},
+        )
+
+        rejected = self.client.post(
+            "/api/admin/registration-invites",
+            headers={"X-CSRF-Token": login.json()["csrf_token"]},
+            json={"role": "trader"},
+        )
+
+        self.assertEqual(422, rejected.status_code)
 
     def test_worker_rotation_requires_both_proofs_and_preserves_one_hour_overlap(self) -> None:
         old_key, worker_id, old_certificate = self._approved_worker(987654, "Broker-Rotation")
@@ -1774,16 +1717,16 @@ class ControlPlaneServiceTests(unittest.TestCase):
         self.assertFalse(impostor["accepted"])
         self.assertIsNone(self.app.state.ledger.pair_route_for_worker(leader_id))
 
-    def test_a_pairing_is_refused_while_the_legacy_strategy_runtime_holds_either_worker(self) -> None:
+    def test_a_pairing_is_refused_while_an_overlapping_execution_claim_holds_either_worker(self) -> None:
         """Requirement: execution-mode exclusivity is checked for both
-        Workers, and a legacy live Strategy Runtime on either Worker's pair
-        rejects the pairing at phase one."""
+        Workers, and a live claim on either Worker's other pair rejects the
+        pairing at phase one."""
 
         leader_key, leader_id, leader_certificate = self._approved_worker(120091, "Broker-A")
         follower_key, follower_id, follower_certificate = self._approved_worker(120092, "Broker-B")
         _third_key, third_id, _third_certificate = self._approved_worker(120093, "Broker-C")
         self.app.state.ledger._claim_pair_execution_mode_locked(
-            follower_id, third_id, "strategy_runtime", "trader-1"
+            follower_id, third_id, "pair_execution_cell"
         )
 
         with self.client.websocket_connect("/api/worker/session") as leader_socket:
@@ -1799,10 +1742,10 @@ class ControlPlaneServiceTests(unittest.TestCase):
                 )
 
         self.assertFalse(refused["accepted"])
-        self.assertIn("legacy Strategy Runtime", refused["reason"])
-        owner = self.app.state.ledger.pair_execution_owner(follower_id, third_id, "strategy_runtime")
+        self.assertIn("another pair", refused["reason"])
+        owner = self.app.state.ledger.pair_execution_owner(follower_id, third_id, "pair_execution_cell")
         assert owner is not None
-        self.assertEqual("trader-1", owner["trader_id"])
+        self.assertNotIn("trader_id", owner)
 
     def test_a_reconnecting_worker_syncs_its_authoritative_route_and_role(self) -> None:
         """Requirement: a Worker that reconnects and finds itself already on
@@ -2087,84 +2030,22 @@ class ControlPlaneServiceTests(unittest.TestCase):
 
     # ---- Administrator surfaces that survive ---- #
 
-    def test_admin_release_of_pair_quarantine_requires_admin_auth(self) -> None:
+    def test_the_admin_quarantine_release_route_is_gone(self) -> None:
+        """Freezing a symbol is each Worker's own job: the controller offers
+        no quarantine release route at all."""
+
+        login = self.client.post(
+            "/api/admin/login", json={"username": "ABCDEF", "password": "A-secure-admin-password!"}
+        )
+        headers = {"X-CSRF-Token": login.json()["csrf_token"]}
+
         response = self.client.post(
             "/api/admin/pairs/quarantine/release",
+            headers=headers,
             json={"route_id": "route-1", "symbol": "EURUSD", "reason": "operator review"},
         )
 
-        self.assertEqual(401, response.status_code)
-
-    def test_admin_release_of_pair_quarantine_names_the_route_and_never_a_trader(self) -> None:
-        """Requirement: the authenticated operator quarantine release is
-        adapted to ``route_id``; it carries no Trader identity."""
-
-        login = self.client.post(
-            "/api/admin/login", json={"username": "ABCDEF", "password": "A-secure-admin-password!"}
-        )
-        headers = {"X-CSRF-Token": login.json()["csrf_token"]}
-
-        for body in (
-            {"route_id": "route-1", "symbol": "EURUSD", "reason": ""},
-            {"symbol": "EURUSD", "reason": "operator review"},
-            {
-                "route_id": "route-1", "symbol": "EURUSD", "reason": "operator review",
-                "trader_id": "trader-1",
-            },
-            {
-                "leader_worker_id": "worker-a", "follower_worker_id": "worker-b",
-                "symbol": "EURUSD", "reason": "operator review",
-            },
-        ):
-            with self.subTest(body=body):
-                response = self.client.post(
-                    "/api/admin/pairs/quarantine/release", headers=headers, json=body
-                )
-
-                self.assertEqual(422, response.status_code)
-
-    def test_admin_release_of_pair_quarantine_requires_a_live_route(self) -> None:
-        """Requirement: quarantine release stays an authenticated route-level
-        operation. Without a live route the controller has no standing to
-        address the pair at all."""
-
-        login = self.client.post(
-            "/api/admin/login", json={"username": "ABCDEF", "password": "A-secure-admin-password!"}
-        )
-        headers = {"X-CSRF-Token": login.json()["csrf_token"]}
-
-        response = self.client.post(
-            "/api/admin/pairs/quarantine/release",
-            headers=headers,
-            json={"route_id": "no-such-route", "symbol": "EURUSD", "reason": "operator review"},
-        )
-
-        self.assertEqual(409, response.status_code)
-        self.assertIn("live Worker route", response.json()["detail"])
-
-    def test_admin_release_of_pair_quarantine_requires_both_workers_to_be_connected(self) -> None:
-        """Requirement: a quarantine release is a one-time action that the
-        controller never persists for later replay, so it must never be
-        silently accepted for delivery "later" -- both the leader and
-        follower Worker session must be connected now."""
-
-        (
-            _leader_key, _leader_id, _leader_certificate,
-            _follower_key, _follower_id, _follower_certificate, route_id,
-        ) = self._pair_route(929292, 939393)
-        login = self.client.post(
-            "/api/admin/login", json={"username": "ABCDEF", "password": "A-secure-admin-password!"}
-        )
-        headers = {"X-CSRF-Token": login.json()["csrf_token"]}
-
-        response = self.client.post(
-            "/api/admin/pairs/quarantine/release",
-            headers=headers,
-            json={"route_id": route_id, "symbol": "EURUSD", "reason": "operator review"},
-        )
-
-        self.assertEqual(409, response.status_code)
-        self.assertIn("connected", response.json()["detail"])
+        self.assertEqual(404, response.status_code)
 
     def _create_pending_enrollment(self) -> str:
         private_key = ec.generate_private_key(ec.SECP256R1())

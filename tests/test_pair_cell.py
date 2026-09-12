@@ -15,6 +15,7 @@ they never reach into private reducers or table layout.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -46,6 +47,7 @@ from abt.pair_cell import (
     RouteMetadataEvent,
     StrategyPolicy,
     WorkerRiskLimits,
+    RELEASE_PROPOSAL_TIMEOUT_SECONDS,
     build_pairing_acceptance,
     calibrated_skew_seconds,
     canonical_policy_from_acceptance,
@@ -459,7 +461,6 @@ class _Side:
         clock: _Clock,
         trace: list[tuple[str, str]],
         fill_price: float,
-        allow_live: bool = True,
     ) -> None:
         self.worker_id = worker_id
         self.role = role
@@ -468,7 +469,6 @@ class _Side:
         self.network = network
         self.clock = clock
         self.limits = limits
-        self.allow_live = allow_live
         self.route = _route(role)
         self.mt5 = FakeMT5(worker_id, trace, fill_price)
         self.journal = FaultyJournal(tmp / f"{worker_id}-journal.db", trace, worker_id)
@@ -486,7 +486,6 @@ class _Side:
             local_risk_limits=self.limits,
             effect_journal=self.journal,
             scheduler=self.scheduler,
-            allow_live=self.allow_live,
             monotonic=self.clock,
         )
 
@@ -538,7 +537,6 @@ class PairCellTestCase(unittest.TestCase):
 
     leader_limits = LEADER_RISK
     follower_limits = FOLLOWER_RISK
-    follower_allow_live = True
 
     def setUp(self) -> None:
         import shutil
@@ -568,7 +566,6 @@ class PairCellTestCase(unittest.TestCase):
             clock=self.clock,
             trace=self.trace,
             fill_price=1.10040,
-            allow_live=self.follower_allow_live,
         )
         self.leader_entries: list[CatalogEntry] = [_entry()]
         self.follower_entries: list[CatalogEntry] = [_entry()]
@@ -880,10 +877,13 @@ class RemovedArchitectureTests(unittest.TestCase):
             set(policy.canonical()),
             {
                 "policy_version",
+                "strategy_budget_usd",
                 "entry_edge_points",
                 "quote_max_age_seconds",
                 "quote_max_skew_seconds",
                 "follower_confirmation_timeout_seconds",
+                "sizing_refresh_seconds",
+                "relay_handling_timeout_seconds",
                 "maximum_holding_seconds",
                 "trading_blackout_start_ny",
                 "trading_blackout_end_ny",
@@ -984,13 +984,13 @@ class RemovedArchitectureTests(unittest.TestCase):
 
 
 class ConfigurationAuthorityTests(unittest.TestCase):
-    def test_a_follower_file_may_set_only_its_own_risk_and_allow_live(self) -> None:
+    def test_a_follower_file_may_set_only_its_own_risk_and_threshold(self) -> None:
         raw = {
             "maximum_margin_fraction": "0.2",
             "daily_loss_fraction": "0.03",
             "trade_loss_fraction": "0.02",
             "maximum_loss_per_trade_usd": "40",
-            "allow_live": False,
+            "daily_loss_warning_threshold_usd": "20",
         }
         validate_configuration_authority(raw, role="follower")
         validate_configuration_authority(raw, role="leader")
@@ -998,10 +998,13 @@ class ConfigurationAuthorityTests(unittest.TestCase):
 
     def test_a_follower_file_containing_shared_policy_is_a_startup_error(self) -> None:
         for key, value in (
+            ("strategy_budget_usd", "5000"),
             ("entry_edge_points", "4"),
             ("quote_max_age_seconds", 1.0),
             ("quote_max_skew_seconds", 1.0),
             ("follower_confirmation_timeout_seconds", 5.0),
+            ("sizing_refresh_seconds", 600.0),
+            ("relay_handling_timeout_seconds", 5.0),
             ("trading_blackout_start_ny", "16:30"),
             ("trading_blackout_end_ny", "18:30"),
             ("maximum_holding_seconds", 60.0),
@@ -1042,10 +1045,13 @@ class DefaultMaterializationTests(unittest.TestCase):
             default_shared_policy_values(),
             {
                 "mode": "live",
+                "strategy_budget_usd": "0",
                 "entry_edge_points": "4",
                 "quote_max_age_seconds": 1.0,
                 "quote_max_skew_seconds": 1.0,
                 "follower_confirmation_timeout_seconds": 5.0,
+                "sizing_refresh_seconds": 3600.0,
+                "relay_handling_timeout_seconds": 5.0,
                 "trading_blackout_start_ny": "16:30",
                 "trading_blackout_end_ny": "18:30",
                 "maximum_holding_seconds": None,
@@ -1997,9 +2003,7 @@ class PolicyPersistenceTests(PairCellTestCase):
 
 
 class ModeDisagreementTests(PairCellTestCase):
-    follower_allow_live = False
-
-    def test_a_follower_with_allow_live_false_refuses_a_live_policy_and_stays_idle(self) -> None:
+    def test_a_follower_accepts_a_live_policy_and_becomes_ready(self) -> None:
         self.tick()
         self.accept()
         self.feed_catalogs()
@@ -2009,24 +2013,10 @@ class ModeDisagreementTests(PairCellTestCase):
         self.net.pump()
         self.tick()
         result = self.follower.cell.handle_event(ClockTickEvent(self.now))
-        self.assertFalse(result.policy_accepted)
-        self.assertFalse(result.ready)
-        self.assertIn("allow_live is false", result.ready_reason)
-        self.assertEqual(result.route_id, ROUTE_ID)  # still paired
+        self.assertTrue(result.policy_accepted)
+        self.assertEqual(result.route_id, ROUTE_ID)
         acks = self.net.payloads("policy_ack", FOLLOWER)
-        self.assertFalse(acks[-1]["accepted"])
-
-    def test_the_leader_treats_the_refusal_as_peer_not_ready_and_originates_nothing(self) -> None:
-        self.tick()
-        self.accept()
-        self.feed_catalogs()
-        self.leader.cell.accept_policy(self.policy())
-        self.net.pump()
-        self.tick()
-        self.warm(SYMBOL)
-        self.feed_quotes()
-        self.assertEqual(self.attempt_payloads(), [])
-        self.assertEqual(self.leader.entry_requests(), [])
+        self.assertTrue(acks[-1]["accepted"])
 
     def test_publishing_a_shadow_policy_while_both_are_empty_resolves_it(self) -> None:
         self.tick()
@@ -2047,11 +2037,167 @@ class ModeDisagreementTests(PairCellTestCase):
         self.tick()
         self.accept()
         self.feed_catalogs()
-        self.leader.cell.accept_policy(self.policy())
+        live = self.policy()
+        self.assertEqual(live.mode, "live")
+        self.leader.cell.accept_policy(live)
         self.net.pump()
         self.tick()
-        self.assertIsNone(self.follower.cell.handle_event(ClockTickEvent(self.now)).policy_hash)
-        self.assertEqual(self.follower.cell.sizing_plans(), {})
+        self.assertEqual(self.follower.cell.handle_event(ClockTickEvent(self.now)).policy_hash, live.hash)
+
+
+# --------------------------------------------------------------------------- #
+# Leader-authored shared tuning: unified budget and timing cadences
+# --------------------------------------------------------------------------- #
+
+
+class UnifiedBudgetTests(PairCellTestCase):
+    def test_the_automatic_base_keeps_each_leg_on_its_own_balance(self) -> None:
+        self.tick()
+        acceptance = self.accept()
+        self.feed_catalogs()
+        policy = self.policy()
+        self.assertEqual(policy.strategy_budget_usd, "0")
+        self.assertEqual(policy.leader_risk.strategy_budget_usd, "10000")
+        self.assertTrue(policy.follower_risk.is_verbatim_copy_of(acceptance.risk_limits()))
+        self.leader.cell.accept_policy(policy)
+        self.net.pump()
+        self.tick()
+        result = self.follower.cell.handle_event(ClockTickEvent(self.now))
+        self.assertTrue(result.policy_accepted)
+
+    def test_a_unified_budget_replaces_the_sizing_base_of_both_legs(self) -> None:
+        self.tick()
+        self.accept()
+        self.feed_catalogs()
+        policy = self.policy(strategy_budget_usd="5000")
+        self.assertEqual(policy.strategy_budget_usd, "5000")
+        self.assertEqual(policy.leader_risk.strategy_budget_usd, "5000")
+        self.assertEqual(policy.follower_risk.strategy_budget_usd, "5000")
+        # Every other tunable still passes through untouched.
+        self.assertEqual(policy.follower_risk.maximum_margin_fraction, FOLLOWER_RISK.maximum_margin_fraction)
+        self.assertEqual(policy.follower_risk.daily_loss_fraction, FOLLOWER_RISK.daily_loss_fraction)
+        self.leader.cell.accept_policy(policy)
+        self.net.pump()
+        self.tick()
+        result = self.follower.cell.handle_event(ClockTickEvent(self.now))
+        self.assertTrue(result.policy_accepted)
+        self.assertEqual(result.policy_hash, policy.hash)
+        self.assertEqual(
+            self.leader.cell.enforced_risk_limits().strategy_budget_usd, "5000"  # type: ignore[union-attr]
+        )
+        self.assertEqual(
+            self.follower.cell.enforced_risk_limits().strategy_budget_usd, "5000"  # type: ignore[union-attr]
+        )
+
+    def test_a_non_positive_or_unreadable_unified_budget_fails_closed(self) -> None:
+        self.tick()
+        self.accept()
+        self.feed_catalogs()
+        for bad in ("-5", "abc", "", None):
+            with self.subTest(bad=bad):
+                with self.assertRaises(PairExecutionCellError):
+                    self.policy(strategy_budget_usd=bad)
+
+    def test_a_unified_policy_with_a_rewritten_non_budget_tunable_is_refused(self) -> None:
+        self.tick()
+        self.accept()
+        self.feed_catalogs()
+        base = self.policy(strategy_budget_usd="5000")
+        rogue = replace(
+            base,
+            follower_risk=replace(base.follower_risk, maximum_margin_fraction="0.1"),
+        )
+        with self.assertRaises(PairExecutionCellError) as raised:
+            self.leader.cell.accept_policy(rogue)
+        self.assertIn("verbatim", str(raised.exception))
+        self.deliver_policy(rogue)
+        result = self.follower.cell.handle_event(ClockTickEvent(self.now))
+        self.assertFalse(result.policy_accepted)
+
+
+class SharedTimingTests(PairCellTestCase):
+    def test_timing_cadences_default_and_compose_into_the_canonical_policy(self) -> None:
+        self.tick()
+        self.accept()
+        self.feed_catalogs()
+        policy = self.policy()
+        self.assertEqual(policy.sizing_refresh_seconds, 3600.0)
+        self.assertEqual(policy.relay_handling_timeout_seconds, 5.0)
+        self.assertEqual(policy.plan_retention_seconds, 10.0)
+        tuned = self.policy(sizing_refresh_seconds=600.0, relay_handling_timeout_seconds=9.0)
+        self.assertEqual(tuned.sizing_refresh_seconds, 600.0)
+        self.assertEqual(tuned.plan_retention_seconds, 14.0)
+
+    def test_non_positive_timing_cadences_fail_closed(self) -> None:
+        self.tick()
+        self.accept()
+        self.feed_catalogs()
+        for key, bad in (
+            ("sizing_refresh_seconds", 0),
+            ("sizing_refresh_seconds", -60.0),
+            ("relay_handling_timeout_seconds", 0.0),
+            ("relay_handling_timeout_seconds", "fast"),
+        ):
+            with self.subTest(key=key, bad=bad):
+                with self.assertRaises((PairExecutionCellError, TypeError, ValueError)):
+                    self.policy(**{key: bad})
+
+    def test_a_legacy_canonical_policy_without_timing_keys_loads_with_defaults(self) -> None:
+        self.tick()
+        self.accept()
+        self.feed_catalogs()
+        policy = self.policy()
+        raw = dict(policy.canonical())
+        del raw["sizing_refresh_seconds"]
+        del raw["relay_handling_timeout_seconds"]
+        del raw["strategy_budget_usd"]
+        loaded = pair_cell._policy_from_canonical(raw)
+        self.assertEqual(loaded.sizing_refresh_seconds, 3600.0)
+        self.assertEqual(loaded.relay_handling_timeout_seconds, 5.0)
+        self.assertEqual(loaded.strategy_budget_usd, "0")
+        self.assertEqual(loaded.hash, policy.hash)
+
+
+class ProductStatusPersistenceTests(PairCellTestCase):
+    def test_suspend_reasons_are_persisted_for_offline_inspection(self) -> None:
+        self.prime()
+        # Let every quote go stale, then force a refresh with no current quote.
+        self.tick(seconds=3601.0)
+        self.tick()
+        suspended = self.leader.cell.suspended_products()
+        self.assertTrue(suspended)
+        db = sqlite3.connect(self.tmp / "worker-leader-cell.db")
+        try:
+            rows = db.execute(
+                "SELECT product_id, universe_generation, reason FROM cell_product_suspend"
+            ).fetchall()
+        finally:
+            db.close()
+        self.assertEqual(
+            {product_id: reason for product_id, _, reason in rows}, suspended
+        )
+        self.assertTrue(all(generation == 1 for _, generation, _ in rows))
+
+    def test_discovery_exclusions_are_persisted_with_reasons_on_both_sides(self) -> None:
+        self.leader_entries = [_entry(), _entry("GBPUSD")]
+        self.follower_entries = [_entry(), _entry("GBPUSD", contract_size="200000")]
+        self.tick()
+        self.accept()
+        self.feed_catalogs()
+        excluded = self.leader.cell.discovery_excluded_symbols()
+        self.assertEqual(1, len(excluded))
+        self.assertEqual("GBPUSD", excluded[0][0])
+        self.assertIn("hard specification mismatch", excluded[0][1])
+        # The follower recomputes the same deterministic result while verifying.
+        self.assertEqual(excluded, self.follower.cell.discovery_excluded_symbols())
+        db = sqlite3.connect(self.tmp / "worker-leader-cell.db")
+        try:
+            rows = db.execute(
+                "SELECT universe_generation, symbol, reason FROM cell_discovery_excluded"
+            ).fetchall()
+        finally:
+            db.close()
+        self.assertEqual([(1, "GBPUSD", excluded[0][1])], rows)
 
 
 # --------------------------------------------------------------------------- #
@@ -3929,6 +4075,147 @@ class QuarantineTests(PairCellTestCase):
         )
         self.assertEqual(self.leader.cell.quarantined_products(), ())
         self.assertIsNotNone(self.leader.cell.quarantine_release_marker(product))
+
+
+class WorkerInitiatedReleaseTests(PairCellTestCase):
+    """Freezing a symbol is each Worker's own job: one side proposes a
+    release over the opaque relay, the peer answers, and only then does the
+    initiator apply it -- both adopting the same marker."""
+
+    def _quarantine_both(self) -> str:
+        self.prime()
+        product = self.product_id()
+        self.leader.mt5.reject_next_entry_retcode = _PRICE_OFF
+        self.feed_quotes()
+        self.net.pump()
+        self.tick()
+        self.assertEqual(self.leader.cell.quarantined_products(), (product,))
+        self.assertEqual(self.follower.cell.quarantined_products(), (product,))
+        return product
+
+    def test_propose_ack_apply_releases_on_both_sides_with_one_marker(self) -> None:
+        product = self._quarantine_both()
+        proposal = self.leader.cell.request_quarantine_release(SYMBOL, reason="broker fixed")
+        proposal_id = cast(str, proposal["proposal_id"])
+        marker = cast(str, proposal["marker"])
+        self.assertEqual(self.leader.cell.quarantine_release_status(proposal_id), {"state": "pending", "proposal_id": proposal_id})
+        self.net.pump()
+        self.tick()
+        self.net.pump()
+        self.tick()
+        status = self.leader.cell.quarantine_release_status(proposal_id)
+        assert status is not None
+        self.assertEqual("applied", status["state"])
+        self.assertEqual(self.leader.cell.quarantined_products(), ())
+        self.assertEqual(self.follower.cell.quarantined_products(), ())
+        self.assertEqual(self.leader.cell.quarantine_release_marker(product), marker)
+        self.assertEqual(self.follower.cell.quarantine_release_marker(product), marker)
+
+    def test_a_release_is_refused_while_the_initiator_has_an_unresolved_attempt(self) -> None:
+        self.prime()
+        self.net.drop_kinds.add("leg_status")
+        self.leader.mt5.reject_next_entry_retcode = _PRICE_OFF
+        self.feed_quotes()
+        with self.assertRaises(PairExecutionCellError) as raised:
+            self.leader.cell.request_quarantine_release(SYMBOL, reason="broker fixed")
+        self.assertIn("unresolved attempt", str(raised.exception))
+
+    def test_a_release_is_rejected_while_the_peer_has_an_unresolved_attempt(self) -> None:
+        self.add_second_product()
+        product = self._quarantine_both()
+        # A fresh edge on the *other* symbol opens a new attempt on both
+        # sides; freeze it unresolved by dropping every leg-status update.
+        self.warm(OTHER_SYMBOL)
+        self.net.drop_kinds.add("leg_status")
+        self.net.drop_kinds.add("pair_entry_confirmed")
+        self.net.drop_kinds.add("pair_entry_failed")
+        self.feed_quotes(symbol=OTHER_SYMBOL)
+        self.net.pump()
+        self.tick()
+        assert self.follower.cell.status().attempt_id is not None
+        proposal = {
+            "proposal_id": "peer-blocked-proposal",
+            "symbol": SYMBOL,
+            "marker": self.now.isoformat(),
+            "actor": LEADER,
+            "reason": "broker fixed",
+        }
+        responses_before = len(self.net.payloads("quarantine_release_response", FOLLOWER))
+        self.follower.cell.handle_event(
+            RelayEnvelopeReceived(self._wire("quarantine_release_proposal", proposal, LEADER, FOLLOWER))
+        )
+        self.tick()
+        responses = self.net.payloads("quarantine_release_response", FOLLOWER)
+        self.assertEqual(len(responses), responses_before + 1)
+        self.assertFalse(responses[-1]["ok"])
+        self.assertIn("unresolved attempt", cast(str, responses[-1]["reason"]))
+        self.assertEqual(self.follower.cell.quarantined_products(), (product,))
+        self.assertEqual(self.leader.cell.quarantined_products(), (product,))
+
+    def test_a_stale_proposal_marker_is_ignored(self) -> None:
+        product = self._quarantine_both()
+        proposal = self.leader.cell.request_quarantine_release(SYMBOL, reason="broker fixed")
+        self.net.pump()
+        self.tick()
+        self.net.pump()
+        self.tick()
+        marker = cast(str, self.follower.cell.quarantine_release_marker(product))
+        self.assertTrue(marker)
+        stale = dict(self.net.payloads("quarantine_release_proposal", LEADER)[-1])
+        stale["proposal_id"] = "stale-proposal"
+        stale["marker"] = "2020-01-01T00:00:00+00:00"
+        acks_before = len(self.net.payloads("quarantine_release_response", FOLLOWER))
+        self.follower.cell.handle_event(
+            RelayEnvelopeReceived(self._wire("quarantine_release_proposal", stale, LEADER, FOLLOWER))
+        )
+        self.tick()
+        acks = self.net.payloads("quarantine_release_response", FOLLOWER)
+        self.assertEqual(len(acks), acks_before + 1)
+        self.assertTrue(acks[-1]["ok"])
+        self.assertEqual(
+            self.follower.cell.quarantine_release_marker(product), marker
+        )
+
+    def test_an_unanswered_proposal_times_out(self) -> None:
+        self._quarantine_both()
+        self.net.drop_kinds.add("quarantine_release_response")
+        proposal = self.leader.cell.request_quarantine_release(SYMBOL, reason="broker fixed")
+        proposal_id = cast(str, proposal["proposal_id"])
+        self.net.pump()
+        self.tick(seconds=RELEASE_PROPOSAL_TIMEOUT_SECONDS + 1.0)
+        self.tick()
+        status = self.leader.cell.quarantine_release_status(proposal_id)
+        assert status is not None
+        self.assertEqual("rejected", status["state"])
+        self.assertIn("deadline", cast(str, status["reason"]))
+
+    def test_an_unknown_response_is_ignored(self) -> None:
+        self.prime()
+        self.leader.cell.handle_event(
+            RelayEnvelopeReceived(
+                self._wire(
+                    "quarantine_release_response",
+                    {"proposal_id": "nope", "ok": True},
+                    FOLLOWER,
+                    LEADER,
+                )
+            )
+        )
+        self.tick()
+        self.assertIsNone(self.leader.cell.quarantine_release_status("nope"))
+
+    def _wire(
+        self, kind: str, payload: dict[str, object], from_worker: str, to_worker: str
+    ) -> dict[str, object]:
+        return {
+            "protocol_version": 4,
+            "kind": kind,
+            "route_id": ROUTE_ID,
+            "from_role": "leader" if from_worker == LEADER else "follower",
+            "from_worker_id": from_worker,
+            "to_worker_id": to_worker,
+            "payload": payload,
+        }
 
 
 # --------------------------------------------------------------------------- #

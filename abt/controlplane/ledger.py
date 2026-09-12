@@ -79,15 +79,6 @@ class ActiveWorker:
     password_secret_ref: str
 
 
-@dataclass(frozen=True)
-class ActiveTrader:
-    trader_id: str
-    registration_id: str
-    strategy_name: str
-    certificate: str
-    public_key_pem: str
-
-
 class ControlLedger:
     """Single-process DuckDB authority for control-plane state and events."""
 
@@ -219,7 +210,7 @@ class ControlLedger:
         return csrf_token
 
     def create_registration_invite(self, issued_by: str, role: str) -> str:
-        if role not in {"worker", "trader"}:
+        if role != "worker":
             raise LedgerError("Registration invite role is invalid.")
         invite = secrets.token_urlsafe(32)
         now = _utc_now()
@@ -425,35 +416,29 @@ class ControlLedger:
 
 
     def _claim_pair_execution_mode_locked(
-        self, leader_worker_id: str, follower_worker_id: str, mode: str, trader_id: str | None
+        self, leader_worker_id: str, follower_worker_id: str, mode: str
     ) -> None:
-        if mode not in ("strategy_runtime", "pair_execution_cell", "shadow"):
+        if mode not in ("pair_execution_cell", "shadow"):
             raise LedgerError("Invalid Pair Execution Cell execution mode.")
-        if mode == "pair_execution_cell" and trader_id is not None:
-            raise LedgerError("A Pair Execution Cell execution-mode claim carries no Trader identity.")
-        if mode == "strategy_runtime" and not trader_id:
-            raise LedgerError("A legacy Strategy Runtime execution-mode claim requires its Trader identity.")
         pair_key = _pair_key(leader_worker_id, follower_worker_id)
         self.active_worker(leader_worker_id)
         self.active_worker(follower_worker_id)
         if mode != "shadow":
             existing = self._connection.execute(
-                "SELECT mode, trader_id FROM pair_execution_owners WHERE pair_key = ? AND mode != 'shadow'",
+                "SELECT mode FROM pair_execution_owners WHERE pair_key = ? AND mode != 'shadow'",
                 [pair_key],
             ).fetchone()
-            if existing is not None and (existing[0] != mode or existing[1] != trader_id):
+            if existing is not None and existing[0] != mode:
                 raise LedgerError(
-                    "This Worker pair already has a different live execution owner; "
-                    "the legacy Strategy Runtime and a Pair Execution Cell cannot both run for the same pair."
+                    "This Worker pair already has a different live execution owner."
                 )
         self._connection.execute(
-            """INSERT INTO pair_execution_owners (pair_key, mode, owner_kind, trader_id, claimed_at)
-               VALUES (?, ?, ?, ?, ?)
+            """INSERT INTO pair_execution_owners (pair_key, mode, owner_kind, claimed_at)
+               VALUES (?, ?, ?, ?)
                ON CONFLICT (pair_key, mode) DO UPDATE SET
                  owner_kind = excluded.owner_kind,
-                 trader_id = excluded.trader_id,
                  claimed_at = excluded.claimed_at""",
-            [pair_key, mode, mode, trader_id, _utc_now()],
+            [pair_key, mode, mode, _utc_now()],
         )
         self._event(
             "pair_execution_mode_claimed",
@@ -462,7 +447,6 @@ class ControlLedger:
                 "follower_worker_id": follower_worker_id,
                 "mode": mode,
                 "owner_kind": mode,
-                "trader_id": trader_id,
             },
         )
 
@@ -491,13 +475,13 @@ class ControlLedger:
 
         with self._lock:
             row = self._connection.execute(
-                """SELECT mode, owner_kind, trader_id, claimed_at FROM pair_execution_owners
+                """SELECT mode, owner_kind, claimed_at FROM pair_execution_owners
                    WHERE pair_key = ? AND mode = ?""",
                 [_pair_key(leader_worker_id, follower_worker_id), mode],
             ).fetchone()
         if row is None:
             return None
-        return {"mode": row[0], "owner_kind": row[1], "trader_id": row[2], "claimed_at": row[3]}
+        return {"mode": row[0], "owner_kind": row[1], "claimed_at": row[2]}
 
     # ---- Worker-initiated pairing: role declaration and availability ---- #
 
@@ -627,7 +611,7 @@ class ControlLedger:
                     )
             self._require_pair_worker_eligibility_locked(leader_worker_id, follower_worker_id)
             self._claim_pair_execution_mode_locked(
-                leader_worker_id, follower_worker_id, "pair_execution_cell", None
+                leader_worker_id, follower_worker_id, "pair_execution_cell"
             )
             proposal_id = str(uuid4())
             expires_at = moment + timedelta(seconds=PAIRING_RESERVATION_TIMEOUT_SECONDS)
@@ -787,7 +771,7 @@ class ControlLedger:
                     leader_worker_id, follower_worker_id, ignore_proposal_id=proposal_id
                 )
                 self._claim_pair_execution_mode_locked(
-                    leader_worker_id, follower_worker_id, "pair_execution_cell", None
+                    leader_worker_id, follower_worker_id, "pair_execution_cell"
                 )
                 route_id = self._issue_pair_route_id_locked(moment)
                 self._connection.execute(
@@ -1084,92 +1068,6 @@ class ControlLedger:
             "route_removed": removed,
         }
 
-    # ---- Quarantine release: authenticated operator action on a route ---- #
-
-    def release_pair_quarantine(
-        self, *, route_id: str, symbol: str, actor: str, reason: str
-    ) -> dict[str, Any]:
-        """Durably audit-log one operator's explicit product quarantine release
-        and return the payload the caller must push live to both Workers.
-
-        This stays an authenticated *route-level* operation and confers no
-        lifecycle ownership: it is authorized against the same live route
-        record as any relayed envelope, names no Trader, and the controller
-        neither knows which products are quarantined nor decides whether a
-        release may take effect. A product quarantine is Worker-local durable
-        state, and a release is a one-time action rather than idempotent
-        latest-state: replaying an old release to a Worker that reconnects
-        later could incorrectly release a *newer* quarantine of the same
-        symbol. So the controller never persists a release for later replay --
-        it only records the immutable audit event and returns the payload; the
-        caller is responsible for delivering it to both currently-connected
-        Worker sessions now.
-        """
-
-        with self._transaction():
-            route = self._pair_route_locked(route_id)
-            if route is None:
-                raise LedgerError(
-                    "A Pair Execution Cell quarantine release requires a live Worker route."
-                )
-            self.active_worker(route["leader_worker_id"])
-            self.active_worker(route["follower_worker_id"])
-            observed_at = _utc_now()
-            self._event(
-                "pair_quarantine_release_requested",
-                {
-                    "route_id": route_id,
-                    "leader_worker_id": route["leader_worker_id"],
-                    "follower_worker_id": route["follower_worker_id"],
-                    "symbol": symbol,
-                    "actor": actor,
-                    "reason": reason,
-                },
-            )
-        return {
-            "route_id": route_id,
-            "leader_worker_id": route["leader_worker_id"],
-            "follower_worker_id": route["follower_worker_id"],
-            "symbol": symbol,
-            "actor": actor,
-            "reason": reason,
-            "observed_at": observed_at,
-        }
-
-    def record_pair_quarantine_release_outcome(
-        self,
-        *,
-        route_id: str,
-        symbol: str,
-        actor: str,
-        leader_outcome: str,
-        follower_outcome: str,
-        applied: bool,
-    ) -> int:
-        """Durably audit-log the delivered per-Worker outcome of one
-        quarantine release request, alongside its overall applied/rejected
-        result.
-
-        Recorded unconditionally -- whether both Workers genuinely applied
-        the release, one or both rejected it (an unresolved attempt), or a
-        Worker's outcome could not be confirmed (disconnect/timeout) -- so
-        the audit trail always reflects what actually happened rather than
-        only ever recording success.
-        """
-
-        with self._transaction():
-            return self._event(
-                "pair_quarantine_release_outcome",
-                {
-                    "route_id": route_id,
-                    "symbol": symbol,
-                    "actor": actor,
-                    "leader_outcome": leader_outcome,
-                    "follower_outcome": follower_outcome,
-                    "applied": applied,
-                },
-            )
-
     def authorize_pair_relay(self, envelope: dict[str, Any]) -> dict[str, Any]:
         """Authorize one opaque Worker-to-Worker envelope for immediate forwarding.
 
@@ -1298,8 +1196,7 @@ class ControlLedger:
         """Per-Worker uniqueness, enforced identically in both transactions.
 
         Neither Worker may appear in another route, in another live pairing
-        reservation, or in a conflicting live execution ownership -- including
-        a legacy Strategy Runtime that still holds either Worker's pair.
+        reservation, or in a conflicting live execution ownership.
         """
 
         pair = (leader_worker_id, follower_worker_id)
@@ -1320,17 +1217,12 @@ class ControlLedger:
                 )
         pair_key = _pair_key(leader_worker_id, follower_worker_id)
         for row in self._connection.execute(
-            """SELECT pair_key, mode FROM pair_execution_owners WHERE mode != 'shadow'"""
+            """SELECT pair_key FROM pair_execution_owners WHERE mode != 'shadow'"""
         ).fetchall():
-            owner_pair, owner_mode = str(row[0]), str(row[1])
+            owner_pair = str(row[0])
             members = set(owner_pair.split("|"))
             if not members & set(pair):
                 continue
-            if owner_mode == "strategy_runtime":
-                raise LedgerError(
-                    "The legacy Strategy Runtime still holds this Worker's pair live; "
-                    "the legacy Strategy Runtime and a Pair Execution Cell cannot both run for the same pair."
-                )
             if owner_pair != pair_key:
                 raise LedgerError(
                     "This Worker already holds a Pair Execution Cell execution-mode claim for another pair."
@@ -1967,7 +1859,6 @@ class ControlLedger:
                     pair_key VARCHAR NOT NULL,
                     mode VARCHAR NOT NULL,
                     owner_kind VARCHAR,
-                    trader_id VARCHAR,
                     claimed_at TIMESTAMPTZ NOT NULL,
                     PRIMARY KEY (pair_key, mode)
                 );
@@ -2043,6 +1934,12 @@ class ControlLedger:
             self._connection.execute("ALTER TABLE workers ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ")
             self._connection.execute("ALTER TABLE workers ADD COLUMN IF NOT EXISTS revoked_at TIMESTAMPTZ")
             self._connection.execute("ALTER TABLE workers DROP COLUMN IF EXISTS safety_state")
+            # Trader registration is removed: only Worker invites exist.  Any
+            # trader-role invite left in an existing ledger dies here rather
+            # than surviving as a usable credential.
+            self._connection.execute(
+                "UPDATE registration_invites SET status = 'expired' WHERE role = 'trader' AND status = 'active'"
+            )
             for table in (
                 "worker_freezes",
                 "manual_trading_target",
@@ -2095,21 +1992,24 @@ class ControlLedger:
     def _migrate_pair_execution_cell_schema(self) -> None:
         """Carry an existing ledger onto the Worker-initiated pairing schema.
 
-        Two shapes change. ``pair_execution_owners`` gains an explicit
-        ``owner_kind`` and loses its mandatory ``trader_id``, because a Pair
-        Execution Cell claim carries the fixed owner kind and no Trader
-        identity while the legacy Strategy Runtime keeps its own. And
-        ``pair_routes`` moves from an administrator-created, ``trader_id``-
-        bound row keyed by pair to a Worker-formed route keyed by a
-        controller-generated ``route_id`` with an explicit
-        ``ACTIVE``/``UNPAIRING`` state.
+        Three shapes change. ``pair_execution_owners`` gains an explicit
+        ``owner_kind``, drops its ``trader_id`` column entirely, and loses the
+        legacy ``strategy_runtime`` mode: execution ownership is Worker-pair
+        scoped only, with no Trader identity anywhere. ``pair_routes`` moves
+        from an administrator-created, ``trader_id``-bound row keyed by pair
+        to a Worker-formed route keyed by a controller-generated ``route_id``
+        with an explicit ``ACTIVE``/``UNPAIRING`` state.
 
         Existing pairings are preserved rather than dropped: each legacy row
         keeps its ordered leader/follower Workers, is issued a fresh globally
         unique ``route_id`` recorded in the never-reuse register, and starts
-        ``ACTIVE`` with its Trader binding discarded. Nothing here touches a
-        Worker's own durable state, so a migrated Worker reconciles its route
-        metadata on reconnect exactly as it would after any disagreement.
+        ``ACTIVE`` with its Trader binding discarded. Stale
+        ``strategy_runtime`` ownership rows are deleted instead: nothing in
+        this codebase can claim or honor that mode anymore, so keeping them
+        would permanently block those Workers from pairing. Nothing here
+        touches a Worker's own durable state, so a migrated Worker reconciles
+        its route metadata on reconnect exactly as it would after any
+        disagreement.
         """
 
         owner_columns = self._table_columns("pair_execution_owners")
@@ -2118,13 +2018,9 @@ class ControlLedger:
         self._connection.execute(
             "UPDATE pair_execution_owners SET owner_kind = mode WHERE owner_kind IS NULL"
         )
-        trader_nullability = self._connection.execute(
-            """SELECT is_nullable FROM information_schema.columns
-               WHERE table_schema = 'main' AND table_name = 'pair_execution_owners'
-                 AND column_name = 'trader_id'""",
-        ).fetchone()
-        if trader_nullability is not None and str(trader_nullability[0]).upper() == "NO":
-            self._connection.execute("ALTER TABLE pair_execution_owners ALTER trader_id DROP NOT NULL")
+        self._connection.execute("DELETE FROM pair_execution_owners WHERE mode = 'strategy_runtime'")
+        if "trader_id" in self._table_columns("pair_execution_owners"):
+            self._connection.execute("ALTER TABLE pair_execution_owners DROP COLUMN trader_id")
 
         route_columns = self._table_columns("pair_routes")
         if not route_columns or "route_id" in route_columns:
@@ -2159,17 +2055,13 @@ class ControlLedger:
         self._drop_orphaned_pair_cell_claims()
 
     def _drop_orphaned_pair_cell_claims(self) -> None:
-        """Strip the Trader binding from Pair Cell claims and drop stray ones.
+        """Drop Pair Cell claims that outlived their reservation or route.
 
-        A ``pair_execution_cell`` claim now carries the fixed owner kind and
-        no Trader identity, and exists only for the lifetime of a reservation
-        or a route.  Any claim left behind by an administrator-created route
-        would otherwise permanently block those two Workers from pairing.
+        A claim exists only for the lifetime of a reservation or a route.  Any
+        claim left behind by an administrator-created route would otherwise
+        permanently block those two Workers from pairing.
         """
 
-        self._connection.execute(
-            "UPDATE pair_execution_owners SET trader_id = NULL WHERE mode = 'pair_execution_cell'"
-        )
         self._connection.execute(
             """DELETE FROM pair_execution_owners WHERE mode = 'pair_execution_cell'
                AND pair_key NOT IN (SELECT pair_key FROM pair_routes)"""

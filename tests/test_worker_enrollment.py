@@ -19,7 +19,12 @@ from abt.controlplane.crypto import enrollment_payload
 from abt.worker.cli import (
     HTTPEnrollmentTransport,
     MetaTrader5Adapter,
+    _QuarantineReleaseCompletion,
+    _RediscoverCompletion,
+    _UnpairCompletion,
+    _one_shot_run,
     _pair_cell_startup_options,
+    _parser,
     _print_diagnostic,
     _select_follower,
     main,
@@ -346,25 +351,43 @@ class WorkerEnrollmentTests(unittest.TestCase):
         self.assertEqual(1, exit_code)
         self.assertIn("leader only", errors.getvalue())
 
-    def test_unpair_and_cancel_unpair_cannot_be_requested_together(self) -> None:
-        errors = io.StringIO()
+    def test_unpair_and_rediscover_are_standalone_commands_not_reconcile_flags(self) -> None:
         with patch("abt.worker.cli.sys.platform", "win32"):
-            exit_code = main(
-                [
-                    "reconcile",
-                    "--config",
-                    str(self.config_path),
-                    "--pair-cell-unpair",
-                    "--pair-cell-cancel-unpair",
-                ],
-                mt5_factory=FakeMT5,
-                transport_factory=FakeTransport,
-                key_store_factory=lambda _: FakeKeyStore(),
-                error_output=errors,
-            )
+            with self.assertRaises(SystemExit) as exited:
+                main(
+                    [
+                        "reconcile",
+                        "--config",
+                        str(self.config_path),
+                        "--pair-cell-unpair",
+                    ],
+                    mt5_factory=FakeMT5,
+                    transport_factory=FakeTransport,
+                    key_store_factory=lambda _: FakeKeyStore(),
+                    error_output=io.StringIO(),
+                )
+        self.assertEqual(2, exited.exception.code)
 
-        self.assertEqual(1, exit_code)
-        self.assertIn("cannot be requested together", errors.getvalue())
+        parser = _parser()
+        unpair = parser.parse_args(["unpair", "--config", str(self.config_path)])
+        self.assertEqual("unpair", unpair.command)
+        self.assertEqual(300.0, unpair.timeout)
+        rediscover = parser.parse_args(
+            ["rediscover", "--config", str(self.config_path), "--reason", "operator review"]
+        )
+        self.assertEqual("rediscover", rediscover.command)
+        self.assertEqual("operator review", rediscover.reason)
+        self.assertEqual(120.0, rediscover.timeout)
+        for view in ("allowed", "frozen", "edge", "excluded"):
+            parsed = parser.parse_args(["symbols", view, "--config", str(self.config_path)])
+            self.assertEqual("symbols", parsed.command)
+            self.assertEqual(view, parsed.symbols_view)
+        release = parser.parse_args(
+            ["quarantine", "release", "--symbol", "EURUSD", "--config", str(self.config_path)]
+        )
+        self.assertEqual("quarantine", release.command)
+        self.assertEqual("release", release.quarantine_action)
+        self.assertEqual("EURUSD", release.symbol)
 
     def test_an_omitted_pair_cell_role_means_available_follower(self) -> None:
         options = _pair_cell_startup_options(
@@ -402,7 +425,8 @@ class WorkerEnrollmentTests(unittest.TestCase):
         )
 
         self.assertIsNotNone(options.select_follower)
-        self.assertTrue(options.rediscover)
+        # Rediscovery left the reconcile flags: it is a standalone command now.
+        self.assertFalse(options.rediscover)
 
     def test_an_unattended_leader_with_the_flag_gets_no_selector(self) -> None:
         options = _pair_cell_startup_options(

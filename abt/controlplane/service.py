@@ -66,22 +66,6 @@ class LoginRequest(BaseModel):
     password: str = Field(min_length=20)
 
 
-class PairQuarantineReleaseRequest(BaseModel):
-    """One operator's explicit, audited release of one quarantined product.
-
-    The pair is named by its ``route_id`` alone -- a Pair Execution Cell
-    route binds no Trader identity -- and ``actor`` is intentionally not a
-    client-supplied field: it is always the authenticated admin session's own
-    username, so the audit trail cannot be forged by the request body.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    route_id: str = Field(min_length=1)
-    symbol: str = Field(min_length=1)
-    reason: str = Field(min_length=1)
-
-
 class EnrollmentRequest(BaseModel):
     registration_invite: str = Field(min_length=1, max_length=512)
     login: int = Field(gt=0)
@@ -102,7 +86,7 @@ class EnrollmentRequest(BaseModel):
 
 
 class RegistrationInviteRequest(BaseModel):
-    role: Literal["worker", "trader"]
+    role: Literal["worker"]
 
 
 
@@ -442,82 +426,6 @@ def create_app(
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-    @app.post("/api/admin/pairs/quarantine/release")
-    async def release_pair_quarantine_route(
-        payload: PairQuarantineReleaseRequest,
-        abt_admin_session: Annotated[str | None, Cookie()] = None,
-        x_csrf_token: Annotated[str | None, Header()] = None,
-    ) -> dict[str, object]:
-        """Explicitly, audibly release one quarantined product for a Worker pair.
-
-        This is an authenticated route-level operator action, not lifecycle
-        ownership: it is authorized against the same live ``route_id`` as any
-        relayed envelope, names no Trader, and the controller neither tracks
-        quarantines nor decides whether a release may take effect.
-        Quarantine is per-Worker durable state with no controller-side
-        mirror, and ``PairExecutionCell`` silently rejects a release while an
-        attempt is unresolved -- it never raises and never reports whether a
-        release actually took effect. So this route never claims success on
-        a fire-and-forget push alone: it sends a correlated request to both
-        the leader and follower Worker session and awaits each one's own
-        genuine applied/rejected outcome (a Worker that never had the symbol
-        quarantined counts as applied -- there is nothing to release there),
-        and only reports success if *both* applied. A rejection, a timeout,
-        or either Worker being disconnected is reported as a failure with
-        whatever per-worker outcome is known, and the request may always be
-        safely retried once the blocking condition (unresolved attempt,
-        disconnected Worker) is resolved -- releasing an already-released (or
-        never-quarantined) product is itself always a safe, applied no-op.
-        """
-
-        username = _require_admin(ledger, abt_admin_session, x_csrf_token, require_csrf=True)
-        try:
-            release = ledger.release_pair_quarantine(
-                route_id=payload.route_id,
-                symbol=payload.symbol,
-                actor=username,
-                reason=payload.reason,
-            )
-            leader_connection = _connected_worker_session(
-                worker_connections,
-                cast(str, release["leader_worker_id"]),
-                reason="The leader Worker must be connected to receive the quarantine release.",
-            )
-            follower_connection = _connected_worker_session(
-                worker_connections,
-                cast(str, release["follower_worker_id"]),
-                reason="The follower Worker must be connected to receive the quarantine release.",
-            )
-        except LedgerError as error:
-            raise HTTPException(status_code=_ledger_error_status(error), detail=str(error)) from error
-
-        release = jsonable_encoder(release)
-        leader_outcome, follower_outcome = await asyncio.gather(
-            _request_pair_cell_quarantine_release(leader_connection, release, request_id=str(uuid4())),
-            _request_pair_cell_quarantine_release(follower_connection, release, request_id=str(uuid4())),
-        )
-        applied = leader_outcome == "applied" and follower_outcome == "applied"
-        ledger.record_pair_quarantine_release_outcome(
-            route_id=payload.route_id,
-            symbol=payload.symbol,
-            actor=username,
-            leader_outcome=leader_outcome,
-            follower_outcome=follower_outcome,
-            applied=applied,
-        )
-        body = {
-            "status": "released" if applied else "rejected",
-            "route_id": payload.route_id,
-            "symbol": release["symbol"],
-            "actor": release["actor"],
-            "reason": release["reason"],
-            "leader_outcome": leader_outcome,
-            "follower_outcome": follower_outcome,
-        }
-        if not applied:
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=body)
-        return body
-
     @app.post("/api/admin/logout", status_code=status.HTTP_204_NO_CONTENT)
     def logout(
         abt_admin_session: Annotated[str | None, Cookie()] = None,
@@ -793,16 +701,6 @@ def create_app(
                     _handle_pair_cell_control_message(
                         ledger, worker_connections, worker.worker_id, connection, request
                     )
-                elif (
-                    message_type == "pair_cell_quarantine_release_result"
-                    and set(request) == {"type", "request_id", "symbol", "outcome"}
-                    and isinstance(request.get("request_id"), str)
-                    and request["request_id"]
-                    and isinstance(request.get("symbol"), str)
-                    and request["symbol"]
-                    and request.get("outcome") in ("applied", "rejected")
-                ):
-                    _record_pair_cell_quarantine_release_result(connection, request)
                 else:
                     raise ValueError("Invalid protocol message.")
         except WebSocketDisconnect as error:
@@ -967,34 +865,6 @@ async def _request_worker_relay(
         connection.pending.pop(request.request_id, None)
 
 
-async def _request_pair_cell_quarantine_release(
-    connection: _WorkerSessionConnection,
-    release: dict[str, object],
-    *,
-    request_id: str,
-) -> str:
-    """Ask one Worker to apply this quarantine release and await its own
-    genuine applied/rejected outcome; a timeout or mid-flight disconnect
-    never counts as applied -- it is reported as ``"unknown"`` so the
-    caller never mistakes "we don't know" for success.
-    """
-
-    message = {
-        "type": "pair_cell_quarantine_release_request",
-        "request_id": request_id,
-        "symbol": release["symbol"],
-        "actor": release["actor"],
-        "reason": release["reason"],
-        "observed_at": release["observed_at"],
-    }
-    try:
-        response = await _request_worker_relay(connection, timeout=15, message=message)
-    except (asyncio.TimeoutError, LedgerError):
-        return "unknown"
-    outcome = response.get("outcome")
-    return cast(str, outcome) if outcome in ("applied", "rejected") else "unknown"
-
-
 def _push_worker_relay(connection: _WorkerSessionConnection, message: dict[str, object]) -> None:
     """Enqueue one fire-and-forget push through the connection's single writer."""
 
@@ -1007,26 +877,6 @@ def _push_worker_relay(connection: _WorkerSessionConnection, message: dict[str, 
 
 
 
-
-
-def _record_pair_cell_quarantine_release_result(
-    connection: _WorkerSessionConnection,
-    request: dict[str, object],
-) -> None:
-    """Resolve the pending admin quarantine-release request this Worker's
-    reply correlates to, by ``request_id``.
-
-    A reply with no matching pending request (already timed out, or a
-    stray/duplicate resend) is safely ignored: whichever side is still
-    waiting on the admin route either already gave up (timeout) or was
-    already satisfied.
-    """
-
-    pending = connection.pending.pop(cast(str, request["request_id"]), None)
-    if pending is None:
-        return
-    if not pending.future.done():
-        pending.future.set_result(request)
 
 
 async def _relay_pair_cell_envelope(
