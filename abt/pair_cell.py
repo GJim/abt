@@ -59,6 +59,7 @@ discovery, unpair, and crash races are reproducible without a live broker.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
+from collections import deque
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_EVEN
@@ -104,6 +105,7 @@ class PairExecutionCellError(RuntimeError):
 
 Role = Literal["leader", "follower"]
 ExecutionMode = Literal["live", "shadow"]
+EntryMode = Literal["edge", "donchian", "momentum"]
 Direction = Literal["LONG", "SHORT"]
 FillingMode = Literal["FOK", "IOC"]
 RouteState = Literal["ACTIVE", "UNPAIRING"]
@@ -547,12 +549,22 @@ _RISK_FIELDS = (
     "trade_loss_fraction",
 )
 
-DEFAULT_MODE: ExecutionMode = "live"
+DEFAULT_MODE: ExecutionMode = "shadow"
+DEFAULT_ENTRY_MODE: EntryMode = "edge"
+DEFAULT_TREND_LOOKBACK_SECONDS = 1800.0
+DEFAULT_TREND_BREAKOUT_BUFFER_POINTS = "2"
+DEFAULT_TREND_MIN_RANGE_POINTS = "12"
+DEFAULT_TREND_MOMENTUM_T_SECONDS = 120.0
+DEFAULT_TREND_VOL_WINDOW_SECONDS = 600.0
+DEFAULT_TREND_MOMENTUM_K = "2.0"
+DEFAULT_TREND_MIN_MOM_POINTS = "5"
+DEFAULT_TREND_MAX_SPREAD_POINTS = "8"
+DEFAULT_TREND_MIN_COVERAGE = 0.8
 DEFAULT_STRATEGY_BUDGET_USD = "0"
 DEFAULT_ENTRY_EDGE_POINTS = "4"
-DEFAULT_MAXIMUM_MARGIN_FRACTION = "0.10"
-DEFAULT_DAILY_LOSS_FRACTION = "0.03"
-DEFAULT_TRADE_LOSS_FRACTION = "0.02"
+DEFAULT_MAXIMUM_MARGIN_FRACTION = "0.01"
+DEFAULT_DAILY_LOSS_FRACTION = "0.02"
+DEFAULT_TRADE_LOSS_FRACTION = "0.01"
 DEFAULT_MAXIMUM_LOSS_PER_TRADE_USD = "40"
 DEFAULT_DAILY_LOSS_WARNING_THRESHOLD_USD = "20"
 DEFAULT_QUOTE_MAX_AGE_SECONDS = 1.0
@@ -568,6 +580,16 @@ SHARED_POLICY_KEYS = (
     "mode",
     "strategy_budget_usd",
     "entry_edge_points",
+    "entry_mode",
+    "trend_lookback_seconds",
+    "trend_breakout_buffer_points",
+    "trend_min_range_points",
+    "trend_momentum_T_seconds",
+    "trend_vol_window_seconds",
+    "trend_momentum_k",
+    "trend_min_mom_points",
+    "trend_max_spread_points",
+    "trend_min_coverage",
     "quote_max_age_seconds",
     "quote_max_skew_seconds",
     "follower_confirmation_timeout_seconds",
@@ -603,6 +625,16 @@ def default_shared_policy_values() -> dict[str, object]:
         "mode": DEFAULT_MODE,
         "strategy_budget_usd": DEFAULT_STRATEGY_BUDGET_USD,
         "entry_edge_points": DEFAULT_ENTRY_EDGE_POINTS,
+        "entry_mode": DEFAULT_ENTRY_MODE,
+        "trend_lookback_seconds": DEFAULT_TREND_LOOKBACK_SECONDS,
+        "trend_breakout_buffer_points": DEFAULT_TREND_BREAKOUT_BUFFER_POINTS,
+        "trend_min_range_points": DEFAULT_TREND_MIN_RANGE_POINTS,
+        "trend_momentum_T_seconds": DEFAULT_TREND_MOMENTUM_T_SECONDS,
+        "trend_vol_window_seconds": DEFAULT_TREND_VOL_WINDOW_SECONDS,
+        "trend_momentum_k": DEFAULT_TREND_MOMENTUM_K,
+        "trend_min_mom_points": DEFAULT_TREND_MIN_MOM_POINTS,
+        "trend_max_spread_points": DEFAULT_TREND_MAX_SPREAD_POINTS,
+        "trend_min_coverage": DEFAULT_TREND_MIN_COVERAGE,
         "quote_max_age_seconds": DEFAULT_QUOTE_MAX_AGE_SECONDS,
         "quote_max_skew_seconds": DEFAULT_QUOTE_MAX_SKEW_SECONDS,
         "follower_confirmation_timeout_seconds": DEFAULT_FOLLOWER_CONFIRMATION_TIMEOUT_SECONDS,
@@ -884,12 +916,54 @@ class StrategyPolicy:
     trading_blackout_end_ny: str = DEFAULT_TRADING_BLACKOUT_END_NY
     mode: ExecutionMode = DEFAULT_MODE
     strategy_budget_usd: str = DEFAULT_STRATEGY_BUDGET_USD
+    entry_mode: EntryMode = DEFAULT_ENTRY_MODE
+    trend_lookback_seconds: float = DEFAULT_TREND_LOOKBACK_SECONDS
+    trend_breakout_buffer_points: str = DEFAULT_TREND_BREAKOUT_BUFFER_POINTS
+    trend_min_range_points: str = DEFAULT_TREND_MIN_RANGE_POINTS
+    trend_momentum_T_seconds: float = DEFAULT_TREND_MOMENTUM_T_SECONDS
+    trend_vol_window_seconds: float = DEFAULT_TREND_VOL_WINDOW_SECONDS
+    trend_momentum_k: str = DEFAULT_TREND_MOMENTUM_K
+    trend_min_mom_points: str = DEFAULT_TREND_MIN_MOM_POINTS
+    trend_max_spread_points: str = DEFAULT_TREND_MAX_SPREAD_POINTS
+    trend_min_coverage: float = DEFAULT_TREND_MIN_COVERAGE
 
     def __post_init__(self) -> None:
         if not self.policy_version:
             raise PairExecutionCellError("A strategy policy requires a version.")
         if _to_decimal(self.entry_edge_points) is None:
             raise PairExecutionCellError("entry_edge_points must be a finite number.")
+        if self.entry_mode not in ("edge", "donchian", "momentum"):
+            raise PairExecutionCellError("entry_mode must be 'edge', 'donchian' or 'momentum'.")
+        for name in (
+            "trend_lookback_seconds",
+            "trend_momentum_T_seconds",
+            "trend_vol_window_seconds",
+        ):
+            value = getattr(self, name)
+            if (
+                not isinstance(value, (int, float))
+                or isinstance(value, bool)
+                or not math.isfinite(value)
+                or value <= 0
+            ):
+                raise PairExecutionCellError(f"{name} must be a positive number.")
+        for name in (
+            "trend_breakout_buffer_points",
+            "trend_min_range_points",
+            "trend_momentum_k",
+            "trend_min_mom_points",
+            "trend_max_spread_points",
+        ):
+            if _to_decimal(getattr(self, name)) is None:
+                raise PairExecutionCellError(f"{name} must be a finite number.")
+        coverage = self.trend_min_coverage
+        if (
+            not isinstance(coverage, (int, float))
+            or isinstance(coverage, bool)
+            or not math.isfinite(coverage)
+            or not 0 < coverage <= 1
+        ):
+            raise PairExecutionCellError("trend_min_coverage must be in (0, 1].")
         for name in (
             "quote_max_age_seconds",
             "quote_max_skew_seconds",
@@ -945,6 +1019,16 @@ class StrategyPolicy:
             "policy_version": self.policy_version,
             "strategy_budget_usd": self.strategy_budget_usd,
             "entry_edge_points": self.entry_edge_points,
+            "entry_mode": self.entry_mode,
+            "trend_lookback_seconds": self.trend_lookback_seconds,
+            "trend_breakout_buffer_points": self.trend_breakout_buffer_points,
+            "trend_min_range_points": self.trend_min_range_points,
+            "trend_momentum_T_seconds": self.trend_momentum_T_seconds,
+            "trend_vol_window_seconds": self.trend_vol_window_seconds,
+            "trend_momentum_k": self.trend_momentum_k,
+            "trend_min_mom_points": self.trend_min_mom_points,
+            "trend_max_spread_points": self.trend_max_spread_points,
+            "trend_min_coverage": self.trend_min_coverage,
             "quote_max_age_seconds": self.quote_max_age_seconds,
             "quote_max_skew_seconds": self.quote_max_skew_seconds,
             "follower_confirmation_timeout_seconds": self.follower_confirmation_timeout_seconds,
@@ -969,9 +1053,36 @@ def _policy_from_canonical(value: Mapping[str, object]) -> StrategyPolicy:
             "The persisted policy uses removed flatten_at_ny semantics; "
             "both accounts must be empty and accept a fresh policy."
         )
+    raw_entry_mode = str(value.get("entry_mode", DEFAULT_ENTRY_MODE))
+    if raw_entry_mode not in ("edge", "donchian", "momentum"):
+        raise PairExecutionCellError("entry_mode must be 'edge', 'donchian' or 'momentum'.")
     return StrategyPolicy(
         policy_version=cast(str, value["policy_version"]),
         entry_edge_points=cast(str, value["entry_edge_points"]),
+        entry_mode=cast(EntryMode, raw_entry_mode),
+        trend_lookback_seconds=float(
+            cast(float, value.get("trend_lookback_seconds", DEFAULT_TREND_LOOKBACK_SECONDS))
+        ),
+        trend_breakout_buffer_points=str(
+            value.get("trend_breakout_buffer_points", DEFAULT_TREND_BREAKOUT_BUFFER_POINTS)
+        ),
+        trend_min_range_points=str(
+            value.get("trend_min_range_points", DEFAULT_TREND_MIN_RANGE_POINTS)
+        ),
+        trend_momentum_T_seconds=float(
+            cast(float, value.get("trend_momentum_T_seconds", DEFAULT_TREND_MOMENTUM_T_SECONDS))
+        ),
+        trend_vol_window_seconds=float(
+            cast(float, value.get("trend_vol_window_seconds", DEFAULT_TREND_VOL_WINDOW_SECONDS))
+        ),
+        trend_momentum_k=str(value.get("trend_momentum_k", DEFAULT_TREND_MOMENTUM_K)),
+        trend_min_mom_points=str(value.get("trend_min_mom_points", DEFAULT_TREND_MIN_MOM_POINTS)),
+        trend_max_spread_points=str(
+            value.get("trend_max_spread_points", DEFAULT_TREND_MAX_SPREAD_POINTS)
+        ),
+        trend_min_coverage=float(
+            cast(float, value.get("trend_min_coverage", DEFAULT_TREND_MIN_COVERAGE))
+        ),
         quote_max_age_seconds=float(cast(float, value["quote_max_age_seconds"])),
         quote_max_skew_seconds=float(cast(float, value["quote_max_skew_seconds"])),
         leader_risk=_risk_from_canonical(cast(Mapping[str, object], value["leader_risk"])),
@@ -1025,10 +1136,23 @@ def canonical_policy_from_acceptance(
             "strategy_budget_usd must be '0' (each leg uses its own startup balance)"
             " or a positive USD amount."
         )
+    raw_entry_mode = str(values["entry_mode"])
+    if raw_entry_mode not in ("edge", "donchian", "momentum"):
+        raise PairExecutionCellError("entry_mode must be 'edge', 'donchian' or 'momentum'.")
     return StrategyPolicy(
         policy_version=policy_version,
         strategy_budget_usd=unified_budget,
         entry_edge_points=str(values["entry_edge_points"]),
+        entry_mode=cast(EntryMode, raw_entry_mode),
+        trend_lookback_seconds=float(cast(float, values["trend_lookback_seconds"])),
+        trend_breakout_buffer_points=str(values["trend_breakout_buffer_points"]),
+        trend_min_range_points=str(values["trend_min_range_points"]),
+        trend_momentum_T_seconds=float(cast(float, values["trend_momentum_T_seconds"])),
+        trend_vol_window_seconds=float(cast(float, values["trend_vol_window_seconds"])),
+        trend_momentum_k=str(values["trend_momentum_k"]),
+        trend_min_mom_points=str(values["trend_min_mom_points"]),
+        trend_max_spread_points=str(values["trend_max_spread_points"]),
+        trend_min_coverage=float(cast(float, values["trend_min_coverage"])),
         quote_max_age_seconds=float(cast(float, values["quote_max_age_seconds"])),
         quote_max_skew_seconds=float(cast(float, values["quote_max_skew_seconds"])),
         leader_risk=_risk_with_unified_budget(leader_risk, unified_budget),
@@ -1610,6 +1734,97 @@ def edge_value(
     return leader_quote.bid - follower_quote.ask
 
 
+# -- trend-following entry (leader-only, 1-second resampled mid buffer) ------ #
+#
+# Both trend modes read the same per-product deque of ``(epoch_second, mid)``
+# built from live leader ticks plus Phase-B seed points.  Resampling to one
+# point per second bounds memory deterministically (``lookback + grace``
+# entries) so a burst tick rate can never shrink coverage -- the failure mode
+# a raw-tick ``maxlen`` cap would have.
+
+_TREND_SEED_GRACE_SECONDS = 5.0
+_TREND_BUFFER_MAXLEN = 4096
+
+
+def _trend_bucket(epoch_seconds: float) -> int:
+    return int(epoch_seconds)
+
+
+def donchian_bias(
+    history: object,
+    mid_now: Decimal,
+    *,
+    now_epoch: float,
+    lookback_seconds: float,
+    buffer_points: Decimal,
+    min_range_points: Decimal,
+    min_coverage: float,
+) -> tuple[Direction | None, Decimal, str]:
+    """Donchian breakout bias from 1-second mids, excluding the current bucket."""
+
+    points: list[tuple[int, Decimal]] = list(history)  # type: ignore[arg-type]
+    current_bucket = _trend_bucket(now_epoch)
+    window = [(sec, mid) for sec, mid in points if current_bucket - lookback_seconds <= sec < current_bucket]
+    if len(window) < 10:
+        return None, Decimal(0), "warming: too few samples"
+    span = window[-1][0] - window[0][0]
+    coverage = span / lookback_seconds if lookback_seconds > 0 else 0
+    if coverage < min_coverage:
+        return None, Decimal(0), f"warming: coverage {coverage:.2f} below minimum"
+    mids = [mid for _, mid in window]
+    upper = max(mids)
+    lower = min(mids)
+    price_range = upper - lower
+    if price_range < min_range_points:
+        return None, Decimal(0), "flat: range below minimum"
+    if mid_now - upper > buffer_points:
+        return "LONG", mid_now - upper, "breakout long"
+    if lower - mid_now > buffer_points:
+        return "SHORT", lower - mid_now, "breakout short"
+    return None, Decimal(0), "no breakout"
+
+
+def momentum_bias(
+    history: object,
+    mid_now: Decimal,
+    *,
+    now_epoch: float,
+    t_seconds: float,
+    vol_window_seconds: float,
+    k: Decimal,
+    min_mom_points: Decimal,
+    min_coverage: float,
+) -> tuple[Direction | None, Decimal, str]:
+    """Normalized-momentum bias: ``score = (mid_now - mid_{now-T}) / stdev``."""
+
+    points: list[tuple[int, Decimal]] = list(history)  # type: ignore[arg-type]
+    current_bucket = _trend_bucket(now_epoch)
+    if not points:
+        return None, Decimal(0), "warming: no samples"
+    ref_candidates = [(sec, mid) for sec, mid in points if sec <= current_bucket - t_seconds]
+    if not ref_candidates:
+        return None, Decimal(0), "warming: no reference point"
+    ref_mid = ref_candidates[-1][1]
+    mom = mid_now - ref_mid
+    vol_points = [float(mid) for sec, mid in points if current_bucket - vol_window_seconds <= sec < current_bucket]
+    if len(vol_points) < 10:
+        return None, Decimal(0), "warming: too few volatility samples"
+    vol_span = points[-1][0] - points[0][0]
+    if vol_span / vol_window_seconds < min_coverage:
+        return None, Decimal(0), "warming: volatility coverage below minimum"
+    mean = sum(vol_points) / len(vol_points)
+    variance = sum((x - mean) ** 2 for x in vol_points) / len(vol_points)
+    vol = Decimal(str(variance**0.5)) if variance > 0 else Decimal(0)
+    if vol <= 0:
+        if abs(mom) >= min_mom_points:
+            return ("LONG" if mom > 0 else "SHORT"), abs(mom), "impulse on flat volatility"
+        return None, Decimal(0), "flat volatility"
+    score = mom / vol
+    if abs(score) >= k and abs(mom) >= min_mom_points:
+        return ("LONG" if mom > 0 else "SHORT"), abs(score), f"momentum score {score:.2f}"
+    return None, Decimal(0), f"score {score:.2f} below threshold"
+
+
 def compute_protection(
     *,
     entry: Decimal,
@@ -2047,6 +2262,28 @@ class QuarantineReleaseEvent:
 
 
 @dataclass(frozen=True, slots=True)
+class TrendSeedPoint:
+    """One Phase-B historical tick used only to prefill the trend buffer."""
+
+    broker_time: datetime
+    bid: Decimal
+    ask: Decimal
+
+
+@dataclass(frozen=True, slots=True)
+class TrendSeedEvent:
+    """Phase-B history prefill: fills the 1-second trend buffer, nothing else.
+
+    Never touches ``_local_quotes``/relay/``_decided_quotes``: a seed point can
+    never look like fresh market evidence or trigger an attempt by itself.
+    """
+
+    product_id: str
+    points: tuple[TrendSeedPoint, ...]
+    degraded: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class RelayEnvelopeReceived:
     """An authenticated, already identity/route-validated opaque envelope."""
 
@@ -2056,6 +2293,7 @@ class RelayEnvelopeReceived:
 PairCellEvent = (
     LocalQuoteEvent
     | LocalQuoteBatchEvent
+    | TrendSeedEvent
     | LocalCatalogEvent
     | RouteMetadataEvent
     | RediscoveryRequestEvent
@@ -2476,6 +2714,7 @@ class PairExecutionCell:
         self._local_quotes: dict[str, QuoteSnapshot] = {}
         self._peer_quotes: dict[str, QuoteSnapshot] = {}
         self._decided_quotes: dict[str, tuple[str, int, str, int]] = {}
+        self._trend_history: dict[str, deque[tuple[int, Decimal]]] = {}
         self._quote_epochs: dict[str, list[str]] = {}
         self._local_facts: ReadinessFactsEvent | None = None
         self._peer_session = True
@@ -3476,6 +3715,26 @@ class PairExecutionCell:
     def discovered_universe(self) -> DiscoveredUniverse | None:
         return self._universe
 
+    def trend_seed_request(self) -> tuple[str, float] | None:
+        """Phase-B prefill hint: ``(entry_mode, window_seconds)`` or ``None``.
+
+        ``None`` when no universe is installed or the effective entry mode is
+        the legacy ``edge`` gate, which reads no history at all.  Before a
+        policy is accepted the documented defaults size the window so the
+        buffer is already warm when the policy lands.
+        """
+
+        if self._universe is None:
+            return None
+        if self._policy is None:
+            return ("edge", max(DEFAULT_TREND_LOOKBACK_SECONDS, DEFAULT_TREND_VOL_WINDOW_SECONDS))
+        if self._policy.entry_mode == "edge":
+            return None
+        return (
+            self._policy.entry_mode,
+            max(self._policy.trend_lookback_seconds, self._policy.trend_vol_window_seconds),
+        )
+
     def discovery_reason(self) -> str:
         return self._discovery_reason
 
@@ -3862,6 +4121,11 @@ class PairExecutionCell:
         self._last_plan_quote_set = frozenset()
         self._suspended_products = {}
         self._decided_quotes = {}
+        self._trend_history = {
+            product_id: history
+            for product_id, history in self._trend_history.items()
+            if universe.product(product_id) is not None
+        }
         self._local_quotes = {
             product_id: quote
             for product_id, quote in self._local_quotes.items()
@@ -4176,6 +4440,8 @@ class PairExecutionCell:
 
         if isinstance(event, LocalQuoteEvent):
             self._accept_local_quote(event)
+        elif isinstance(event, TrendSeedEvent):
+            self._apply_trend_seed(event)
         elif isinstance(event, LocalQuoteBatchEvent):
             accepted = tuple(q for q in event.quotes if self._accept_local_quote(q, publish=False))
             if accepted:
@@ -4701,9 +4967,79 @@ class PairExecutionCell:
             calibration=event.calibration,
         )
         self._local_quotes[event.product_id] = quote
+        self._record_trend_mid(event.product_id, quote.bid, quote.ask, quote.broker_time)
         if publish:
             self._publish_quote(quote)
         return True
+
+    def _trend_window_seconds(self) -> float:
+        policy = self._policy
+        if policy is None:
+            return max(DEFAULT_TREND_LOOKBACK_SECONDS, DEFAULT_TREND_VOL_WINDOW_SECONDS)
+        return max(policy.trend_lookback_seconds, policy.trend_vol_window_seconds)
+
+    def _record_trend_mid(
+        self, product_id: str, bid: Decimal, ask: Decimal, broker_time: datetime
+    ) -> None:
+        """Append one 1-second resampled mid; time-eviction is the only trim."""
+
+        if bid <= 0 or ask <= 0 or ask < bid:
+            return
+        try:
+            epoch = _as_utc(broker_time).timestamp()
+        except PairExecutionCellError:
+            return
+        bucket = _trend_bucket(epoch)
+        mid = (bid + ask) / 2
+        history = self._trend_history.get(product_id)
+        if history is None:
+            history = deque(maxlen=_TREND_BUFFER_MAXLEN)
+            self._trend_history[product_id] = history
+        if history and history[-1][0] == bucket:
+            history[-1] = (bucket, mid)
+            return
+        if history and bucket < history[-1][0]:
+            return  # regressed tick: never move the buffer backwards
+        history.append((bucket, mid))
+        cutoff = bucket - int(self._trend_window_seconds()) - int(_TREND_SEED_GRACE_SECONDS)
+        while history and history[0][0] < cutoff:
+            history.popleft()
+
+    def _apply_trend_seed(self, event: TrendSeedEvent) -> None:
+        """Phase-B prefill: merge historical mids into the 1-second buffer only."""
+
+        if self._universe is not None and self._universe.product(event.product_id) is None:
+            return
+        if not event.points:
+            return
+        history = self._trend_history.get(event.product_id)
+        if history is None:
+            history = deque(maxlen=_TREND_BUFFER_MAXLEN)
+            self._trend_history[event.product_id] = history
+        merged: dict[int, Decimal] = {sec: mid for sec, mid in history}
+        for point in event.points:
+            if point.bid <= 0 or point.ask <= 0 or point.ask < point.bid:
+                continue
+            try:
+                epoch = _as_utc(point.broker_time).timestamp()
+            except PairExecutionCellError:
+                continue
+            merged[_trend_bucket(epoch)] = (point.bid + point.ask) / 2
+        if not merged:
+            return
+        try:
+            now_bucket = _trend_bucket(_as_utc(self._now).timestamp())
+        except PairExecutionCellError:
+            now_bucket = max(merged)
+        cutoff = now_bucket - int(self._trend_window_seconds()) - int(_TREND_SEED_GRACE_SECONDS)
+        kept = sorted(sec for sec in merged if sec >= cutoff)
+        history.clear()
+        for sec in kept[-_TREND_BUFFER_MAXLEN:]:
+            history.append((sec, merged[sec]))
+        self._transition(
+            "trend_seed_applied",
+            f"{event.product_id} points={len(history)} degraded={int(event.degraded)}",
+        )
 
     def _note_epoch(self, product_id: str, epoch: str) -> None:
         seen = self._quote_epochs.setdefault(product_id, [])
@@ -5236,11 +5572,61 @@ class PairExecutionCell:
 
     # -- leader: candidate admission and ranking ----------------------------- #
 
+    def _trend_bias_for_product(
+        self,
+        product_id: str,
+        local_quote: QuoteSnapshot,
+        point: Decimal,
+    ) -> tuple[Direction | None, Decimal, str]:
+        """Leader-only trend bias from the 1-second mid buffer plus spread gate."""
+
+        policy = self._policy
+        assert policy is not None
+        spread_points = (local_quote.ask - local_quote.bid) / point if point > 0 else Decimal(0)
+        max_spread = _to_decimal(policy.trend_max_spread_points)
+        if max_spread is not None and spread_points > max_spread:
+            return None, Decimal(0), f"spread {spread_points:.1f} above maximum"
+        history = self._trend_history.get(product_id, ())
+        mid_now = (local_quote.bid + local_quote.ask) / 2
+        try:
+            now_epoch = _as_utc(self._now).timestamp()
+        except PairExecutionCellError:
+            return None, Decimal(0), "clock unavailable"
+        if policy.entry_mode == "donchian":
+            buffer_points = _to_decimal(policy.trend_breakout_buffer_points) or Decimal(0)
+            min_range = _to_decimal(policy.trend_min_range_points) or Decimal(0)
+            return donchian_bias(
+                history,
+                mid_now,
+                now_epoch=now_epoch,
+                lookback_seconds=policy.trend_lookback_seconds,
+                buffer_points=buffer_points,
+                min_range_points=min_range,
+                min_coverage=policy.trend_min_coverage,
+            )
+        if policy.entry_mode == "momentum":
+            k = _to_decimal(policy.trend_momentum_k) or Decimal(0)
+            min_mom = _to_decimal(policy.trend_min_mom_points) or Decimal(0)
+            return momentum_bias(
+                history,
+                mid_now,
+                now_epoch=now_epoch,
+                t_seconds=policy.trend_momentum_T_seconds,
+                vol_window_seconds=policy.trend_vol_window_seconds,
+                k=k,
+                min_mom_points=min_mom,
+                min_coverage=policy.trend_min_coverage,
+            )
+        return None, Decimal(0), f"unknown entry_mode {policy.entry_mode}"
+
     def _candidates(self) -> list[tuple[Decimal, Decimal, str, Direction]]:
         """Leader-side admitted candidates ordered by the specification's keys.
 
         No candidate is evaluated, ranked, or selected while any valid positive
         plan is missing, and none at all while the route is ``UNPAIRING``.
+        ``entry_mode=edge`` keeps the legacy cross-broker spread gate;
+        ``donchian``/``momentum`` replace it with a leader-only trend gate
+        while every other safety gate stays identical.
         """
 
         policy = self._policy
@@ -5266,6 +5652,33 @@ class PairExecutionCell:
                 continue
             if self._decided_quotes.get(product_id) == _quote_key(local_quote, peer_quote):
                 continue  # one attempt per decision quote revision; never a retry storm
+            if policy.entry_mode != "edge":
+                plan_for_point = self._plans.get((product_id, "LONG")) or self._plans.get(
+                    (product_id, "SHORT")
+                )
+                if plan_for_point is None:
+                    continue
+                point = _to_decimal(plan_for_point.canonical_point)
+                if point is None or point <= 0:
+                    continue
+                bias, strength, _reason = self._trend_bias_for_product(
+                    product_id, local_quote, point
+                )
+                if bias is None:
+                    continue
+                sized = self._pair_lots(product_id, bias)
+                if sized is None:
+                    continue
+                lots, leader_plan, follower_plan = sized
+                if local_quote.symbol != leader_plan.symbol or peer_quote.symbol != follower_plan.symbol:
+                    continue
+                conservative_usd_per_point = min(
+                    cast(Decimal, _to_decimal(leader_plan.usd_per_point_per_lot)),
+                    cast(Decimal, _to_decimal(follower_plan.usd_per_point_per_lot)),
+                )
+                expected_move_usd = strength * conservative_usd_per_point * lots
+                ranked.append((expected_move_usd, strength, product_id, bias))
+                continue
             for leader_direction in ("LONG", "SHORT"):
                 direction = cast(Direction, leader_direction)
                 sized = self._pair_lots(product_id, direction)
@@ -5295,12 +5708,16 @@ class PairExecutionCell:
     def entry_candidates(self) -> list[dict[str, object]]:
         """Observable, deterministically ranked leader candidate admission."""
 
+        policy = self._policy
+        entry_mode = policy.entry_mode if policy is not None else DEFAULT_ENTRY_MODE
+        score_key = "edge_points" if entry_mode == "edge" else "trend_strength"
         return [
             {
                 "expected_edge_usd": str(edge_usd),
-                "edge_points": str(points),
+                score_key: str(points),
                 "product_id": product_id,
                 "leader_direction": direction,
+                "entry_mode": entry_mode,
             }
             for edge_usd, points, product_id, direction in self._candidates()
         ]
@@ -5331,14 +5748,21 @@ class PairExecutionCell:
             return "peer admission blocked: remaining-loss allowance has not been reseeded"
         candidates = self._candidates()
         if not candidates:
+            if policy.entry_mode == "edge":
+                return (
+                    "no entry candidate passed sizing, quote freshness/skew, quarantine, "
+                    f"and edge threshold gates (entry_edge_points={policy.entry_edge_points})"
+                )
             return (
                 "no entry candidate passed sizing, quote freshness/skew, quarantine, "
-                f"and edge threshold gates (entry_edge_points={policy.entry_edge_points})"
+                f"and trend gates (entry_mode={policy.entry_mode})"
             )
         candidate = candidates[0]
+        score_key = "edge_points" if policy.entry_mode == "edge" else "trend_strength"
         return (
             f"entry candidate selected: product_id={candidate[2]} direction={candidate[3]} "
-            f"edge_points={candidate[1]} expected_edge_usd={candidate[0]}"
+            f"{score_key}={candidate[1]} expected_edge_usd={candidate[0]} "
+            f"entry_mode={policy.entry_mode}"
         )
 
     # -- leader: immediate entry -------------------------------------------- #

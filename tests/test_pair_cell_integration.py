@@ -64,6 +64,7 @@ SYMBOL = "EURUSD"
 #: real-websocket round trip from being mistaken for stale market evidence.
 LEADER_CONFIG = parse_pair_cell_config(
     {
+        "mode": "live",
         "entry_edge_points": "1",
         "quote_max_age_seconds": 30.0,
         "quote_max_skew_seconds": 30.0,
@@ -560,9 +561,9 @@ class PairExecutionCellEndToEndTests(unittest.TestCase):
         self.assertEqual(1, len(pair.leader_mt5.positions))
         self.assertEqual(1, len(pair.follower_mt5.positions))
         # Both legs use exactly the common lots: the lower Worker capacity,
-        # 4 000 * 0.10 / 1 000 = 0.4 lots, never a fixed volume.
-        self.assertEqual(0.4, float(cast(float, pair.leader_mt5.positions[0]["volume"])))
-        self.assertEqual(0.4, float(cast(float, pair.follower_mt5.positions[0]["volume"])))
+        # 4 000 * 0.01 / 1 000 = 0.04 lots, never a fixed volume.
+        self.assertEqual(0.04, float(cast(float, pair.leader_mt5.positions[0]["volume"])))
+        self.assertEqual(0.04, float(cast(float, pair.follower_mt5.positions[0]["volume"])))
         for mt5 in (pair.leader_mt5, pair.follower_mt5):
             self.assertGreater(float(cast(float, mt5.positions[0]["sl"])), 0.0)
             # Asymmetric profit-max protection: SL-only stops with the

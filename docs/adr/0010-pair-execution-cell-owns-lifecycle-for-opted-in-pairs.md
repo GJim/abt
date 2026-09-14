@@ -6,6 +6,15 @@
 > removed, so the cell owns *every* live pair's lifecycle unconditionally. The
 > "legacy Strategy Runtime" mutual-exclusion guards below now only defend
 > against stale ledger rows, and "shadow" remains the sole alternative mode.
+>
+> **Defaults tightened 2026-09-13:** the synthesized production defaults are
+> now `shadow` mode (was `live`), `maximum_margin_fraction` `0.01` (was
+> `0.10`), `daily_loss_fraction` `0.02` (was `0.03`), and
+> `trade_loss_fraction` `0.01` (was `0.02`). The body below still quotes the
+> original numbers where it describes the prior decision; the living values
+> are `DEFAULT_MODE`, `DEFAULT_MAXIMUM_MARGIN_FRACTION`,
+> `DEFAULT_DAILY_LOSS_FRACTION`, and `DEFAULT_TRADE_LOSS_FRACTION` in
+> `abt/pair_cell.py`.
 
 Supersedes ADR-0009's lifecycle-owner placement, but only for Worker pairs
 running the Pair Execution Cell execution mode. ADR-0009's Strategy Runtime

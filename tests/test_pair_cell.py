@@ -46,6 +46,8 @@ from abt.pair_cell import (
     RouteAssignment,
     RouteMetadataEvent,
     StrategyPolicy,
+    TrendSeedEvent,
+    TrendSeedPoint,
     WorkerRiskLimits,
     RELEASE_PROPOSAL_TIMEOUT_SECONDS,
     build_pairing_acceptance,
@@ -54,8 +56,10 @@ from abt.pair_cell import (
     default_shared_policy_values,
     default_worker_risk_limits,
     discover_compatible_products,
+    donchian_bias,
     floor_to_volume_step,
     is_derived_product_identity,
+    momentum_bias,
     validate_configuration_authority,
 )
 from abt.worker.effect_journal import EffectJournalError, WorkerEffectJournal
@@ -78,15 +82,22 @@ _UNSET = object()
 
 # Each Worker authors its own block.  The follower's arrives verbatim in its
 # Pairing Acceptance payload and the leader may only transcribe it.
+# Fractions are pinned explicitly so behavior tests do not follow production
+# default changes; the defaults themselves are covered by
+# DefaultMaterializationTests.
 LEADER_RISK = WorkerRiskLimits(
     strategy_budget_usd="10000",
     maximum_margin_fraction="0.5",
     maximum_loss_per_trade_usd="150",
+    daily_loss_fraction="0.03",
+    trade_loss_fraction="0.02",
 )
 FOLLOWER_RISK = WorkerRiskLimits(
     strategy_budget_usd="4000",
     maximum_margin_fraction="0.5",
     maximum_loss_per_trade_usd="150",
+    daily_loss_fraction="0.03",
+    trade_loss_fraction="0.02",
 )
 CALIBRATED = BrokerClockCalibration(offset_seconds=0.0, error_seconds=0.0, status="calibrated")
 
@@ -611,6 +622,9 @@ class PairCellTestCase(unittest.TestCase):
 
     def policy(self, **shared: object) -> StrategyPolicy:
         values: dict[str, object] = {
+            # The harness exercises the live execution path; the synthesized
+            # production default (shadow) is covered by DefaultMaterializationTests.
+            "mode": "live",
             "entry_edge_points": "1",
             "quote_max_age_seconds": 2.0,
             "quote_max_skew_seconds": 1.0,
@@ -879,6 +893,16 @@ class RemovedArchitectureTests(unittest.TestCase):
                 "policy_version",
                 "strategy_budget_usd",
                 "entry_edge_points",
+                "entry_mode",
+                "trend_lookback_seconds",
+                "trend_breakout_buffer_points",
+                "trend_min_range_points",
+                "trend_momentum_T_seconds",
+                "trend_vol_window_seconds",
+                "trend_momentum_k",
+                "trend_min_mom_points",
+                "trend_max_spread_points",
+                "trend_min_coverage",
                 "quote_max_age_seconds",
                 "quote_max_skew_seconds",
                 "follower_confirmation_timeout_seconds",
@@ -1000,6 +1024,8 @@ class ConfigurationAuthorityTests(unittest.TestCase):
         for key, value in (
             ("strategy_budget_usd", "5000"),
             ("entry_edge_points", "4"),
+            ("entry_mode", "donchian"),
+            ("trend_lookback_seconds", 1800.0),
             ("quote_max_age_seconds", 1.0),
             ("quote_max_skew_seconds", 1.0),
             ("follower_confirmation_timeout_seconds", 5.0),
@@ -1044,9 +1070,19 @@ class DefaultMaterializationTests(unittest.TestCase):
         self.assertEqual(
             default_shared_policy_values(),
             {
-                "mode": "live",
+                "mode": "shadow",
                 "strategy_budget_usd": "0",
                 "entry_edge_points": "4",
+                "entry_mode": "edge",
+                "trend_lookback_seconds": 1800.0,
+                "trend_breakout_buffer_points": "2",
+                "trend_min_range_points": "12",
+                "trend_momentum_T_seconds": 120.0,
+                "trend_vol_window_seconds": 600.0,
+                "trend_momentum_k": "2.0",
+                "trend_min_mom_points": "5",
+                "trend_max_spread_points": "8",
+                "trend_min_coverage": 0.8,
                 "quote_max_age_seconds": 1.0,
                 "quote_max_skew_seconds": 1.0,
                 "follower_confirmation_timeout_seconds": 5.0,
@@ -1059,17 +1095,17 @@ class DefaultMaterializationTests(unittest.TestCase):
         )
         limits = default_worker_risk_limits(startup_balance_usd=12345.0, account_currency="USD")
         self.assertEqual(limits.strategy_budget_usd, "12345")
-        self.assertEqual(limits.maximum_margin_fraction, "0.10")
-        self.assertEqual(limits.daily_loss_fraction, "0.03")
-        self.assertEqual(limits.trade_loss_fraction, "0.02")
+        self.assertEqual(limits.maximum_margin_fraction, "0.01")
+        self.assertEqual(limits.daily_loss_fraction, "0.02")
+        self.assertEqual(limits.trade_loss_fraction, "0.01")
         self.assertEqual(limits.maximum_loss_per_trade_usd, "40")
 
     def test_the_default_budget_is_the_startup_balance_with_no_margin_headroom(self) -> None:
         limits = default_worker_risk_limits(startup_balance_usd="10000", account_currency="USD")
-        # 0.10 is the whole margin budget; legacy's extra 20% headroom is gone.
-        self.assertEqual(limits.margin_budget_usd, Decimal("1000.00"))
-        self.assertEqual(limits.daily_loss_limit_usd, Decimal("300.00"))
-        self.assertEqual(limits.trade_loss_limit_usd, Decimal("200.00"))
+        # 0.01 is the whole margin budget; legacy's extra 20% headroom is gone.
+        self.assertEqual(limits.margin_budget_usd, Decimal("100.00"))
+        self.assertEqual(limits.daily_loss_limit_usd, Decimal("200.00"))
+        self.assertEqual(limits.trade_loss_limit_usd, Decimal("100.00"))
         # 40 is a hard per-trade admission cap, not an emergency stop trigger.
         self.assertEqual(limits.leg_loss_cap_usd, Decimal("40"))
 
@@ -2032,6 +2068,19 @@ class ModeDisagreementTests(PairCellTestCase):
         result = self.follower.cell.handle_event(ClockTickEvent(self.now))
         self.assertTrue(result.policy_accepted)
         self.assertEqual(result.policy_hash, shadow.hash)
+
+    def test_the_synthesized_default_policy_is_shadow(self) -> None:
+        self.tick()
+        self.accept()
+        self.feed_catalogs()
+        acceptance = self.leader.cell.peer_pairing_acceptance()
+        assert acceptance is not None, "the leader has no Pairing Acceptance payload"
+        policy = canonical_policy_from_acceptance(
+            policy_version="policy-1",
+            leader_risk=self.leader.limits,
+            acceptance=acceptance,
+        )
+        self.assertEqual(policy.mode, "shadow")
 
     def test_the_follower_never_rewrites_the_policy_to_shadow_by_itself(self) -> None:
         self.tick()
@@ -6049,6 +6098,323 @@ class LegacyQuarantineScopeTests(PairCellTestCase):
             self.leader.cell.quarantine_reason(f"{OTHER_SYMBOL}:0000000000000000")
         )
         self.assertTrue(self.leader.cell.is_quarantined(other))
+
+
+# --------------------------------------------------------------------------- #
+# Trend-following entry (Donchian breakout / normalized momentum)
+# --------------------------------------------------------------------------- #
+
+
+def _trend_history(seconds: int, start_mid: str, step: str, *, base: int = 1_000_000) -> list[tuple[int, Decimal]]:
+    """A deterministic 1-second mid series rising by ``step`` per second."""
+
+    mid = Decimal(start_mid)
+    increment = Decimal(step)
+    series: list[tuple[int, Decimal]] = []
+    for offset in range(seconds):
+        series.append((base + offset, mid + increment * offset))
+    return series
+
+
+class TrendBiasTests(unittest.TestCase):
+    def test_donchian_long_breakout_above_the_rolling_high(self) -> None:
+        history = _trend_history(120, "1.10000", "0.00001")
+        bias, distance, reason = donchian_bias(
+            history,
+            Decimal("1.10150"),
+            now_epoch=1_000_000 + 120,
+            lookback_seconds=120.0,
+            buffer_points=Decimal("0.00002"),
+            min_range_points=Decimal("0.00012"),
+            min_coverage=0.8,
+        )
+        self.assertEqual(bias, "LONG")
+        self.assertGreater(distance, Decimal(0))
+        self.assertIn("breakout", reason)
+
+    def test_donchian_short_breakdown_below_the_rolling_low(self) -> None:
+        history = _trend_history(120, "1.10200", "-0.00001")
+        bias, distance, _ = donchian_bias(
+            history,
+            Decimal("1.10000"),
+            now_epoch=1_000_000 + 120,
+            lookback_seconds=120.0,
+            buffer_points=Decimal("0.00002"),
+            min_range_points=Decimal("0.00012"),
+            min_coverage=0.8,
+        )
+        self.assertEqual(bias, "SHORT")
+        self.assertGreater(distance, Decimal(0))
+
+    def test_donchian_inside_the_range_is_no_bias(self) -> None:
+        history = _trend_history(120, "1.10000", "0.00001")
+        bias, _, _ = donchian_bias(
+            history,
+            Decimal("1.10050"),
+            now_epoch=1_000_000 + 120,
+            lookback_seconds=120.0,
+            buffer_points=Decimal("0.00002"),
+            min_range_points=Decimal("0.00012"),
+            min_coverage=0.8,
+        )
+        self.assertIsNone(bias)
+
+    def test_donchian_flat_range_is_no_bias(self) -> None:
+        history = [(1_000_000 + offset, Decimal("1.10000")) for offset in range(120)]
+        bias, _, reason = donchian_bias(
+            history,
+            Decimal("1.10050"),
+            now_epoch=1_000_000 + 120,
+            lookback_seconds=120.0,
+            buffer_points=Decimal("0.00002"),
+            min_range_points=Decimal("0.00012"),
+            min_coverage=0.8,
+        )
+        self.assertIsNone(bias)
+        self.assertIn("flat", reason)
+
+    def test_donchian_thin_buffer_stays_warming(self) -> None:
+        history = _trend_history(5, "1.10000", "0.00001")
+        bias, _, reason = donchian_bias(
+            history,
+            Decimal("1.10150"),
+            now_epoch=1_000_000 + 120,
+            lookback_seconds=120.0,
+            buffer_points=Decimal("0.00002"),
+            min_range_points=Decimal("0.00012"),
+            min_coverage=0.8,
+        )
+        self.assertIsNone(bias)
+        self.assertIn("warming", reason)
+
+    def test_momentum_impulse_scores_above_threshold(self) -> None:
+        history = _trend_history(600, "1.10000", "0.000001")
+        bias, score, _ = momentum_bias(
+            history,
+            Decimal("1.10100"),
+            now_epoch=1_000_000 + 600,
+            t_seconds=120.0,
+            vol_window_seconds=600.0,
+            k=Decimal("2.0"),
+            min_mom_points=Decimal("0.00005"),
+            min_coverage=0.5,
+        )
+        self.assertEqual(bias, "LONG")
+        self.assertGreaterEqual(score, Decimal("2.0"))
+
+    def test_momentum_drift_below_threshold_is_no_bias(self) -> None:
+        history = _trend_history(600, "1.10000", "0.00001")
+        # Reference 120s ago sits 120 steps back; a 10-point nudge above it
+        # clears min_mom but scores far below k against the ramp's volatility.
+        bias, _, _ = momentum_bias(
+            history,
+            Decimal("1.10490"),
+            now_epoch=1_000_000 + 600,
+            t_seconds=120.0,
+            vol_window_seconds=600.0,
+            k=Decimal("2.0"),
+            min_mom_points=Decimal("0.00005"),
+            min_coverage=0.5,
+        )
+        self.assertIsNone(bias)
+
+    def test_momentum_without_a_reference_point_stays_warming(self) -> None:
+        history = _trend_history(30, "1.10000", "0.00001")
+        bias, _, reason = momentum_bias(
+            history,
+            Decimal("1.10100"),
+            now_epoch=1_000_000 + 30,
+            t_seconds=120.0,
+            vol_window_seconds=600.0,
+            k=Decimal("2.0"),
+            min_mom_points=Decimal("0.00005"),
+            min_coverage=0.5,
+        )
+        self.assertIsNone(bias)
+        self.assertIn("warming", reason)
+
+
+class TrendEntryTests(PairCellTestCase):
+    def _feed_trend(
+        self, *, start_mid: str, step_points: int, count: int, step_seconds: int = 10, sequence_start: int = 10
+    ) -> None:
+        """Advance a 1-second-resampled leader mid series through live quotes."""
+
+        point = Decimal("0.00001")
+        mid = Decimal(start_mid)
+        sequence = sequence_start
+        for _ in range(count):
+            self.now += timedelta(seconds=step_seconds)
+            bid = mid - Decimal("0.00005")
+            ask = mid + Decimal("0.00005")
+            self.feed_quotes(
+                leader_bid=str(bid),
+                leader_ask=str(ask),
+                follower_bid="1.10000",
+                follower_ask="1.10010",
+                sequence=sequence,
+            )
+            sequence += 1
+            mid += point * step_points
+
+    def test_donchian_breakout_creates_a_trend_candidate(self) -> None:
+        self.prime(
+            shared={
+                "entry_mode": "donchian",
+                "trend_lookback_seconds": 120.0,
+                "trend_breakout_buffer_points": "0.00002",
+                "trend_min_range_points": "0.00005",
+                "trend_max_spread_points": "20",
+                "trend_min_coverage": 0.5,
+            }
+        )
+        # Rising mids build the rolling high, then one jump clears it.
+        self._feed_trend(start_mid="1.10000", step_points=1, count=14)
+        self.leader.cell.handle_event(PeerSessionEvent(connected=False, observed_at=self.now))
+        self.now += timedelta(seconds=10)
+        self.feed_quotes(
+            leader_bid="1.10245",
+            leader_ask="1.10255",
+            follower_bid="1.10000",
+            follower_ask="1.10010",
+            sequence=100,
+        )
+        candidates = self.leader.cell.entry_candidates()
+        self.assertTrue(candidates, "a breakout should admit a trend candidate")
+        self.assertEqual(candidates[0]["leader_direction"], "LONG")
+        self.assertEqual(candidates[0]["entry_mode"], "donchian")
+
+    def test_donchian_counter_trend_direction_is_excluded(self) -> None:
+        self.prime(
+            shared={
+                "entry_mode": "donchian",
+                "trend_lookback_seconds": 120.0,
+                "trend_breakout_buffer_points": "0.00002",
+                "trend_min_range_points": "0.00005",
+                "trend_max_spread_points": "20",
+                "trend_min_coverage": 0.5,
+            }
+        )
+        self._feed_trend(start_mid="1.10000", step_points=1, count=14)
+        self.leader.cell.handle_event(PeerSessionEvent(connected=False, observed_at=self.now))
+        self.now += timedelta(seconds=10)
+        # A mid inside the rolling range breaks out in neither direction.
+        self.feed_quotes(
+            leader_bid="1.10002",
+            leader_ask="1.10012",
+            follower_bid="1.10000",
+            follower_ask="1.10010",
+            sequence=100,
+        )
+        self.assertEqual(self.leader.cell.entry_candidates(), [])
+
+    def test_donchian_wide_spread_blocks_the_breakout(self) -> None:
+        self.prime(
+            shared={
+                "entry_mode": "donchian",
+                "trend_lookback_seconds": 120.0,
+                "trend_breakout_buffer_points": "0.00002",
+                "trend_min_range_points": "0.00012",
+                "trend_max_spread_points": "2",
+                "trend_min_coverage": 0.5,
+            }
+        )
+        self._feed_trend(start_mid="1.10000", step_points=1, count=14)
+        self.leader.cell.handle_event(PeerSessionEvent(connected=False, observed_at=self.now))
+        self.now += timedelta(seconds=10)
+        self.feed_quotes(
+            leader_bid="1.10245",
+            leader_ask="1.10285",
+            follower_bid="1.10000",
+            follower_ask="1.10010",
+            sequence=100,
+        )
+        self.assertEqual(self.leader.cell.entry_candidates(), [])
+
+    def test_momentum_impulse_creates_a_trend_candidate(self) -> None:
+        self.prime(
+            shared={
+                "entry_mode": "momentum",
+                "trend_momentum_T_seconds": 60.0,
+                "trend_vol_window_seconds": 300.0,
+                "trend_momentum_k": "2.0",
+                "trend_min_mom_points": "0.00005",
+                "trend_max_spread_points": "20",
+                "trend_min_coverage": 0.3,
+            }
+        )
+        self._feed_trend(start_mid="1.10000", step_points=0, count=32, step_seconds=10)
+        self.leader.cell.handle_event(PeerSessionEvent(connected=False, observed_at=self.now))
+        self.now += timedelta(seconds=10)
+        self.feed_quotes(
+            leader_bid="1.10095",
+            leader_ask="1.10105",
+            follower_bid="1.10000",
+            follower_ask="1.10010",
+            sequence=200,
+        )
+        candidates = self.leader.cell.entry_candidates()
+        self.assertTrue(candidates, "an impulse should admit a momentum candidate")
+        self.assertEqual(candidates[0]["leader_direction"], "LONG")
+        self.assertEqual(candidates[0]["entry_mode"], "momentum")
+
+    def test_trend_seed_prefills_the_buffer_without_publishing_quotes(self) -> None:
+        self.prime(
+            shared={
+                "entry_mode": "donchian",
+                "trend_lookback_seconds": 120.0,
+                "trend_breakout_buffer_points": "0.00002",
+                "trend_min_range_points": "0.00012",
+                "trend_max_spread_points": "20",
+                "trend_min_coverage": 0.5,
+            }
+        )
+        product = self.product_id()
+        quotes_before = self.net.kinds(LEADER).count("quote")
+        base = self.now - timedelta(seconds=100)
+        points = tuple(
+            TrendSeedPoint(
+                broker_time=base + timedelta(seconds=offset),
+                bid=Decimal("1.10000") + Decimal(offset) * Decimal("0.00001"),
+                ask=Decimal("1.10010") + Decimal(offset) * Decimal("0.00001"),
+            )
+            for offset in range(90)
+        )
+        self.leader.cell.handle_event(
+            TrendSeedEvent(product_id=product, points=points, degraded=False)
+        )
+        # A seed never looks like fresh market evidence on the relay.
+        self.assertEqual(self.net.kinds(LEADER).count("quote"), quotes_before)
+        self.assertEqual(self.attempt_payloads(), [])
+        # But the buffer is warm: a live breakout above the seeded high admits.
+        self.leader.cell.handle_event(PeerSessionEvent(connected=False, observed_at=self.now))
+        self.now += timedelta(seconds=10)
+        self.feed_quotes(
+            leader_bid="1.10245",
+            leader_ask="1.10255",
+            follower_bid="1.10000",
+            follower_ask="1.10010",
+            sequence=100,
+        )
+        candidates = self.leader.cell.entry_candidates()
+        self.assertTrue(candidates, "seeded history should warm the trend buffer")
+        self.assertEqual(candidates[0]["leader_direction"], "LONG")
+
+    def test_invalid_entry_mode_is_rejected(self) -> None:
+        self.tick()
+        self.accept()
+        self.feed_catalogs()
+        with self.assertRaises(PairExecutionCellError):
+            self.policy(entry_mode="breakout")
+
+    def test_edge_mode_keeps_legacy_candidate_shape(self) -> None:
+        self.prime()
+        self.leader.cell.handle_event(PeerSessionEvent(connected=False, observed_at=self.now))
+        self.feed_quotes()
+        candidates = self.leader.cell.entry_candidates()
+        self.assertTrue(candidates)
+        self.assertEqual(candidates[0]["entry_mode"], "edge")
+        self.assertIn("edge_points", candidates[0])
 
 
 if __name__ == "__main__":  # pragma: no cover

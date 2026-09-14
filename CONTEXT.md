@@ -195,7 +195,7 @@ _Avoid_: 以路由世代同時表示配對與探索、重新探索產生新 rout
 由初始相容商品探索錄取、凍結於當前 `universe_generation`、未遭隔離，且雙方報價、point/tick size、帳戶幣別 tick value、volume、填單模式與保護校準皆新鮮完整的配對商品集合。任一商品資料缺失或過期只移除該商品資格，不觸發 signal-time RPC，也不使其他商品失去資格。
 
 **最佳進場候選（Best Entry Candidate）**:
-leader 對可交易商品宇宙內每個商品的兩個鏡像方向套用 edge-points 門檻（以該商品 canonical 執行 point 換算）後，以雙方預先快取之每 point USD 價值計算保守預期 edge USD 並選出的唯一候選；同值時依 normalized edge points、衍生商品識別、direction 決定固定順序。選定後商品、方向、量與排名證據凍結於該次嘗試。
+leader 對可交易商品宇宙內每個商品的兩個鏡像方向套用進場門檻後，以雙方預先快取之每 point USD 價值計算保守預期 edge USD 並選出的唯一候選；同值時依 normalized 指標、衍生商品識別、direction 決定固定順序。`edge` 模式門檻為 edge-points（以該商品 canonical 執行 point 換算）；`donchian`／`momentum` 趨勢模式改以 leader-only 趨勢偏置定向（1 秒重採樣 mid buffer，另受 spread 上限與暖機 coverage 閘門約束），其餘 sizing、報價新鮮度／skew、隔離、剩餘額度門檻不變。選定後商品、方向、量與排名證據凍結於該次嘗試。
 _Avoid_: 最大 raw price edge
 
 **配對商品隔離（Pair Product Quarantine）**:
@@ -211,7 +211,7 @@ _Avoid_: 配對合約、配對租約、商品白名單、只保存政策雜湊
 _Avoid_: 設定檔一律可覆寫任意 tunable、follower 覆寫共享政策
 
 **執行模式權責與 allow_live**:
-`mode` 是配對層級且由 leader 撰寫的值，預設為 `live`，follower 不撰寫也不改寫。follower 可於本機設定明確的 `allow_live` 安全開關（預設 `true`）；當 `allow_live` 為 `false` 而 canonical 政策為 `live` 時，follower 失效關閉：明確拒絕該政策、不發布接受、不受理任何嘗試，維持已配對但不具進場就緒。它不得將 `mode` 改寫為 `shadow`，不得在 leader 為 live 時靜默以 shadow 運作，也不進行協商。leader 只能將該拒絕視為對側未就緒而不建立任何嘗試，不得視為接受。化解方式為操作員行為：在雙方 broker 驗證空倉時由 leader 發布 `shadow` 政策，或調整 follower 的 `allow_live` 後於空倉狀態重新評估。
+`mode` 是配對層級且由 leader 撰寫的值，預設為 `shadow`，follower 不撰寫也不改寫。follower 可於本機設定明確的 `allow_live` 安全開關（預設 `true`）；當 `allow_live` 為 `false` 而 canonical 政策為 `live` 時，follower 失效關閉：明確拒絕該政策、不發布接受、不受理任何嘗試，維持已配對但不具進場就緒。它不得將 `mode` 改寫為 `shadow`，不得在 leader 為 live 時靜默以 shadow 運作，也不進行協商。leader 只能將該拒絕視為對側未就緒而不建立任何嘗試，不得視為接受。化解方式為操作員行為：在雙方 broker 驗證空倉時由 leader 發布 `shadow` 政策（即預設），或調整 follower 的 `allow_live` 後於空倉狀態重新評估。
 _Avoid_: follower 靜默降級為 shadow、以 follower 設定改寫配對政策
 
 **逐商品量規劃（Per-Product Sizing Plan）**:
@@ -230,7 +230,7 @@ _Avoid_: arm/commit、進場提交授權
 配對嘗試只有在雙方都被證明安全後才是 terminal：兩台帳戶工作者各自在自己本地啟動、彼此獨立的單調確認計時器內取得雙方 exact broker 部位證據並套用精確保護後宣告 `ACTIVE`；或任一方計時器到期、拒單、送單結果未知、報價過期或 peer session 遺失時，各自僅以自身 durable effect 與新鮮 broker 事實收斂至 desired `EMPTY`，並盡力通知對側加速其收斂。逾時、報價過期或就緒條件消失都不得直接遺棄嘗試，也不得假設對側已完成或尚未送單。
 
 **部署模式開關**:
-每配對的執行模式（`pair_execution_cell` 或 `shadow`，預設 live）；`shadow` 需明確選擇。配對執行單元的互斥主張在配對保留 transaction 中同時為**兩台**工作者取得，並於最終建立路由的 transaction 再次確認；其 owner kind 固定為 `pair_execution_cell` 且不帶 `trader_id`。安全解除配對移除路由時同時釋放雙方主張。
+每配對的執行模式（`pair_execution_cell` 或 `shadow`，預設 shadow）；`live` 需明確選擇。配對執行單元的互斥主張在配對保留 transaction 中同時為**兩台**工作者取得，並於最終建立路由的 transaction 再次確認；其 owner kind 固定為 `pair_execution_cell` 且不帶 `trader_id`。安全解除配對移除路由時同時釋放雙方主張。
 
 **影子模式**:
 配對執行單元執行完整的候選排名與立即派遣進場決策路徑（報價一致性、就緒狀態、edge 決策），但以模擬 ticket 與模擬成交價取代真正的 `order_send`，不寫入 Worker effect journal 也不送出任何 broker 寫入；用於在正式切換前比較新舊路徑的候選決策與遙測。

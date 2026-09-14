@@ -441,7 +441,7 @@ not to local operator configuration.
 
 #### Mode authority and the follower's fail-closed guard
 
-`mode` is a **pair-level, leader-authored** value with default `live`. It is
+`mode` is a **pair-level, leader-authored** value with default `shadow`. It is
 part of the shared canonical policy, and the follower never authors it and
 never rewrites it.
 
@@ -467,14 +467,15 @@ has no role, follower-selection, or default-materialization options.
 
 ### Default policy materialization
 
-The default execution mode is `live`. This is an intentional operator
-decision: an unattended Worker that pairs itself is expected to trade, not to
-sit in shadow mode until someone edits a file. Live by default does not weaken
-any admission rule. Every Worker still fails closed unless pairing, initial
-compatible product discovery, broker clock calibration, sizing, protection
-constructibility, broker-verified emptiness, and peer readiness all pass.
-Shadow mode remains selectable for rollout and comparison, and a follower may
-always refuse live through `allow_live = false`.
+The default execution mode is `shadow`. This is an intentional operator
+decision: an unattended Worker that pairs itself must prove its candidate
+decisions in shadow before anyone authorizes live broker writes by explicitly
+selecting `live`. Shadow by default does not weaken any admission rule. Every
+Worker still fails closed unless pairing, initial compatible product
+discovery, broker clock calibration, sizing, protection constructibility,
+broker-verified emptiness, and peer readiness all pass. Live mode remains
+selectable for production, and a follower may always refuse live through
+`allow_live = false`.
 
 The default `strategy_budget_usd` for each Worker is that Worker's startup
 broker account **balance**. This is a deliberate divergence from
@@ -512,9 +513,9 @@ behavior where an equivalent parameter exists, so the cell starts from the
 already-operated strategy's numbers:
 
 - `entry_edge_points` = `4`;
-- `maximum_margin_fraction` = `0.10`;
-- `daily_loss_fraction` = `0.03`;
-- `trade_loss_fraction` = `0.02`;
+- `maximum_margin_fraction` = `0.01`;
+- `daily_loss_fraction` = `0.02`;
+- `trade_loss_fraction` = `0.01`;
 - `maximum_loss_per_trade_usd` = `40`;
 - `quote_max_age_seconds` = `1`;
 - `follower_confirmation_timeout_seconds` = `5`;
@@ -634,8 +635,8 @@ Each Worker has its own:
 
 - `strategy_budget_usd`;
 - `maximum_margin_fraction`;
-- `daily_loss_fraction`, initially `0.03`;
-- `trade_loss_fraction`, initially `0.02`; and
+- `daily_loss_fraction`, initially `0.02`;
+- `trade_loss_fraction`, initially `0.01`; and
 - `maximum_loss_per_trade_usd`.
 
 #### Sizing and protection plan timing
@@ -1101,7 +1102,7 @@ attribute.
 27. As a strategy operator, I want the default `strategy_budget_usd` to be that Worker's startup broker balance in a USD account, frozen into the pairing's policy, so that sizing matches the account without manual entry and cannot drift mid-pairing.
 28. As a strategy operator, I want a non-USD currency, an unreadable account, or a non-positive balance to fail closed, so that no pairing ever proceeds on a substituted budget.
 29. As a strategy operator, I want a new pairing after a different startup balance to produce a new policy hash, so that budget changes are explicit and both Workers re-accept them while empty.
-30. As a strategy operator, I want live to be the default execution mode while every admission rule still fails closed, so that autonomous pairing is useful without being reckless.
+30. As a strategy operator, I want shadow to be the default execution mode while every admission rule still fails closed, so that autonomous pairing proves its candidate decisions before anyone authorizes live broker writes.
 31. As a Worker operator, I want both Workers to persist the full canonical policy content and not only its hash, so that a restarted Worker knows exactly what it agreed to without re-requesting it.
 32. As a strategy operator, I want the two Workers to discover their compatible universe from their own catalogs after the route exists, so that no pre-approved Built list has to be produced before the pair exists.
 33. As a strategy operator, I want `trade_mode == 4` applied to each catalog before the intersection, exactly as `strategy/realtime_arbitrage.py` does, so that non-fully-tradable symbols never reach compatibility comparison.
@@ -1217,14 +1218,14 @@ attribute.
   `route_id`, `trader_id`, `built_products`, or `eligible_products` in any file
   is a startup error, as is a file whose keys exceed the authority of the role
   the Worker actually receives.
-- `mode` is pair-level and leader-authored, default `live`. A follower with
+- `mode` is pair-level and leader-authored, default `shadow`. A follower with
   `allow_live = false` fails closed against a `live` policy: it refuses with an
   explicit reason and stays paired, safe, and idle. It never rewrites policy,
   never silently runs shadow against a live leader, and the leader never treats
   the refusal as acceptance. Resolution is an operator action while both
   accounts are empty.
-- Default mode is `live` by explicit operator decision; all fail-closed
-  admission rules are unchanged. `shadow` remains available for rollout.
+- Default mode is `shadow` by explicit operator decision; all fail-closed
+  admission rules are unchanged. `live` remains available for production.
 - The follower authors its own frozen startup balance and its own four risk
   tunables and sends them to the leader in a **Pairing Acceptance payload**
   through the opaque relay. The leader copies them **verbatim** into the
@@ -1349,11 +1350,11 @@ permitted to set that value; anything else is a startup configuration error.
 
 | Parameter | Default | Authored by |
 | --- | --- | --- |
-| `mode` | `live` | leader (pair-level) |
+| `mode` | `shadow` | leader (pair-level) |
 | `strategy_budget_usd` (per Worker) | that Worker's startup broker account **balance**, USD account and strictly positive required, frozen into the pairing | each Worker for itself; the follower's arrives verbatim in the Pairing Acceptance payload |
-| `maximum_margin_fraction` (per Worker) | `0.10` | each Worker for itself |
-| `daily_loss_fraction` (per Worker) | `0.03` | each Worker for itself |
-| `trade_loss_fraction` (per Worker) | `0.02` | each Worker for itself |
+| `maximum_margin_fraction` (per Worker) | `0.01` | each Worker for itself |
+| `daily_loss_fraction` (per Worker) | `0.02` | each Worker for itself |
+| `trade_loss_fraction` (per Worker) | `0.01` | each Worker for itself |
 | `maximum_loss_per_trade_usd` (per Worker) | `40` (hard per-trade cap; see note) | each Worker for itself |
 | `entry_edge_points` | `4` | leader |
 | `quote_max_age_seconds` | `1` | leader |
@@ -1363,8 +1364,9 @@ permitted to set that value; anything else is a startup configuration error.
 | `trading_blackout_end_ny` | `18:30` | leader |
 | `maximum_holding_seconds` | unset | leader |
 
-Defaults other than `quote_max_skew_seconds`, `mode`, and
-`strategy_budget_usd` match the existing `strategy/realtime_arbitrage.py`
+Defaults other than `quote_max_skew_seconds`, `mode`,
+`strategy_budget_usd`, `maximum_margin_fraction`, `daily_loss_fraction`, and
+`trade_loss_fraction` match the existing `strategy/realtime_arbitrage.py`
 operating values, with one explicit reinterpretation:
 `maximum_loss_per_trade_usd = 40` reuses legacy `--emergency-stop-loss-usd`'s
 number as a hard per-trade admission cap rather than as an emergency stop-out
@@ -1499,7 +1501,7 @@ details of the Worker runtime rather than strategy policy.
 - Revocation tests prove identity revocation removes entry readiness without
   removing the route as a safe unpair and without implying broker `EMPTY`.
 - Configuration tests prove an absent configuration file starts the cell with
-  the documented synthesized defaults including `live` mode and the startup
+  the documented synthesized defaults including `shadow` mode and the startup
   broker balance as `strategy_budget_usd`, and that a route, `route_id`,
   `trader_id`, `built_products`, or `eligible_products` in a file is a startup
   error.
@@ -1513,7 +1515,7 @@ details of the Worker runtime rather than strategy policy.
   contradicting its file's authority fails closed rather than applying the
   file partially.
 - Mode-disagreement tests prove `mode` is leader-authored and defaults to
-  `live`, that a follower with `allow_live = false` refuses a `live` policy
+  `shadow`, that a follower with `allow_live = false` refuses a `live` policy
   with an explicit reason and stays paired but not entry-ready, that it never
   rewrites the policy and never silently runs shadow, that the leader treats
   the refusal as peer-not-ready and originates no attempt, and that publishing
@@ -1724,7 +1726,7 @@ Configuration and defaults:
     non-TTY leader without it staying authenticated and unpaired with an
     actionable diagnostic instead of blocking. Add the conceptual safe-unpair
     and rediscovery operator surfaces on either role.
-13. Materialize the default policy: leader-authored pair-level `live` mode with
+13. Materialize the default policy: leader-authored pair-level `shadow` mode with
     the follower's `allow_live = false` fail-closed refusal path, startup
     broker **balance** (USD account, strictly positive, otherwise fail closed)
     as each Worker's `strategy_budget_usd` frozen into the pairing, no extra

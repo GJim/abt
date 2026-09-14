@@ -60,6 +60,7 @@ from abt.worker.pair_cell_adapter import (
     _payload_hash,
     default_pair_cell_config,
     evaluate_follower_acceptance,
+    fetch_trend_seed_points,
     load_durable_route,
     load_frozen_acceptance,
     load_frozen_budget,
@@ -901,9 +902,9 @@ class PairCellConfigurationTests(unittest.TestCase):
         self.assertEqual("20", config.daily_loss_warning_threshold_usd)
         limits = worker_risk_limits(StartupBalance(amount_usd="2500"), config)
         self.assertEqual("2500", limits.strategy_budget_usd)
-        self.assertEqual("0.10", limits.maximum_margin_fraction)
-        self.assertEqual("0.03", limits.daily_loss_fraction)
-        self.assertEqual("0.02", limits.trade_loss_fraction)
+        self.assertEqual("0.01", limits.maximum_margin_fraction)
+        self.assertEqual("0.02", limits.daily_loss_fraction)
+        self.assertEqual("0.01", limits.trade_loss_fraction)
         self.assertEqual("40", limits.maximum_loss_per_trade_usd)
 
     def test_a_route_or_trader_or_built_product_key_is_a_startup_error(self) -> None:
@@ -950,6 +951,8 @@ class PairCellConfigurationTests(unittest.TestCase):
             ("mode", "shadow"),
             ("strategy_budget_usd", "5000"),
             ("entry_edge_points", "9"),
+            ("entry_mode", "donchian"),
+            ("trend_lookback_seconds", 900.0),
             ("quote_max_age_seconds", 2.0),
             ("quote_max_skew_seconds", 2.0),
             ("follower_confirmation_timeout_seconds", 9.0),
@@ -1004,6 +1007,54 @@ class PairCellConfigurationTests(unittest.TestCase):
                 with self.assertRaises(WorkerEnrollmentError):
                     parse_pair_cell_config({key: bad})
 
+    def test_trend_entry_mode_is_leader_authored(self) -> None:
+        for mode in ("edge", "donchian", "momentum"):
+            with self.subTest(mode=mode):
+                config = parse_pair_cell_config({"entry_mode": mode})
+                self.assertTrue(config.declares_shared_policy)
+                self.assertIsNone(config.role_authority_error("leader"))
+                reason = config.role_authority_error("follower")
+                self.assertIsNotNone(reason)
+                self.assertIn("entry_mode", cast(str, reason))
+        with self.assertRaises(WorkerEnrollmentError):
+            parse_pair_cell_config({"entry_mode": "breakout"})
+
+    def test_trend_tunables_must_be_usable_numbers(self) -> None:
+        config = parse_pair_cell_config(
+            {
+                "trend_lookback_seconds": 900.0,
+                "trend_momentum_T_seconds": 60.0,
+                "trend_vol_window_seconds": 300.0,
+                "trend_breakout_buffer_points": "3",
+                "trend_min_range_points": "10",
+                "trend_momentum_k": "1.5",
+                "trend_min_mom_points": "4",
+                "trend_max_spread_points": "9",
+                "trend_min_coverage": 0.5,
+            }
+        )
+        self.assertEqual(900.0, config.shared_policy["trend_lookback_seconds"])
+        self.assertEqual("3", config.shared_policy["trend_breakout_buffer_points"])
+        for key, bad in (
+            ("trend_lookback_seconds", 0),
+            ("trend_lookback_seconds", -5.0),
+            ("trend_lookback_seconds", "long"),
+            ("trend_momentum_T_seconds", True),
+            ("trend_vol_window_seconds", 0.0),
+            ("trend_breakout_buffer_points", "wide"),
+            ("trend_breakout_buffer_points", True),
+            ("trend_min_range_points", "NaN"),
+            ("trend_momentum_k", "steep"),
+            ("trend_min_mom_points", ""),
+            ("trend_max_spread_points", True),
+            ("trend_min_coverage", 0),
+            ("trend_min_coverage", 1.5),
+            ("trend_min_coverage", "most"),
+        ):
+            with self.subTest(key=key, bad=bad):
+                with self.assertRaises(WorkerEnrollmentError):
+                    parse_pair_cell_config({key: bad})
+
     def test_a_malformed_file_is_a_startup_error(self) -> None:
         path = self.directory / "pair.json"
         path.write_text("{not json", encoding="utf-8")
@@ -1015,6 +1066,102 @@ class PairCellConfigurationTests(unittest.TestCase):
         path.write_text(json.dumps({"entry_edge_points": "7"}), encoding="utf-8")
         config = load_pair_cell_config(path)
         self.assertEqual({"entry_edge_points": "7"}, dict(config.shared_policy))
+
+
+class TrendSeedTests(unittest.TestCase):
+    def test_lossless_ticks_win_over_bars(self) -> None:
+        now = datetime(2024, 1, 2, 14, 0, tzinfo=UTC)
+        ticks = [
+            {
+                "time": int((now - timedelta(seconds=300 - offset)).timestamp()),
+                "time_msc": int((now - timedelta(seconds=300 - offset)).timestamp() * 1000),
+                "bid": 1.10000 + offset * 0.00001,
+                "ask": 1.10010 + offset * 0.00001,
+            }
+            for offset in range(300)
+        ]
+
+        class TickMT5:
+            COPY_TICKS_ALL = 3
+
+            def copy_ticks_range(self, symbol: str, start: datetime, end: datetime, flags: int) -> object:
+                assert symbol == SYMBOL
+                assert flags == 3
+                return ticks
+
+            def copy_rates_from_pos(self, *args: object) -> object:  # pragma: no cover
+                raise AssertionError("bars must not be read when ticks succeed")
+
+        points, degraded = fetch_trend_seed_points(
+            TickMT5(), SYMBOL, window_seconds=300.0, now=now
+        )
+        self.assertFalse(degraded)
+        self.assertEqual(300, len(points))
+        self.assertLess(points[0].broker_time, points[-1].broker_time)
+        self.assertLess(points[0].bid, points[-1].bid)
+
+    def test_bars_are_a_degraded_fallback(self) -> None:
+        now = datetime(2024, 1, 2, 14, 0, tzinfo=UTC)
+
+        class BarMT5:
+            def copy_ticks_range(self, *args: object) -> object:
+                raise RuntimeError("no tick history")
+
+            def copy_rates_from_pos(self, symbol: str, timeframe: object, start_pos: int, count: int) -> object:
+                assert symbol == SYMBOL
+                return [
+                    {
+                        "time": int((now - timedelta(minutes=3 - offset)).timestamp()),
+                        "high": 1.10050,
+                        "low": 1.10030,
+                    }
+                    for offset in range(3)
+                ]
+
+        points, degraded = fetch_trend_seed_points(
+            BarMT5(), SYMBOL, window_seconds=300.0, now=now
+        )
+        self.assertTrue(degraded)
+        self.assertEqual(3, len(points))
+        self.assertEqual(points[0].bid, points[0].ask)
+
+    def test_total_history_failure_is_an_empty_degraded_seed(self) -> None:
+        class DeadMT5:
+            def copy_ticks_range(self, *args: object) -> object:
+                raise RuntimeError("down")
+
+            def copy_rates_from_pos(self, *args: object) -> object:
+                raise RuntimeError("down")
+
+        points, degraded = fetch_trend_seed_points(
+            DeadMT5(), SYMBOL, window_seconds=300.0, now=datetime(2024, 1, 2, 14, 0, tzinfo=UTC)
+        )
+        self.assertEqual([], points)
+        self.assertTrue(degraded)
+
+    def test_malformed_ticks_are_skipped_not_fatal(self) -> None:
+        now = datetime(2024, 1, 2, 14, 0, tzinfo=UTC)
+
+        class RaggedMT5:
+            COPY_TICKS_ALL = 3
+
+            def copy_ticks_range(self, symbol: str, start: datetime, end: datetime, flags: int) -> object:
+                good = {
+                    "time": int(now.timestamp()),
+                    "time_msc": int(now.timestamp() * 1000),
+                    "bid": 1.1,
+                    "ask": 1.1001,
+                }
+                return [None, {"bid": "x"}, good] + [dict(good, time_msc=int(now.timestamp() * 1000) - offset * 1000, bid=1.1, ask=1.1001) for offset in range(1, 20)]
+
+            def copy_rates_from_pos(self, *args: object) -> object:  # pragma: no cover
+                raise AssertionError("bars must not be read when ticks succeed")
+
+        points, degraded = fetch_trend_seed_points(
+            RaggedMT5(), SYMBOL, window_seconds=300.0, now=now
+        )
+        self.assertFalse(degraded)
+        self.assertEqual(20, len(points))
 
 
 class StartupBalanceTests(unittest.TestCase):
@@ -1054,7 +1201,7 @@ class StartupBalanceTests(unittest.TestCase):
 
     def test_no_margin_headroom_beyond_the_margin_fraction(self) -> None:
         limits = worker_risk_limits(StartupBalance(amount_usd="10000"), default_pair_cell_config())
-        self.assertEqual(Decimal("1000.00"), limits.margin_budget_usd)
+        self.assertEqual(Decimal("100.00"), limits.margin_budget_usd)
 
 
 # --------------------------------------------------------------------------- #
@@ -1440,6 +1587,11 @@ class PairingTestCase(unittest.TestCase):
         follower_config: PairCellConfig | None = None,
         follower_balance: float = 4_000.0,
     ) -> tuple[Worker, Worker]:
+        # Lifecycle tests exercise the live execution path; pass
+        # ``default_pair_cell_config()`` explicitly for the synthesized
+        # (shadow) production default, covered by ModeAuthorityTests.
+        if leader_config is None:
+            leader_config = parse_pair_cell_config({"mode": "live"})
         follower = self.worker(
             FOLLOWER, bid=1.10100, ask=1.10110, balance=follower_balance, config=follower_config
         )
@@ -1905,7 +2057,7 @@ class DurableRouteAndAuthorityTests(PairingTestCase):
         leader_risk = leader.runtime.enforced_risk_limits()
         assert leader_risk is not None
         self.assertEqual("10000", leader_risk.strategy_budget_usd)
-        self.assertEqual("0.10", leader_risk.maximum_margin_fraction)
+        self.assertEqual("0.01", leader_risk.maximum_margin_fraction)
 
 
 class DiscoveryLifecycleTests(PairingTestCase):
@@ -1950,8 +2102,8 @@ class DiscoveryLifecycleTests(PairingTestCase):
         assert leader.runtime.cell is not None
         plans = leader.runtime.cell.sizing_plans()
         self.assertEqual({("LONG"), ("SHORT")}, {direction for _, direction in plans})
-        # 10 000 * 0.10 / 1 000 = 1 lot for the leader.
-        self.assertEqual({"1"}, {plan.local_max_lots for plan in plans.values()})
+        # 10 000 * 0.01 / 1 000 = 0.1 lots for the leader.
+        self.assertEqual({"0.1"}, {plan.local_max_lots for plan in plans.values()})
         _ = follower
 
     def test_the_hourly_refresh_never_admits_a_newly_appeared_symbol(self) -> None:
@@ -2210,15 +2362,15 @@ class SafeUnpairTests(PairingTestCase):
 
 
 class ModeAuthorityTests(PairingTestCase):
-    def test_a_follower_accepts_the_default_live_policy(self) -> None:
-        leader, follower = self.paired()
+    def test_a_follower_accepts_the_default_shadow_policy(self) -> None:
+        leader, follower = self.paired(leader_config=default_pair_cell_config())
         self.assertTrue(
             pump_until(
                 [leader, follower],
                 lambda: follower.runtime.enforced_risk_limits() is not None,
                 rounds=160,
             ),
-            f"the follower never accepted the live policy "
+            f"the follower never accepted the shadow policy "
             f"({follower.results[-1] if follower.results else None})",
         )
         self.assertIsNotNone(follower.runtime.enforced_risk_limits())
@@ -3120,11 +3272,11 @@ class FullLifecycleTests(PairingTestCase):
         self.assertEqual(leader.runtime.route_id, follower.runtime.route_id)
 
         # Both legs use exactly the common lots -- the lower Worker capacity,
-        # 4 000 * 0.10 / 1 000 = 0.4 -- never a fixed per-Worker volume.
+        # 4 000 * 0.01 / 1 000 = 0.04 -- never a fixed per-Worker volume.
         self.assertEqual(1, len(leader.mt5.positions))
         self.assertEqual(1, len(follower.mt5.positions))
         for mt5 in (leader.mt5, follower.mt5):
-            self.assertEqual(0.4, float(cast(float, mt5.positions[0]["volume"])))
+            self.assertEqual(0.04, float(cast(float, mt5.positions[0]["volume"])))
             self.assertGreater(float(cast(float, mt5.positions[0]["sl"])), 0.0)
             # Asymmetric profit-max protection: SL-only stops at each leg's
             # allowed loss with the take-profit cap removed (MT5 reports 0).
@@ -3152,8 +3304,11 @@ class FullLifecycleTests(PairingTestCase):
             [row["event"] for row in follower.runtime.cell.transition_history()],
         )
         # Drive the market favorably past the trail cadence: the first
-        # trailing adjustment must tighten the solo stop.
-        follower.mt5.prices[SYMBOL] = (1.09900, 1.09910)
+        # trailing adjustment must tighten the solo stop.  The default 1%
+        # margin sizes the leg at 0.04 lots, so one full risk distance is wide
+        # (0.01000); the drive must clear the solo lock before the trail can
+        # advance past it to 1.10010.
+        follower.mt5.prices[SYMBOL] = (1.09000, 1.09010)
         self.clock.advance(301.0)
         self.assertTrue(
             pump_until(
