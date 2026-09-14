@@ -1254,6 +1254,12 @@ def fetch_trend_seed_points(
     a closed-market gap yielding zero points.  ``broker_offset_seconds`` is
     this broker's measured ``offset_seconds``; ``None`` means uncalibrated
     and the UTC window is used as-is.
+
+    Returned points carry **calibrated UTC** (broker epochs minus the offset):
+    the cell buckets trend history on the wall-clock timeline its reference
+    and volatility windows run on, so storing raw server epochs would park
+    the whole buffer hours in the future and the windows would never overlap
+    it.  The query window above is the only place broker-clock epochs belong.
     """
 
     window = timedelta(seconds=max(60.0, window_seconds) + 60.0)
@@ -1282,7 +1288,7 @@ def fetch_trend_seed_points(
                 continue
             points.append(
                 TrendSeedPoint(
-                    broker_time=datetime.fromtimestamp(epoch_ms / 1000.0, UTC),
+                    broker_time=datetime.fromtimestamp(epoch_ms / 1000.0, UTC) - shift,
                     bid=Decimal(str(bid)),
                     ask=Decimal(str(ask)),
                 )
@@ -1314,7 +1320,7 @@ def fetch_trend_seed_points(
             ):
                 continue
             mid = (Decimal(str(high)) + Decimal(str(low))) / 2
-            moment_dt = datetime.fromtimestamp(int(moment), UTC)
+            moment_dt = datetime.fromtimestamp(int(moment), UTC) - shift
             degraded.append(TrendSeedPoint(broker_time=moment_dt, bid=mid, ask=mid))
         degraded.sort(key=lambda point: point.broker_time)
         return degraded, True

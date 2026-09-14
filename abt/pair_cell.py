@@ -2324,7 +2324,13 @@ class QuarantineReleaseEvent:
 
 @dataclass(frozen=True, slots=True)
 class TrendSeedPoint:
-    """One Phase-B historical tick used only to prefill the trend buffer."""
+    """One Phase-B historical tick used only to prefill the trend buffer.
+
+    ``broker_time`` is calibrated UTC (broker-server time minus the measured
+    clock offset), never a raw server epoch: the buffer and the trend bias
+    share the wall-clock timeline, and raw epochs would park history hours
+    in the future where no evaluation window overlaps it.
+    """
 
     broker_time: datetime
     bid: Decimal
@@ -5153,7 +5159,9 @@ class PairExecutionCell:
             calibration=event.calibration,
         )
         self._local_quotes[event.product_id] = quote
-        self._record_trend_mid(event.product_id, quote.bid, quote.ask, quote.broker_time)
+        self._record_trend_mid(
+            event.product_id, quote.bid, quote.ask, quote.broker_time, quote.calibration
+        )
         if publish:
             self._publish_quote(quote)
         return True
@@ -5165,21 +5173,41 @@ class PairExecutionCell:
         return max(policy.trend_lookback_seconds, policy.trend_vol_window_seconds)
 
     def _record_trend_mid(
-        self, product_id: str, bid: Decimal, ask: Decimal, broker_time: datetime
+        self,
+        product_id: str,
+        bid: Decimal,
+        ask: Decimal,
+        broker_time: datetime,
+        calibration: BrokerClockCalibration,
     ) -> None:
         """Append one 1-second resampled mid; time-eviction is the only trim.
+
+        Buckets live on the *calibrated* broker timeline (broker time minus
+        the measured clock offset): the same wall-clock timeline the trend
+        bias evaluates its reference and volatility windows on.  Bucketing raw
+        broker-server time instead puts the whole buffer hours in the future
+        on a typical UTC+2/+3 broker, so those windows never overlap it and
+        trend entries stay in ``warming`` forever.  A quote whose clock cannot
+        be placed (uncalibrated or stale calibration) is staged nowhere: it
+        can never pass the freshness gate either, so admitting it would only
+        corrupt the timeline its neighbors share.
 
         Every kept point is also staged for the 1-second debug tape (flushed
         once per second by :meth:`_maybe_flush_tape`): the tape key is the
         same ``(product_id, source, epoch_sec)`` the buffer merges on, so a
         post-hoc replay sees exactly the decision input.  Dropped points
-        (invalid or regressed ticks) are staged nowhere, mirroring the buffer.
+        (invalid, uncalibrated, or regressed ticks) are staged nowhere,
+        mirroring the buffer.
         """
 
         if bid <= 0 or ask <= 0 or ask < bid:
             return
+        if not calibration.usable:
+            return
         try:
-            epoch = _as_utc(broker_time).timestamp()
+            epoch = (
+                _as_utc(broker_time) - timedelta(seconds=calibration.offset_seconds)
+            ).timestamp()
         except PairExecutionCellError:
             return
         bucket = _trend_bucket(epoch)
@@ -5361,6 +5389,7 @@ class PairExecutionCell:
         existing = self._peer_quotes.get(product_id)
         if existing is not None and existing.recovery_epoch == epoch and sequence <= existing.sequence:
             return
+        peer_calibration = _calibration_from_canonical(payload.get("calibration"))
         self._peer_quotes[product_id] = QuoteSnapshot(
             worker_id=self._peer_worker_id,
             product_id=product_id,
@@ -5371,16 +5400,19 @@ class PairExecutionCell:
             local_receive_time=self._now,
             recovery_epoch=epoch,
             sequence=sequence,
-            calibration=_calibration_from_canonical(payload.get("calibration")),
+            calibration=peer_calibration,
         )
-        if bid > 0 and ask >= bid:
+        if bid > 0 and ask >= bid and peer_calibration.usable:
             try:
-                bucket = _trend_bucket(_as_utc(broker_time).timestamp())
+                bucket = _trend_bucket(
+                    (_as_utc(broker_time) - timedelta(seconds=peer_calibration.offset_seconds)).timestamp()
+                )
             except PairExecutionCellError:
                 bucket = None
             if bucket is not None:
-                # The peer's own live view, staged so a post-hoc replay can
-                # re-derive the freshness/skew gates exactly as evaluated.
+                # The peer's own live view, staged on the shared wall-clock
+                # timeline so a post-hoc replay can re-derive the
+                # freshness/skew gates exactly as evaluated.
                 self._stage_tape_row(
                     product_id, "peer", bucket, (bid + ask) / 2, bid, ask
                 )

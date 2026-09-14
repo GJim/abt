@@ -195,7 +195,7 @@ _Avoid_: 以路由世代同時表示配對與探索、重新探索產生新 rout
 由初始相容商品探索錄取、凍結於當前 `universe_generation`、未遭隔離，且雙方報價、point/tick size、帳戶幣別 tick value、volume、填單模式與保護校準皆新鮮完整的配對商品集合。任一商品資料缺失或過期只移除該商品資格，不觸發 signal-time RPC，也不使其他商品失去資格。
 
 **最佳進場候選（Best Entry Candidate）**:
-leader 對可交易商品宇宙內每個商品的兩個鏡像方向套用進場門檻後，以雙方預先快取之每 point USD 價值計算保守預期 edge USD 並選出的唯一候選；同值時依 normalized 指標、衍生商品識別、direction 決定固定順序。`edge` 模式門檻為 edge-points（以該商品 canonical 執行 point 換算）；`donchian`／`momentum` 趨勢模式改以 leader-only 趨勢偏置定向（1 秒重採樣 mid buffer，另受 spread 上限與暖機 coverage 閘門約束），報價新鮮度改用趨勢時間尺度的寬限預算（`trend_quote_max_age_seconds`，預設 60 秒）且不檢查跨 broker skew（趨勢訊號不比較兩邊價格）；其餘 sizing、隔離、剩餘額度門檻不變。選定後商品、方向、量與排名證據凍結於該次嘗試。每次候選評估記錄逐門計數（缺報價／過期／skew／無趨勢／無量規劃等）供診斷，leader 與 peer 的 1 秒 mid 另存去重 tape 供事後重播。
+leader 對可交易商品宇宙內每個商品的兩個鏡像方向套用進場門檻後，以雙方預先快取之每 point USD 價值計算保守預期 edge USD 並選出的唯一候選；同值時依 normalized 指標、衍生商品識別、direction 決定固定順序。`edge` 模式門檻為 edge-points（以該商品 canonical 執行 point 換算）；`donchian`／`momentum` 趨勢模式改以 leader-only 趨勢偏置定向（1 秒重採樣 mid buffer，buffer 與評估窗同在校準後 UTC 時間軸，另受 spread 上限與暖機 coverage 閘門約束），報價新鮮度改用趨勢時間尺度的寬限預算（`trend_quote_max_age_seconds`，預設 60 秒）且不檢查跨 broker skew（趨勢訊號不比較兩邊價格）；其餘 sizing、隔離、剩餘額度門檻不變。選定後商品、方向、量與排名證據凍結於該次嘗試。每次候選評估記錄逐門計數（缺報價／過期／skew／無趨勢／無量規劃等）供診斷，leader 與 peer 的 1 秒 mid 另存去重 tape 供事後重播。
 _Avoid_: 最大 raw price edge
 
 **配對商品隔離（Pair Product Quarantine）**:

@@ -6711,5 +6711,82 @@ class DebugEvidenceTests(PairCellTestCase):
         self.assertEqual(latest[1], 0)
 
 
+class TrendClockTests(PairCellTestCase):
+    """The trend buffer and its evaluation share the calibrated UTC timeline.
+
+    Production brokers report server-clock ticks hours ahead of UTC; bucketing
+    those raw epochs parks the whole buffer in the future where the reference
+    and volatility windows never overlap it, so trend entries stay warming
+    forever.  These tests pin the calibrated behavior.
+    """
+
+    SHIFT_SECONDS = 10800.0
+
+    def _momentum_prime(self) -> None:
+        self.prime(
+            shared={
+                "entry_mode": "momentum",
+                "trend_momentum_T_seconds": 60.0,
+                "trend_vol_window_seconds": 300.0,
+                "trend_momentum_k": "2.0",
+                "trend_min_mom_points": "5",
+                "trend_max_spread_points": "20",
+                "trend_min_coverage": 0.3,
+            }
+        )
+
+    def _shifted_feed(self, *, leader_mid: Decimal, sequence: int) -> None:
+        """One flat quote pair on a UTC+3 broker: shifted epochs, measured offset."""
+
+        shift = timedelta(seconds=self.SHIFT_SECONDS)
+        calibration = BrokerClockCalibration(offset_seconds=self.SHIFT_SECONDS)
+        self.feed_quotes(
+            leader_bid=str(leader_mid - Decimal("0.00005")),
+            leader_ask=str(leader_mid + Decimal("0.00005")),
+            follower_bid="1.10000",
+            follower_ask="1.10010",
+            sequence=sequence,
+            leader_broker_time=self.now + shift,
+            follower_broker_time=self.now + shift,
+            leader_calibration=calibration,
+            follower_calibration=calibration,
+        )
+
+    def test_momentum_fires_on_broker_clock_shifted_ticks(self) -> None:
+        self._momentum_prime()
+        sequence = 10
+        for _ in range(32):
+            self.now += timedelta(seconds=10)
+            self._shifted_feed(leader_mid=Decimal("1.10000"), sequence=sequence)
+            sequence += 1
+        self.leader.cell.handle_event(PeerSessionEvent(connected=False, observed_at=self.now))
+        self.now += timedelta(seconds=10)
+        self._shifted_feed(leader_mid=Decimal("1.10100"), sequence=200)
+        candidates = self.leader.cell.entry_candidates()
+        self.assertTrue(candidates, "shifted broker ticks must evaluate on wall UTC")
+        self.assertEqual(candidates[0]["leader_direction"], "LONG")
+        # No bucket may sit in the future: the buffer shares the wall timeline.
+        product = self.product_id()
+        history = self.leader.cell._trend_history[product]
+        self.assertTrue(history)
+        self.assertLessEqual(history[-1][0], int(self.now.timestamp()))
+
+    def test_uncalibrated_quotes_stay_out_of_the_trend_buffer(self) -> None:
+        self.prime()
+        product = self.product_id()
+        before = list(self.leader.cell._trend_history.get(product, ()))
+        self.assertTrue(before, "prime must leave a calibrated buffer behind")
+        self.now += timedelta(seconds=10)
+        self.feed_quotes(
+            sequence=50,
+            leader_calibration=BrokerClockCalibration(status="uncalibrated"),
+        )
+        self.assertEqual(
+            list(self.leader.cell._trend_history.get(product, ())),
+            before,
+            "an unplaceable clock must not corrupt the shared timeline",
+        )
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

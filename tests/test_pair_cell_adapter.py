@@ -1245,6 +1245,42 @@ class TrendSeedTests(unittest.TestCase):
         self.assertEqual(now - timedelta(seconds=360), captured["start"])
         self.assertEqual(now, captured["end"])
 
+    def test_seed_points_are_returned_on_the_calibrated_timeline(self) -> None:
+        """Seed stamps land on wall UTC: broker epochs minus the measured offset.
+
+        The cell buckets trend history on the wall-clock timeline its windows
+        run on; raw server epochs would park the buffer hours in the future.
+        """
+
+        now = datetime(2024, 1, 2, 14, 0, tzinfo=UTC)
+        ticks = [
+            {
+                "time": int(now.timestamp()) + 10800 - offset,
+                "time_msc": int(now.timestamp() * 1000) + 10800000 - offset * 1000,
+                "bid": 1.10000,
+                "ask": 1.10010,
+            }
+            for offset in range(60, 360, 10)
+        ]
+
+        class ShiftedMT5:
+            COPY_TICKS_ALL = 3
+
+            def copy_ticks_range(self, *args: object) -> object:
+                return ticks
+
+            def copy_rates_from_pos(self, *args: object) -> object:  # pragma: no cover
+                raise AssertionError("bars must not be read when ticks succeed")
+
+        points, degraded = fetch_trend_seed_points(
+            ShiftedMT5(), SYMBOL, window_seconds=300.0, now=now, broker_offset_seconds=10800.0
+        )
+        self.assertFalse(degraded)
+        self.assertEqual(30, len(points))
+        for point in points:
+            self.assertLessEqual(point.broker_time, now)
+        self.assertGreaterEqual((now - points[0].broker_time).total_seconds(), 50)
+
     def test_native_structured_array_ticks_are_parsed(self) -> None:
         """Real MT5 returns numpy structured arrays, not dicts."""
 
