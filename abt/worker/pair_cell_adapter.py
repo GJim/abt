@@ -1785,6 +1785,14 @@ class PairCellPollingConfig:
     #: How often fresh safe-unpair evidence is re-derived while ``UNPAIRING``
     #: or while reconciling an absent controller route.
     safe_unpair_probe_interval: timedelta = timedelta(seconds=1)
+    #: How often an already-sent safe-unpair assertion is re-sent while
+    #: ``UNPAIRING`` even though nothing local moved.  A controller-side
+    #: ``enter`` discards every stored assertion, and that wipe is invisible
+    #: to the peer that sent it -- its local version never moves, so without
+    #: a heartbeat it would never resend and both sides would log safe=True
+    #: forever while the route waits for an assertion one side believes it
+    #: already sent.
+    assertion_heartbeat_interval: timedelta = timedelta(seconds=30)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1887,6 +1895,7 @@ class PairCellRuntime:
         self._next_route_sync_at = epoch_placeholder = now()
         self._next_acceptance_publication = epoch_placeholder
         self._next_safe_unpair_probe = epoch_placeholder
+        self._next_assertion_heartbeat_at = epoch_placeholder
         self._next_acceptance_diagnostic = epoch_placeholder
         self._last_state_diagnostic: tuple[object, ...] | None = None
         self._pending_budget: tuple[str, StartupBalance] | None = None
@@ -3061,6 +3070,7 @@ class PairCellRuntime:
         self._published_state_version = None
         self._asserted_state_version = None
         self._probed_state_version = None
+        self._next_assertion_heartbeat_at = self._now()
         self._published_policy = False
         self._acceptance_wait = None
         self._operator_requests_applied = True
@@ -3484,7 +3494,10 @@ class PairCellRuntime:
         emptiness or terminality.  An assertion is sent only when the cell's
         own fresh evidence says this account is broker-verified empty and
         every attempt and local effect it owns is terminal, and any new or
-        changed local effect advances the version and invalidates it.
+        changed local effect advances the version and invalidates it.  An
+        already-sent assertion is additionally re-sent on a heartbeat, since
+        a controller-side ``enter`` discards stored assertions without
+        telling their senders.
         """
 
         cell, record = self._cell, self._durable_route
@@ -3515,7 +3528,21 @@ class PairCellRuntime:
         self._probed_state_version = version
         self._next_safe_unpair_probe = now + self._polling.safe_unpair_probe_interval
         assertion = cell.safe_unpair_assertion()
-        if not assertion.safe or self._asserted_state_version == assertion.state_version:
+        if assertion.safe and self._asserted_state_version == assertion.state_version:
+            # This exact assertion was already sent, but a controller-side
+            # ``enter`` discards every stored assertion without telling the
+            # sender -- the local version never moves, so without a resend
+            # both sides would report safe=True forever while the route waits
+            # for an assertion one side believes it already sent.
+            if now < self._next_assertion_heartbeat_at:
+                return
+            _LOGGER.debug(
+                "%s evt=assertion_heartbeat route=%s state_version=%s",
+                _RTAG,
+                _short(record.route_id),
+                assertion.state_version,
+            )
+        elif not assertion.safe:
             return
         try:
             self._session.send_pair_cell_unpair_assertion(
@@ -3525,6 +3552,7 @@ class PairCellRuntime:
             _LOGGER.warning("The safe-unpair assertion could not be sent.", exc_info=True)
             return
         self._asserted_state_version = assertion.state_version
+        self._next_assertion_heartbeat_at = now + self._polling.assertion_heartbeat_interval
 
     def _maybe_publish_policy(self) -> PairResult | None:
         """Leader-only: compose and adopt the one canonical policy.

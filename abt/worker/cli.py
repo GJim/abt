@@ -269,6 +269,11 @@ def main(
         except WorkerEnrollmentError as error:
             print(f"Worker reconciliation failed: {error}", file=error_output)
             return 1
+    elif arguments.command == "unpair":
+        # An invoked safe unpair: the runtime auto-enters UNPAIRING on
+        # restore/adopt, latches the exit flag once the route is removed, and
+        # reports the authoritative controller-confirmed noop when routeless.
+        pair_cell_options = PairCellStartupOptions(unpair=True)
     else:
         pair_cell_options = PairCellStartupOptions()
     if arguments.verbose:
@@ -571,12 +576,24 @@ class _UnpairCompletion:
         if route_id is None:
             if self._ever_routed:
                 return f"Route {self._route_id} was removed; the safe unpair is complete."
-            return "This Worker is not on a Pair Execution Cell route; nothing to unpair."
+            if runtime.should_exit:
+                # The controller authoritatively confirmed no route exists
+                # (the ``unpair_noop`` path); anything earlier may just be a
+                # route that has not been adopted yet, since role declaration
+                # and route sync are asynchronous.
+                return "This Worker is not on a Pair Execution Cell route; nothing to unpair."
+            return None
         self._ever_routed = True
         self._route_id = route_id
         if not self._sent:
-            if not runtime.request_safe_unpair():
-                raise WorkerEnrollmentError("The Pair Execution Cell unpair command could not be sent.")
+            cell = runtime.cell
+            if cell is None or cell.route_state() != "UNPAIRING":
+                # Re-entering UNPAIRING discards both Workers' fresh
+                # assertions controller-side, so never re-enter while the
+                # route already reports UNPAIRING (e.g. the startup request
+                # already moved it there).
+                if not runtime.request_safe_unpair():
+                    raise WorkerEnrollmentError("The Pair Execution Cell unpair command could not be sent.")
             self._sent = True
         return None
 
@@ -663,6 +680,14 @@ class _QuarantineReleaseCompletion:
         )
 
 
+#: How many already-arrived socket messages one one-shot iteration drains.
+#: ``receive_worker_relay`` pulls exactly one message per call, while a single
+#: request typically completes with several (a control reply plus route
+#: pushes plus relay acks), so one call per iteration would stretch completion
+#: over many polls; the cap keeps a burst from starving the pump below.
+_ONE_SHOT_RECEIVE_DRAIN_LIMIT = 25
+
+
 def _one_shot_run(
     *,
     done: Callable[[PairCellRuntime, object], str | None],
@@ -709,6 +734,17 @@ def _one_shot_run(
             while True:
                 if maintenance is not None:
                     maintenance()
+                receive = getattr(session, "receive_worker_relay", None)
+                if callable(receive):
+                    # Control replies, route pushes and relay envelopes only
+                    # reach the runtime's drain queues through this receive
+                    # seam.  Without it a one-shot command sends its request
+                    # and then waits for a reply it never reads, and a dead
+                    # socket is never noticed (only a receive raises
+                    # ``WorkerSessionDisconnected`` for the reconnect loop).
+                    for _ in range(_ONE_SHOT_RECEIVE_DRAIN_LIMIT):
+                        if not receive(timeout=0.0):
+                            break
                 last_result = runtime.pump(now())
                 message = done(runtime, last_result)
                 if message is not None:

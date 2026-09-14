@@ -270,6 +270,7 @@ class FakeRuntime:
     def __init__(self) -> None:
         self.route_id: str | None = None
         self.cell: object | None = None
+        self.should_exit = False
         self.generation: int | None = None
         self.diagnostic = ""
         self.unpair_calls = 0
@@ -308,8 +309,16 @@ class FakeRuntime:
 
 class WatcherTests(unittest.TestCase):
     def test_unpair_reports_nothing_to_do_off_route(self) -> None:
+        runtime = FakeRuntime()
+        runtime.should_exit = True
         watcher = _UnpairCompletion()
-        self.assertIn("nothing to unpair", watcher(FakeRuntime(), None) or "")
+        self.assertIn("nothing to unpair", watcher(runtime, None) or "")
+
+    def test_unpair_waits_for_the_authoritative_noop_before_giving_up(self) -> None:
+        watcher = _UnpairCompletion()
+        # A route that has not been adopted yet (role declaration and route
+        # sync are asynchronous) must not be mistaken for "nothing to unpair".
+        self.assertIsNone(watcher(FakeRuntime(), None))
 
     def test_unpair_sends_once_then_reports_removal(self) -> None:
         runtime = FakeRuntime()
@@ -322,6 +331,22 @@ class WatcherTests(unittest.TestCase):
         message = watcher(runtime, None)
         self.assertIn("route-1", message or "")
         self.assertIn("complete", message or "")
+
+    def test_unpair_does_not_re_enter_while_already_unpairing(self) -> None:
+        runtime = FakeRuntime()
+        runtime.route_id = "route-1"
+        runtime.cell = SimpleNamespace(route_state=lambda: "UNPAIRING")
+        watcher = _UnpairCompletion()
+        self.assertIsNone(watcher(runtime, None))
+        self.assertEqual(0, runtime.unpair_calls)
+
+    def test_unpair_sends_while_still_active(self) -> None:
+        runtime = FakeRuntime()
+        runtime.route_id = "route-1"
+        runtime.cell = SimpleNamespace(route_state=lambda: "ACTIVE")
+        watcher = _UnpairCompletion()
+        self.assertIsNone(watcher(runtime, None))
+        self.assertEqual(1, runtime.unpair_calls)
 
     def test_unpair_send_failure_raises(self) -> None:
         runtime = FakeRuntime()
@@ -449,3 +474,51 @@ class WatcherTests(unittest.TestCase):
             )
         self.assertIn("timed out", str(raised.exception))
         self.assertTrue(runtime.closed)
+
+    def test_one_shot_run_drains_the_receive_seam_every_iteration(self) -> None:
+        """Control replies and route pushes only arrive via ``receive``.
+
+        A one-shot command that never receives would send its request and
+        then wait for a reply it never reads, so the run must drain the
+        receive seam before every pump.
+        """
+        runtime = FakeRuntime()
+        runtime.route_id = "route-1"
+        pumps = 0
+
+        def pump(_: object) -> object:
+            nonlocal pumps
+            pumps += 1
+            if pumps >= 2:
+                runtime.route_id = None
+            return None
+
+        runtime.pump = pump  # type: ignore[method-assign]
+        mt5 = SimpleNamespace(
+            initialize=lambda: True,
+            login=lambda login, *, password, server: True,
+            account_info=lambda: {"login": 7, "server": "Broker-Demo"},
+        )
+        received: list[object] = []
+        session = SimpleNamespace(
+            request_password=lambda: "secret",
+            receive_worker_relay=lambda timeout=None: received.append(timeout) is None and False,
+        )
+        output = io.StringIO()
+        clock = iter([datetime(2026, 9, 12, tzinfo=UTC)] * 100).__next__
+        run = _one_shot_run(
+            done=_UnpairCompletion(), timeout_seconds=30.0, output=output, now=clock  # type: ignore[arg-type]
+        )
+        run(
+            mt5=mt5,
+            session=session,
+            login=7,
+            server="Broker-Demo",
+            sleep=lambda _: None,
+            maintenance=None,
+            effect_journal=None,
+            pair_cell_factory=lambda *args: runtime,
+        )
+        self.assertIn("complete", output.getvalue())
+        self.assertGreaterEqual(len(received), 2)
+        self.assertTrue(all(timeout == 0.0 for timeout in received))

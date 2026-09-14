@@ -1747,6 +1747,7 @@ class PairingTestCase(unittest.TestCase):
         options: PairCellStartupOptions = PairCellStartupOptions(),
         symbols: dict[str, dict[str, object]] | None = None,
         login: int | None = None,
+        polling_config: PairCellPollingConfig | None = None,
     ) -> Worker:
         mt5 = FakeMT5(
             clock=self.clock,
@@ -1766,6 +1767,7 @@ class PairingTestCase(unittest.TestCase):
             mt5=mt5,
             config=config,
             options=options,
+            polling_config=polling_config,
         )
 
     def paired(
@@ -1775,6 +1777,7 @@ class PairingTestCase(unittest.TestCase):
         leader_config: PairCellConfig | None = None,
         follower_config: PairCellConfig | None = None,
         follower_balance: float = 4_000.0,
+        polling_config: PairCellPollingConfig | None = None,
     ) -> tuple[Worker, Worker]:
         # Lifecycle tests exercise the live execution path; pass
         # ``default_pair_cell_config()`` explicitly for the synthesized
@@ -1782,7 +1785,12 @@ class PairingTestCase(unittest.TestCase):
         if leader_config is None:
             leader_config = parse_pair_cell_config({"mode": "live"})
         follower = self.worker(
-            FOLLOWER, bid=1.10100, ask=1.10110, balance=follower_balance, config=follower_config
+            FOLLOWER,
+            bid=1.10100,
+            ask=1.10110,
+            balance=follower_balance,
+            config=follower_config,
+            polling_config=polling_config,
         )
         leader = self.worker(
             LEADER,
@@ -1792,6 +1800,7 @@ class PairingTestCase(unittest.TestCase):
             config=leader_config,
             options=leader_options
             or PairCellStartupOptions(role="leader", follower_worker_id=FOLLOWER),
+            polling_config=polling_config,
         )
         self.assertTrue(
             pump_until(
@@ -2433,11 +2442,14 @@ class DiscoveryLifecycleTests(PairingTestCase):
 
 
 class SafeUnpairTests(PairingTestCase):
-    def _idle_pair(self) -> tuple[Worker, Worker]:
+    def _idle_pair(
+        self, *, polling_config: PairCellPollingConfig | None = None
+    ) -> tuple[Worker, Worker]:
         """A paired, entry-ready pair whose edge threshold admits nothing."""
 
         leader, follower = self.paired(
-            leader_config=parse_pair_cell_config({"entry_edge_points": "100000"})
+            leader_config=parse_pair_cell_config({"entry_edge_points": "100000"}),
+            polling_config=polling_config,
         )
         self.assertTrue(
             pump_until(
@@ -2543,6 +2555,77 @@ class SafeUnpairTests(PairingTestCase):
         )
         self.assertNotEqual(original, leader.runtime.route_id)
         self.assertEqual(leader.runtime.route_id, follower.runtime.route_id)
+
+    def _one_sided_wipe(
+        self, heartbeat: timedelta
+    ) -> tuple[Worker, Worker, str]:
+        """Recreate the production interleave: follower asserts, a second
+        ``enter`` wipes it, then the leader asserts, so only the leader's
+        assertion stands controller-side while both sides report safe=True."""
+
+        leader, follower = self._idle_pair(
+            polling_config=polling(
+                safe_unpair_probe_interval=timedelta(seconds=1),
+                assertion_heartbeat_interval=heartbeat,
+            )
+        )
+        original = cast(str, leader.runtime.route_id)
+        # The leader holds exposure, so only the follower can assert.
+        leader.mt5.positions.append({"ticket": 9191, "symbol": SYMBOL, "type": 0, "volume": 1.0})
+        pump_until([leader, follower], lambda: False, rounds=6)
+        self.assertTrue(leader.runtime.request_safe_unpair())
+        self.assertTrue(
+            pump_until(
+                [leader, follower],
+                lambda: (original, FOLLOWER) in self.controller.assertions,
+                rounds=120,
+            ),
+            "the follower never asserted",
+        )
+        self.assertNotIn((original, LEADER), self.controller.assertions)
+        # A second enter (operator retry, double send, restarted peer) wipes
+        # the follower's stored assertion; the send lands synchronously and
+        # the sender cannot tell it happened.
+        self.assertTrue(leader.runtime.request_safe_unpair())
+        self.assertEqual({}, dict(self.controller.assertions))
+        # The leader's exposure clears, so it asserts too -- leaving only the
+        # leader's assertion standing controller-side.
+        leader.mt5.positions.clear()
+        self.assertTrue(
+            pump_until(
+                [leader, follower],
+                lambda: (original, LEADER) in self.controller.assertions,
+                rounds=120,
+            ),
+            "the leader never asserted after its exposure cleared",
+        )
+        return leader, follower, original
+
+    def test_a_controller_side_wipe_is_healed_by_the_assertion_heartbeat(self) -> None:
+        """Neither side's local version moves after the wipe, so only the
+        heartbeat re-asserts -- and then the route is removed without any
+        restart or version bump."""
+
+        leader, follower, original = self._one_sided_wipe(timedelta(seconds=5))
+        self.assertIn(original, self.controller.routes)
+        self.assertTrue(
+            pump_until(
+                [leader, follower],
+                lambda: original not in self.controller.routes,
+                rounds=400,
+            ),
+            "the wiped assertion was never re-asserted",
+        )
+
+    def test_without_the_heartbeat_a_wipe_stalls_the_unpair_forever(self) -> None:
+        """Reproduces the stalemate the heartbeat exists to bound: both sides
+        keep deriving safe=True from unchanged local evidence, neither
+        resends on its own, and the route is never removed."""
+
+        leader, follower, original = self._one_sided_wipe(timedelta(hours=1))
+        pump_until([leader, follower], lambda: False, rounds=60)
+        self.assertEqual({(original, LEADER): 0}, dict(self.controller.assertions))
+        self.assertIn(original, self.controller.routes)
 
 
 # --------------------------------------------------------------------------- #
