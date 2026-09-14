@@ -7,6 +7,7 @@ import tempfile
 import unittest
 
 from abt.worker.enrollment import WorkerEnrollmentError, WorkerSessionDisconnected
+from abt.worker.wine_mt5_client import BridgeClientError
 from abt.worker.effect_journal import WorkerEffectJournal
 from abt.worker.reconciliation import (
     AccountMismatchError,
@@ -353,6 +354,67 @@ class WorkerReconciliationTests(unittest.TestCase):
                 server="Broker-Demo",
                 sleep=waits.append,
                 run_reconciliation=lambda **_: (_ for _ in ()).throw(WorkerSessionDisconnected("controller disconnected")),
+            )
+
+        self.assertEqual(11, opened)
+        self.assertEqual([float(5 * 2 ** attempt) for attempt in range(10)], waits)
+
+    def test_retries_bridge_errors_with_the_same_bounded_backoff(self) -> None:
+        """A broker-bridge blip during reconnect must not kill the worker."""
+
+        opened = 0
+        waits: list[float] = []
+        runs = 0
+
+        def open_session() -> ReconnectSession:
+            nonlocal opened
+            opened += 1
+            if opened < 3:
+                raise BridgeClientError("bridge request timed out")
+            return ReconnectSession()
+
+        def run_reconciliation(**_: object) -> None:
+            nonlocal runs
+            runs += 1
+
+        with self.assertLogs("abt.worker.reconciliation", level="WARNING") as logs:
+            reconnect_worker_session(
+                open_session=open_session,
+                mt5=ReadOnlyMT5(),
+                login=123456,
+                server="Broker-Demo",
+                sleep=waits.append,
+                run_reconciliation=run_reconciliation,
+            )
+
+        self.assertEqual(3, opened)
+        self.assertEqual(1, runs)
+        self.assertEqual([5.0, 10.0], waits)
+        self.assertEqual(
+            ["WARNING:abt.worker.reconciliation:Local broker bridge unavailable "
+             "(bridge request timed out); reconnecting attempt 1/10 in 5 seconds.",
+             "WARNING:abt.worker.reconciliation:Local broker bridge unavailable "
+             "(bridge request timed out); reconnecting attempt 2/10 in 10 seconds."],
+            logs.output,
+        )
+
+    def test_bridge_errors_stop_after_ten_reconnect_attempts(self) -> None:
+        opened = 0
+        waits: list[float] = []
+
+        def open_session() -> ReconnectSession:
+            nonlocal opened
+            opened += 1
+            raise BridgeClientError("bridge request pipe closed")
+
+        with self.assertRaisesRegex(BridgeClientError, "bridge request pipe closed"):
+            reconnect_worker_session(
+                open_session=open_session,
+                mt5=ReadOnlyMT5(),
+                login=123456,
+                server="Broker-Demo",
+                sleep=waits.append,
+                run_reconciliation=lambda **_: None,
             )
 
         self.assertEqual(11, opened)

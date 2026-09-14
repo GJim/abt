@@ -14,6 +14,7 @@ from ..trader_protocol import BrokerReceipt, MAX_LIVE_SYMBOLS
 from .enrollment import WorkerEnrollmentError, WorkerSessionDisconnected
 from .effect_journal import EffectJournalError, WorkerEffectJournal
 from .scheduler import BrokerActionNotStarted, ScheduledTraderRpc
+from .wine_mt5_client import BridgeClientError
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -466,6 +467,23 @@ def reconnect_worker_session(
             delay = float(5 * 2 ** attempts)
             _LOGGER.warning(
                 "Worker session disconnected (%s); reconnecting attempt %s/10 in %.0f seconds.",
+                error,
+                attempts + 1,
+                delay,
+            )
+            sleep(delay)
+            attempts += 1
+        except BridgeClientError as error:
+            # A local broker-bridge blip must not kill the worker: re-open
+            # the session under the same bounded backoff as a transport
+            # disconnect.  Anything else still fails fast below.
+            if connected_at is not None and monotonic_clock() - connected_at >= _RECONNECT_BACKOFF_RESET_SECONDS:
+                attempts = 0
+            if attempts >= 10:
+                raise
+            delay = float(5 * 2 ** attempts)
+            _LOGGER.warning(
+                "Local broker bridge unavailable (%s); reconnecting attempt %s/10 in %.0f seconds.",
                 error,
                 attempts + 1,
                 delay,
