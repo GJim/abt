@@ -91,6 +91,23 @@ def _json_value(value: Any) -> Any:
     as_dict = getattr(value, "_asdict", None)
     if callable(as_dict):
         return _json_value(as_dict())
+    names = getattr(getattr(value, "dtype", None), "names", None)
+    if names:
+        # Numpy structured arrays (every MT5 copy_* history call): a bare
+        # tolist() would reduce rows to nameless tuples that the Linux side
+        # cannot parse back into tick/rate evidence, silently starving trend
+        # seeding on every Wine worker.  Keep the field names instead.
+        try:
+            rows = list(value)
+        except TypeError as error:
+            raise BridgeError(f"MT5 returned an unreadable structured array: {error}") from error
+        encoded = []
+        for row in rows:
+            try:
+                encoded.append({name: _json_value(row[name]) for name in names})
+            except (TypeError, ValueError, IndexError, KeyError) as error:
+                raise BridgeError(f"MT5 returned an unreadable structured row: {error}") from error
+        return encoded
     to_list = getattr(value, "tolist", None)
     if callable(to_list):
         return _json_value(to_list())

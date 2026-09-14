@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 from datetime import datetime
+from types import SimpleNamespace
 
 from abt.worker.wine_mt5_bridge import BridgeError, handle_request
 
@@ -138,6 +139,52 @@ class WineMT5BridgeContractTests(unittest.TestCase):
         )["result"]
         self.assertEqual(42, by_position[0]["position"])
         self.assertEqual(2, by_range[0]["args"])
+
+    def test_structured_history_arrays_keep_their_field_names(self) -> None:
+        """Numpy rows must cross the bridge as dicts, never nameless tuples."""
+
+        class Scalar:
+            def __init__(self, value: object) -> None:
+                self._value = value
+
+            def tolist(self) -> object:
+                return self._value
+
+        class VoidRow:
+            __slots__ = ("_values",)
+
+            def __init__(self, values: dict[str, object]) -> None:
+                self._values = values
+
+            def __getitem__(self, name: str) -> Scalar:
+                return Scalar(self._values[name])
+
+        class StructuredArray:
+            dtype = SimpleNamespace(names=("time", "bid", "ask", "time_msc"))
+
+            def __init__(self, rows: list[VoidRow]) -> None:
+                self._rows = rows
+
+            def __iter__(self):  # type: ignore[no-untyped-def]
+                return iter(self._rows)
+
+        class NativeMT5(FakeMT5):
+            def copy_ticks_range(self, symbol: str, start: datetime, end: datetime, flags: int) -> object:
+                return StructuredArray(
+                    [VoidRow({"time": 1726000000, "bid": 1.1, "ask": 1.1001, "time_msc": 1726000000000})]
+                )
+
+        result = handle_request(
+            NativeMT5(),
+            self.request(
+                "copy_ticks_range",
+                {"symbol": "EURUSD", "from": "2026-08-20T00:00:00+00:00", "to": "2026-08-20T00:01:00+00:00", "flags": 3},
+            ),
+        )["result"]
+        self.assertEqual(
+            [{"time": 1726000000, "bid": 1.1, "ask": 1.1001, "time_msc": 1726000000000}],
+            result,
+        )
 
     def test_copy_rates_from_pos_resolves_named_constants_or_raw_int(self) -> None:
         mt5 = FakeMT5()
