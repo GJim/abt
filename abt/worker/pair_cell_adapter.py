@@ -1315,24 +1315,73 @@ def sample_broker_clock_calibration(
         try:
             evidence = _evidence(mt5.symbol_info_tick(symbol), "symbol tick")
             epoch_milliseconds = _tick_epoch_milliseconds(evidence)
-        except WorkerEnrollmentError:
+        except WorkerEnrollmentError as exc:
+            _LOGGER.debug(
+                "%s evt=calibration_sample sym=%s idx=%s ok=0 reason=tick_unreadable"
+                " before=%s err=%s",
+                _RTAG,
+                symbol,
+                index,
+                before.isoformat(),
+                exc,
+            )
             return None
         after = now()
         if previous_epoch is not None and epoch_milliseconds <= previous_epoch:
+            _LOGGER.debug(
+                "%s evt=calibration_sample sym=%s idx=%s ok=0 reason=frozen"
+                " epoch_ms=%s prev_epoch_ms=%s before=%s after=%s",
+                _RTAG,
+                symbol,
+                index,
+                epoch_milliseconds,
+                previous_epoch,
+                before.isoformat(),
+                after.isoformat(),
+            )
             return None  # frozen, halted or replayed feed: never calibrate from it
         previous_epoch = epoch_milliseconds
         midpoint = before + (after - before) / 2
-        offsets.append(epoch_milliseconds / 1000.0 - midpoint.timestamp())
-        spans.append((after - before).total_seconds())
+        sample_offset = epoch_milliseconds / 1000.0 - midpoint.timestamp()
+        sample_span = (after - before).total_seconds()
+        _LOGGER.debug(
+            "%s evt=calibration_sample sym=%s idx=%s ok=1 epoch_ms=%s before=%s after=%s"
+            " offset_s=%.3f span_s=%.3f",
+            _RTAG,
+            symbol,
+            index,
+            epoch_milliseconds,
+            before.isoformat(),
+            after.isoformat(),
+            sample_offset,
+            sample_span,
+        )
+        offsets.append(sample_offset)
+        spans.append(sample_span)
         observed_at = after
     if observed_at is None:
         return None
     offset = float(median(offsets))
     dispersion = max(offsets) - min(offsets)
     if dispersion > _MAX_CALIBRATION_DISPERSION_SECONDS:
+        _LOGGER.debug(
+            "%s evt=calibration_sample sym=%s ok=0 reason=dispersed offsets=%s dispersion_s=%.3f",
+            _RTAG,
+            symbol,
+            [f"{value:.3f}" for value in offsets],
+            dispersion,
+        )
         return None  # the samples disagree too much to bound the clock usefully
     residual = max(0.0, max(offsets) - offset)
     error = residual + dispersion + max(spans) / 2
+    _LOGGER.debug(
+        "%s evt=calibration_sample sym=%s ok=1 offsets=%s offset_s=%.3f error_s=%.3f",
+        _RTAG,
+        symbol,
+        [f"{value:.3f}" for value in offsets],
+        offset,
+        error,
+    )
     return BrokerClockSample(
         calibration=BrokerClockCalibration(
             offset_seconds=offset, error_seconds=round(error, 6), status="calibrated"
@@ -3093,7 +3142,8 @@ class PairCellRuntime:
         return True
 
     def _calibrate(self) -> None:
-        for symbol in self._calibration_symbols():
+        tried = self._calibration_symbols()
+        for symbol in tried:
             sample = sample_broker_clock_calibration(
                 self._raw_mt5,
                 symbol,
@@ -3103,8 +3153,19 @@ class PairCellRuntime:
             )
             if sample is not None:
                 self._clock_sample = sample
+                _LOGGER.debug(
+                    "%s evt=calibration ok=1 sym=%s offset_s=%.3f error_s=%.3f",
+                    _RTAG,
+                    symbol,
+                    sample.calibration.offset_seconds,
+                    sample.calibration.error_seconds,
+                )
                 return
-        _LOGGER.warning("No eligible symbol could calibrate this broker's clock this cycle.")
+            _LOGGER.debug("%s evt=calibration ok=0 sym=%s", _RTAG, symbol)
+        _LOGGER.warning(
+            "No eligible symbol could calibrate this broker's clock this cycle (tried=%s).",
+            ",".join(tried),
+        )
 
     def _calibration_symbols(self) -> tuple[str, ...]:
         cell = self._cell
