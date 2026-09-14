@@ -2210,7 +2210,10 @@ class SharedTimingTests(PairCellTestCase):
 class ProductStatusPersistenceTests(PairCellTestCase):
     def test_suspend_reasons_are_persisted_for_offline_inspection(self) -> None:
         self.prime()
-        # Let every quote go stale, then force a refresh with no current quote.
+        # A hard failure (not fully tradable) suspends; transient quote gaps
+        # retain installed plans instead (see PlanRetentionTests).
+        self.leader_entries = [_entry(trade_mode=3)]
+        self.feed_catalogs()
         self.tick(seconds=3601.0)
         self.tick()
         suspended = self.leader.cell.suspended_products()
@@ -2563,6 +2566,29 @@ class PlanRetentionTests(PairCellTestCase):
             "sizing-plan version is neither current nor a retained superseded version",
             [str(row["detail"]) for row in self.follower.cell.transition_history()],
         )
+
+    def test_stale_quotes_do_not_suspend_installed_plans(self) -> None:
+        """Regression: a transient quote gap must retain plans, not flap versions.
+
+        Rebuilding every refresh while quotes flap suspends/re-adds products
+        and changes the plan-set version each time (relay + state-log spam).
+        """
+
+        self.prime()
+        product = self.product_id()
+        before = self.leader.cell.status().plan_set_version
+        self.assertTrue(before)
+        self.assertIn((product, "LONG"), self.leader.cell.sizing_plans())
+        # Advance past the hourly rebuild with no fresh quote in hand.
+        self.now += timedelta(seconds=61 * 60)
+        self.leader.cell.handle_event(ClockTickEvent(self.now))
+        self.net.pump()
+        self.assertEqual(
+            self.leader.cell.status().plan_set_version,
+            before,
+            "installed plans must survive a transient quote gap",
+        )
+        self.assertIn((product, "LONG"), self.leader.cell.sizing_plans())
 
 
 # --------------------------------------------------------------------------- #
@@ -6262,8 +6288,8 @@ class TrendEntryTests(PairCellTestCase):
             shared={
                 "entry_mode": "donchian",
                 "trend_lookback_seconds": 120.0,
-                "trend_breakout_buffer_points": "0.00002",
-                "trend_min_range_points": "0.00005",
+                "trend_breakout_buffer_points": "2",
+                "trend_min_range_points": "5",
                 "trend_max_spread_points": "20",
                 "trend_min_coverage": 0.5,
             }
@@ -6289,8 +6315,8 @@ class TrendEntryTests(PairCellTestCase):
             shared={
                 "entry_mode": "donchian",
                 "trend_lookback_seconds": 120.0,
-                "trend_breakout_buffer_points": "0.00002",
-                "trend_min_range_points": "0.00005",
+                "trend_breakout_buffer_points": "2",
+                "trend_min_range_points": "5",
                 "trend_max_spread_points": "20",
                 "trend_min_coverage": 0.5,
             }
@@ -6313,8 +6339,8 @@ class TrendEntryTests(PairCellTestCase):
             shared={
                 "entry_mode": "donchian",
                 "trend_lookback_seconds": 120.0,
-                "trend_breakout_buffer_points": "0.00002",
-                "trend_min_range_points": "0.00012",
+                "trend_breakout_buffer_points": "2",
+                "trend_min_range_points": "12",
                 "trend_max_spread_points": "2",
                 "trend_min_coverage": 0.5,
             }
@@ -6338,7 +6364,7 @@ class TrendEntryTests(PairCellTestCase):
                 "trend_momentum_T_seconds": 60.0,
                 "trend_vol_window_seconds": 300.0,
                 "trend_momentum_k": "2.0",
-                "trend_min_mom_points": "0.00005",
+                "trend_min_mom_points": "5",
                 "trend_max_spread_points": "20",
                 "trend_min_coverage": 0.3,
             }
@@ -6358,13 +6384,60 @@ class TrendEntryTests(PairCellTestCase):
         self.assertEqual(candidates[0]["leader_direction"], "LONG")
         self.assertEqual(candidates[0]["entry_mode"], "momentum")
 
+    def test_momentum_live_point_count_thresholds_admit_an_impulse(self) -> None:
+        """Regression: production point-count config must fire on a real impulse.
+
+        ``trend_min_mom_points="5"`` means five canonical points, not five
+        price units; unscaled, no FX impulse could ever clear it.
+        """
+
+        self.prime(
+            shared={
+                "entry_mode": "momentum",
+                "trend_momentum_T_seconds": 120.0,
+                "trend_vol_window_seconds": 600.0,
+                "trend_momentum_k": "2.0",
+                "trend_min_mom_points": "5",
+                "trend_max_spread_points": "8",
+                "trend_min_coverage": 0.8,
+            }
+        )
+        # Flat ramp inside a 4-point spread, then an 80-point jump.
+        point = Decimal("0.00001")
+        mid = Decimal("1.10000")
+        sequence = 10
+        for _ in range(55):
+            self.now += timedelta(seconds=10)
+            self.feed_quotes(
+                leader_bid=str(mid - 2 * point),
+                leader_ask=str(mid + 2 * point),
+                follower_bid="1.10000",
+                follower_ask="1.10004",
+                sequence=sequence,
+            )
+            sequence += 1
+        self.leader.cell.handle_event(PeerSessionEvent(connected=False, observed_at=self.now))
+        self.now += timedelta(seconds=10)
+        jumped = mid + 80 * point
+        self.feed_quotes(
+            leader_bid=str(jumped - 2 * point),
+            leader_ask=str(jumped + 2 * point),
+            follower_bid="1.10000",
+            follower_ask="1.10004",
+            sequence=200,
+        )
+        candidates = self.leader.cell.entry_candidates()
+        self.assertTrue(candidates, "live point-count thresholds must admit an 80-point impulse")
+        self.assertEqual(candidates[0]["leader_direction"], "LONG")
+        self.assertEqual(candidates[0]["entry_mode"], "momentum")
+
     def test_trend_seed_prefills_the_buffer_without_publishing_quotes(self) -> None:
         self.prime(
             shared={
                 "entry_mode": "donchian",
                 "trend_lookback_seconds": 120.0,
-                "trend_breakout_buffer_points": "0.00002",
-                "trend_min_range_points": "0.00012",
+                "trend_breakout_buffer_points": "2",
+                "trend_min_range_points": "12",
                 "trend_max_spread_points": "20",
                 "trend_min_coverage": 0.5,
             }

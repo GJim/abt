@@ -918,6 +918,9 @@ class StrategyPolicy:
     strategy_budget_usd: str = DEFAULT_STRATEGY_BUDGET_USD
     entry_mode: EntryMode = DEFAULT_ENTRY_MODE
     trend_lookback_seconds: float = DEFAULT_TREND_LOOKBACK_SECONDS
+    # All ``*_points`` trend thresholds are point counts in canonical-point
+    # units (like entry_edge_points): the cell scales them by the product's
+    # canonical point before comparing against price-unit buffer mids.
     trend_breakout_buffer_points: str = DEFAULT_TREND_BREAKOUT_BUFFER_POINTS
     trend_min_range_points: str = DEFAULT_TREND_MIN_RANGE_POINTS
     trend_momentum_T_seconds: float = DEFAULT_TREND_MOMENTUM_T_SECONDS
@@ -2704,6 +2707,10 @@ class PairExecutionCell:
         self._plans_refreshed_at: datetime | None = None
         self._last_plan_quote_set: frozenset[str] = frozenset()
         self._suspended_products: dict[str, str] = {}
+        # Policy hash the installed plans were built under.  A rebuild under
+        # the same hash may retain prior plans across transient quote/facts
+        # gaps; a policy change forces a full rebuild without retention.
+        self._plans_policy_hash: str | None = None
         self._peer_plans: dict[tuple[str, Direction], SizingPlan] = {}
         self._peer_plan_index: dict[str, SizingPlan] = {}
         self._peer_plan_set_version: str | None = None
@@ -4120,6 +4127,7 @@ class PairExecutionCell:
         self._plans_refreshed_at = None
         self._last_plan_quote_set = frozenset()
         self._suspended_products = {}
+        self._plans_policy_hash = None
         self._decided_quotes = {}
         self._trend_history = {
             product_id: history
@@ -4532,6 +4540,32 @@ class PairExecutionCell:
         )
         return (self._now - self._plans_refreshed_at).total_seconds() >= refresh_seconds
 
+    def _retain_prior_product_plans(
+        self, product_id: str, plans: dict[tuple[str, Direction], SizingPlan]
+    ) -> bool:
+        """Reinstall this product's installed plans; True when any was retained."""
+
+        retained = False
+        for key, plan in self._plans.items():
+            if key[0] == product_id:
+                plans[key] = plan
+                retained = True
+        return retained
+
+    def _retain_prior_direction_plan(
+        self,
+        product_id: str,
+        direction: Direction,
+        plans: dict[tuple[str, Direction], SizingPlan],
+    ) -> bool:
+        """Reinstall one installed direction plan; True when one was retained."""
+
+        prior = self._plans.get((product_id, direction))
+        if prior is None:
+            return False
+        plans[(product_id, direction)] = prior
+        return True
+
     def _refresh_sizing_plans(self) -> None:
         """Rebuild every discovered product/direction plan; suspend failures.
 
@@ -4544,10 +4578,19 @@ class PairExecutionCell:
         limits = self._limits
         assert universe is not None and limits is not None  # guarded by _refresh_due
         policy = cast(StrategyPolicy, self._policy)
+        # Retention is only safe under the policy the installed plans were
+        # built under; anything else (first build, policy change, rediscovery)
+        # rebuilds fully.  Together with pricing from the last known quote
+        # (below), this breaks the suspend/re-add rebuild ping-pong that a
+        # strict freshness cutoff would otherwise drive on every quote gap.
+        retain_prior = (
+            bool(self._plans)
+            and self._policy is not None
+            and self._plans_policy_hash == self._policy.hash
+        )
         catalog = {entry.name: entry for entry in (self._local_catalog.entries if self._local_catalog else ())}
         plans: dict[tuple[str, Direction], SizingPlan] = {}
         suspended: dict[str, str] = {}
-        quoted = self._quoted_products()
         for product in universe.products:
             product_id = product.product_id
             drift = _compatibility_drift(catalog.get(product.symbol), product)
@@ -4555,11 +4598,21 @@ class PairExecutionCell:
                 suspended[product_id] = drift
                 continue
             quote = self._local_quotes.get(product_id)
-            if product_id not in quoted or quote is None:
+            if quote is None:
+                # Never quoted: nothing to price with.  Retain prior plans
+                # under the same policy instead of flapping suspend/re-add.
+                if retain_prior and self._retain_prior_product_plans(product_id, plans):
+                    continue
                 suspended[product_id] = "no current local quote exists for this product"
                 continue
+            # A stale quote still prices margin and carries live facts: plans
+            # are slow-moving economics, so rebuild from the last known quote
+            # rather than suspending.  Entry-time freshness gates are unchanged
+            # and still guard every actual order.
             facts = self._read_local_product_facts(product.symbol)
             if facts is None:
+                if retain_prior and self._retain_prior_product_plans(product_id, plans):
+                    continue
                 suspended[product_id] = "local symbol economics are unavailable"
                 continue
             if not facts.tradable:
@@ -4594,11 +4647,15 @@ class PairExecutionCell:
                 price = quote.ask if typed == "LONG" else quote.bid
                 margin_per_lot = self._margin_per_lot(product.symbol, typed, price)
                 if margin_per_lot is None or margin_per_lot <= 0:
+                    if retain_prior and self._retain_prior_direction_plan(product_id, typed, plans):
+                        directions_built += 1
                     continue
                 local_max_lots = floor_to_volume_step(
                     limits.margin_budget_usd / margin_per_lot, volume_min, volume_max, volume_step
                 )
                 if local_max_lots is None:
+                    if retain_prior and self._retain_prior_direction_plan(product_id, typed, plans):
+                        directions_built += 1
                     continue
                 plan = SizingPlan(
                     universe_generation=universe.universe_generation,
@@ -4667,6 +4724,7 @@ class PairExecutionCell:
         self._db.commit()
         self._plans, self._suspended_products = plans, suspended
         self._plans_refreshed_at = self._now
+        self._plans_policy_hash = policy.hash
         self._last_plan_quote_set = self._quoted_products()
         self._purge_expired_plan_versions(policy)
         self._recompute_plan_version()
@@ -5593,8 +5651,10 @@ class PairExecutionCell:
         except PairExecutionCellError:
             return None, Decimal(0), "clock unavailable"
         if policy.entry_mode == "donchian":
-            buffer_points = _to_decimal(policy.trend_breakout_buffer_points) or Decimal(0)
-            min_range = _to_decimal(policy.trend_min_range_points) or Decimal(0)
+            # Config thresholds are point counts (like entry_edge_points);
+            # scale by the canonical point into the price units the buffer holds.
+            buffer_points = (_to_decimal(policy.trend_breakout_buffer_points) or Decimal(0)) * point
+            min_range = (_to_decimal(policy.trend_min_range_points) or Decimal(0)) * point
             return donchian_bias(
                 history,
                 mid_now,
@@ -5606,7 +5666,8 @@ class PairExecutionCell:
             )
         if policy.entry_mode == "momentum":
             k = _to_decimal(policy.trend_momentum_k) or Decimal(0)
-            min_mom = _to_decimal(policy.trend_min_mom_points) or Decimal(0)
+            # Point counts into price units, mirroring the donchian branch above.
+            min_mom = (_to_decimal(policy.trend_min_mom_points) or Decimal(0)) * point
             return momentum_bias(
                 history,
                 mid_now,
