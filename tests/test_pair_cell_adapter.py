@@ -2556,6 +2556,54 @@ class SafeUnpairTests(PairingTestCase):
         self.assertNotEqual(original, leader.runtime.route_id)
         self.assertEqual(leader.runtime.route_id, follower.runtime.route_id)
 
+    def test_a_repaired_pair_rediscovers_without_a_catalog_change(self) -> None:
+        """Same-process re-pairing must re-feed an unchanged catalog.
+
+        Regression for the production stall where, after a safe unpair in one
+        process, the new cell never received a ``LocalCatalogEvent`` (the
+        adapter's feed generation is process-scoped while the cell's local
+        catalog is route-scoped), so the follower sat on "no catalog summary
+        has been exchanged yet" and the leader on "a catalog summary is
+        unavailable from one Worker" forever.
+        """
+
+        leader, follower = self._idle_pair()
+        original = cast(str, leader.runtime.route_id)
+        self.assertTrue(leader.runtime.request_safe_unpair())
+        self.assertTrue(
+            pump_until(
+                [leader, follower], lambda: original not in self.controller.routes, rounds=120
+            ),
+            "two fresh assertions never removed the route",
+        )
+        # The catalog itself does not change across the re-pairing: that is
+        # exactly the case that used to suppress the feed.
+        self.assertTrue(
+            pump_until(
+                [leader, follower],
+                lambda: leader.runtime.enabled and follower.runtime.enabled,
+                rounds=80,
+            ),
+            f"the Workers never re-paired ({leader.runtime.pairing_diagnostic!r})",
+        )
+        self.assertNotEqual(original, leader.runtime.route_id)
+        self.assertEqual(leader.runtime.route_id, follower.runtime.route_id)
+        self.assertTrue(
+            pump_until(
+                [leader, follower],
+                lambda: bool(leader.results and follower.results)
+                and cast(object, leader.results[-1]).ready  # type: ignore[attr-defined]
+                and cast(object, follower.results[-1]).ready,  # type: ignore[attr-defined]
+                rounds=200,
+            ),
+            f"the re-paired Workers never rediscovered"
+            f" (leader_ready={getattr(leader.results[-1], 'ready_reason', None)!r},"
+            f" follower_ready={getattr(follower.results[-1], 'ready_reason', None)!r})",
+        )
+        assert leader.runtime.cell is not None and follower.runtime.cell is not None
+        self.assertIsNotNone(leader.runtime.cell.discovered_universe())
+        self.assertIsNotNone(follower.runtime.cell.discovered_universe())
+
     def _one_sided_wipe(
         self, heartbeat: timedelta
     ) -> tuple[Worker, Worker, str]:

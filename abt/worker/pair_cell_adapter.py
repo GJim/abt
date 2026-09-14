@@ -2964,7 +2964,13 @@ class PairCellRuntime:
         self._pairing_reason = ""
         observed_at = self._now()
         # Discovery needs this account's whole catalog immediately after the
-        # route exists and before any quote is processed.
+        # route exists and before any quote is processed.  The feed generation
+        # is process-scoped while the cell's local catalog is route-scoped: a
+        # new cell in the same process must be fed even when the catalog is
+        # unchanged, otherwise it never publishes a summary and discovery
+        # stalls with "no catalog summary has been exchanged yet" on this side
+        # and "a catalog summary is unavailable from one Worker" on the peer.
+        self._fed_catalog_generation = 0
         if self._catalog_entries is None:
             if self._refresh_local_evidence(observed_at):
                 self._next_refresh_at = observed_at + self._polling.sizing_refresh_interval
@@ -3079,6 +3085,11 @@ class PairCellRuntime:
         self._trend_seeded = set()
         self._owned_legs = {}
         self._observed_open = {}
+        # The catalog feed generation is process-scoped while each cell's
+        # local catalog is route-scoped: clear it here so the next route's
+        # cell is fed even when the catalog itself is unchanged.
+        # (``_construct_cell`` re-asserts this defensively before feeding.)
+        self._fed_catalog_generation = 0
         # A new pairing re-reads the startup balance and therefore produces a
         # different policy hash whenever that balance changed.
         self._startup_balance = None
