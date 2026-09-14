@@ -113,7 +113,9 @@ from ..pair_cell import (
     _resolve_unified_budget,
     build_pairing_acceptance,
     canonical_policy_from_acceptance,
+    default_shared_policy_values,
     default_worker_risk_limits,
+    default_worker_risk_values,
     validate_configuration_authority,
 )
 from ..trader_protocol import PAIR_CELL_PROTOCOL_VERSION
@@ -491,6 +493,64 @@ def parse_pair_cell_config(raw: object, *, source: object = "<memory>") -> PairC
             f"The Pair Execution Cell configuration is invalid: {source}: {error}"
         ) from error
     return config
+
+
+def pair_cell_config_template(*, desired_role: Role | None) -> dict[str, object]:
+    """Editable defaults template, safe for the role this Worker wants.
+
+    A leader-desired Worker gets the full shared policy plus its own risk
+    block; anything else gets only its own risk block.  Shared keys must
+    never appear in a file that could belong to a follower: the assigned
+    follower role contradicts them and the cell fails closed at construction.
+    Every value equals the synthesized default, so a freshly generated file
+    behaves exactly like no file until the operator edits it.
+    """
+
+    template: dict[str, object] = {
+        **default_worker_risk_values(),
+        "daily_loss_warning_threshold_usd": DEFAULT_DAILY_LOSS_WARNING_THRESHOLD_USD,
+    }
+    if desired_role == "leader":
+        template = {**default_shared_policy_values(), **template}
+    return template
+
+
+def ensure_pair_cell_config_template(path: Path | None, *, desired_role: Role | None) -> bool:
+    """Write the editable template when no configuration file exists yet.
+
+    Never overwrites an existing file: operator edits are authoritative.
+    ``True`` when a configuration file is present afterwards (pre-existing
+    or just generated); ``False`` otherwise, in which case the caller keeps
+    running on the synthesized defaults.
+    """
+
+    if path is None:
+        return False
+    if path.exists():
+        return True
+    template = pair_cell_config_template(desired_role=desired_role)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f"{path.name}.tmp")
+        with open(temporary, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(json.dumps(template, indent=2, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    except OSError:
+        _LOGGER.warning(
+            "The Pair Execution Cell configuration template could not be generated: %s;"
+            " continuing with the synthesized defaults.",
+            path,
+            exc_info=True,
+        )
+        return False
+    _LOGGER.info(
+        "Generated the default Pair Execution Cell configuration template for editing: %s%s.",
+        path,
+        " (leader shared policy included)" if desired_role == "leader" else "",
+    )
+    return True
 
 
 # --------------------------------------------------------------------------- #
@@ -1169,6 +1229,7 @@ def fetch_trend_seed_points(
     *,
     window_seconds: float,
     now: datetime,
+    broker_offset_seconds: float | None = None,
 ) -> tuple[list[TrendSeedPoint], bool]:
     """Best-effort Phase-B history for one symbol: ``(points, degraded)``.
 
@@ -1178,14 +1239,23 @@ def fetch_trend_seed_points(
     ``degraded``: good enough to place Donchian levels, never a trigger
     itself.  Total failure returns ``([], True)`` and never raises -- the
     live-tick buffer in the cell is always the recovery path.
+
+    The tick range is queried in the **broker clock**: MT5 indexes tick
+    history by server-clock epochs (the same +3h shift the clock calibration
+    measures), so a raw UTC window would read hours in the past -- typically
+    a closed-market gap yielding zero points.  ``broker_offset_seconds`` is
+    this broker's measured ``offset_seconds``; ``None`` means uncalibrated
+    and the UTC window is used as-is.
     """
 
-    start = now - timedelta(seconds=max(60.0, window_seconds) + 60.0)
+    window = timedelta(seconds=max(60.0, window_seconds) + 60.0)
+    shift = timedelta(seconds=broker_offset_seconds) if broker_offset_seconds is not None else timedelta(0)
+    start, end = now - window + shift, now + shift
     try:
         flags = getattr(mt5, "COPY_TICKS_ALL", 3)
         if not isinstance(flags, int) or isinstance(flags, bool):
             flags = 3
-        raw_ticks = mt5.copy_ticks_range(symbol, start, now, flags)  # type: ignore[attr-defined]
+        raw_ticks = mt5.copy_ticks_range(symbol, start, end, flags)  # type: ignore[attr-defined]
         points: list[TrendSeedPoint] = []
         for item in _as_history_records(raw_ticks):
             try:
@@ -1214,6 +1284,7 @@ def fetch_trend_seed_points(
         if len(points) >= 10:
             points.sort(key=lambda point: point.broker_time)
             return points, False
+        _LOGGER.debug("%s evt=trend_seed_thin_ticks sym=%s n=%s", _RTAG, symbol, len(points))
     except Exception:
         _LOGGER.debug("%s evt=trend_seed_ticks_fail sym=%s", _RTAG, symbol, exc_info=True)
     try:
@@ -1245,6 +1316,27 @@ def fetch_trend_seed_points(
 
 
 def _as_history_records(raw: object) -> list[object]:
+    names = getattr(getattr(raw, "dtype", None), "names", None)
+    if names:
+        # Real MT5 history calls return a numpy structured array whose rows
+        # are numpy.void scalars: neither Mapping nor _asdict covers them, so
+        # without this normalization every record would be silently dropped.
+        # (The Wine bridge JSON-round-trips rows into dicts, which is why
+        # only the native path starves.)  Mirror mt5.cli._structured_records.
+        try:
+            rows = list(raw)  # type: ignore[arg-type]
+        except TypeError:
+            return []
+        try:
+            return [
+                {
+                    name: (row[name].item() if hasattr(row[name], "item") else row[name])
+                    for name in names
+                }
+                for row in rows
+            ]
+        except (TypeError, ValueError, IndexError, KeyError):
+            return []
     if raw is None:
         return []
     if isinstance(raw, (list, tuple)):
@@ -1763,7 +1855,11 @@ class PairCellRuntime:
         self._now = now
         self._sleep = sleep
         # A malformed or over-reaching configuration file is a startup error,
-        # never a partially applied file.
+        # never a partially applied file.  A missing file is generated from
+        # role-safe defaults so the operator has something editable; an
+        # existing file is never touched.
+        if config is None and config_path is not None:
+            ensure_pair_cell_config_template(config_path, desired_role=options.role)
         self._config = config if config is not None else load_pair_cell_config(config_path)
 
         self._cell: PairExecutionCell | None = None
@@ -2104,12 +2200,21 @@ class PairCellRuntime:
                 or "a positive USD startup balance is required before this Worker may propose"
             )
             return
-        self._proposal_attempts += 1
         try:
             self._session.propose_pair_cell_pairing(follower_worker_id)
         except WorkerEnrollmentError:
             _LOGGER.warning("The Pair Execution Cell pairing proposal failed.", exc_info=True)
+            if self._pairing_state == "listing":
+                # Transport failure before the controller saw anything: go
+                # back to "selecting" so the next pump re-lists instead of
+                # stranding this leader in "listing", which _advance_pairing
+                # never revisits.
+                self._pairing_state = "selecting"
             return
+        # Count only proposals the controller actually received: a transport
+        # failure must stay retryable instead of consuming the one-shot
+        # `--follower-worker-id` attempt.
+        self._proposal_attempts += 1
         self._pending_budget = (follower_worker_id, balance)
         self._pairing_state = "proposing"
 
@@ -3468,6 +3573,10 @@ class PairCellRuntime:
         product seeds once per generation -- best effort, failures included --
         so a broken history source can never stall the pump loop; the
         live-tick buffer remains the recovery path either way.
+
+        At most one product is fetched per pump: a history read is a slow
+        broker round-trip, and seeding a whole universe synchronously would
+        stall quotes, relay traffic and readiness behind it.
         """
 
         cell = self._cell
@@ -3481,7 +3590,12 @@ class PairCellRuntime:
             return None
         generation = universe.universe_generation
         self._trend_seeded = {key for key in self._trend_seeded if key[0] == generation}
-        result: PairResult | None = None
+        calibration = self.broker_clock_calibration(observed_at)
+        if not calibration.usable:
+            # Without a measured offset the tick window cannot be placed on
+            # the broker clock; retry on a later pump instead of reading a
+            # wrong window and marking the product seeded.
+            return None
         for product in universe.products:
             key = (generation, product.product_id)
             if key in self._trend_seeded:
@@ -3492,6 +3606,7 @@ class PairCellRuntime:
                 product.symbol,
                 window_seconds=request[1],
                 now=observed_at,
+                broker_offset_seconds=calibration.offset_seconds,
             )
             if not points:
                 _LOGGER.debug(
@@ -3500,7 +3615,7 @@ class PairCellRuntime:
                     generation,
                     product.symbol,
                 )
-                continue
+                return None
             _LOGGER.debug(
                 "%s evt=trend_seed gen=%s sym=%s n=%s degraded=%s",
                 _RTAG,
@@ -3509,14 +3624,14 @@ class PairCellRuntime:
                 len(points),
                 int(degraded),
             )
-            result = cell.handle_event(
+            return cell.handle_event(
                 TrendSeedEvent(
                     product_id=product.product_id,
                     points=tuple(points),
                     degraded=degraded,
                 )
-            ) or result
-        return result
+            )
+        return None
 
     def _read_quotes(self, observed_at: datetime) -> tuple[LocalQuoteEvent, ...]:
         """Only genuinely new market evidence becomes a quote event.

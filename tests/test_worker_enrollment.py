@@ -755,6 +755,7 @@ class WorkerCredentialTests(unittest.TestCase):
             positions_get=lambda: ("position",),
             symbols_get=lambda: ("symbol",),
             copy_rates_range=lambda *_: ("rate",),
+            copy_rates_from_pos=lambda *_: ("rate-from-pos",),
             symbol_info_tick=lambda _: {"time": 1},
             symbol_select=lambda _symbol, _enable: True,
             order_calc_margin=lambda action, symbol, volume, price: 123.45,
@@ -769,6 +770,7 @@ class WorkerCredentialTests(unittest.TestCase):
         self.assertEqual(("position",), adapter.positions_get())
         self.assertEqual(("symbol",), adapter.symbols_get())
         self.assertEqual(("rate",), adapter.copy_rates_range("EURUSD", 15, object(), object()))
+        self.assertEqual(("rate-from-pos",), adapter.copy_rates_from_pos("EURUSD", 15, 0, 10))
         self.assertEqual({"time": 1}, adapter.symbol_info_tick("EURUSD"))
         self.assertTrue(adapter.symbol_select("EURUSD", True))
         self.assertEqual(123.45, adapter.order_calc_margin(0, "EURUSD", 1.0, 1.1))

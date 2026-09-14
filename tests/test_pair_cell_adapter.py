@@ -25,6 +25,7 @@ from pathlib import Path
 import shutil
 import sqlite3
 import tempfile
+from types import SimpleNamespace
 from typing import cast
 import unittest
 from uuid import uuid4
@@ -59,12 +60,14 @@ from abt.worker.pair_cell_adapter import (
     _pair_cell_broker_request,
     _payload_hash,
     default_pair_cell_config,
+    ensure_pair_cell_config_template,
     evaluate_follower_acceptance,
     fetch_trend_seed_points,
     load_durable_route,
     load_frozen_acceptance,
     load_frozen_budget,
     load_pair_cell_config,
+    pair_cell_config_template,
     parse_pair_cell_config,
     read_catalog_entries,
     read_local_quote,
@@ -1067,6 +1070,45 @@ class PairCellConfigurationTests(unittest.TestCase):
         config = load_pair_cell_config(path)
         self.assertEqual({"entry_edge_points": "7"}, dict(config.shared_policy))
 
+    def test_absent_file_generates_a_follower_safe_template(self) -> None:
+        """No shared key may appear unless the leader role was requested."""
+
+        path = self.directory / "worker.paircell.json"
+        self.assertTrue(ensure_pair_cell_config_template(path, desired_role=None))
+        template = json.loads(path.read_text(encoding="utf-8"))
+        self.assertIn("maximum_margin_fraction", template)
+        self.assertIn("daily_loss_warning_threshold_usd", template)
+        self.assertNotIn("mode", template)
+        self.assertNotIn("entry_mode", template)
+        config = load_pair_cell_config(path)
+        self.assertFalse(config.declares_shared_policy)
+
+    def test_leader_template_includes_shared_policy_defaults(self) -> None:
+        path = self.directory / "leader.paircell.json"
+        self.assertTrue(ensure_pair_cell_config_template(path, desired_role="leader"))
+        template = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual("shadow", template["mode"])
+        self.assertIn("entry_mode", template)
+        config = load_pair_cell_config(path)
+        self.assertTrue(config.declares_shared_policy)
+        # A freshly generated file behaves exactly like no file: identical limits.
+        generated_limits = worker_risk_limits(StartupBalance(amount_usd="2500"), config)
+        default_limits = worker_risk_limits(
+            StartupBalance(amount_usd="2500"), default_pair_cell_config()
+        )
+        self.assertEqual(default_limits, generated_limits)
+
+    def test_an_existing_file_is_never_overwritten(self) -> None:
+        path = self.directory / "pair.json"
+        path.write_text(json.dumps({"mode": "live"}), encoding="utf-8")
+        self.assertTrue(ensure_pair_cell_config_template(path, desired_role="leader"))
+        self.assertEqual({"mode": "live"}, json.loads(path.read_text(encoding="utf-8")))
+
+    def test_template_generation_without_a_path_keeps_synthesized_defaults(self) -> None:
+        self.assertFalse(ensure_pair_cell_config_template(None, desired_role="leader"))
+        config = load_pair_cell_config(None)
+        self.assertEqual({}, dict(config.shared_policy))
+
 
 class TrendSeedTests(unittest.TestCase):
     def test_lossless_ticks_win_over_bars(self) -> None:
@@ -1162,6 +1204,153 @@ class TrendSeedTests(unittest.TestCase):
         )
         self.assertFalse(degraded)
         self.assertEqual(20, len(points))
+
+    def test_tick_window_is_placed_on_the_broker_clock(self) -> None:
+        """History is indexed by server-clock epochs, not UTC."""
+
+        now = datetime(2024, 1, 2, 14, 0, tzinfo=UTC)
+        captured: dict[str, object] = {}
+
+        class WindowMT5:
+            COPY_TICKS_ALL = 3
+
+            def copy_ticks_range(self, symbol: str, start: datetime, end: datetime, flags: int) -> object:
+                captured["start"], captured["end"] = start, end
+                return []
+
+            def copy_rates_from_pos(self, *args: object) -> object:
+                return []
+
+        fetch_trend_seed_points(
+            WindowMT5(), SYMBOL, window_seconds=300.0, now=now, broker_offset_seconds=10800.0
+        )
+        self.assertEqual(now - timedelta(seconds=360) + timedelta(seconds=10800), captured["start"])
+        self.assertEqual(now + timedelta(seconds=10800), captured["end"])
+
+    def test_tick_window_without_calibration_stays_utc(self) -> None:
+        now = datetime(2024, 1, 2, 14, 0, tzinfo=UTC)
+        captured: dict[str, object] = {}
+
+        class WindowMT5:
+            COPY_TICKS_ALL = 3
+
+            def copy_ticks_range(self, symbol: str, start: datetime, end: datetime, flags: int) -> object:
+                captured["start"], captured["end"] = start, end
+                return []
+
+            def copy_rates_from_pos(self, *args: object) -> object:
+                return []
+
+        fetch_trend_seed_points(WindowMT5(), SYMBOL, window_seconds=300.0, now=now)
+        self.assertEqual(now - timedelta(seconds=360), captured["start"])
+        self.assertEqual(now, captured["end"])
+
+    def test_native_structured_array_ticks_are_parsed(self) -> None:
+        """Real MT5 returns numpy structured arrays, not dicts."""
+
+        now = datetime(2024, 1, 2, 14, 0, tzinfo=UTC)
+
+        class Scalar:
+            def __init__(self, value: object) -> None:
+                self._value = value
+
+            def item(self) -> object:
+                return self._value
+
+        class VoidRow:
+            def __init__(self, values: dict[str, object]) -> None:
+                self._values = values
+
+            def __getitem__(self, name: str) -> Scalar:
+                return Scalar(self._values[name])
+
+        class StructuredArray:
+            dtype = SimpleNamespace(names=("time", "bid", "ask", "time_msc", "flags"))
+
+            def __init__(self, rows: list[VoidRow]) -> None:
+                self._rows = rows
+
+            def __iter__(self):  # type: ignore[no-untyped-def]
+                return iter(self._rows)
+
+        class NativeMT5:
+            COPY_TICKS_ALL = 3
+
+            def copy_ticks_range(self, symbol: str, start: datetime, end: datetime, flags: int) -> object:
+                base_ms = int(now.timestamp() * 1000)
+                return StructuredArray(
+                    [
+                        VoidRow(
+                            {
+                                "time": int(now.timestamp()) - offset,
+                                "bid": 1.10000,
+                                "ask": 1.10010,
+                                "time_msc": base_ms - offset * 1000,
+                                "flags": 6,
+                            }
+                        )
+                        for offset in range(20)
+                    ]
+                )
+
+            def copy_rates_from_pos(self, *args: object) -> object:  # pragma: no cover
+                raise AssertionError("bars must not be read when ticks succeed")
+
+        points, degraded = fetch_trend_seed_points(
+            NativeMT5(), SYMBOL, window_seconds=300.0, now=now
+        )
+        self.assertFalse(degraded)
+        self.assertEqual(20, len(points))
+
+    def test_native_structured_array_bars_degrade_gracefully(self) -> None:
+        now = datetime(2024, 1, 2, 14, 0, tzinfo=UTC)
+
+        class Scalar:
+            def __init__(self, value: object) -> None:
+                self._value = value
+
+            def item(self) -> object:
+                return self._value
+
+        class VoidRow:
+            def __init__(self, values: dict[str, object]) -> None:
+                self._values = values
+
+            def __getitem__(self, name: str) -> Scalar:
+                return Scalar(self._values[name])
+
+        class StructuredArray:
+            dtype = SimpleNamespace(names=("time", "high", "low"))
+
+            def __init__(self, rows: list[VoidRow]) -> None:
+                self._rows = rows
+
+            def __iter__(self):  # type: ignore[no-untyped-def]
+                return iter(self._rows)
+
+        class NativeMT5:
+            def copy_ticks_range(self, *args: object) -> object:
+                return []
+
+            def copy_rates_from_pos(self, symbol: str, timeframe: object, start_pos: int, count: int) -> object:
+                return StructuredArray(
+                    [
+                        VoidRow(
+                            {
+                                "time": int(now.timestamp()) - offset * 60,
+                                "high": 1.10050,
+                                "low": 1.10030,
+                            }
+                        )
+                        for offset in range(3)
+                    ]
+                )
+
+        points, degraded = fetch_trend_seed_points(
+            NativeMT5(), SYMBOL, window_seconds=300.0, now=now
+        )
+        self.assertTrue(degraded)
+        self.assertEqual(3, len(points))
 
 
 class StartupBalanceTests(unittest.TestCase):

@@ -181,6 +181,9 @@ class MetaTrader5Adapter:
     def copy_rates_range(self, symbol: str, timeframe: object, from_time: object, to_time: object) -> object:
         return self._mt5.copy_rates_range(symbol, timeframe, from_time, to_time)
 
+    def copy_rates_from_pos(self, symbol: str, timeframe: object, start_pos: int, count: int) -> object:
+        return self._mt5.copy_rates_from_pos(symbol, timeframe, start_pos, count)
+
     def symbol_info_tick(self, symbol: str) -> object:
         return self._mt5.symbol_info_tick(symbol)
 
