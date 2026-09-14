@@ -905,6 +905,7 @@ class RemovedArchitectureTests(unittest.TestCase):
                 "trend_min_coverage",
                 "quote_max_age_seconds",
                 "quote_max_skew_seconds",
+                "trend_quote_max_age_seconds",
                 "follower_confirmation_timeout_seconds",
                 "sizing_refresh_seconds",
                 "relay_handling_timeout_seconds",
@@ -1085,6 +1086,7 @@ class DefaultMaterializationTests(unittest.TestCase):
                 "trend_min_coverage": 0.8,
                 "quote_max_age_seconds": 1.0,
                 "quote_max_skew_seconds": 1.0,
+                "trend_quote_max_age_seconds": 60.0,
                 "follower_confirmation_timeout_seconds": 5.0,
                 "sizing_refresh_seconds": 3600.0,
                 "relay_handling_timeout_seconds": 5.0,
@@ -6488,6 +6490,225 @@ class TrendEntryTests(PairCellTestCase):
         self.assertTrue(candidates)
         self.assertEqual(candidates[0]["entry_mode"], "edge")
         self.assertIn("edge_points", candidates[0])
+
+
+class TrendRelaxedGatesTests(PairCellTestCase):
+    """Trend modes gate on their own timescale, not the edge arbitrage budget."""
+
+    def _momentum_prime(self, **extra: object) -> None:
+        shared: dict[str, object] = {
+            "entry_mode": "momentum",
+            "trend_momentum_T_seconds": 60.0,
+            "trend_vol_window_seconds": 300.0,
+            "trend_momentum_k": "2.0",
+            "trend_min_mom_points": "5",
+            "trend_max_spread_points": "20",
+            "trend_min_coverage": 0.3,
+        }
+        shared.update(extra)
+        self.prime(shared=shared)
+
+    def _flat_run(self, *, count: int = 32, sequence_start: int = 10) -> int:
+        point = Decimal("0.00001")
+        mid = Decimal("1.10000")
+        sequence = sequence_start
+        for _ in range(count):
+            self.now += timedelta(seconds=10)
+            self.feed_quotes(
+                leader_bid=str(mid - Decimal("0.00005")),
+                leader_ask=str(mid + Decimal("0.00005")),
+                follower_bid="1.10000",
+                follower_ask="1.10010",
+                sequence=sequence,
+            )
+            sequence += 1
+        return sequence
+
+    def test_momentum_admits_quotes_within_trend_age_budget(self) -> None:
+        """30s-old quotes pass the 60s trend budget (edge would reject them)."""
+
+        self._momentum_prime()
+        self._flat_run()
+        self.leader.cell.handle_event(PeerSessionEvent(connected=False, observed_at=self.now))
+        self.now += timedelta(seconds=10)
+        stale = self.now - timedelta(seconds=30)
+        self.feed_quotes(
+            leader_bid="1.10095",
+            leader_ask="1.10105",
+            follower_bid="1.10000",
+            follower_ask="1.10010",
+            sequence=200,
+            leader_broker_time=stale,
+            follower_broker_time=stale,
+        )
+        candidates = self.leader.cell.entry_candidates()
+        self.assertTrue(candidates, "30s-old quotes must pass the 60s trend budget")
+        self.assertEqual(candidates[0]["leader_direction"], "LONG")
+        self.assertEqual(candidates[0]["entry_mode"], "momentum")
+
+    def test_momentum_skips_the_cross_broker_skew_gate(self) -> None:
+        """A 30s calibrated skew must not block a trend decision (edge: reject)."""
+
+        self._momentum_prime()
+        self._flat_run()
+        self.leader.cell.handle_event(PeerSessionEvent(connected=False, observed_at=self.now))
+        self.now += timedelta(seconds=10)
+        self.feed_quotes(
+            leader_bid="1.10095",
+            leader_ask="1.10105",
+            follower_bid="1.10000",
+            follower_ask="1.10010",
+            sequence=200,
+            follower_broker_time=self.now - timedelta(seconds=30),
+        )
+        candidates = self.leader.cell.entry_candidates()
+        self.assertTrue(candidates, "trend modes must skip the skew gate")
+        self.assertEqual(candidates[0]["leader_direction"], "LONG")
+
+    def test_edge_mode_still_enforces_freshness_and_skew(self) -> None:
+        """Regression guard: the relaxed budget must never leak into edge mode."""
+
+        self.prime()
+        self.leader.cell.handle_event(PeerSessionEvent(connected=False, observed_at=self.now))
+        self.now += timedelta(seconds=10)
+        edge = {"leader_bid": "1.10000", "leader_ask": "1.10010",
+                "follower_bid": "1.10050", "follower_ask": "1.10060"}
+        # 30s-old quotes on both legs: stale under the 2s edge budget.
+        self.feed_quotes(
+            **edge,  # type: ignore[arg-type]
+            sequence=10,
+            leader_broker_time=self.now - timedelta(seconds=30),
+            follower_broker_time=self.now - timedelta(seconds=30),
+        )
+        self.assertEqual(self.leader.cell.entry_candidates(), [])
+        # Fresh local leg but a 30s skew: rejected under the 1s skew budget.
+        self.feed_quotes(
+            **edge,  # type: ignore[arg-type]
+            sequence=11,
+            follower_broker_time=self.now - timedelta(seconds=30),
+        )
+        self.assertEqual(self.leader.cell.entry_candidates(), [])
+
+    def test_trend_quote_age_budget_defaults_and_validates(self) -> None:
+        self.assertEqual(default_shared_policy_values()["trend_quote_max_age_seconds"], 60.0)
+        self.tick()
+        self.accept()
+        self.feed_catalogs()
+        with self.assertRaises(PairExecutionCellError):
+            self.policy(entry_mode="momentum", trend_quote_max_age_seconds=-5)
+
+    def test_quoted_products_respects_trend_age_budget(self) -> None:
+        """The plan precondition must admit the same quotes the entry gate admits."""
+
+        self._momentum_prime()
+        self.now += timedelta(seconds=30)
+        self.feed_quotes(
+            sequence=100,
+            leader_broker_time=self.now - timedelta(seconds=30),
+            follower_broker_time=self.now - timedelta(seconds=30),
+        )
+        self.assertTrue(
+            self.leader.cell._quoted_products(),
+            "30s-old quotes keep plans under the trend budget",
+        )
+
+
+class DebugEvidenceTests(PairCellTestCase):
+    """The 1-second tape and the admission gate counters for post-hoc replay."""
+
+    def test_tape_records_live_mids_with_last_wins_dedup(self) -> None:
+        self.prime()
+        self.leader.cell.handle_event(PeerSessionEvent(connected=False, observed_at=self.now))
+        product = self.product_id()
+        bucket = int(self.now.timestamp())
+        self.feed_quotes(
+            leader_bid="1.10000", leader_ask="1.10010",
+            follower_bid="1.10000", follower_ask="1.10010",
+            sequence=10,
+        )
+        self.feed_quotes(
+            leader_bid="1.10020", leader_ask="1.10030",
+            follower_bid="1.10000", follower_ask="1.10010",
+            sequence=11,
+        )
+        # The 1s flush throttle needs the pump to advance before asserting.
+        self.tick(seconds=2)
+        rows = self.leader.cell._db.execute(
+            "SELECT mid, bid, ask FROM cell_market_tape_1s"
+            " WHERE product_id = ? AND source = 'live' AND epoch_sec = ?",
+            (product, bucket),
+        ).fetchall()
+        self.assertEqual(len(rows), 1, "one second keeps one tape row")
+        self.assertEqual(rows[0][0], str((Decimal("1.10020") + Decimal("1.10030")) / 2))
+        self.assertEqual(rows[0][1], "1.10020")
+
+    def test_trend_seed_stages_gap_fill_tape_rows(self) -> None:
+        self.prime(
+            shared={
+                "entry_mode": "donchian",
+                "trend_lookback_seconds": 120.0,
+                "trend_breakout_buffer_points": "2",
+                "trend_min_range_points": "12",
+                "trend_max_spread_points": "20",
+                "trend_min_coverage": 0.5,
+            }
+        )
+        product = self.product_id()
+        base = self.now - timedelta(seconds=100)
+        points = tuple(
+            TrendSeedPoint(
+                broker_time=base + timedelta(seconds=offset),
+                bid=Decimal("1.10000") + Decimal(offset) * Decimal("0.00001"),
+                ask=Decimal("1.10010") + Decimal(offset) * Decimal("0.00001"),
+            )
+            for offset in range(90)
+        )
+        self.leader.cell.handle_event(
+            TrendSeedEvent(product_id=product, points=points, degraded=False)
+        )
+        # The 1s flush throttle needs the pump to advance before asserting.
+        self.tick(seconds=2)
+        count = self.leader.cell._db.execute(
+            "SELECT COUNT(*) FROM cell_market_tape_1s WHERE product_id = ? AND source = 'seed'",
+            (product,),
+        ).fetchone()[0]
+        self.assertGreaterEqual(count, 80, "seed history must land gap-fill tape rows")
+
+    def test_gate_stats_name_the_blocking_gate(self) -> None:
+        self.prime()
+        ranked = self.leader.cell._candidates()
+        self.assertEqual(ranked, [])
+        stats = self.leader.cell._last_gate_stats
+        self.assertIsNotNone(stats)
+        assert stats is not None
+        self.assertEqual(stats["products"], 1)
+        self.assertEqual(stats["below_edge"], 2)
+        self.assertEqual(stats["admitted"], 0)
+        formatted = self.leader.cell._format_gate_stats()
+        self.assertIn("below_edge=2", formatted)
+        self.assertIn("admitted=0", formatted)
+        diagnostic = self.leader.cell.entry_admission_diagnostic()
+        self.assertIn("gates(", diagnostic)
+
+    def test_gate_stats_persist_minutely(self) -> None:
+        self.prime()
+        db = self.leader.cell._db
+        before = db.execute("SELECT COUNT(*) FROM cell_admission_stats").fetchone()[0]
+        self.now += timedelta(seconds=61)
+        stale = self.now - timedelta(seconds=61)
+        self.feed_quotes(
+            sequence=50,
+            leader_broker_time=stale,
+            follower_broker_time=stale,
+        )
+        self.leader.cell._candidates()
+        after = db.execute("SELECT COUNT(*) FROM cell_admission_stats").fetchone()[0]
+        self.assertGreater(after, before, "gate counters must persist on a minute cadence")
+        latest = db.execute(
+            "SELECT stale_local_quote, admitted FROM cell_admission_stats ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertEqual(latest[0], 1)
+        self.assertEqual(latest[1], 0)
 
 
 if __name__ == "__main__":  # pragma: no cover

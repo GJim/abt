@@ -79,6 +79,7 @@ from ..pair_cell import (
     DEFAULT_TREND_MIN_RANGE_POINTS,
     DEFAULT_TREND_MOMENTUM_K,
     DEFAULT_TREND_MOMENTUM_T_SECONDS,
+    DEFAULT_TREND_QUOTE_MAX_AGE_SECONDS,
     DEFAULT_TREND_VOL_WINDOW_SECONDS,
     LOCAL_SETTING_KEYS,
     RELAY_HANDLING_WINDOW_SECONDS,
@@ -231,7 +232,11 @@ ATTEMPT_SCOPED_TABLES = (
 #: MT5 ``10021`` quarantine (and its release audit) is keyed by derived product
 #: identity and has no automatic expiry, and the local attempt/effect state
 #: version and publisher epoch must never
-#: move backwards.  The reset is a deny-list, so any table this module does not
+#: move backwards.  The 1-second market tape and the admission gate counters
+#: are post-hoc debugging evidence in the same class: they are never read on
+#: the decision path, and clearing them with the route would destroy exactly
+#: the incident replay they exist for (retention bounds them instead).  The
+#: reset is a deny-list, so any table this module does not
 #: name is preserved; ``test_pair_cell_adapter`` fails when a new durable cell
 #: table is left unclassified.
 PRESERVED_SAFETY_TABLES = (
@@ -242,6 +247,8 @@ PRESERVED_SAFETY_TABLES = (
     "cell_state_version",
     "cell_publisher_epoch",
     "cell_transitions",
+    "cell_market_tape_1s",
+    "cell_admission_stats",
 )
 
 
@@ -430,6 +437,7 @@ def parse_pair_cell_config(raw: object, *, source: object = "<memory>") -> PairC
         ("relay_handling_timeout_seconds", RELAY_HANDLING_WINDOW_SECONDS),
         ("trend_lookback_seconds", DEFAULT_TREND_LOOKBACK_SECONDS),
         ("trend_momentum_T_seconds", DEFAULT_TREND_MOMENTUM_T_SECONDS),
+        ("trend_quote_max_age_seconds", DEFAULT_TREND_QUOTE_MAX_AGE_SECONDS),
         ("trend_vol_window_seconds", DEFAULT_TREND_VOL_WINDOW_SECONDS),
     ):
         candidate = shared_policy.get(key, default)

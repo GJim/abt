@@ -195,7 +195,7 @@ _Avoid_: 以路由世代同時表示配對與探索、重新探索產生新 rout
 由初始相容商品探索錄取、凍結於當前 `universe_generation`、未遭隔離，且雙方報價、point/tick size、帳戶幣別 tick value、volume、填單模式與保護校準皆新鮮完整的配對商品集合。任一商品資料缺失或過期只移除該商品資格，不觸發 signal-time RPC，也不使其他商品失去資格。
 
 **最佳進場候選（Best Entry Candidate）**:
-leader 對可交易商品宇宙內每個商品的兩個鏡像方向套用進場門檻後，以雙方預先快取之每 point USD 價值計算保守預期 edge USD 並選出的唯一候選；同值時依 normalized 指標、衍生商品識別、direction 決定固定順序。`edge` 模式門檻為 edge-points（以該商品 canonical 執行 point 換算）；`donchian`／`momentum` 趨勢模式改以 leader-only 趨勢偏置定向（1 秒重採樣 mid buffer，另受 spread 上限與暖機 coverage 閘門約束），其餘 sizing、報價新鮮度／skew、隔離、剩餘額度門檻不變。選定後商品、方向、量與排名證據凍結於該次嘗試。
+leader 對可交易商品宇宙內每個商品的兩個鏡像方向套用進場門檻後，以雙方預先快取之每 point USD 價值計算保守預期 edge USD 並選出的唯一候選；同值時依 normalized 指標、衍生商品識別、direction 決定固定順序。`edge` 模式門檻為 edge-points（以該商品 canonical 執行 point 換算）；`donchian`／`momentum` 趨勢模式改以 leader-only 趨勢偏置定向（1 秒重採樣 mid buffer，另受 spread 上限與暖機 coverage 閘門約束），報價新鮮度改用趨勢時間尺度的寬限預算（`trend_quote_max_age_seconds`，預設 60 秒）且不檢查跨 broker skew（趨勢訊號不比較兩邊價格）；其餘 sizing、隔離、剩餘額度門檻不變。選定後商品、方向、量與排名證據凍結於該次嘗試。每次候選評估記錄逐門計數（缺報價／過期／skew／無趨勢／無量規劃等）供診斷，leader 與 peer 的 1 秒 mid 另存去重 tape 供事後重播。
 _Avoid_: 最大 raw price edge
 
 **配對商品隔離（Pair Product Quarantine）**:
@@ -203,7 +203,7 @@ _Avoid_: 最大 raw price edge
 _Avoid_: 暫時沒有報價、報價過期
 
 **策略政策雜湊（Canonical Policy Hash）**:
-leader 持有並發布之唯一 canonical 策略與風控政策版本雜湊，涵蓋執行模式、雙方各自的 strategy budget 與逐商品量規劃依據、雙方各自的紐約已實現虧損預算、edge-points 門檻、報價新鮮度與 skew 上限、follower 確認逾時秒數與生命週期退出政策；它不預先選定單一商品或方向，也不列舉商品篩選清單。政策撰寫權責分明：shared 政策（`mode`、`entry_edge_points`、`quote_max_age_seconds`、`quote_max_skew_seconds`、`follower_confirmation_timeout_seconds`、`trading_blackout_start_ny`、`trading_blackout_end_ny`、`maximum_holding_seconds`）由 leader 獨自撰寫；`leader_risk` 由 leader 為自身撰寫；`follower_risk` 與 follower 的凍結啟動餘額只來自配對接受載荷並由 leader 逐字複製。紐約週一至週五的半開區間 `[trading_blackout_start_ny, trading_blackout_end_ny)` 禁止進場並使既有配對由兩個 Worker 各自進入 desired-`EMPTY`，紐約週六與週日全天禁止交易；holiday 暫由操作員處理。未提供設定檔時政策由執行期以預設值合成，其中每台工作者的 strategy budget 預設為其啟動時的 broker 帳戶**餘額**（必須為 USD 帳戶且餘額為正，否則失效關閉）並凍結於該次配對。follower 先逐位元組驗證自身區塊與所送內容相同，再只在自身帳戶已 broker 驗證空倉時依雜湊持久接受該政策。雙方必須持久保存**完整 canonical 政策內容**，而非僅保存雜湊；雜湊只是對雙方各自已持有內容的完整性檢查，重啟後不需重新索取政策即可驗證嘗試。政策內容變更需要新雜湊及兩台帳戶工作者的 broker 驗證空倉事實，主控台全程不解讀政策內容。
+leader 持有並發布之唯一 canonical 策略與風控政策版本雜湊，涵蓋執行模式、雙方各自的 strategy budget 與逐商品量規劃依據、雙方各自的紐約已實現虧損預算、edge-points 門檻、報價新鮮度與 skew 上限、趨勢模式寬限報價年齡（`trend_quote_max_age_seconds`）、follower 確認逾時秒數與生命週期退出政策；它不預先選定單一商品或方向，也不列舉商品篩選清單。政策撰寫權責分明：shared 政策（`mode`、`entry_edge_points`、`quote_max_age_seconds`、`quote_max_skew_seconds`、`follower_confirmation_timeout_seconds`、`trading_blackout_start_ny`、`trading_blackout_end_ny`、`maximum_holding_seconds`）由 leader 獨自撰寫；`leader_risk` 由 leader 為自身撰寫；`follower_risk` 與 follower 的凍結啟動餘額只來自配對接受載荷並由 leader 逐字複製。紐約週一至週五的半開區間 `[trading_blackout_start_ny, trading_blackout_end_ny)` 禁止進場並使既有配對由兩個 Worker 各自進入 desired-`EMPTY`，紐約週六與週日全天禁止交易；holiday 暫由操作員處理。未提供設定檔時政策由執行期以預設值合成，其中每台工作者的 strategy budget 預設為其啟動時的 broker 帳戶**餘額**（必須為 USD 帳戶且餘額為正，否則失效關閉）並凍結於該次配對。follower 先逐位元組驗證自身區塊與所送內容相同，再只在自身帳戶已 broker 驗證空倉時依雜湊持久接受該政策。雙方必須持久保存**完整 canonical 政策內容**，而非僅保存雜湊；雜湊只是對雙方各自已持有內容的完整性檢查，重啟後不需重新索取政策即可驗證嘗試。政策內容變更需要新雜湊及兩台帳戶工作者的 broker 驗證空倉事實，主控台全程不解讀政策內容。
 _Avoid_: 配對合約、配對租約、商品白名單、只保存政策雜湊
 
 **配對設定檔權責（Role-Specific Configuration Authority）**:

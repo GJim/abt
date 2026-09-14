@@ -569,6 +569,20 @@ DEFAULT_MAXIMUM_LOSS_PER_TRADE_USD = "40"
 DEFAULT_DAILY_LOSS_WARNING_THRESHOLD_USD = "20"
 DEFAULT_QUOTE_MAX_AGE_SECONDS = 1.0
 DEFAULT_QUOTE_MAX_SKEW_SECONDS = 1.0
+#: Quote-age budget for trend (donchian/momentum) decisions.  Trend bias is
+#: computed from the leader-local 1-second mid buffer over a minutes-long
+#: window, so it needs a staleness bound on the decision's own timescale --
+#: not the sub-second budget edge arbitrage requires.  The peer quote keeps a
+#: bound too (the follower's rough protection is priced off it), only looser.
+DEFAULT_TREND_QUOTE_MAX_AGE_SECONDS = 60.0
+#: How long 1-second tape rows and admission counters are kept for post-hoc
+#: debugging.  The tape is decision input, not an audit trail: 48h of mids
+#: and 7d of per-minute gate counters bound the database while covering any
+#: realistic incident review.
+_TAPE_RETENTION_SECONDS = 48 * 3600
+_ADMISSION_STATS_RETENTION_SECONDS = 7 * 24 * 3600
+_ADMISSION_STATS_PERSIST_SECONDS = 60.0
+_TAPE_FLUSH_SECONDS = 1.0
 DEFAULT_FOLLOWER_CONFIRMATION_TIMEOUT_SECONDS = 5.0
 DEFAULT_TRADING_BLACKOUT_START_NY = "16:30"
 DEFAULT_TRADING_BLACKOUT_END_NY = "18:30"
@@ -592,6 +606,7 @@ SHARED_POLICY_KEYS = (
     "trend_min_coverage",
     "quote_max_age_seconds",
     "quote_max_skew_seconds",
+    "trend_quote_max_age_seconds",
     "follower_confirmation_timeout_seconds",
     "sizing_refresh_seconds",
     "relay_handling_timeout_seconds",
@@ -637,6 +652,7 @@ def default_shared_policy_values() -> dict[str, object]:
         "trend_min_coverage": DEFAULT_TREND_MIN_COVERAGE,
         "quote_max_age_seconds": DEFAULT_QUOTE_MAX_AGE_SECONDS,
         "quote_max_skew_seconds": DEFAULT_QUOTE_MAX_SKEW_SECONDS,
+        "trend_quote_max_age_seconds": DEFAULT_TREND_QUOTE_MAX_AGE_SECONDS,
         "follower_confirmation_timeout_seconds": DEFAULT_FOLLOWER_CONFIRMATION_TIMEOUT_SECONDS,
         "sizing_refresh_seconds": _SIZING_REFRESH_SECONDS,
         "relay_handling_timeout_seconds": RELAY_HANDLING_WINDOW_SECONDS,
@@ -908,6 +924,7 @@ class StrategyPolicy:
     quote_max_skew_seconds: float
     leader_risk: WorkerRiskLimits
     follower_risk: WorkerRiskLimits
+    trend_quote_max_age_seconds: float = DEFAULT_TREND_QUOTE_MAX_AGE_SECONDS
     follower_confirmation_timeout_seconds: float = DEFAULT_FOLLOWER_CONFIRMATION_TIMEOUT_SECONDS
     sizing_refresh_seconds: float = _SIZING_REFRESH_SECONDS
     relay_handling_timeout_seconds: float = RELAY_HANDLING_WINDOW_SECONDS
@@ -929,6 +946,11 @@ class StrategyPolicy:
     trend_min_mom_points: str = DEFAULT_TREND_MIN_MOM_POINTS
     trend_max_spread_points: str = DEFAULT_TREND_MAX_SPREAD_POINTS
     trend_min_coverage: float = DEFAULT_TREND_MIN_COVERAGE
+    # Trend decisions read the leader-local minutes-long mid buffer, never a
+    # cross-broker price comparison, so both legs use this trend-timescale
+    # quote-age budget instead of the sub-second edge budget, and the skew
+    # gate (which only edge arbitrage needs) is skipped for trend modes.
+    trend_quote_max_age_seconds: float = DEFAULT_TREND_QUOTE_MAX_AGE_SECONDS
 
     def __post_init__(self) -> None:
         if not self.policy_version:
@@ -970,6 +992,7 @@ class StrategyPolicy:
         for name in (
             "quote_max_age_seconds",
             "quote_max_skew_seconds",
+            "trend_quote_max_age_seconds",
             "follower_confirmation_timeout_seconds",
             "sizing_refresh_seconds",
             "relay_handling_timeout_seconds",
@@ -1034,6 +1057,7 @@ class StrategyPolicy:
             "trend_min_coverage": self.trend_min_coverage,
             "quote_max_age_seconds": self.quote_max_age_seconds,
             "quote_max_skew_seconds": self.quote_max_skew_seconds,
+            "trend_quote_max_age_seconds": self.trend_quote_max_age_seconds,
             "follower_confirmation_timeout_seconds": self.follower_confirmation_timeout_seconds,
             "sizing_refresh_seconds": self.sizing_refresh_seconds,
             "relay_handling_timeout_seconds": self.relay_handling_timeout_seconds,
@@ -1088,6 +1112,14 @@ def _policy_from_canonical(value: Mapping[str, object]) -> StrategyPolicy:
         ),
         quote_max_age_seconds=float(cast(float, value["quote_max_age_seconds"])),
         quote_max_skew_seconds=float(cast(float, value["quote_max_skew_seconds"])),
+        trend_quote_max_age_seconds=float(
+            cast(
+                float,
+                value.get(
+                    "trend_quote_max_age_seconds", DEFAULT_TREND_QUOTE_MAX_AGE_SECONDS
+                ),
+            )
+        ),
         leader_risk=_risk_from_canonical(cast(Mapping[str, object], value["leader_risk"])),
         follower_risk=_risk_from_canonical(cast(Mapping[str, object], value["follower_risk"])),
         follower_confirmation_timeout_seconds=float(
@@ -1158,6 +1190,7 @@ def canonical_policy_from_acceptance(
         trend_min_coverage=float(cast(float, values["trend_min_coverage"])),
         quote_max_age_seconds=float(cast(float, values["quote_max_age_seconds"])),
         quote_max_skew_seconds=float(cast(float, values["quote_max_skew_seconds"])),
+        trend_quote_max_age_seconds=float(cast(float, values["trend_quote_max_age_seconds"])),
         leader_risk=_risk_with_unified_budget(leader_risk, unified_budget),
         follower_risk=_risk_with_unified_budget(acceptance.risk_limits(), unified_budget),
         follower_confirmation_timeout_seconds=float(
@@ -2036,6 +2069,31 @@ def compute_solo_lock_sl(
         return None
 
 
+#: Admission gate counters in their fixed report/store order.  ``products``
+#: counts universe-matched plan products entering evaluation; every other key
+#: counts products blocked at that gate; ``admitted`` counts ranked entries.
+_GATE_STAT_KEYS = (
+    "products",
+    "quarantined",
+    "no_local_quote",
+    "stale_local_quote",
+    "no_peer_quote",
+    "stale_peer_quote",
+    "skew",
+    "decided_quote",
+    "no_plan",
+    "trend_bias",
+    "no_sizing",
+    "below_edge",
+    "symbol_mismatch",
+    "admitted",
+)
+
+
+def _empty_gate_stats() -> dict[str, int]:
+    return {key: 0 for key in _GATE_STAT_KEYS}
+
+
 # --------------------------------------------------------------------------- #
 # Quotes and typed events
 # --------------------------------------------------------------------------- #
@@ -2723,6 +2781,18 @@ class PairExecutionCell:
         self._decided_quotes: dict[str, tuple[str, int, str, int]] = {}
         self._trend_history: dict[str, deque[tuple[int, Decimal]]] = {}
         self._quote_epochs: dict[str, list[str]] = {}
+        # Post-hoc debugging evidence.  The 1-second tape mirrors the
+        # in-memory trend buffer merge (one row per product/source/second,
+        # last writer wins for live rows, seed rows never overwrite live
+        # ones); gate counters record *which* admission gate blocks each
+        # product every time candidates are evaluated.  Both are bounded by
+        # retention, never read on the decision path.
+        self._tape_replace: dict[tuple[str, str, int], tuple[str, str, str, str]] = {}
+        self._tape_ignore: dict[tuple[str, str, int], tuple[str, str, str, str]] = {}
+        self._tape_last_flush: datetime | None = None
+        self._last_gate_stats: dict[str, int] | None = None
+        self._last_gate_stats_at: datetime | None = None
+        self._last_gate_stats_persisted_at: datetime | None = None
         self._local_facts: ReadinessFactsEvent | None = None
         self._peer_session = True
         self._peer_ready = False
@@ -2901,6 +2971,38 @@ class PairExecutionCell:
                 event TEXT NOT NULL,
                 detail TEXT,
                 at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS cell_market_tape_1s (
+                product_id TEXT NOT NULL,
+                source TEXT NOT NULL,
+                epoch_sec INTEGER NOT NULL,
+                mid TEXT NOT NULL,
+                spread TEXT NOT NULL,
+                bid TEXT NOT NULL,
+                ask TEXT NOT NULL,
+                recorded_at TEXT NOT NULL,
+                PRIMARY KEY (product_id, source, epoch_sec)
+            );
+            CREATE INDEX IF NOT EXISTS idx_cell_market_tape_1s_epoch
+                ON cell_market_tape_1s (epoch_sec);
+            CREATE TABLE IF NOT EXISTS cell_admission_stats (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                recorded_at TEXT NOT NULL,
+                entry_mode TEXT NOT NULL,
+                products INTEGER NOT NULL DEFAULT 0,
+                quarantined INTEGER NOT NULL DEFAULT 0,
+                no_local_quote INTEGER NOT NULL DEFAULT 0,
+                stale_local_quote INTEGER NOT NULL DEFAULT 0,
+                no_peer_quote INTEGER NOT NULL DEFAULT 0,
+                stale_peer_quote INTEGER NOT NULL DEFAULT 0,
+                skew INTEGER NOT NULL DEFAULT 0,
+                decided_quote INTEGER NOT NULL DEFAULT 0,
+                no_plan INTEGER NOT NULL DEFAULT 0,
+                trend_bias INTEGER NOT NULL DEFAULT 0,
+                no_sizing INTEGER NOT NULL DEFAULT 0,
+                below_edge INTEGER NOT NULL DEFAULT 0,
+                symbol_mismatch INTEGER NOT NULL DEFAULT 0,
+                admitted INTEGER NOT NULL DEFAULT 0
             );
             """
         )
@@ -4511,11 +4613,19 @@ class PairExecutionCell:
         policy = self._policy
         if policy is None or self._universe is None:
             return frozenset()
+        # Admit the same quotes the entry gate admits: trend decisions run on
+        # the relaxed trend budget, so the plan precondition must too, or
+        # plans would flap absent exactly when trend entries could use them.
+        max_age = (
+            policy.trend_quote_max_age_seconds
+            if policy.entry_mode != "edge"
+            else policy.quote_max_age_seconds
+        )
         return frozenset(
             product.product_id
             for product in self._universe.products
             if (quote := self._local_quotes.get(product.product_id)) is not None
-            and quote.fresh(self._now, policy.quote_max_age_seconds)
+            and quote.fresh(self._now, max_age)
         )
 
     def _refresh_due(self) -> bool:
@@ -4681,6 +4791,24 @@ class PairExecutionCell:
             if directions_built == 0:
                 suspended[product_id] = "no direction has a valid positive sizing plan"
         self._install_plans(plans, suspended, policy)
+        self._prune_debug_evidence()
+
+    def _prune_debug_evidence(self) -> None:
+        """Bound the post-hoc debugging tables; never part of a decision."""
+
+        try:
+            now_epoch = _as_utc(self._now).timestamp()
+        except PairExecutionCellError:
+            return
+        self._db.execute(
+            "DELETE FROM cell_market_tape_1s WHERE epoch_sec < ?",
+            (int(now_epoch) - _TAPE_RETENTION_SECONDS,),
+        )
+        cutoff = _iso(self._now - timedelta(seconds=_ADMISSION_STATS_RETENTION_SECONDS))
+        self._db.execute(
+            "DELETE FROM cell_admission_stats WHERE recorded_at < ?", (cutoff,)
+        )
+        self._db.commit()
 
     def _install_plans(
         self,
@@ -5039,7 +5167,14 @@ class PairExecutionCell:
     def _record_trend_mid(
         self, product_id: str, bid: Decimal, ask: Decimal, broker_time: datetime
     ) -> None:
-        """Append one 1-second resampled mid; time-eviction is the only trim."""
+        """Append one 1-second resampled mid; time-eviction is the only trim.
+
+        Every kept point is also staged for the 1-second debug tape (flushed
+        once per second by :meth:`_maybe_flush_tape`): the tape key is the
+        same ``(product_id, source, epoch_sec)`` the buffer merges on, so a
+        post-hoc replay sees exactly the decision input.  Dropped points
+        (invalid or regressed ticks) are staged nowhere, mirroring the buffer.
+        """
 
         if bid <= 0 or ask <= 0 or ask < bid:
             return
@@ -5055,13 +5190,89 @@ class PairExecutionCell:
             self._trend_history[product_id] = history
         if history and history[-1][0] == bucket:
             history[-1] = (bucket, mid)
+            self._stage_tape_row(product_id, "live", bucket, mid, bid, ask)
             return
         if history and bucket < history[-1][0]:
             return  # regressed tick: never move the buffer backwards
         history.append((bucket, mid))
+        self._stage_tape_row(product_id, "live", bucket, mid, bid, ask)
         cutoff = bucket - int(self._trend_window_seconds()) - int(_TREND_SEED_GRACE_SECONDS)
         while history and history[0][0] < cutoff:
             history.popleft()
+
+    def _stage_tape_row(
+        self,
+        product_id: str,
+        source: str,
+        epoch_sec: int,
+        mid: Decimal,
+        bid: Decimal,
+        ask: Decimal,
+    ) -> None:
+        """Stage one tape row; live rows overwrite, seed rows never do.
+
+        Seed history only fills gaps: a live row for the same second is the
+        fresher evidence and must survive a later seed for that bucket, while
+        a live row always supersedes an earlier seed row for its own second.
+        """
+
+        row = (str(mid), str(ask - bid), str(bid), str(ask))
+        if source == "seed":
+            self._tape_ignore.setdefault((product_id, source, epoch_sec), row)
+        else:
+            self._tape_replace[(product_id, source, epoch_sec)] = row
+
+    def _maybe_flush_tape(self) -> None:
+        """Durably write staged tape rows at most once per second.
+
+        A failed flush drops the staged rows with a warning rather than
+        breaking the decision pump: the tape is debugging evidence, never
+        trade state.  Admission counters are flushed on their own cadence by
+        :meth:`_maybe_persist_gate_stats`.
+        """
+
+        if not self._tape_replace and not self._tape_ignore:
+            return
+        if (
+            self._tape_last_flush is not None
+            and (self._now - self._tape_last_flush).total_seconds() < _TAPE_FLUSH_SECONDS
+        ):
+            return
+        recorded_at = _iso(self._now)
+        try:
+            if self._tape_replace:
+                self._db.executemany(
+                    "INSERT INTO cell_market_tape_1s"
+                    " (product_id, source, epoch_sec, mid, spread, bid, ask, recorded_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+                    " ON CONFLICT(product_id, source, epoch_sec) DO UPDATE SET"
+                    " mid=excluded.mid, spread=excluded.spread,"
+                    " bid=excluded.bid, ask=excluded.ask, recorded_at=excluded.recorded_at",
+                    [
+                        (product_id, source, epoch_sec, mid, spread, bid, ask, recorded_at)
+                        for (product_id, source, epoch_sec), (mid, spread, bid, ask)
+                        in self._tape_replace.items()
+                    ],
+                )
+            if self._tape_ignore:
+                self._db.executemany(
+                    "INSERT INTO cell_market_tape_1s"
+                    " (product_id, source, epoch_sec, mid, spread, bid, ask, recorded_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
+                    [
+                        (product_id, source, epoch_sec, mid, spread, bid, ask, recorded_at)
+                        for (product_id, source, epoch_sec), (mid, spread, bid, ask)
+                        in self._tape_ignore.items()
+                    ],
+                )
+            self._db.commit()
+        except sqlite3.Error:
+            _LOGGER.warning("%s evt=tape_flush_fail rows=%s", _TAG,
+                            len(self._tape_replace) + len(self._tape_ignore), exc_info=True)
+        finally:
+            self._tape_replace.clear()
+            self._tape_ignore.clear()
+            self._tape_last_flush = self._now
 
     def _apply_trend_seed(self, event: TrendSeedEvent) -> None:
         """Phase-B prefill: merge historical mids into the 1-second buffer only."""
@@ -5094,6 +5305,22 @@ class PairExecutionCell:
         history.clear()
         for sec in kept[-_TREND_BUFFER_MAXLEN:]:
             history.append((sec, merged[sec]))
+        # Stage the same kept buckets for the debug tape (seed rows never
+        # overwrite live rows for their second; see _stage_tape_row).
+        kept_set = set(kept[-_TREND_BUFFER_MAXLEN:])
+        for point in event.points:
+            if point.bid <= 0 or point.ask <= 0 or point.ask < point.bid:
+                continue
+            try:
+                epoch = _as_utc(point.broker_time).timestamp()
+            except PairExecutionCellError:
+                continue
+            bucket = _trend_bucket(epoch)
+            if bucket in kept_set:
+                self._stage_tape_row(
+                    event.product_id, "seed", bucket,
+                    (point.bid + point.ask) / 2, point.bid, point.ask,
+                )
         self._transition(
             "trend_seed_applied",
             f"{event.product_id} points={len(history)} degraded={int(event.degraded)}",
@@ -5146,6 +5373,17 @@ class PairExecutionCell:
             sequence=sequence,
             calibration=_calibration_from_canonical(payload.get("calibration")),
         )
+        if bid > 0 and ask >= bid:
+            try:
+                bucket = _trend_bucket(_as_utc(broker_time).timestamp())
+            except PairExecutionCellError:
+                bucket = None
+            if bucket is not None:
+                # The peer's own live view, staged so a post-hoc replay can
+                # re-derive the freshness/skew gates exactly as evaluated.
+                self._stage_tape_row(
+                    product_id, "peer", bucket, (bid + ask) / 2, bid, ask
+                )
 
     # -- relay publication -------------------------------------------------- #
 
@@ -5535,6 +5773,7 @@ class PairExecutionCell:
             # still need its current fail-closed readiness to avoid waiting
             # indefinitely for a state snapshot after reconnect or restart.
             self._maybe_publish_state()
+            self._maybe_flush_tape()
             return
         if self._role == "follower":
             self._maybe_install_pending_universe()
@@ -5559,6 +5798,7 @@ class PairExecutionCell:
         self._maybe_finalize_empty()
         self._await_peer_terminal_proof()
         self._maybe_declare_active()
+        self._maybe_flush_tape()
 
     def _update_daily_loss_warning(self) -> None:
         """Pause new entries once, and clear the pause automatically at NY reset."""
@@ -5686,52 +5926,79 @@ class PairExecutionCell:
         No candidate is evaluated, ranked, or selected while any valid positive
         plan is missing, and none at all while the route is ``UNPAIRING``.
         ``entry_mode=edge`` keeps the legacy cross-broker spread gate;
-        ``donchian``/``momentum`` replace it with a leader-only trend gate
-        while every other safety gate stays identical.
+        ``donchian``/``momentum`` replace it with a leader-only trend gate.
+        Trend decisions read the leader-local minutes-long mid buffer, never a
+        cross-broker price comparison, so they use the trend-timescale quote
+        age budget (``trend_quote_max_age_seconds``) on both legs and skip the
+        skew gate that only edge arbitrage needs.  Both legs still need a bound
+        because the follower's rough protection is priced off its own quote.
+        Every evaluation records per-gate counters (see ``_note_gate_stats``)
+        so a silent no-candidate state names its blocking gate.
         """
 
         policy = self._policy
+        stats = _empty_gate_stats()
         if policy is None or self._universe is None or self._route_state == "UNPAIRING":
+            self._note_gate_stats(stats, persist=False)
             return []
+        trend_mode = policy.entry_mode != "edge"
+        max_age = (
+            policy.trend_quote_max_age_seconds if trend_mode else policy.quote_max_age_seconds
+        )
         threshold = cast(Decimal, _to_decimal(policy.entry_edge_points))
         ranked: list[tuple[Decimal, Decimal, str, Direction]] = []
         for product_id in sorted({key[0] for key in self._plans}):
             product = self._universe.product(product_id)
             if product is None:
                 continue
+            stats["products"] += 1
             if self.is_quarantined(product_id, symbol=product.symbol):
+                stats["quarantined"] += 1
                 continue
             local_quote = self._local_quotes.get(product_id)
             peer_quote = self._peer_quotes.get(product_id)
-            if local_quote is None or peer_quote is None:
+            if local_quote is None:
+                stats["no_local_quote"] += 1
                 continue
-            if not local_quote.fresh(self._now, policy.quote_max_age_seconds):
+            if peer_quote is None:
+                stats["no_peer_quote"] += 1
                 continue
-            if not peer_quote.fresh(self._now, policy.quote_max_age_seconds):
+            if not local_quote.fresh(self._now, max_age):
+                stats["stale_local_quote"] += 1
                 continue
-            if calibrated_skew_seconds(local_quote, peer_quote) > policy.quote_max_skew_seconds:
+            if not peer_quote.fresh(self._now, max_age):
+                stats["stale_peer_quote"] += 1
+                continue
+            if not trend_mode and calibrated_skew_seconds(local_quote, peer_quote) > policy.quote_max_skew_seconds:
+                stats["skew"] += 1
                 continue
             if self._decided_quotes.get(product_id) == _quote_key(local_quote, peer_quote):
+                stats["decided_quote"] += 1
                 continue  # one attempt per decision quote revision; never a retry storm
             if policy.entry_mode != "edge":
                 plan_for_point = self._plans.get((product_id, "LONG")) or self._plans.get(
                     (product_id, "SHORT")
                 )
                 if plan_for_point is None:
+                    stats["no_plan"] += 1
                     continue
                 point = _to_decimal(plan_for_point.canonical_point)
                 if point is None or point <= 0:
+                    stats["no_plan"] += 1
                     continue
                 bias, strength, _reason = self._trend_bias_for_product(
                     product_id, local_quote, point
                 )
                 if bias is None:
+                    stats["trend_bias"] += 1
                     continue
                 sized = self._pair_lots(product_id, bias)
                 if sized is None:
+                    stats["no_sizing"] += 1
                     continue
                 lots, leader_plan, follower_plan = sized
                 if local_quote.symbol != leader_plan.symbol or peer_quote.symbol != follower_plan.symbol:
+                    stats["symbol_mismatch"] += 1
                     continue
                 conservative_usd_per_point = min(
                     cast(Decimal, _to_decimal(leader_plan.usd_per_point_per_lot)),
@@ -5739,23 +6006,28 @@ class PairExecutionCell:
                 )
                 expected_move_usd = strength * conservative_usd_per_point * lots
                 ranked.append((expected_move_usd, strength, product_id, bias))
+                stats["admitted"] += 1
                 continue
             for leader_direction in ("LONG", "SHORT"):
                 direction = cast(Direction, leader_direction)
                 sized = self._pair_lots(product_id, direction)
                 if sized is None:
+                    stats["no_sizing"] += 1
                     continue
                 lots, leader_plan, follower_plan = sized
                 if local_quote.symbol != leader_plan.symbol or peer_quote.symbol != follower_plan.symbol:
+                    stats["symbol_mismatch"] += 1
                     continue
                 # The canonical execution point is the coarser broker's, so the
                 # edge threshold is always measured on the conservative one.
                 point = _to_decimal(leader_plan.canonical_point)
                 if point is None or point <= 0:
+                    stats["no_sizing"] += 1
                     continue
                 raw_edge = edge_value(local_quote, peer_quote, direction)
                 edge_points = raw_edge / point
                 if edge_points < threshold:
+                    stats["below_edge"] += 1
                     continue
                 conservative_usd_per_point = min(
                     cast(Decimal, _to_decimal(leader_plan.usd_per_point_per_lot)),
@@ -5763,8 +6035,58 @@ class PairExecutionCell:
                 )
                 expected_edge_usd = edge_points * conservative_usd_per_point * lots
                 ranked.append((expected_edge_usd, edge_points, product_id, direction))
+                stats["admitted"] += 1
         ranked.sort(key=lambda item: (-item[0], -item[1], item[2], item[3]))
+        self._note_gate_stats(stats, persist=True)
         return ranked
+
+    def _note_gate_stats(self, stats: dict[str, int], *, persist: bool) -> None:
+        """Cache the latest admission gate counters and persist them minutely.
+
+        The cache feeds :meth:`entry_admission_diagnostic` so the log names
+        the blocking gate instead of a generic no-candidate string; the
+        minute-cadence durable rows back post-hoc analysis without growing
+        the database on the 200ms pump.
+        """
+
+        self._last_gate_stats = dict(stats)
+        self._last_gate_stats_at = self._now
+        if not persist or self._policy is None:
+            return
+        if (
+            self._last_gate_stats_persisted_at is not None
+            and (self._last_gate_stats_at - self._last_gate_stats_persisted_at).total_seconds()
+            < _ADMISSION_STATS_PERSIST_SECONDS
+        ):
+            return
+        try:
+            self._db.execute(
+                "INSERT INTO cell_admission_stats"
+                " (recorded_at, entry_mode, products, quarantined,"
+                " no_local_quote, stale_local_quote, no_peer_quote, stale_peer_quote,"
+                " skew, decided_quote, no_plan, trend_bias, no_sizing, below_edge,"
+                " symbol_mismatch, admitted)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    _iso(self._last_gate_stats_at),
+                    self._policy.entry_mode,
+                    *(stats[key] for key in _GATE_STAT_KEYS),
+                ),
+            )
+            self._db.commit()
+        except sqlite3.Error:
+            _LOGGER.warning("%s evt=gate_stats_persist_fail", _TAG, exc_info=True)
+            return
+        self._last_gate_stats_persisted_at = self._last_gate_stats_at
+
+    def _format_gate_stats(self) -> str:
+        """Flat ``k=v`` counters for the log vocabulary; never time-varying."""
+
+        if self._last_gate_stats is None:
+            return "gates=unevaluated"
+        # Deliberately no age field: a ticking age would change the admission
+        # diagnostic every pump and turn the change-only state log into spam.
+        return "gates(" + " ".join(f"{key}={self._last_gate_stats[key]}" for key in _GATE_STAT_KEYS) + ")"
 
     def entry_candidates(self) -> list[dict[str, object]]:
         """Observable, deterministically ranked leader candidate admission."""
@@ -5809,14 +6131,18 @@ class PairExecutionCell:
             return "peer admission blocked: remaining-loss allowance has not been reseeded"
         candidates = self._candidates()
         if not candidates:
+            gates = self._format_gate_stats()
             if policy.entry_mode == "edge":
                 return (
                     "no entry candidate passed sizing, quote freshness/skew, quarantine, "
-                    f"and edge threshold gates (entry_edge_points={policy.entry_edge_points})"
+                    f"and edge threshold gates (entry_edge_points={policy.entry_edge_points}) "
+                    f"{gates}"
                 )
             return (
-                "no entry candidate passed sizing, quote freshness/skew, quarantine, "
-                f"and trend gates (entry_mode={policy.entry_mode})"
+                "no entry candidate passed sizing, quote freshness, quarantine, "
+                f"and trend gates (entry_mode={policy.entry_mode} "
+                f"trend_quote_max_age_s={policy.trend_quote_max_age_seconds} skew_gate=off) "
+                f"{gates}"
             )
         candidate = candidates[0]
         score_key = "edge_points" if policy.entry_mode == "edge" else "trend_strength"
