@@ -145,6 +145,27 @@ _PEER_PROOF_ESCALATION_MULTIPLIER = 6.0
 # Statuses that are durable proof the peer created no broker exposure.
 _PEER_NON_SEND_STATUSES = ("rejected", "expired_not_started", "no_attempt_record")
 _PEER_TERMINAL_STATUSES = _PEER_NON_SEND_STATUSES + ("empty",)
+# Operator-initiated shutdown must close both legs together: a peer that sees
+# this marker in an ``empty`` leg status skips the winner-only solo path and
+# contains immediately, even when its own leg is profitable.
+OPERATOR_SHUTDOWN_MARKER = "operator_shutdown"
+
+
+def _is_operator_shutdown_reason(reason: object) -> bool:
+    """Whether a close/leg-status reason means operator shutdown.
+
+    Accepts the canonical marker plus the historical operator strings
+    (``operator interrupt`` from the graceful-shutdown loop and
+    ``operator shutdown`` used by tests/CLI), so both fresh and durable
+    reasons converge onto the joint-close route.
+    """
+
+    if not isinstance(reason, str) or not reason:
+        return False
+    lowered = reason.lower()
+    if OPERATOR_SHUTDOWN_MARKER in lowered:
+        return True
+    return "operator" in lowered and ("shutdown" in lowered or "interrupt" in lowered)
 
 PairState = Literal[
     "IDLE",
@@ -1969,7 +1990,7 @@ def compute_trailing_sl(
 ) -> str | None:
     """Advance a profit-leg stop toward the market without widening risk.
 
-    The trail keeps one full initial risk distance from the current exit
+    The trail keeps half the initial risk distance from the current exit
     price (bid for LONG, ask for SHORT): as the market moves favorably the
     stop follows and locks profit; when the market moves adversely the
     existing stop is kept.  Returns the new SL string, or ``None`` when no
@@ -1991,10 +2012,11 @@ def compute_trailing_sl(
     risk_distance = abs(fill_price - initial_sl)
     if risk_distance <= 0:
         return None
+    trail_distance = risk_distance / 2
     if direction == "LONG":
         if current_price <= fill_price:
             return None  # no profit to lock yet
-        candidate = _round_to_tick(current_price - risk_distance, tick_size, ROUND_FLOOR)
+        candidate = _round_to_tick(current_price - trail_distance, tick_size, ROUND_FLOOR)
         if candidate <= initial_sl:
             return None  # only advances past the initial stop ever move
         if current_price - candidate < minimum_stop_distance:
@@ -2004,7 +2026,7 @@ def compute_trailing_sl(
     else:
         if current_price >= fill_price:
             return None  # no profit to lock yet
-        candidate = _round_to_tick(current_price + risk_distance, tick_size, ROUND_CEILING)
+        candidate = _round_to_tick(current_price + trail_distance, tick_size, ROUND_CEILING)
         if candidate >= initial_sl:
             return None  # only advances past the initial stop ever move
         if candidate - current_price < minimum_stop_distance:
@@ -2823,6 +2845,10 @@ class PairExecutionCell:
         self._active_since: datetime | None = None
         self._state: PairState = "IDLE"
         self._desired: DesiredState = "NONE"
+        # Attempt IDs that entered containment via operator shutdown.  These
+        # legs report ``empty`` with the shutdown marker so the peer takes the
+        # joint-close route instead of winner-only solo continuation.
+        self._operator_shutdown_attempts: set[str] = set()
         self._needs_human: str | None = None
         self._now = datetime(1970, 1, 1, tzinfo=UTC)
         self._recovering = False
@@ -3121,6 +3147,18 @@ class PairExecutionCell:
         if desired_row is not None:
             self._desired = cast(DesiredState, desired_row[0])
             self._pair_confirmed = bool(desired_row[1])
+        if self._attempt is not None:
+            # Re-arm the shutdown marker after a restart: the durable
+            # ``close_requested`` history is the intent record, so a leader
+            # that force-exited mid-shutdown still broadcasts the joint-close
+            # route instead of looking like a plain stop-out to the peer.
+            for (detail,) in self._db.execute(
+                "SELECT detail FROM cell_transitions WHERE attempt_id = ? AND event = 'close_requested'",
+                (self._attempt.attempt_id,),
+            ).fetchall():
+                if _is_operator_shutdown_reason(detail):
+                    self._operator_shutdown_attempts.add(self._attempt.attempt_id)
+                    break
         active_row = self._db.execute(
             "SELECT active_since FROM cell_active_state WHERE attempt_id = ?", (attempt_row[0],)
         ).fetchone()
@@ -7548,6 +7586,17 @@ class PairExecutionCell:
             self._begin_close(f"peer_leg_{status}")
             self._maybe_finalize_empty()
         elif status == "empty":
+            peer_reason = cast(str, payload.get("reason") or "")
+            if _is_operator_shutdown_reason(peer_reason):
+                # Operator shutdown is a joint-close route, never a solo
+                # opportunity: both legs flatten together even when the
+                # survivor is profitable.  The shutdown initiator keeps its
+                # attempt open (via _maybe_finalize_empty) until this side
+                # reports empty back, so graceful shutdown waits for both.
+                self._transition("peer_operator_shutdown", peer_reason or attempt_id)
+                self._begin_close(f"peer_{OPERATOR_SHUTDOWN_MARKER}")
+                self._maybe_finalize_empty()
+                return
             if (
                 self._desired == "ACTIVE"
                 and self._leg is not None
@@ -7999,7 +8048,14 @@ class PairExecutionCell:
         """``UNPAIRING`` and metadata reconciliation never block this path."""
 
         if self._attempt is None or self._desired == "EMPTY":
+            # The marker must survive a repeated close call: the first
+            # operator-shutdown intent stays armed even when a later
+            # containment reason (e.g. restart recovery) re-enters here.
+            if self._attempt is not None and _is_operator_shutdown_reason(reason):
+                self._operator_shutdown_attempts.add(self._attempt.attempt_id)
             return
+        if _is_operator_shutdown_reason(reason):
+            self._operator_shutdown_attempts.add(self._attempt.attempt_id)
         self._desired = "EMPTY"
         self._timer_deadline = None
         self._persist_desired()
@@ -8085,7 +8141,9 @@ class PairExecutionCell:
         if self._peer_proof_last_probe is None or now - self._peer_proof_last_probe >= timeout * _PEER_PROOF_PROBE_MULTIPLIER:
             self._peer_proof_last_probe = now
             self._peer_proof_probes_sent += 1
-            self._report_leg_status("empty")
+            self._report_leg_status(
+                "empty", reason=self._empty_leg_status_reason(attempt.attempt_id)
+            )
             self._relay.send(
                 self._envelope("leg_status_request", {"attempt_id": attempt.attempt_id})
             )
@@ -8130,12 +8188,21 @@ class PairExecutionCell:
                 _terminal_status_for(reason), attempt_id=attempt_id, reason=reason
             )
 
+    def _empty_leg_status_reason(self, attempt_id: str) -> str:
+        """The ``reason`` to attach when reporting ``empty`` for one attempt."""
+
+        if attempt_id in self._operator_shutdown_attempts:
+            return OPERATOR_SHUTDOWN_MARKER
+        return ""
+
     def _report_current_leg_status(self) -> None:
         leg = self._leg
         if leg is None or self._attempt is None:
             return
         if leg.empty_verified:
-            self._report_leg_status("empty")
+            self._report_leg_status(
+                "empty", reason=self._empty_leg_status_reason(self._attempt.attempt_id)
+            )
         elif leg.protection_status == "precise":
             self._report_leg_status("protection_precise", sl=leg.precise_sl, tp=leg.precise_tp)
         elif leg.entry_status == "filled":
@@ -8181,7 +8248,9 @@ class PairExecutionCell:
             self._persist_leg()
             self._transition("empty_verified", attempt.attempt_id)
             self._state = "CONVERGING_EMPTY"
-            self._report_leg_status("empty")
+            self._report_leg_status(
+                "empty", reason=self._empty_leg_status_reason(attempt.attempt_id)
+            )
             self._maybe_finalize_empty()
 
     def _cancel_owned(self, order: dict[str, object]) -> None:
@@ -8288,6 +8357,8 @@ class PairExecutionCell:
         return True
 
     def _reset_attempt(self) -> None:
+        if self._attempt is not None:
+            self._operator_shutdown_attempts.discard(self._attempt.attempt_id)
         self._attempt = None
         self._leg = None
         self._peer_leg = PeerLegView()

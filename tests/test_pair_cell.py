@@ -2673,7 +2673,7 @@ class LossPolicyTests(PairCellTestCase):
             minimum_stop_distance="0",
             usd_per_point_per_lot="1",
         )
-        # Profitable: the stop follows one risk distance (75 ticks) behind.
+        # Profitable: the stop follows half risk distance (37.5 ticks) behind.
         advanced = compute_trailing_sl(
             direction="LONG",
             fill_price=Decimal("1.10030"),
@@ -2683,7 +2683,7 @@ class LossPolicyTests(PairCellTestCase):
             volume=Decimal("2"),
             allowed_loss_usd=Decimal("150"),
         )
-        self.assertEqual(None if advanced is None else Decimal(advanced), Decimal("1.10055"))
+        self.assertEqual(None if advanced is None else Decimal(advanced), Decimal("1.10092"))
         # Adverse or flat markets never move the stop.
         self.assertIsNone(
             compute_trailing_sl(
@@ -2707,7 +2707,7 @@ class LossPolicyTests(PairCellTestCase):
             allowed_loss_usd=Decimal("150"),
         )
         self.assertEqual(
-            None if short_advanced is None else Decimal(short_advanced), Decimal("1.10035")
+            None if short_advanced is None else Decimal(short_advanced), Decimal("1.09998")
         )
 
     def test_solo_lock_prefers_breakeven_then_half_risk_then_hold(self) -> None:
@@ -3205,7 +3205,7 @@ class ImmediateEntryTests(PairCellTestCase):
         self.assertEqual(len(self.follower.modify_requests()), 1)
 
         # The market runs in the leader LONG direction: the profit leg trails
-        # its stop one full initial risk distance (75 ticks) behind the bid.
+        # its stop half the initial risk distance (37.5 ticks) behind the bid.
         # Advances smaller than _SOLO_TRAIL_MIN_STEP_TICKS are held; the
         # follower hedge leg only trails on its own favorable move.
         self.feed_quotes(
@@ -3218,7 +3218,7 @@ class ImmediateEntryTests(PairCellTestCase):
         self.tick(seconds=300)
 
         leader_modify = self.leader.modify_requests()[-1]
-        self.assertEqual(Decimal(str(leader_modify["sl"])), Decimal("1.10055"))
+        self.assertEqual(Decimal(str(leader_modify["sl"])), Decimal("1.10092"))
         self.assertEqual(str(leader_modify["tp"]), "0")
         self.assertEqual(len(self.follower.modify_requests()), 1)
         self.assertIn(
@@ -4409,6 +4409,75 @@ class ExitConvergenceTests(PairCellTestCase):
         self.assertEqual(self.leader.mt5.positions, [])
         self.assertEqual(self.follower.mt5.positions, [])
         self.assertEqual(self.leader.cell.handle_event(ClockTickEvent(self.now)).state, "EMPTY")
+
+    def test_operator_shutdown_closes_a_profitable_peer_instead_of_solo(self) -> None:
+        self.run_entry()
+        # The follower SHORT is strictly profitable once ask drops below its
+        # fill, which is exactly when a plain peer-empty would go solo.
+        self.feed_quotes(
+            leader_bid="1.10050",
+            leader_ask="1.10060",
+            follower_bid="1.09950",
+            follower_ask="1.09960",
+            sequence=3,
+        )
+        self.tick()
+        attempt_id = self.last_attempt().attempt_id
+        old_follower_tickets = [p["ticket"] for p in self.follower.mt5.positions]
+        self.assertTrue(old_follower_tickets)
+        self.leader.cell.request_close("operator interrupt")
+        self.net.pump()
+        empties = [
+            p
+            for p in self.net.payloads("leg_status", LEADER)
+            if p.get("attempt_id") == attempt_id and p.get("status") == "empty"
+        ]
+        self.assertTrue(empties, "the leader must report empty")
+        self.assertTrue(
+            any(p.get("reason") == "operator_shutdown" for p in empties),
+            "the empty report must carry the joint-close marker",
+        )
+        follower_events = [row["event"] for row in self.follower.cell.transition_history()]
+        self.assertIn("peer_operator_shutdown", follower_events)
+        self.assertNotIn("peer_leg_empty_follower_continues_solo", follower_events)
+        # Freeze quotes so no fresh attempt follows the joint close.
+        self.now += timedelta(seconds=30)
+        for _ in range(5):
+            self.tick()
+        remaining = [p["ticket"] for p in self.follower.mt5.positions]
+        self.assertFalse(
+            any(ticket in remaining for ticket in old_follower_tickets),
+            "the profitable peer leg must be flattened, not left solo",
+        )
+
+    def test_operator_shutdown_marker_survives_leader_restart(self) -> None:
+        self.run_entry()
+        attempt_id = self.last_attempt().attempt_id
+        self.leader.cell.request_close("operator interrupt")
+        marker = self.net.mark()
+        self.leader.restart()
+        self.leader.cell.recover()
+        # Let the bounded terminal-proof probe fire after the restart.
+        self.clock.advance(6.0)
+        self.now += timedelta(seconds=6)
+        self.leader.cell.handle_event(ClockTickEvent(self.now))
+        self.net.pump()
+        fresh_empties = [
+            envelope
+            for envelope in self.net.sent[marker:]
+            if envelope["from_worker_id"] == LEADER
+            and envelope["kind"] == "leg_status"
+            and envelope["payload"].get("attempt_id") == attempt_id
+            and envelope["payload"].get("status") == "empty"
+        ]
+        self.assertTrue(fresh_empties, "the leader must re-report empty after restart")
+        self.assertTrue(
+            any(
+                envelope["payload"].get("reason") == "operator_shutdown"
+                for envelope in fresh_empties
+            ),
+            "the restart must re-arm the marker from durable close history",
+        )
 
 
 # --------------------------------------------------------------------------- #

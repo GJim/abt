@@ -554,6 +554,12 @@ def _run_reconciliation_with_relay(
                     return
         except KeyboardInterrupt:
             if graceful_shutdown.requested or pair_cell is None:
+                _LOGGER.warning(
+                    "Pair Execution Cell graceful shutdown abandoned before both legs "
+                    "were terminal; the peer keeps managing any surviving leg under "
+                    "its own trailing stop. Restarting now rejoins containment via "
+                    "the durable close history."
+                )
                 raise
             graceful_shutdown.requested = True
             pair_cell.request_close("operator interrupt")

@@ -96,6 +96,7 @@ from ..pair_cell import (
     LocalCatalogEvent,
     LocalQuoteBatchEvent,
     LocalQuoteEvent,
+    NEW_YORK,
     PairExecutionCell,
     PairExecutionCellError,
     PairResult,
@@ -146,6 +147,16 @@ _RTAG = "pcr"
 def _short(value: object) -> str:
     text = "-" if value is None else str(value)
     return text if len(text) <= 8 else text[:8]
+
+
+def _is_new_york_weekend(observed_at: datetime) -> bool:
+    """Whether the New York calendar day is Saturday/Sunday (market closed)."""
+
+    try:
+        local = observed_at.astimezone(NEW_YORK)
+    except Exception:
+        return False
+    return local.weekday() >= 5
 
 _T = TypeVar("_T")
 
@@ -1807,6 +1818,17 @@ class PairCellPollingConfig:
     #: forever while the route waits for an assertion one side believes it
     #: already sent.
     assertion_heartbeat_interval: timedelta = timedelta(seconds=30)
+    #: How often the market-data health observer runs.  Deliberately slow:
+    #: entry is already protected by quote coverage and
+    #: ``trend_quote_max_age_seconds``, so this observer only watches,
+    #: alerts, and rewarms -- it never gates trading.  Occasional dropped
+    #: ticks must never trigger it.
+    data_health_interval: timedelta = timedelta(seconds=60)
+    #: How long without any genuinely new local tick before the observer
+    #: raises one alert.  Keep aligned with ``trend_quote_max_age_seconds``
+    #: so the alert fires exactly when entries start blocking on stale
+    #: quotes, never earlier.
+    data_health_freeze_seconds: float = 180.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -1928,12 +1950,19 @@ class PairCellRuntime:
         self._observed_open: dict[str, None] = {}
         self._quote_cursors: dict[str, _TickCursor] = {}
         self._trend_seeded: set[tuple[int, str]] = set()
+        # Market-data health observer (watch-only: never gates trading).
+        # Baseline is the last pump that observed a genuinely new tick;
+        # everything here is in-memory timestamp comparison, no MT5 calls.
+        self._last_quote_advance_at: datetime | None = None
+        self._data_health_alerted = False
+        self._data_health_alert_at: datetime | None = None
         self._local_facts: ReadinessFactsEvent | None = None
         epoch = now()
         self._next_quote_at = epoch
         self._next_readiness_at = epoch
         self._next_snapshot_at = epoch
         self._next_refresh_at = epoch
+        self._next_data_health_at = epoch
 
         record = self._durable_route
         if record is not None:
@@ -3445,6 +3474,7 @@ class PairCellRuntime:
             self._next_quote_at = observed_at + self._polling.quote_interval
             quotes = self._read_quotes(observed_at)
             if quotes:
+                self._note_quote_advance(observed_at)
                 result = cell.handle_event(LocalQuoteBatchEvent(quotes))
         if observed_at >= self._next_snapshot_at:
             self._next_snapshot_at = observed_at + self._polling.broker_snapshot_interval
@@ -3453,6 +3483,9 @@ class PairCellRuntime:
                 result = cell.handle_event(snapshot)
                 for realized in self._realized_loss_facts(snapshot, observed_at, result):
                     result = cell.handle_event(realized)
+        if observed_at >= self._next_data_health_at:
+            self._next_data_health_at = observed_at + self._polling.data_health_interval
+            self._check_data_health(observed_at)
         self._log_state_diagnostic(cell)
         self._sync_route_control()
         return result
@@ -3729,6 +3762,72 @@ class PairCellRuntime:
             _LOGGER.warning("Pair Execution Cell broker snapshot read failed.", exc_info=True)
             return None
         return BrokerSnapshotEvent(orders=orders, positions=positions, observed_at=observed_at)
+
+    def _note_quote_advance(self, observed_at: datetime) -> None:
+        """Record a genuinely new tick; rewarm trend history after a freeze.
+
+        Runs only when the quote poll observed at least one advanced tick
+        cursor, so occasional dropped ticks can never trigger anything here.
+        Recovery clears this generation's trend-seed markers so the existing
+        one-product-per-pump seed flow backfills the tape instead of waiting
+        for it to regrow organically.  Trading gates are never touched.
+        """
+
+        if self._data_health_alerted:
+            stalled: float | None = None
+            if self._data_health_alert_at is not None:
+                stalled = (observed_at - self._data_health_alert_at).total_seconds()
+            _LOGGER.info(
+                "%s evt=data_health_recovered stalled_s=%s; rewarming trend history",
+                _RTAG,
+                "unknown" if stalled is None else f"{stalled:.0f}",
+            )
+            self._data_health_alerted = False
+            self._data_health_alert_at = None
+            cell = self._cell
+            universe = None if cell is None else cell.discovered_universe()
+            if universe is not None:
+                generation = universe.universe_generation
+                self._trend_seeded = {
+                    key for key in self._trend_seeded if key[0] != generation
+                }
+        self._last_quote_advance_at = observed_at
+
+    def _check_data_health(self, observed_at: datetime) -> None:
+        """Alert once when no genuinely new tick arrived for a full freeze window.
+
+        Pure in-memory timestamp comparison -- no MT5 calls, no effect on
+        quotes, admission, or protection.  Weekends are skipped: a closed
+        market legitimately produces no ticks.  Never latches trading state;
+        the operator restarts a dead terminal or bridge on seeing the alert.
+        """
+
+        cell = self._cell
+        if cell is None:
+            return
+        universe = cell.discovered_universe()
+        if universe is None or not universe.products:
+            return
+        if self._last_quote_advance_at is None:
+            self._last_quote_advance_at = observed_at
+            return
+        if _is_new_york_weekend(observed_at):
+            return
+        frozen_s = (observed_at - self._last_quote_advance_at).total_seconds()
+        if self._data_health_alerted or frozen_s < self._polling.data_health_freeze_seconds:
+            return
+        calibration = self.broker_clock_calibration(observed_at)
+        _LOGGER.warning(
+            "%s evt=data_health_frozen frozen_s=%.0f products=%d calibration_usable=%s; "
+            "entries stay blocked by quote freshness gates; check the MT5 "
+            "terminal/bridge feed (operator action may be required)",
+            _RTAG,
+            frozen_s,
+            len(universe.products),
+            calibration.usable,
+        )
+        self._data_health_alerted = True
+        self._data_health_alert_at = observed_at
 
     # -- realized per-leg loss facts ------------------------------------------ #
 

@@ -3662,15 +3662,16 @@ class FullLifecycleTests(PairingTestCase):
         # Drive the market favorably past the trail cadence: the first
         # trailing adjustment must tighten the solo stop.  The default 1%
         # margin sizes the leg at 0.04 lots, so one full risk distance is wide
-        # (0.01000); the drive must clear the solo lock before the trail can
-        # advance past it to 1.10010.
+        # (0.01000); the half-distance trail keeps 0.00500 from the exit price,
+        # so the drive must clear the solo lock before the trail can advance
+        # past it to 1.09510 (= 1.09010 ask + 0.00500).
         follower.mt5.prices[SYMBOL] = (1.09000, 1.09010)
         self.clock.advance(301.0)
         self.assertTrue(
             pump_until(
                 [leader, follower],
                 lambda: bool(follower.mt5.positions)
-                and abs(float(follower.mt5.positions[0]["sl"]) - 1.10010) < 1e-9,
+                and abs(float(follower.mt5.positions[0]["sl"]) - 1.09510) < 1e-9,
                 rounds=20,
             ),
             "the solo leg never trailed its stop",
@@ -3701,6 +3702,67 @@ class FullLifecycleTests(PairingTestCase):
             "the safe unpair never removed the route",
         )
         self.assertNotIn(original, self.controller.routes)
+
+
+# --------------------------------------------------------------------------- #
+# Market-data health observer (watch-only)
+# --------------------------------------------------------------------------- #
+
+
+class DataHealthWatchTests(PairingTestCase):
+    def _active_pair(self) -> tuple[Worker, Worker]:
+        leader, follower = self.paired()
+        self.assertTrue(
+            pump_until(
+                [leader, follower],
+                lambda: leader.state == "ACTIVE" and follower.state == "ACTIVE",
+                rounds=400,
+            ),
+            "the pair never reached ACTIVE",
+        )
+        return leader, follower
+
+    def test_frozen_feed_alerts_once_then_recovery_rewarms(self) -> None:
+        leader, follower = self._active_pair()
+        assert leader.runtime.cell is not None
+        # Freeze the leader's only symbol: live ticks stop advancing while
+        # the process, relay, and broker snapshot reads keep working.
+        leader.mt5.frozen_symbols.add(SYMBOL)
+        self.clock.advance(200.0)
+        with self.assertLogs("abt.worker.pair_cell_adapter", level="WARNING") as logs:
+            leader.runtime.pump(self.clock())
+            follower.runtime.pump(self.clock())
+        output = "\n".join(logs.output)
+        self.assertIn("evt=data_health_frozen", output)
+        # Watch-only: trading state is never latched by the observer.
+        self.assertFalse(leader.runtime.cell.status().needs_human)
+        # Thaw: the next genuinely new tick recovers with one INFO and
+        # clears this generation's trend-seed markers so history backfills.
+        leader.mt5.frozen_symbols.discard(SYMBOL)
+        generation = leader.runtime.cell.discovered_universe().universe_generation
+        # Let the quote gate elapse so the thawed tick is actually observed.
+        self.clock.advance(1.0)
+        with self.assertLogs("abt.worker.pair_cell_adapter", level="INFO") as logs:
+            leader.runtime.pump(self.clock())
+        output = "\n".join(logs.output)
+        self.assertIn("evt=data_health_recovered", output)
+        seeded = leader.runtime._trend_seeded
+        self.assertFalse(
+            any(key[0] == generation for key in seeded),
+            "recovery must drop this generation's seed markers for backfill",
+        )
+
+    def test_weekend_freeze_stays_quiet(self) -> None:
+        leader, follower = self._active_pair()
+        # Saturday 2024-01-06: a closed market legitimately produces no ticks.
+        self.clock.advance(4 * 24 * 3600.0)
+        leader.mt5.frozen_symbols.add(SYMBOL)
+        self.clock.advance(200.0)
+        with self.assertLogs("abt.worker.pair_cell_adapter", level="WARNING") as logs:
+            leader.runtime.pump(self.clock())
+            follower.runtime.pump(self.clock())
+        output = "\n".join(logs.output)
+        self.assertNotIn("evt=data_health_frozen", output)
 
 
 if __name__ == "__main__":  # pragma: no cover - convenience entry point
