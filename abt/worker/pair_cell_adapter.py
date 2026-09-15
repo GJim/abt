@@ -3117,6 +3117,11 @@ class PairCellRuntime:
         self._limits = None
         self._durable_route = None
         clear_durable_route(self._route_path)
+        # The route is authoritatively gone, so a fail-closed diagnostic tied
+        # to that route ("controller routes this Worker on X but no budget")
+        # is moot: without this the surviving peer of a force-deleted route
+        # would stay fail-closed until a process restart.
+        self._fail_closed_reason = None
         self._discard_proposal_records()
         self._reset_route_scoped_state()
         self._proposal_id = None

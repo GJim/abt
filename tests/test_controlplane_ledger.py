@@ -215,6 +215,116 @@ class ControlLedgerTests(unittest.TestCase):
         # The failed migration leaves the original worker untouched.
         self.assertEqual(first_worker_id, self.ledger.active_worker(first_worker_id).worker_id)
 
+    def test_delete_worker_force_removes_pair_route_and_frees_the_account(self) -> None:
+        first_challenge, _ = self.ledger.issue_enrollment_challenge()
+        first = self.ledger.create_enrollment(
+            login=123456,
+            server="Broker-Demo",
+            public_key_pem="public-key-one",
+            account_info={"login": 123456},
+            terminal_info={"name": "MetaTrader 5"},
+            password_secret_ref="abt/data/mt5/pending/one",
+            enrollment_challenge=first_challenge,
+        )
+        first_worker_id = self.ledger.approve_enrollment(
+            first.enrollment_id, "ABCDEF", lambda worker_id, *_: f"certificate:{worker_id}"
+        )
+        peer_challenge, _ = self.ledger.issue_enrollment_challenge()
+        peer = self.ledger.create_enrollment(
+            login=654321,
+            server="Broker-Demo",
+            public_key_pem="public-key-peer",
+            account_info={"login": 654321},
+            terminal_info={"name": "MetaTrader 5"},
+            password_secret_ref="abt/data/mt5/pending/peer",
+            enrollment_challenge=peer_challenge,
+        )
+        peer_worker_id = self.ledger.approve_enrollment(
+            peer.enrollment_id, "ABCDEF", lambda worker_id, *_: f"certificate:{worker_id}"
+        )
+        reservation = self.ledger.reserve_pair_route_proposal(
+            leader_worker_id=first_worker_id,
+            follower_worker_id=peer_worker_id,
+            connected_worker_ids={first_worker_id, peer_worker_id},
+        )
+        route = self.ledger.create_pair_route(
+            proposal_id=str(reservation["proposal_id"]),
+            connected_worker_ids={first_worker_id, peer_worker_id},
+        )
+
+        outcome = self.ledger.delete_worker(first_worker_id, "ABCDEF")
+
+        self.assertEqual("abt/data/mt5/pending/one", outcome["password_secret_ref"])
+        self.assertEqual([route["route_id"]], outcome["removed_route_ids"])
+        self.assertEqual([peer_worker_id], outcome["peer_worker_ids"])
+        self.assertIsNone(self.ledger.pair_route(str(route["route_id"])))
+        self.assertIsNone(self.ledger.pair_route_for_worker(peer_worker_id))
+        with self.assertRaisesRegex(LedgerError, "not active"):
+            self.ledger.active_worker(first_worker_id)
+        with self.assertRaisesRegex(LedgerError, "does not exist"):
+            self.ledger.enrollment_status(first.enrollment_id)
+        # The surviving peer keeps its own enrollment row.
+        self.assertEqual("approved", self.ledger.enrollment_status(peer.enrollment_id))
+        # The same MT5 account can immediately register again.
+        again_challenge, _ = self.ledger.issue_enrollment_challenge()
+        again = self.ledger.create_enrollment(
+            login=123456,
+            server="Broker-Demo",
+            public_key_pem="public-key-again",
+            account_info={"login": 123456},
+            terminal_info={"name": "MetaTrader 5"},
+            password_secret_ref="abt/data/mt5/pending/again",
+            enrollment_challenge=again_challenge,
+        )
+        again_worker_id = self.ledger.approve_enrollment(
+            again.enrollment_id, "ABCDEF", lambda worker_id, *_: f"certificate:{worker_id}"
+        )
+        self.assertNotEqual(first_worker_id, again_worker_id)
+
+    def test_delete_worker_releases_reservations_and_rejects_unknown_workers(self) -> None:
+        first_challenge, _ = self.ledger.issue_enrollment_challenge()
+        first = self.ledger.create_enrollment(
+            login=123456,
+            server="Broker-Demo",
+            public_key_pem="public-key-one",
+            account_info={"login": 123456},
+            terminal_info={"name": "MetaTrader 5"},
+            password_secret_ref="abt/data/mt5/pending/one",
+            enrollment_challenge=first_challenge,
+        )
+        first_worker_id = self.ledger.approve_enrollment(
+            first.enrollment_id, "ABCDEF", lambda worker_id, *_: f"certificate:{worker_id}"
+        )
+        peer_challenge, _ = self.ledger.issue_enrollment_challenge()
+        peer = self.ledger.create_enrollment(
+            login=654321,
+            server="Broker-Demo",
+            public_key_pem="public-key-peer",
+            account_info={"login": 654321},
+            terminal_info={"name": "MetaTrader 5"},
+            password_secret_ref="abt/data/mt5/pending/peer",
+            enrollment_challenge=peer_challenge,
+        )
+        peer_worker_id = self.ledger.approve_enrollment(
+            peer.enrollment_id, "ABCDEF", lambda worker_id, *_: f"certificate:{worker_id}"
+        )
+        reservation = self.ledger.reserve_pair_route_proposal(
+            leader_worker_id=first_worker_id,
+            follower_worker_id=peer_worker_id,
+            connected_worker_ids={first_worker_id, peer_worker_id},
+        )
+
+        outcome = self.ledger.delete_worker(first_worker_id, "ABCDEF")
+
+        self.assertEqual([], outcome["removed_route_ids"])
+        self.assertIsNone(
+            self.ledger.pair_route_reservation(str(reservation["proposal_id"]))
+        )
+        with self.assertRaisesRegex(LedgerError, "does not exist"):
+            self.ledger.delete_worker(first_worker_id, "ABCDEF")
+        with self.assertRaisesRegex(LedgerError, "does not exist"):
+            self.ledger.delete_worker("no-such-worker", "ABCDEF")
+
     def test_approved_enrollment_migration_is_blocked_while_reserved(self) -> None:
         first_challenge, _ = self.ledger.issue_enrollment_challenge()
         first = self.ledger.create_enrollment(

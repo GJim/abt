@@ -219,6 +219,24 @@ function App() {
     }
   }
 
+  async function deleteWorker(workerId: string): Promise<boolean> {
+    if (!csrfToken) return false
+    setError(null)
+    try {
+      const response = await fetch(`/api/admin/workers/${encodeURIComponent(workerId)}`, {
+        method: 'DELETE',
+        credentials: 'same-origin',
+        headers: { 'X-CSRF-Token': csrfToken },
+      })
+      if (!response.ok) throw new Error('Worker deletion failed.')
+      await refreshManagementData()
+      return true
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : 'Worker deletion failed.')
+      return false
+    }
+  }
+
   if (isRestoringSession) {
     return <main className="login-shell"><p>Restoring control-plane session…</p></main>
   }
@@ -265,6 +283,7 @@ function App() {
             isProcessingEnrollment={(enrollmentId) => processingEnrollmentId === enrollmentId}
             onReviewEnrollment={(enrollmentId, action) => void reviewEnrollment(enrollmentId, action)}
             onRevokeWorker={revokeWorker}
+            onDeleteWorker={deleteWorker}
             workers={workers}
           />
         ) : page === 'invites' ? (

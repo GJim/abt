@@ -11,6 +11,7 @@ type WorkerManagementPageProps = {
   isProcessingEnrollment: (enrollmentId: string) => boolean
   onReviewEnrollment: (enrollmentId: string, action: 'approve' | 'reject') => void
   onRevokeWorker: (workerId: string) => Promise<boolean>
+  onDeleteWorker: (workerId: string) => Promise<boolean>
   workers: AccountWorker[]
 }
 
@@ -20,11 +21,14 @@ export function WorkerManagementPage({
   isProcessingEnrollment,
   onReviewEnrollment,
   onRevokeWorker,
+  onDeleteWorker,
   workers,
 }: WorkerManagementPageProps) {
   const [revokeCandidate, setRevokeCandidate] = useState<AccountWorker | null>(null)
   const [isRevoking, setIsRevoking] = useState(false)
   const [revokeStatus, setRevokeStatus] = useState<string | null>(null)
+  const [deleteCandidate, setDeleteCandidate] = useState<AccountWorker | null>(null)
+  const [isDeleting, setIsDeleting] = useState(false)
   async function confirmRevoke() {
     if (!revokeCandidate) {
       return
@@ -41,6 +45,24 @@ export function WorkerManagementPage({
       }
     } finally {
       setIsRevoking(false)
+    }
+  }
+  async function confirmDelete() {
+    if (!deleteCandidate) {
+      return
+    }
+
+    setIsDeleting(true)
+    try {
+      const deleted = await onDeleteWorker(deleteCandidate.worker_id)
+      if (deleted) {
+        setRevokeStatus(`Worker ${deleteCandidate.login} on ${deleteCandidate.server} was permanently deleted.`)
+        setDeleteCandidate(null)
+      } else {
+        setRevokeStatus('Worker deletion failed. Confirm the worker state and try again.')
+      }
+    } finally {
+      setIsDeleting(false)
     }
   }
 
@@ -122,6 +144,10 @@ export function WorkerManagementPage({
             setRevokeStatus(null)
             setRevokeCandidate(worker)
           }}
+          onDelete={(worker) => {
+            setRevokeStatus(null)
+            setDeleteCandidate(worker)
+          }}
           workers={workers}
         />
       </section>
@@ -138,15 +164,30 @@ export function WorkerManagementPage({
           </div>
         </section>
       ) : null}
+
+      {deleteCandidate ? (
+        <section aria-labelledby="delete-worker-heading" className="worker-revoke-confirmation">
+          <h2 id="delete-worker-heading">Permanently delete {deleteCandidate.login} on {deleteCandidate.server}?</h2>
+          <p>This removes the worker and its registration, force-removes any pair route or reservation holding it, and deletes its MT5 password from the secret store. The same account can register again immediately. Only do this after confirming both accounts are flat — force-removal skips the safe-unpair terminal proof.</p>
+          <div className="action-row">
+            <button className="reject-button" disabled={isDeleting} onClick={() => void confirmDelete()} type="button">
+              {isDeleting ? 'Deleting…' : 'Confirm permanent deletion'}
+            </button>
+            <button disabled={isDeleting} onClick={() => setDeleteCandidate(null)} type="button">Cancel</button>
+          </div>
+        </section>
+      ) : null}
     </section>
   )
 }
 
 function WorkerRoster({
   onRevoke,
+  onDelete,
   workers,
 }: {
   onRevoke: (worker: AccountWorker) => void
+  onDelete: (worker: AccountWorker) => void
   workers: AccountWorker[]
 }) {
   const sortedWorkers = [...workers].sort((first, second) => {
@@ -176,6 +217,7 @@ function WorkerRoster({
             {worker.connectivity !== 'revoked' ? (
               <button className="reject-button" onClick={() => onRevoke(worker)} type="button">Revoke certificate</button>
             ) : null}
+            <button className="reject-button" onClick={() => onDelete(worker)} type="button">Delete worker</button>
           </li>
         )
       })}

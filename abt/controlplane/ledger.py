@@ -1650,6 +1650,102 @@ class ControlLedger:
             )
             self._event("worker_certificate_revoked", {"worker_id": worker_id, "revoked_by": revoked_by})
 
+    def delete_worker(self, worker_id: str, deleted_by: str) -> dict[str, Any]:
+        """Hard-delete one Worker and everything that would block re-registration.
+
+        Removes the worker row plus its own enrollment row, so the same
+        login+server can immediately re-register. Any live pair route or
+        pairing reservation holding this Worker is force-removed: the
+        ordinary safe-unpair proof cannot run when a Worker lost its
+        durable route copy, so the operator must first confirm both
+        accounts are flat. Worker-scoped pairing state (role
+        declaration, relay facts, certificate overlaps, state versions,
+        assertions) goes with it. Audit ``events`` rows are kept, with
+        a ``worker_deleted`` event recording the removal.
+
+        Returns the OpenBao ``password_secret_ref`` so the service layer
+        can delete the MT5 credential, plus the removed route ids and
+        surviving peer ids for session cleanup.
+        """
+
+        with self._transaction():
+            row = self._connection.execute(
+                """SELECT w.enrollment_id, w.login, w.server, e.password_secret_ref
+                   FROM workers w JOIN enrollments e ON e.enrollment_id = w.enrollment_id
+                   WHERE w.worker_id = ?""",
+                [worker_id],
+            ).fetchone()
+            if row is None:
+                raise LedgerError("Worker does not exist.")
+            enrollment_id, login, server, password_secret_ref = (
+                str(row[0]),
+                int(row[1]),
+                str(row[2]),
+                str(row[3]),
+            )
+            removed_route_ids: list[str] = []
+            peer_worker_ids: list[str] = []
+            for route_row in self._connection.execute(
+                "SELECT route_id FROM pair_routes WHERE leader_worker_id = ? OR follower_worker_id = ?",
+                [worker_id, worker_id],
+            ).fetchall():
+                route = self._pair_route_locked(str(route_row[0]))
+                if route is None:
+                    continue
+                peer_worker_ids.append(
+                    str(
+                        route["follower_worker_id"]
+                        if route["leader_worker_id"] == worker_id
+                        else route["leader_worker_id"]
+                    )
+                )
+                removed_route_ids.append(str(route["route_id"]))
+                self._remove_pair_route_locked(route, reason="worker_deleted")
+            for reservation_row in self._connection.execute(
+                """SELECT proposal_id FROM pair_route_reservations
+                   WHERE leader_worker_id = ? OR follower_worker_id = ?""",
+                [worker_id, worker_id],
+            ).fetchall():
+                self._release_pair_route_reservation_locked(str(reservation_row[0]), "worker_deleted")
+            self._connection.execute(
+                "DELETE FROM pair_cell_role_declarations WHERE worker_id = ?", [worker_id]
+            )
+            self._connection.execute("DELETE FROM worker_relay_facts WHERE worker_id = ?", [worker_id])
+            self._connection.execute(
+                "DELETE FROM certificate_overlaps WHERE role = 'worker' AND identity_id = ?",
+                [worker_id],
+            )
+            self._connection.execute(
+                "DELETE FROM pair_route_worker_state_versions WHERE worker_id = ?", [worker_id]
+            )
+            self._connection.execute(
+                "DELETE FROM pair_unpair_assertions WHERE worker_id = ?", [worker_id]
+            )
+            self._connection.execute("DELETE FROM workers WHERE worker_id = ?", [worker_id])
+            self._connection.execute(
+                "DELETE FROM enrollments WHERE enrollment_id = ?", [enrollment_id]
+            )
+            self._event(
+                "worker_deleted",
+                {
+                    "worker_id": worker_id,
+                    "enrollment_id": enrollment_id,
+                    "login": login,
+                    "server": server,
+                    "deleted_by": deleted_by,
+                    "removed_route_ids": removed_route_ids,
+                },
+            )
+        return {
+            "worker_id": worker_id,
+            "enrollment_id": enrollment_id,
+            "login": login,
+            "server": server,
+            "password_secret_ref": password_secret_ref,
+            "removed_route_ids": removed_route_ids,
+            "peer_worker_ids": peer_worker_ids,
+        }
+
     def worker_reconciliation(self) -> list[dict[str, Any]]:
         now = _utc_now()
         with self._lock:

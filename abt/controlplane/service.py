@@ -425,6 +425,44 @@ def create_app(
         )
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
+    @app.delete("/api/admin/workers/{worker_id}", status_code=status.HTTP_204_NO_CONTENT)
+    async def delete_worker(
+        worker_id: str,
+        abt_admin_session: Annotated[str | None, Cookie()] = None,
+        x_csrf_token: Annotated[str | None, Header()] = None,
+    ) -> Response:
+        username = _require_admin(ledger, abt_admin_session, x_csrf_token, require_csrf=True)
+        try:
+            outcome = ledger.delete_worker(worker_id, username)
+            _create_pki_backup(backup_manager)
+        except LedgerError as error:
+            raise HTTPException(status_code=_ledger_error_status(error), detail=str(error)) from error
+        if secret_store is not None:
+            try:
+                secret_store.delete_password(str(outcome["password_secret_ref"]))
+            except SecretStoreError:
+                _LOGGER.warning(
+                    "The deleted worker's MT5 password could not be removed from the secret store.",
+                    exc_info=True,
+                )
+        else:
+            _LOGGER.warning("The deleted worker's MT5 password was kept: the secret store is unavailable.")
+        connections = tuple(worker_connections.pop(worker_id, set()))
+        await asyncio.gather(
+            *(connection.websocket.close(code=status.WS_1008_POLICY_VIOLATION) for connection in connections),
+            return_exceptions=True,
+        )
+        for route_id, peer_id in zip(
+            cast(list[str], outcome["removed_route_ids"]),
+            cast(list[str], outcome["peer_worker_ids"]),
+        ):
+            _push_pair_cell_message(
+                worker_connections,
+                peer_id,
+                {"type": "pair_cell_route_removed", "route_id": route_id, "reason": "worker_deleted"},
+            )
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
 
     @app.post("/api/admin/logout", status_code=status.HTTP_204_NO_CONTENT)
     def logout(

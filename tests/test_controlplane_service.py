@@ -1975,6 +1975,47 @@ class ControlPlaneServiceTests(unittest.TestCase):
         assert surviving is not None
         self.assertEqual("ACTIVE", surviving["state"])
 
+    def test_admin_can_hard_delete_a_paired_worker(self) -> None:
+        """Requirement: the console can permanently delete a worker, its
+        registration, its MT5 password, and any pair route holding it, so
+        the same account can register again immediately."""
+
+        (
+            _leader_key, leader_id, _leader_certificate,
+            _follower_key, follower_id, _follower_certificate, route_id,
+        ) = self._pair_route(120161, 120162)
+        leader_ref = self.app.state.ledger._connection.execute(
+            "SELECT e.password_secret_ref FROM workers w JOIN enrollments e ON e.enrollment_id = w.enrollment_id WHERE w.worker_id = ?",
+            [leader_id],
+        ).fetchone()[0]
+        self.assertIn(leader_ref, self.secret_store.passwords)
+        login = self.client.post(
+            "/api/admin/login", json={"username": "ABCDEF", "password": "A-secure-admin-password!"}
+        )
+        headers = {"X-CSRF-Token": login.json()["csrf_token"]}
+
+        response = self.client.delete(f"/api/admin/workers/{leader_id}", headers=headers)
+
+        self.assertEqual(204, response.status_code)
+        self.assertIsNone(self.app.state.ledger.pair_route(route_id))
+        self.assertIsNone(self.app.state.ledger.pair_route_for_worker(follower_id))
+        workers = {item["worker_id"] for item in self.client.get("/api/admin/workers").json()}
+        self.assertNotIn(leader_id, workers)
+        self.assertIn(follower_id, workers)
+        self.assertNotIn(leader_ref, self.secret_store.passwords)
+        # The deleted account re-registers without a migration conflict.
+        _, again_id, _ = self._approved_worker(120161, "Broker-A")
+        self.assertNotEqual(leader_id, again_id)
+
+    def test_delete_worker_requires_an_existing_worker(self) -> None:
+        login = self.client.post(
+            "/api/admin/login", json={"username": "ABCDEF", "password": "A-secure-admin-password!"}
+        )
+        headers = {"X-CSRF-Token": login.json()["csrf_token"]}
+
+        self.assertEqual(404, self.client.delete("/api/admin/workers/no-such-worker", headers=headers).status_code)
+        self.assertEqual(401, self.client.delete("/api/admin/workers/no-such-worker").status_code)
+
     def test_a_malformed_pairing_control_message_is_refused_without_dropping_the_session(self) -> None:
         worker_key, worker_id, worker_certificate = self._approved_worker(120171, "Broker-A")
 
