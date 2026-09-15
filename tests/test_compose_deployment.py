@@ -94,5 +94,10 @@ class ComposeDeploymentTests(unittest.TestCase):
         self.assertIn("transit/keys/abt-device-certificates type=ecdsa-p256", bootstrap)
         self.assertIn('"${compose[@]}" up -d --build controller cloudflared', bootstrap)
         self.assertIn('"${compose[@]}" ps --status running --services | grep -Fxq cloudflared', bootstrap)
-        compatibility_entrypoint = (Path(__file__).parents[1] / "deploy" / "bootstrap-openbao.sh").read_text(encoding="utf-8")
-        self.assertIn("bootstrap-deployment.sh", compatibility_entrypoint)
+
+    def test_controller_only_update_leaves_secrets_topology_alone(self) -> None:
+        update = (Path(__file__).parents[1] / "deploy" / "update-controller.sh").read_text(encoding="utf-8")
+        self.assertIn('"${compose[@]}" up -d --build controller', update)
+        self.assertNotIn("--build controller cloudflared", update)
+        self.assertNotIn("up -d --build softhsm openbao", update)
+        self.assertIn("http://localhost:8000/health", update)
