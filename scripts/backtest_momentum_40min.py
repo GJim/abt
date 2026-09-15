@@ -43,7 +43,7 @@ from abt.pair_cell import momentum_bias  # noqa: E402  pure function, no side ef
 CONFIG = {
     "daily_loss_fraction": "0.02",
     "daily_loss_warning_threshold_usd": "20",
-    "entry_edge_points": "4",
+    "edge_min_net_points": "-3",
     "entry_mode": "momentum",
     "follower_confirmation_timeout_seconds": 5.0,
     "maximum_holding_seconds": None,

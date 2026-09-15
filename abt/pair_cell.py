@@ -582,7 +582,11 @@ DEFAULT_TREND_MIN_MOM_POINTS = "5"
 DEFAULT_TREND_MAX_SPREAD_POINTS = "8"
 DEFAULT_TREND_MIN_COVERAGE = 0.8
 DEFAULT_STRATEGY_BUDGET_USD = "0"
-DEFAULT_ENTRY_EDGE_POINTS = "4"
+#: Edge-mode admission floor: (edge - mean bilateral spread) in canonical
+#: points.  May be negative -- a slightly negative net is a bounded micro-loss
+#: traded for entry frequency, since the mirrored box caps every pair at
+#: roughly its entry net.  Replaces the old entry_edge_points threshold.
+DEFAULT_EDGE_MIN_NET_POINTS = "-3"
 DEFAULT_MAXIMUM_MARGIN_FRACTION = "0.01"
 DEFAULT_DAILY_LOSS_FRACTION = "0.02"
 DEFAULT_TRADE_LOSS_FRACTION = "0.01"
@@ -614,7 +618,7 @@ REQUIRED_ACCOUNT_CURRENCY = "USD"
 SHARED_POLICY_KEYS = (
     "mode",
     "strategy_budget_usd",
-    "entry_edge_points",
+    "edge_min_net_points",
     "entry_mode",
     "trend_lookback_seconds",
     "trend_breakout_buffer_points",
@@ -660,7 +664,7 @@ def default_shared_policy_values() -> dict[str, object]:
     return {
         "mode": DEFAULT_MODE,
         "strategy_budget_usd": DEFAULT_STRATEGY_BUDGET_USD,
-        "entry_edge_points": DEFAULT_ENTRY_EDGE_POINTS,
+        "edge_min_net_points": DEFAULT_EDGE_MIN_NET_POINTS,
         "entry_mode": DEFAULT_ENTRY_MODE,
         "trend_lookback_seconds": DEFAULT_TREND_LOOKBACK_SECONDS,
         "trend_breakout_buffer_points": DEFAULT_TREND_BREAKOUT_BUFFER_POINTS,
@@ -940,7 +944,7 @@ class StrategyPolicy:
     """
 
     policy_version: str
-    entry_edge_points: str
+    edge_min_net_points: str
     quote_max_age_seconds: float
     quote_max_skew_seconds: float
     leader_risk: WorkerRiskLimits
@@ -957,7 +961,7 @@ class StrategyPolicy:
     entry_mode: EntryMode = DEFAULT_ENTRY_MODE
     trend_lookback_seconds: float = DEFAULT_TREND_LOOKBACK_SECONDS
     # All ``*_points`` trend thresholds are point counts in canonical-point
-    # units (like entry_edge_points): the cell scales them by the product's
+    # units (like edge_min_net_points): the cell scales them by the product's
     # canonical point before comparing against price-unit buffer mids.
     trend_breakout_buffer_points: str = DEFAULT_TREND_BREAKOUT_BUFFER_POINTS
     trend_min_range_points: str = DEFAULT_TREND_MIN_RANGE_POINTS
@@ -976,8 +980,8 @@ class StrategyPolicy:
     def __post_init__(self) -> None:
         if not self.policy_version:
             raise PairExecutionCellError("A strategy policy requires a version.")
-        if _to_decimal(self.entry_edge_points) is None:
-            raise PairExecutionCellError("entry_edge_points must be a finite number.")
+        if _to_decimal(self.edge_min_net_points) is None:
+            raise PairExecutionCellError("edge_min_net_points must be a finite number.")
         if self.entry_mode not in ("edge", "donchian", "momentum"):
             raise PairExecutionCellError("entry_mode must be 'edge', 'donchian' or 'momentum'.")
         for name in (
@@ -1063,10 +1067,10 @@ class StrategyPolicy:
 
     def canonical(self) -> dict[str, object]:
         return {
-            "policy_version": self.policy_version,
-            "strategy_budget_usd": self.strategy_budget_usd,
-            "entry_edge_points": self.entry_edge_points,
-            "entry_mode": self.entry_mode,
+        "policy_version": self.policy_version,
+        "strategy_budget_usd": self.strategy_budget_usd,
+        "edge_min_net_points": self.edge_min_net_points,
+        "entry_mode": self.entry_mode,
             "trend_lookback_seconds": self.trend_lookback_seconds,
             "trend_breakout_buffer_points": self.trend_breakout_buffer_points,
             "trend_min_range_points": self.trend_min_range_points,
@@ -1106,7 +1110,9 @@ def _policy_from_canonical(value: Mapping[str, object]) -> StrategyPolicy:
         raise PairExecutionCellError("entry_mode must be 'edge', 'donchian' or 'momentum'.")
     return StrategyPolicy(
         policy_version=cast(str, value["policy_version"]),
-        entry_edge_points=cast(str, value["entry_edge_points"]),
+        edge_min_net_points=str(
+            value.get("edge_min_net_points", DEFAULT_EDGE_MIN_NET_POINTS)
+        ),
         entry_mode=cast(EntryMode, raw_entry_mode),
         trend_lookback_seconds=float(
             cast(float, value.get("trend_lookback_seconds", DEFAULT_TREND_LOOKBACK_SECONDS))
@@ -1198,7 +1204,7 @@ def canonical_policy_from_acceptance(
     return StrategyPolicy(
         policy_version=policy_version,
         strategy_budget_usd=unified_budget,
-        entry_edge_points=str(values["entry_edge_points"]),
+        edge_min_net_points=str(values["edge_min_net_points"]),
         entry_mode=cast(EntryMode, raw_entry_mode),
         trend_lookback_seconds=float(cast(float, values["trend_lookback_seconds"])),
         trend_breakout_buffer_points=str(values["trend_breakout_buffer_points"]),
@@ -5961,7 +5967,7 @@ class PairExecutionCell:
         except PairExecutionCellError:
             return None, Decimal(0), "clock unavailable"
         if policy.entry_mode == "donchian":
-            # Config thresholds are point counts (like entry_edge_points);
+            # Config thresholds are point counts (like edge_min_net_points);
             # scale by the canonical point into the price units the buffer holds.
             buffer_points = (_to_decimal(policy.trend_breakout_buffer_points) or Decimal(0)) * point
             min_range = (_to_decimal(policy.trend_min_range_points) or Decimal(0)) * point
@@ -6015,7 +6021,14 @@ class PairExecutionCell:
         max_age = (
             policy.trend_quote_max_age_seconds if trend_mode else policy.quote_max_age_seconds
         )
-        threshold = cast(Decimal, _to_decimal(policy.entry_edge_points))
+        min_net: Decimal | None = None
+        if not trend_mode:
+            # Fail closed on a non-finite floor: the policy validator
+            # guarantees finiteness, so None here means corrupted state.
+            min_net = _to_decimal(policy.edge_min_net_points)
+            if min_net is None:
+                self._note_gate_stats(stats, persist=True)
+                return []
         ranked: list[tuple[Decimal, Decimal, str, Direction]] = []
         for product_id in sorted({key[0] for key in self._plans}):
             product = self._universe.product(product_id)
@@ -6089,22 +6102,27 @@ class PairExecutionCell:
                     stats["symbol_mismatch"] += 1
                     continue
                 # The canonical execution point is the coarser broker's, so the
-                # edge threshold is always measured on the conservative one.
+                # net is always measured on the conservative one.  Net spread
+                # cost is the bilateral mean: each leg will cross roughly half
+                # the summed spread again on the way out of the mirrored box.
                 point = _to_decimal(leader_plan.canonical_point)
                 if point is None or point <= 0:
                     stats["no_sizing"] += 1
                     continue
+                assert min_net is not None
                 raw_edge = edge_value(local_quote, peer_quote, direction)
-                edge_points = raw_edge / point
-                if edge_points < threshold:
+                spread_sum = (local_quote.ask - local_quote.bid) + (peer_quote.ask - peer_quote.bid)
+                net_price = raw_edge - spread_sum / 2
+                net_points = net_price / point
+                if net_points <= min_net:
                     stats["below_edge"] += 1
                     continue
                 conservative_usd_per_point = min(
                     cast(Decimal, _to_decimal(leader_plan.usd_per_point_per_lot)),
                     cast(Decimal, _to_decimal(follower_plan.usd_per_point_per_lot)),
                 )
-                expected_edge_usd = edge_points * conservative_usd_per_point * lots
-                ranked.append((expected_edge_usd, edge_points, product_id, direction))
+                expected_net_usd = net_price * conservative_usd_per_point * lots
+                ranked.append((expected_net_usd, net_points, product_id, direction))
                 stats["admitted"] += 1
         ranked.sort(key=lambda item: (-item[0], -item[1], item[2], item[3]))
         self._note_gate_stats(stats, persist=True)
@@ -6163,7 +6181,7 @@ class PairExecutionCell:
 
         policy = self._policy
         entry_mode = policy.entry_mode if policy is not None else DEFAULT_ENTRY_MODE
-        score_key = "edge_points" if entry_mode == "edge" else "trend_strength"
+        score_key = "net_points" if entry_mode == "edge" else "trend_strength"
         return [
             {
                 "expected_edge_usd": str(edge_usd),
@@ -6205,7 +6223,7 @@ class PairExecutionCell:
             if policy.entry_mode == "edge":
                 return (
                     "no entry candidate passed sizing, quote freshness/skew, quarantine, "
-                    f"and edge threshold gates (entry_edge_points={policy.entry_edge_points}) "
+                    f"and edge net gates (edge_min_net_points={policy.edge_min_net_points}) "
                     f"{gates}"
                 )
             return (
@@ -6215,7 +6233,7 @@ class PairExecutionCell:
                 f"{gates}"
             )
         candidate = candidates[0]
-        score_key = "edge_points" if policy.entry_mode == "edge" else "trend_strength"
+        score_key = "net_points" if policy.entry_mode == "edge" else "trend_strength"
         return (
             f"entry candidate selected: product_id={candidate[2]} direction={candidate[3]} "
             f"{score_key}={candidate[1]} expected_edge_usd={candidate[0]} "
@@ -7250,37 +7268,150 @@ class PairExecutionCell:
                 return None  # too small to be worth a broker modify
         return advanced, NO_TAKE_PROFIT, "trail"
 
+    def _mirrored_precise_protection(self) -> tuple[str, str] | None:
+        """Edge-mode half of the joint box exit: shared absolute SL/TP prices.
+
+        Both Workers derive identical ``P_low``/``P_high`` deterministically
+        from the immutable attempt (both fills, both plans, both allowed
+        losses) with no extra relay round-trip: ``P_low`` is the SL of the
+        LONG leg and the TP of the SHORT leg, ``P_high`` the reverse.  Each
+        side takes the inner pair (the minimum of the two initial formulas),
+        so both legs' risk stays within their own ``allowed_leg_loss_usd``.
+        Either box boundary locks the pair net at roughly the entry net,
+        whichever side triggers first; the relay follow-close is only the
+        backstop for a leg whose broker feed never touches its mirrored
+        level.  There is no trailing in edge mode: the box is one-shot.
+
+        Returns this Worker's own ``(sl, tp)`` on its own tick grid, or
+        ``None`` when no box contains both fills (fail closed: callers keep
+        rough protection instead of widening risk).
+        """
+
+        attempt, leg = self._attempt, self._leg
+        if attempt is None or leg is None or leg.protection_status != "rough":
+            return None
+        if self._policy is None or self._policy.entry_mode != "edge":
+            return None
+        peer_role: Role = "follower" if leg.role == "leader" else "leader"
+        plan_own = self._attempt_plan_for_role(attempt, leg.role)
+        plan_peer = self._attempt_plan_for_role(attempt, peer_role)
+        fill_own = _to_decimal(leg.fill_price)
+        fill_peer = _to_decimal(self._peer_leg.fill_price)
+        allowed_own = _to_decimal(attempt.allowed_loss_of(leg.role))
+        allowed_peer = _to_decimal(attempt.allowed_loss_of(peer_role))
+        volume = _to_decimal(attempt.lots)
+        if (
+            plan_own is None or plan_peer is None
+            or fill_own is None or fill_peer is None
+            or allowed_own is None or allowed_peer is None or volume is None
+            or allowed_own <= 0 or allowed_peer <= 0 or volume <= 0
+        ):
+            return None
+        long_role: Role = leg.role if attempt.direction_of(leg.role) == "LONG" else peer_role
+        short_role: Role = peer_role if long_role == leg.role else leg.role
+        fills = {leg.role: fill_own, peer_role: fill_peer}
+        plans = {leg.role: plan_own, peer_role: plan_peer}
+        allows = {leg.role: allowed_own, peer_role: allowed_peer}
+        box_long = compute_protection(
+            entry=fills[long_role],
+            direction="LONG",
+            volume=volume,
+            plan=plans[long_role],
+            allowed_loss_usd=allows[long_role],
+        )
+        box_short = compute_protection(
+            entry=fills[short_role],
+            direction="SHORT",
+            volume=volume,
+            plan=plans[short_role],
+            allowed_loss_usd=allows[short_role],
+        )
+        if box_long is None or box_short is None:
+            return None
+        price_low = max(Decimal(box_long[0]), Decimal(box_short[1]))
+        price_high = min(Decimal(box_long[1]), Decimal(box_short[0]))
+        if not (
+            price_low < min(fill_own, fill_peer)
+            and price_high > max(fill_own, fill_peer)
+            and price_low < price_high
+        ):
+            return None  # the box cannot contain both fills: fail closed
+        tick_size = _to_decimal(plans[leg.role].tick_size)
+        minimum_stop_distance = _to_decimal(plans[leg.role].minimum_stop_distance)
+        if (
+            tick_size is None or tick_size <= 0
+            or minimum_stop_distance is None or minimum_stop_distance < 0
+        ):
+            return None
+        if attempt.direction_of(leg.role) == "LONG":
+            # Round toward the entry: tighter, never wider than the box.
+            sl = _round_to_tick(price_low, tick_size, ROUND_CEILING)
+            tp = _round_to_tick(price_high, tick_size, ROUND_FLOOR)
+            if not (sl < fill_own and tp > fill_own):
+                return None
+            if fill_own - sl < minimum_stop_distance or tp - fill_own < minimum_stop_distance:
+                return None
+        else:
+            sl = _round_to_tick(price_high, tick_size, ROUND_FLOOR)
+            tp = _round_to_tick(price_low, tick_size, ROUND_CEILING)
+            if not (sl > fill_own and tp < fill_own):
+                return None
+            if sl - fill_own < minimum_stop_distance or fill_own - tp < minimum_stop_distance:
+                return None
+        if sl <= 0 or tp <= 0:
+            return None
+        return str(sl), str(tp)
+
     def _maybe_apply_precise_protection(self) -> None:
-        """Apply initial SL-only protection, then trail either solo leg."""
+        """Apply precise protection after confirmation; trail momentum legs only.
+
+        Trend (momentum/donchian) legs get the asymmetric SL-only revision
+        and keep trailing while solo-capable.  Edge legs get the one-shot
+        mirrored box instead and never trail: the box exit is the strategy.
+        """
 
         attempt, leg = self._attempt, self._leg
         if attempt is None or leg is None or not self._pair_confirmed or self._desired != "ACTIVE":
             return
+        edge_mode = self._policy is not None and self._policy.entry_mode == "edge"
+        model = "mirrored" if edge_mode else "asymmetric"
         initial = leg.protection_status == "rough"
-        trail_due = (
-            not initial
-            and leg.protection_status == "precise"
-            and self._active_since is not None
-            and (
-                leg.last_protection_update_at is None
-                or self._now >= _parse_utc(leg.last_protection_update_at) + timedelta(seconds=_PROFIT_TRAIL_SECONDS)
+        if edge_mode:
+            # The mirrored box is one-shot: applied once at confirmation,
+            # never trailed afterwards.
+            if not initial:
+                return
+            mirrored = self._mirrored_precise_protection()
+            if mirrored is None:
+                self._freeze_or_fallback_protection("no executable mirrored protection exists")
+                return
+            sl, tp, kind = mirrored[0], mirrored[1], "mirrored"
+        else:
+            trail_due = (
+                not initial
+                and leg.protection_status == "precise"
+                and self._active_since is not None
+                and (
+                    leg.last_protection_update_at is None
+                    or self._now >= _parse_utc(leg.last_protection_update_at) + timedelta(seconds=_PROFIT_TRAIL_SECONDS)
+                )
             )
-        )
-        if not initial and not trail_due:
-            return
-        computed = self._asymmetric_precise_protection()
-        if computed is None:
-            if initial:
-                self._freeze_or_fallback_protection("no executable asymmetric protection exists")
-            return
-        sl, tp, kind = computed
+            if not initial and not trail_due:
+                return
+            computed = self._asymmetric_precise_protection()
+            if computed is None:
+                if initial:
+                    self._freeze_or_fallback_protection("no executable asymmetric protection exists")
+                return
+            sl, tp, kind = computed
         is_trail = kind == "trail"
         if not is_trail and not initial:
             return
         if not is_trail:
             _LOGGER.info(
-                "%s evt=prot_asym role=%s tkt=%s sl=%s tp=%s att=%s",
+                "%s evt=prot_%s role=%s tkt=%s sl=%s tp=%s att=%s",
                 _TAG,
+                "mirror" if kind == "mirrored" else "asym",
                 leg.role,
                 leg.ticket,
                 sl,
@@ -7320,7 +7451,7 @@ class PairExecutionCell:
         try:
             self._journal.prepare(effect_id, payload)
         except EffectJournalError as error:
-            self._freeze_or_fallback_protection(f"asymmetric protection could not be journaled: {error}")
+            self._freeze_or_fallback_protection(f"{model} protection could not be journaled: {error}")
             return
         outcome = self._run_broker_write(effect_id, payload, priority="protection")
         if outcome.category == "completed":
@@ -7328,13 +7459,17 @@ class PairExecutionCell:
             leg.last_protection_update_at = _iso(self._now)
             self._persist_leg()
             self._state = "PROTECTING"
-            event = "profit_trail_applied" if is_trail else "asymmetric_protection_applied"
+            event = (
+                "mirrored_protection_applied"
+                if kind == "mirrored"
+                else ("profit_trail_applied" if is_trail else "asymmetric_protection_applied")
+            )
             self._transition(event, attempt.attempt_id)
             self._record_timing(event)
             self._report_leg_status("protection_precise", sl=sl, tp=tp)
             self._request_broker_read()
         else:
-            self._freeze_or_fallback_protection(f"asymmetric protection broker result: {outcome.category}")
+            self._freeze_or_fallback_protection(f"{model} protection broker result: {outcome.category}")
 
     def _apply_solo_lock(self) -> None:
         """One immediate solo tightening outside the trail cadence.
@@ -7602,31 +7737,41 @@ class PairExecutionCell:
                 and self._leg is not None
                 and not self._leg.empty_verified
                 and self._leg.ticket
-                and self._own_leg_in_profit()
             ):
-                # Either leg may outlive the peer, but only as a winner: the
-                # capped loser stops out while the profitable survivor keeps
-                # running solo under its trailing stop instead of being
-                # contained with it.  A flat or adverse leg still contains
-                # with the peer (operator close, timed exit, blackout, and
-                # integrity paths all keep working).  The pair finalizes when
-                # both legs are empty (own SL/trail, timed exit, blackout).
-                if previous_status != "empty":
-                    _LOGGER.info(
-                        "%s evt=solo att=%s tkt=%s role=%s",
-                        _TAG,
-                        _short_id(attempt_id),
-                        self._leg.ticket,
-                        self._role,
-                    )
-                    event = (
-                        "peer_leg_empty_leader_continues_solo"
-                        if self._role == "leader"
-                        else "peer_leg_empty_follower_continues_solo"
-                    )
-                    self._transition(event, attempt_id)
-                    self._apply_solo_lock()
-                return
+                if self._policy is not None and self._policy.entry_mode == "edge":
+                    # Edge mode never solos: one flat leg means the mirrored
+                    # box is broken, so the survivor market-closes at once.
+                    # The broker-side mirrored stops are the first line; this
+                    # relay follow is the backstop for a leg whose broker feed
+                    # never touched its mirrored level.
+                    self._transition("peer_leg_empty_edge_follow", attempt_id)
+                    self._begin_close("peer_leg_empty")
+                    self._maybe_finalize_empty()
+                    return
+                if self._own_leg_in_profit():
+                    # Either leg may outlive the peer, but only as a winner: the
+                    # capped loser stops out while the profitable survivor keeps
+                    # running solo under its trailing stop instead of being
+                    # contained with it.  A flat or adverse leg still contains
+                    # with the peer (operator close, timed exit, blackout, and
+                    # integrity paths all keep working).  The pair finalizes when
+                    # both legs are empty (own SL/trail, timed exit, blackout).
+                    if previous_status != "empty":
+                        _LOGGER.info(
+                            "%s evt=solo att=%s tkt=%s role=%s",
+                            _TAG,
+                            _short_id(attempt_id),
+                            self._leg.ticket,
+                            self._role,
+                        )
+                        event = (
+                            "peer_leg_empty_leader_continues_solo"
+                            if self._role == "leader"
+                            else "peer_leg_empty_follower_continues_solo"
+                        )
+                        self._transition(event, attempt_id)
+                        self._apply_solo_lock()
+                    return
             self._begin_close("peer_leg_empty")
             self._maybe_finalize_empty()
 

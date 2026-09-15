@@ -625,7 +625,7 @@ class PairCellTestCase(unittest.TestCase):
             # The harness exercises the live execution path; the synthesized
             # production default (shadow) is covered by DefaultMaterializationTests.
             "mode": "live",
-            "entry_edge_points": "1",
+            "edge_min_net_points": "1",
             "quote_max_age_seconds": 2.0,
             "quote_max_skew_seconds": 1.0,
             "follower_confirmation_timeout_seconds": 5.0,
@@ -728,6 +728,48 @@ class PairCellTestCase(unittest.TestCase):
     def run_entry(self) -> None:
         self.prime()
         self.feed_quotes()
+
+    def run_momentum_entry(self) -> None:
+        """Entry through momentum mode: flat history, then one impulse jump.
+
+        Trend protection assertions (asymmetric SL-only, trailing, solo)
+        must run in a trend mode, since edge mode now uses the mirrored box
+        and never solos.  The impulse jumps the leader mid 100 points while
+        volatility is flat, so momentum admits a LONG with the same sizing
+        and allowances as the edge fixture.
+        """
+
+        self.prime(
+            shared={
+                "entry_mode": "momentum",
+                "trend_momentum_T_seconds": 60.0,
+                "trend_vol_window_seconds": 300.0,
+                "trend_momentum_k": "2.0",
+                "trend_min_mom_points": "5",
+                "trend_max_spread_points": "20",
+                "trend_min_coverage": 0.3,
+            }
+        )
+        point = Decimal("0.00001")
+        mid = Decimal("1.10000")
+        sequence = 10
+        for _ in range(32):
+            self.now += timedelta(seconds=10)
+            self.feed_quotes(
+                leader_bid=str(mid - Decimal("0.00005")),
+                leader_ask=str(mid + Decimal("0.00005")),
+                follower_bid="1.10000",
+                follower_ask="1.10010",
+                sequence=sequence,
+            )
+            sequence += 1
+        self.feed_quotes(
+            leader_bid="1.10095",
+            leader_ask="1.10105",
+            follower_bid="1.10000",
+            follower_ask="1.10010",
+            sequence=sequence,
+        )
 
     def attempt_payloads(self) -> list[dict[str, object]]:
         return self.net.payloads("attempt", LEADER)
@@ -862,7 +904,7 @@ class RemovedArchitectureTests(unittest.TestCase):
         with self.assertRaises(TypeError):
             StrategyPolicy(  # type: ignore[call-arg]
                 policy_version="policy-1",
-                entry_edge_points="4",
+                edge_min_net_points="4",
                 quote_max_age_seconds=1.0,
                 quote_max_skew_seconds=1.0,
                 leader_risk=LEADER_RISK,
@@ -892,7 +934,7 @@ class RemovedArchitectureTests(unittest.TestCase):
             {
                 "policy_version",
                 "strategy_budget_usd",
-                "entry_edge_points",
+                "edge_min_net_points",
                 "entry_mode",
                 "trend_lookback_seconds",
                 "trend_breakout_buffer_points",
@@ -1024,7 +1066,7 @@ class ConfigurationAuthorityTests(unittest.TestCase):
     def test_a_follower_file_containing_shared_policy_is_a_startup_error(self) -> None:
         for key, value in (
             ("strategy_budget_usd", "5000"),
-            ("entry_edge_points", "4"),
+            ("edge_min_net_points", "4"),
             ("entry_mode", "donchian"),
             ("trend_lookback_seconds", 1800.0),
             ("quote_max_age_seconds", 1.0),
@@ -1042,7 +1084,7 @@ class ConfigurationAuthorityTests(unittest.TestCase):
             self.assertIn(key, str(raised.exception))
 
     def test_a_leader_file_may_set_shared_policy_but_a_role_conflict_fails_closed(self) -> None:
-        raw = {"entry_edge_points": "6", "maximum_margin_fraction": "0.2"}
+        raw = {"edge_min_net_points": "6", "maximum_margin_fraction": "0.2"}
         validate_configuration_authority(raw, role="leader")
         validate_configuration_authority(raw, role=None)
         with self.assertRaises(PairExecutionCellError):
@@ -1073,7 +1115,7 @@ class DefaultMaterializationTests(unittest.TestCase):
             {
                 "mode": "shadow",
                 "strategy_budget_usd": "0",
-                "entry_edge_points": "4",
+                "edge_min_net_points": "-3",
                 "entry_mode": "edge",
                 "trend_lookback_seconds": 1800.0,
                 "trend_breakout_buffer_points": "2",
@@ -1844,7 +1886,7 @@ class PairingAcceptanceTests(PairCellTestCase):
         ):
             rogue = StrategyPolicy(
                 policy_version="policy-1",
-                entry_edge_points="1",
+                edge_min_net_points="1",
                 quote_max_age_seconds=2.0,
                 quote_max_skew_seconds=1.0,
                 leader_risk=self.leader.limits,
@@ -1899,7 +1941,7 @@ class PairingAcceptanceTests(PairCellTestCase):
         self.feed_catalogs()
         rogue = StrategyPolicy(
             policy_version="policy-1",
-            entry_edge_points="1",
+            edge_min_net_points="1",
             quote_max_age_seconds=2.0,
             quote_max_skew_seconds=1.0,
             leader_risk=self.leader.limits,
@@ -1981,11 +2023,11 @@ class PolicyPersistenceTests(PairCellTestCase):
     def test_policy_change_requires_both_accounts_to_be_broker_verified_empty(self) -> None:
         self.run_entry()
         with self.assertRaises(PairExecutionCellError):
-            self.leader.cell.accept_policy(self.policy(entry_edge_points="9"))
+            self.leader.cell.accept_policy(self.policy(edge_min_net_points="9"))
 
     def test_a_new_policy_hash_is_accepted_while_both_are_empty(self) -> None:
         self.prime()
-        changed = self.policy(entry_edge_points="9")
+        changed = self.policy(edge_min_net_points="9")
         self.leader.cell.accept_policy(changed)
         self.net.pump()
         self.assertEqual(
@@ -2018,7 +2060,7 @@ class PolicyPersistenceTests(PairCellTestCase):
     def test_an_envelope_from_an_unauthorized_worker_or_version_is_ignored(self) -> None:
         self.prime()
         policy = cast(StrategyPolicy, self.accepted_policy)
-        rogue = self.policy(entry_edge_points="77")
+        rogue = self.policy(edge_min_net_points="77")
         for override in ({"from_worker_id": "worker-intruder"}, {"protocol_version": 99}):
             envelope: dict[str, object] = {
                 "protocol_version": pair_cell.PROTOCOL_VERSION,
@@ -2944,20 +2986,27 @@ class CandidateAdmissionTests(PairCellTestCase):
         self.warm(OTHER_SYMBOL)
         # Suspend entry origination so both products stay observable candidates.
         self.leader.cell.handle_event(PeerSessionEvent(connected=False, observed_at=self.now))
-        self.feed_quotes(symbol=OTHER_SYMBOL, leader_ask="1.10010", follower_bid="1.10090")
+        self.feed_quotes(
+            symbol=OTHER_SYMBOL,
+            leader_ask="1.10010",
+            follower_bid="1.10090",
+            follower_ask="1.10100",
+        )
         self.feed_quotes(symbol=SYMBOL)
         candidates = self.leader.cell.entry_candidates()
         self.assertEqual(self.attempt_payloads(), [])
         self.assertEqual(candidates[0]["product_id"], self.product_id(OTHER_SYMBOL))
         self.assertEqual(candidates[0]["leader_direction"], "LONG")
-        self.assertEqual(Decimal(str(candidates[0]["expected_edge_usd"])), Decimal("160"))
-        self.assertEqual(Decimal(str(candidates[1]["expected_edge_usd"])), Decimal("80"))
+        self.assertEqual(Decimal(str(candidates[0]["expected_edge_usd"])), Decimal("0.0014"))
+        self.assertEqual(Decimal(str(candidates[0]["net_points"])), Decimal("70"))
+        self.assertEqual(Decimal(str(candidates[1]["expected_edge_usd"])), Decimal("0.0006"))
+        self.assertEqual(Decimal(str(candidates[1]["net_points"])), Decimal("30"))
 
     def test_the_canonical_execution_point_governs_the_edge_threshold(self) -> None:
         # The coarser broker's point is the canonical one, so a 40-point edge
         # on the finer broker is only 4 points against the canonical point.
         self.follower_entries = [_entry(point="0.0001")]
-        self.prime(shared={"entry_edge_points": "10"})
+        self.prime(shared={"edge_min_net_points": "10"})
         product = self.product_id()
         self.assertEqual(
             self.leader.cell.discovered_universe().product(product).canonical_point,  # type: ignore[union-attr]
@@ -3042,7 +3091,7 @@ class CandidateAdmissionTests(PairCellTestCase):
         self.assertEqual(self.last_attempt().leader_quote.ask, Decimal("1.10010"))
 
     def test_edge_below_the_threshold_is_not_a_candidate(self) -> None:
-        self.prime(shared={"entry_edge_points": "100"})
+        self.prime(shared={"edge_min_net_points": "100"})
         self.feed_quotes()
         self.assertEqual(self.attempt_payloads(), [])
 
@@ -3109,28 +3158,31 @@ class ImmediateEntryTests(PairCellTestCase):
         self.assertEqual(Decimal(attempt.leader_rough_sl), Decimal("1.10010") - Decimal("0.00075"))
         self.assertEqual(Decimal(attempt.leader_rough_tp), Decimal("1.10010") + Decimal("0.00075"))
 
-    def test_asymmetric_protection_applies_sl_only_without_a_common_boundary(self) -> None:
-        # The default fixture fills (leader 1.10010, follower 1.10040) admit no
-        # inward common boundary, which used to keep verified rough fallback.
-        # The asymmetric profit-max model needs no common boundary: each leg
-        # is protected independently with an SL-only stop at its allowed loss
-        # and no take-profit cap.
+    def test_mirrored_protection_applies_a_shared_box(self) -> None:
+        # Edge mode locks the pair with one shared box: P_low is the LONG
+        # leg's SL and the SHORT leg's TP, P_high the reverse, each taken
+        # from the inner (minimum) of the two initial formulas.  Default
+        # fills (leader 1.10010, follower 1.10040) give P_low=1.10000 and
+        # P_high=1.10080 on both legs.
         self.run_entry()
         self.assertEqual(self.leader.cell.handle_event(ClockTickEvent(self.now)).state, "ACTIVE")
         self.assertEqual(self.follower.cell.handle_event(ClockTickEvent(self.now)).state, "ACTIVE")
         leader_modify = self.leader.modify_requests()[-1]
         follower_modify = self.follower.modify_requests()[-1]
-        # 150 USD over 2 lots at 1 USD/tick is 75 ticks; 80 USD is 40 ticks.
-        self.assertEqual(Decimal(str(leader_modify["sl"])), Decimal("1.09935"))
-        self.assertEqual(str(leader_modify["tp"]), "0")
+        self.assertEqual(Decimal(str(leader_modify["sl"])), Decimal("1.10000"))
+        self.assertEqual(Decimal(str(leader_modify["tp"])), Decimal("1.10080"))
         self.assertEqual(Decimal(str(follower_modify["sl"])), Decimal("1.10080"))
-        self.assertEqual(str(follower_modify["tp"]), "0")
+        self.assertEqual(Decimal(str(follower_modify["tp"])), Decimal("1.10000"))
+        self.assertIn(
+            "mirrored_protection_applied",
+            [row["event"] for row in self.leader.cell.transition_history()],
+        )
         self.assertNotIn(
             "protection_rough_fallback",
             [row["event"] for row in self.leader.cell.transition_history()],
         )
 
-    def test_asymmetric_protection_recomputes_each_leg_sl_from_actual_fill(self) -> None:
+    def test_mirrored_protection_recomputes_the_box_from_actual_fills(self) -> None:
         self.leader.mt5.fill_price = 1.10010
         self.follower.mt5.fill_price = 1.10035
         self.prime()
@@ -3140,16 +3192,18 @@ class ImmediateEntryTests(PairCellTestCase):
         self.assertEqual(self.follower.cell.handle_event(ClockTickEvent(self.now)).state, "ACTIVE")
         leader_modify = self.leader.modify_requests()[-1]
         follower_modify = self.follower.modify_requests()[-1]
-        self.assertEqual(Decimal(str(leader_modify["sl"])), Decimal("1.09935"))
-        self.assertEqual(str(leader_modify["tp"]), "0")
+        # Long box (150 USD, 75 ticks): SL 1.09935 / TP 1.10085.  Short box
+        # (80 USD, 40 ticks): SL 1.10075 / TP 1.09995.  The inner pair wins.
+        self.assertEqual(Decimal(str(leader_modify["sl"])), Decimal("1.09995"))
+        self.assertEqual(Decimal(str(leader_modify["tp"])), Decimal("1.10075"))
         self.assertEqual(Decimal(str(follower_modify["sl"])), Decimal("1.10075"))
-        self.assertEqual(str(follower_modify["tp"]), "0")
+        self.assertEqual(Decimal(str(follower_modify["tp"])), Decimal("1.09995"))
         self.assertNotIn(
             "protection_rough_fallback",
             [row["event"] for row in self.leader.cell.transition_history()],
         )
 
-    def test_asymmetric_protection_maps_a_short_leader_to_sl_only_boundaries(self) -> None:
+    def test_mirrored_protection_maps_a_short_leader_to_shared_boundaries(self) -> None:
         self.leader.mt5.fill_price = 1.10045
         self.follower.mt5.fill_price = 1.10010
         self.prime()
@@ -3164,25 +3218,31 @@ class ImmediateEntryTests(PairCellTestCase):
         self.assertEqual(self.follower.cell.handle_event(ClockTickEvent(self.now)).state, "ACTIVE")
         leader_modify = self.leader.modify_requests()[-1]
         follower_modify = self.follower.modify_requests()[-1]
-        self.assertEqual(Decimal(str(leader_modify["sl"])), Decimal("1.10120"))
-        self.assertEqual(str(leader_modify["tp"]), "0")
+        # The SHORT leader owns the upper boundary as its SL and the lower
+        # one as its TP; the LONG follower mirrors them exactly.
+        self.assertEqual(Decimal(str(leader_modify["sl"])), Decimal("1.10050"))
+        self.assertEqual(Decimal(str(leader_modify["tp"])), Decimal("1.09970"))
         self.assertEqual(Decimal(str(follower_modify["sl"])), Decimal("1.09970"))
-        self.assertEqual(str(follower_modify["tp"]), "0")
+        self.assertEqual(Decimal(str(follower_modify["tp"])), Decimal("1.10050"))
         self.assertNotIn(
             "protection_rough_fallback",
             [row["event"] for row in self.leader.cell.transition_history()],
         )
 
-        # No shared-grid contraction exists anymore: without a favorable move
-        # the leader trails nothing and the follower hedge leg stays static.
+        # Edge mode never trails: without a box revision the modify counts
+        # stay flat even after the trail cadence passes.
         leader_count = len(self.leader.modify_requests())
         follower_count = len(self.follower.modify_requests())
         self.tick(seconds=300)
 
         self.assertEqual(len(self.leader.modify_requests()), leader_count)
         self.assertEqual(len(self.follower.modify_requests()), follower_count)
+        self.assertNotIn(
+            "profit_trail_applied",
+            [row["event"] for row in self.leader.cell.transition_history()],
+        )
 
-    def test_both_legs_apply_asymmetric_sl_only_protection(self) -> None:
+    def test_both_legs_apply_the_mirrored_box(self) -> None:
         self.leader.mt5.fill_price = 1.10030
         self.follower.mt5.fill_price = 1.10050
 
@@ -3192,15 +3252,64 @@ class ImmediateEntryTests(PairCellTestCase):
         self.assertEqual(self.follower.cell.handle_event(ClockTickEvent(self.now)).state, "ACTIVE")
         leader_modify = self.leader.modify_requests()[-1]
         follower_modify = self.follower.modify_requests()[-1]
-        self.assertEqual(Decimal(str(leader_modify["sl"])), Decimal("1.09955"))
-        self.assertEqual(str(leader_modify["tp"]), "0")
+        self.assertEqual(Decimal(str(leader_modify["sl"])), Decimal("1.10010"))
+        self.assertEqual(Decimal(str(leader_modify["tp"])), Decimal("1.10090"))
         self.assertEqual(Decimal(str(follower_modify["sl"])), Decimal("1.10090"))
-        self.assertEqual(str(follower_modify["tp"]), "0")
+        self.assertEqual(Decimal(str(follower_modify["tp"])), Decimal("1.10010"))
 
-    def test_leader_profit_trail_advances_after_five_minutes(self) -> None:
-        self.leader.mt5.fill_price = 1.10030
+    def test_an_infeasible_mirrored_box_keeps_rough_fallback(self) -> None:
+        # A 40-point fill gap equals the follower's 40-tick TP distance, so
+        # the inner box cannot contain both fills (P_low lands exactly on the
+        # leader fill).  Both legs fail closed to verified rough protection
+        # instead of widening risk, and the pair still converges by time exit.
         self.follower.mt5.fill_price = 1.10050
         self.run_entry()
+
+        self.assertEqual(self.leader.cell.handle_event(ClockTickEvent(self.now)).state, "ACTIVE")
+        self.assertEqual(self.follower.cell.handle_event(ClockTickEvent(self.now)).state, "ACTIVE")
+        self.assertIn(
+            "protection_rough_fallback",
+            [row["event"] for row in self.leader.cell.transition_history()],
+        )
+        self.assertIn(
+            "protection_rough_fallback",
+            [row["event"] for row in self.follower.cell.transition_history()],
+        )
+        self.assertNotIn(
+            "mirrored_protection_applied",
+            [row["event"] for row in self.leader.cell.transition_history()],
+        )
+        self.assertEqual(self.leader.close_requests(), [])
+        self.assertEqual(self.follower.close_requests(), [])
+        self.assertEqual(len(self.leader.mt5.positions), 1)
+        self.assertEqual(len(self.follower.mt5.positions), 1)
+
+    def test_edge_mode_follows_when_the_peer_leg_empties(self) -> None:
+        # Edge mode never solos: when the follower hedge leg disappears, the
+        # leader market-closes at once instead of running on.
+        self.run_entry()
+        self.assertEqual(self.leader.cell.handle_event(ClockTickEvent(self.now)).state, "ACTIVE")
+
+        self.feed_quotes(sequence=3)
+        self.tick()
+        self.follower.mt5.positions = []
+        self.follower.cell.handle_event(
+            BrokerSnapshotEvent(orders=[], positions=[], observed_at=self.now)
+        )
+        self.net.pump()
+
+        self.leader.cell.handle_event(ClockTickEvent(self.now))
+        self.assertNotEqual(self.leader.close_requests(), [])
+        history = [row["event"] for row in self.leader.cell.transition_history()]
+        self.assertIn("peer_leg_empty_edge_follow", history)
+        self.assertNotIn("peer_leg_empty_leader_continues_solo", history)
+
+    def test_leader_profit_trail_advances_after_five_minutes(self) -> None:
+        # Trailing is a trend-mode behavior: edge legs hold the mirrored box
+        # and never trail.
+        self.leader.mt5.fill_price = 1.10030
+        self.follower.mt5.fill_price = 1.10050
+        self.run_momentum_entry()
         self.assertEqual(len(self.leader.modify_requests()), 1)
         self.assertEqual(len(self.follower.modify_requests()), 1)
 
@@ -3213,7 +3322,7 @@ class ImmediateEntryTests(PairCellTestCase):
             leader_ask="1.10140",
             follower_bid="1.10050",
             follower_ask="1.10060",
-            sequence=3,
+            sequence=300,
         )
         self.tick(seconds=300)
 
@@ -3227,7 +3336,8 @@ class ImmediateEntryTests(PairCellTestCase):
         )
 
     def test_leader_continues_solo_after_the_follower_hedge_leg_stops_out(self) -> None:
-        self.run_entry()
+        # Solo continuation is a trend-mode behavior: edge legs always follow.
+        self.run_momentum_entry()
         self.assertEqual(self.leader.cell.handle_event(ClockTickEvent(self.now)).state, "ACTIVE")
 
         # The capped follower leg stops out first while the leader profit leg
@@ -3236,11 +3346,11 @@ class ImmediateEntryTests(PairCellTestCase):
         # one immediate lock (breakeven, else half-risk), so the survivor may
         # sit in PROTECTING rather than ACTIVE while still holding.
         self.feed_quotes(
-            leader_bid="1.10050",
-            leader_ask="1.10060",
+            leader_bid="1.10150",
+            leader_ask="1.10160",
             follower_bid="1.10050",
             follower_ask="1.10060",
-            sequence=3,
+            sequence=300,
         )
         self.tick()
         self.follower.mt5.positions = []
@@ -3262,18 +3372,18 @@ class ImmediateEntryTests(PairCellTestCase):
         )
 
     def test_follower_continues_solo_after_the_leader_leg_stops_out(self) -> None:
-        self.run_entry()
-        self.assertEqual(self.follower.cell.handle_event(ClockTickEvent(self.now)).state, "ACTIVE")
-
         # Dual-solo contract: either leg may outlive the peer.  The follower
         # keeps running under its own trailing stop with one immediate solo
         # lock instead of being contained with the empty leader leg.
+        self.run_momentum_entry()
+        self.assertEqual(self.follower.cell.handle_event(ClockTickEvent(self.now)).state, "ACTIVE")
+
         self.feed_quotes(
             leader_bid="1.10000",
             leader_ask="1.10010",
             follower_bid="1.09950",
             follower_ask="1.09960",
-            sequence=3,
+            sequence=300,
         )
         self.tick()
         self.leader.mt5.positions = []
@@ -3356,7 +3466,7 @@ class ImmediateEntryTests(PairCellTestCase):
             self.leader.cell.handle_event(ClockTickEvent(self.now)).state, "EMPTY"
         )
 
-    def test_asymmetric_protection_is_not_evaluated_before_pair_confirmation(self) -> None:
+    def test_mirrored_protection_is_not_evaluated_before_pair_confirmation(self) -> None:
         self.prime()
         self.net.hold_kinds.add("leg_status")
         self.feed_quotes()
@@ -3368,11 +3478,11 @@ class ImmediateEntryTests(PairCellTestCase):
         self.net.release_held()
         self.net.pump()
         self.assertTrue(self.leader.cell.handle_event(ClockTickEvent(self.now)).pair_confirmed)
-        # Confirmation carries the first SL-only precise revision: a capped
-        # stop with the take-profit cap removed.
+        # Confirmation carries the first mirrored revision: the shared box,
+        # not an SL-only stop.
         leader_modify = self.leader.modify_requests()[-1]
-        self.assertEqual(Decimal(str(leader_modify["sl"])), Decimal("1.09935"))
-        self.assertEqual(str(leader_modify["tp"]), "0")
+        self.assertEqual(Decimal(str(leader_modify["sl"])), Decimal("1.10000"))
+        self.assertEqual(Decimal(str(leader_modify["tp"])), Decimal("1.10080"))
         self.assertEqual(len(self.net.payloads("pair_entry_confirmed", LEADER)), 1)
 
     def test_identical_precise_protection_does_not_trigger_containment(self) -> None:
@@ -3536,7 +3646,7 @@ class FollowerAdmissionTests(PairCellTestCase):
         self.feed_quotes()
         self.assertEqual(self.net.payloads("attempt", FOLLOWER), [])
         with self.assertRaises(PairExecutionCellError):
-            self.follower.cell.accept_policy(self.policy(entry_edge_points="3"))
+            self.follower.cell.accept_policy(self.policy(edge_min_net_points="3"))
 
 
 # --------------------------------------------------------------------------- #
@@ -4694,16 +4804,17 @@ class PeerTerminalProofTests(PairCellTestCase):
         # keeps managing its profit leg. While authenticated peer envelopes
         # keep arriving, the follower must keep probing without escalating.
         # Solo is winner-only, so run the leader quote profitable first.
-        self.run_entry()
+        # (Solo continuation only exists in trend modes.)
+        self.run_momentum_entry()
         self.assertEqual(self.leader.cell.handle_event(ClockTickEvent(self.now)).state, "ACTIVE")
         self.assertEqual(self.follower.cell.handle_event(ClockTickEvent(self.now)).state, "ACTIVE")
 
         self.feed_quotes(
-            leader_bid="1.10050",
-            leader_ask="1.10060",
+            leader_bid="1.10150",
+            leader_ask="1.10160",
             follower_bid="1.10050",
             follower_ask="1.10060",
-            sequence=3,
+            sequence=300,
         )
         self.tick()
         self.follower.mt5.positions = []
@@ -4731,17 +4842,17 @@ class PeerTerminalProofTests(PairCellTestCase):
         self.assertEqual(len(self.leader.mt5.positions), 1, "the solo profit leg keeps running")
 
     def test_repeated_peer_empty_reports_log_solo_once(self) -> None:
-        self.run_entry()
+        self.run_momentum_entry()
         self.assertEqual(self.leader.cell.handle_event(ClockTickEvent(self.now)).state, "ACTIVE")
 
         # Winner-only solo: run the leader quote profitable before the peer
         # empties so the survivor path (not containment) is exercised.
         self.feed_quotes(
-            leader_bid="1.10050",
-            leader_ask="1.10060",
+            leader_bid="1.10150",
+            leader_ask="1.10160",
             follower_bid="1.10050",
             follower_ask="1.10060",
-            sequence=3,
+            sequence=300,
         )
         self.tick()
         self.follower.mt5.positions = []
@@ -6558,7 +6669,7 @@ class TrendEntryTests(PairCellTestCase):
         candidates = self.leader.cell.entry_candidates()
         self.assertTrue(candidates)
         self.assertEqual(candidates[0]["entry_mode"], "edge")
-        self.assertIn("edge_points", candidates[0])
+        self.assertIn("net_points", candidates[0])
 
 
 class TrendRelaxedGatesTests(PairCellTestCase):

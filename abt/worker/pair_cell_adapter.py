@@ -69,6 +69,7 @@ from uuid import uuid4
 from ..pair_cell import (
     PROTOCOL_VERSION as PAIR_CELL_ENVELOPE_VERSION,
     DEFAULT_DAILY_LOSS_WARNING_THRESHOLD_USD,
+    DEFAULT_EDGE_MIN_NET_POINTS,
     DEFAULT_ENTRY_MODE,
     DEFAULT_STRATEGY_BUDGET_USD,
     DEFAULT_TREND_BREAKOUT_BUFFER_POINTS,
@@ -480,6 +481,7 @@ def parse_pair_cell_config(raw: object, *, source: object = "<memory>") -> PairC
             "entry_mode must be 'edge', 'donchian' or 'momentum'."
         )
     for key, default in (
+        ("edge_min_net_points", DEFAULT_EDGE_MIN_NET_POINTS),
         ("trend_breakout_buffer_points", DEFAULT_TREND_BREAKOUT_BUFFER_POINTS),
         ("trend_min_range_points", DEFAULT_TREND_MIN_RANGE_POINTS),
         ("trend_momentum_k", DEFAULT_TREND_MOMENTUM_K),

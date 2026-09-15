@@ -953,7 +953,7 @@ class PairCellConfigurationTests(unittest.TestCase):
         for key, value in (
             ("mode", "shadow"),
             ("strategy_budget_usd", "5000"),
-            ("entry_edge_points", "9"),
+            ("edge_min_net_points", "9"),
             ("entry_mode", "donchian"),
             ("trend_lookback_seconds", 900.0),
             ("quote_max_age_seconds", 2.0),
@@ -1066,9 +1066,9 @@ class PairCellConfigurationTests(unittest.TestCase):
 
     def test_a_present_file_is_loaded_from_disk(self) -> None:
         path = self.directory / "pair.json"
-        path.write_text(json.dumps({"entry_edge_points": "7"}), encoding="utf-8")
+        path.write_text(json.dumps({"edge_min_net_points": "7"}), encoding="utf-8")
         config = load_pair_cell_config(path)
-        self.assertEqual({"entry_edge_points": "7"}, dict(config.shared_policy))
+        self.assertEqual({"edge_min_net_points": "7"}, dict(config.shared_policy))
 
     def test_absent_file_generates_a_follower_safe_template(self) -> None:
         """No shared key may appear unless the leader role was requested."""
@@ -2177,7 +2177,7 @@ class WorkerInitiatedPairingTests(PairingTestCase):
     def test_a_leader_whose_configuration_exceeds_its_assigned_role_fails_closed(self) -> None:
         """A follower that was handed a leader-authored file never pairs partially."""
 
-        shared = parse_pair_cell_config({"entry_edge_points": "9"})
+        shared = parse_pair_cell_config({"edge_min_net_points": "9"})
         follower = self.worker(
             FOLLOWER, bid=1.10100, ask=1.10110, balance=4_000.0, config=shared
         )
@@ -2186,7 +2186,7 @@ class WorkerInitiatedPairingTests(PairingTestCase):
         )
         pump_until([leader, follower], lambda: follower.runtime.pairing_state == "unpaired", rounds=20)
         self.assertFalse(follower.runtime.enabled)
-        self.assertIn("entry_edge_points", follower.runtime.pairing_diagnostic)
+        self.assertIn("edge_min_net_points", follower.runtime.pairing_diagnostic)
 
     def test_a_worker_without_a_positive_usd_balance_never_pairs(self) -> None:
         follower = self.worker(FOLLOWER, bid=1.10100, ask=1.10110, balance=0.0)
@@ -2297,7 +2297,7 @@ class DurableRouteAndAuthorityTests(PairingTestCase):
 class DiscoveryLifecycleTests(PairingTestCase):
     def _discovered(self) -> tuple[Worker, Worker]:
         leader, follower = self.paired(
-            leader_config=parse_pair_cell_config({"entry_edge_points": "100000"})
+            leader_config=parse_pair_cell_config({"edge_min_net_points": "100000"})
         )
         self.assertTrue(
             pump_until(
@@ -2484,7 +2484,7 @@ class SafeUnpairTests(PairingTestCase):
         """A paired, entry-ready pair whose edge threshold admits nothing."""
 
         leader, follower = self.paired(
-            leader_config=parse_pair_cell_config({"entry_edge_points": "100000"}),
+            leader_config=parse_pair_cell_config({"edge_min_net_points": "100000"}),
             polling_config=polling_config,
         )
         self.assertTrue(
@@ -2793,7 +2793,7 @@ class DurablePersistenceTests(PairingTestCase):
 
     def _idle_pair(self) -> tuple[Worker, Worker]:
         return self.paired(
-            leader_config=parse_pair_cell_config({"entry_edge_points": "100000"})
+            leader_config=parse_pair_cell_config({"edge_min_net_points": "100000"})
         )
 
     def _tables(self, worker: Worker) -> set[str]:
@@ -3024,7 +3024,7 @@ class DurablePersistenceTests(PairingTestCase):
         leader = self.worker(
             LEADER,
             options=PairCellStartupOptions(role="leader", follower_worker_id=FOLLOWER),
-            config=parse_pair_cell_config({"entry_edge_points": "100000"}),
+            config=parse_pair_cell_config({"edge_min_net_points": "100000"}),
         )
         self.assertTrue(
             pump_until([leader, follower], lambda: leader.runtime.enabled, rounds=40),
@@ -3071,7 +3071,7 @@ class DurablePersistenceTests(PairingTestCase):
         self.controller.strip_acceptance = True
         self.controller.drop_relay_kinds_from = {FOLLOWER: {"pairing_acceptance"}}
         leader, follower = self.paired(
-            leader_config=parse_pair_cell_config({"entry_edge_points": "100000"})
+            leader_config=parse_pair_cell_config({"edge_min_net_points": "100000"})
         )
         pump_until([leader, follower], lambda: False, rounds=20)
         assert leader.runtime.cell is not None
@@ -3634,52 +3634,46 @@ class FullLifecycleTests(PairingTestCase):
         for mt5 in (leader.mt5, follower.mt5):
             self.assertEqual(0.04, float(cast(float, mt5.positions[0]["volume"])))
             self.assertGreater(float(cast(float, mt5.positions[0]["sl"])), 0.0)
-            # Asymmetric profit-max protection: SL-only stops at each leg's
-            # allowed loss with the take-profit cap removed (MT5 reports 0).
-            self.assertEqual(float(cast(float, mt5.positions[0]["tp"])), 0.0)
+            self.assertGreater(float(cast(float, mt5.positions[0]["tp"])), 0.0)
         # Mirror directions: the leader is LONG against its ask, the follower
         # SHORT against its bid.
         self.assertEqual(FakeMT5.ORDER_TYPE_BUY, leader.mt5.positions[0]["type"])
         self.assertEqual(FakeMT5.ORDER_TYPE_SELL, follower.mt5.positions[0]["type"])
+        # Mirrored box: one shared boundary pair across both brokers -- the
+        # LONG leg's SL is the SHORT leg's TP and vice versa.
+        self.assertAlmostEqual(
+            float(cast(float, leader.mt5.positions[0]["sl"])),
+            float(cast(float, follower.mt5.positions[0]["tp"])),
+        )
+        self.assertAlmostEqual(
+            float(cast(float, leader.mt5.positions[0]["tp"])),
+            float(cast(float, follower.mt5.positions[0]["sl"])),
+        )
 
         # Flatten the edge and let the flat quotes propagate, so the exit path
         # converges instead of immediately originating the next attempt.
         follower.mt5.prices[SYMBOL] = leader.mt5.prices[SYMBOL]
         pump_until([leader, follower], lambda: False, rounds=40)
         leader.runtime.request_close("timed_exit")
-        # The leader empties on its own close while the profitable follower
-        # leg keeps running solo under its trailing stop instead of
-        # containing with the peer.
+        # Edge mode never solos: the leader empties on its own close and the
+        # follower follows at once instead of running on.
         self.assertTrue(
             pump_until([leader, follower], lambda: not leader.mt5.positions, rounds=100),
             "the leader never closed on its own timed exit",
         )
+        self.assertTrue(
+            pump_until([leader, follower], lambda: not follower.mt5.positions, rounds=200),
+            "the follower never followed the emptied leader leg",
+        )
         assert follower.runtime.cell is not None
         self.assertIn(
+            "peer_leg_empty_edge_follow",
+            [row["event"] for row in follower.runtime.cell.transition_history()],
+        )
+        self.assertNotIn(
             "peer_leg_empty_follower_continues_solo",
             [row["event"] for row in follower.runtime.cell.transition_history()],
         )
-        # Drive the market favorably past the trail cadence: the first
-        # trailing adjustment must tighten the solo stop.  The default 1%
-        # margin sizes the leg at 0.04 lots, so one full risk distance is wide
-        # (0.01000); the half-distance trail keeps 0.00500 from the exit price,
-        # so the drive must clear the solo lock before the trail can advance
-        # past it to 1.09510 (= 1.09010 ask + 0.00500).
-        follower.mt5.prices[SYMBOL] = (1.09000, 1.09010)
-        self.clock.advance(301.0)
-        self.assertTrue(
-            pump_until(
-                [leader, follower],
-                lambda: bool(follower.mt5.positions)
-                and abs(float(follower.mt5.positions[0]["sl"]) - 1.09510) < 1e-9,
-                rounds=20,
-            ),
-            "the solo leg never trailed its stop",
-        )
-        # Return to flat with broker stop fills enabled: the touched stop
-        # fills broker-side and the cell observes the empty account.
-        follower.mt5.stop_fills = True
-        follower.mt5.prices[SYMBOL] = leader.mt5.prices[SYMBOL]
         self.assertTrue(
             pump_until(
                 [leader, follower],

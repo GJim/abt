@@ -65,7 +65,7 @@ SYMBOL = "EURUSD"
 LEADER_CONFIG = parse_pair_cell_config(
     {
         "mode": "live",
-        "entry_edge_points": "1",
+        "edge_min_net_points": "1",
         "quote_max_age_seconds": 30.0,
         "quote_max_skew_seconds": 30.0,
     }
@@ -438,7 +438,7 @@ class _Pair:
 
         # Leader is LONG (prices from its ask); follower is SHORT (prices from
         # its bid). A coherent edge needs follower.bid - leader.ask to clear
-        # ``entry_edge_points``.
+        # ``edge_min_net_points``.
         self.leader_mt5 = FakeMT5(login=910001, server="Broker-A", bid=1.10000, ask=1.10010, balance=10_000.0)
         self.follower_mt5 = FakeMT5(login=910002, server="Broker-B", bid=1.10100, ask=1.10110, balance=4_000.0)
 
@@ -566,9 +566,16 @@ class PairExecutionCellEndToEndTests(unittest.TestCase):
         self.assertEqual(0.04, float(cast(float, pair.follower_mt5.positions[0]["volume"])))
         for mt5 in (pair.leader_mt5, pair.follower_mt5):
             self.assertGreater(float(cast(float, mt5.positions[0]["sl"])), 0.0)
-            # Asymmetric profit-max protection: SL-only stops with the
-            # take-profit cap removed (MT5 reports 0).
-            self.assertEqual(float(cast(float, mt5.positions[0]["tp"])), 0.0)
+            self.assertGreater(float(cast(float, mt5.positions[0]["tp"])), 0.0)
+        # Mirrored box: the LONG leg's SL is the SHORT leg's TP and vice versa.
+        self.assertAlmostEqual(
+            float(cast(float, pair.leader_mt5.positions[0]["sl"])),
+            float(cast(float, pair.follower_mt5.positions[0]["tp"])),
+        )
+        self.assertAlmostEqual(
+            float(cast(float, pair.leader_mt5.positions[0]["tp"])),
+            float(cast(float, pair.follower_mt5.positions[0]["sl"])),
+        )
 
     def test_the_controller_route_record_carries_no_trader_identity(self) -> None:
         pair = _Pair(self, self.server, Path(self._tmp.name))
@@ -745,7 +752,7 @@ class PairExecutionCellEndToEndTests(unittest.TestCase):
             # An edge nothing can clear keeps this test on the unpair path.
             leader_config=parse_pair_cell_config(
                 {
-                    "entry_edge_points": "100000",
+                    "edge_min_net_points": "100000",
                     "quote_max_age_seconds": 30.0,
                     "quote_max_skew_seconds": 30.0,
                 }
