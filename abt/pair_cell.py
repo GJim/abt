@@ -2455,6 +2455,8 @@ class PairResult:
     rediscovery_failure: str | None
     recovering: bool
     timing: dict[str, object] = field(default_factory=dict)
+    local_broker_verified_empty: bool = False
+    peer_empty_claim: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -5148,6 +5150,16 @@ class PairExecutionCell:
         if facts is None or facts.orders is None or facts.positions is None:
             return False
         return not facts.orders and not facts.positions and facts.terminal_connected
+
+    def policy_publish_blocker(self) -> str | None:
+        """Why the canonical policy cannot be (re)published right now, if any.
+
+        Read-only wrapper over the adoption gate so the Worker adapter can
+        log an actionable reason instead of retrying silently.  No state is
+        changed here.
+        """
+
+        return self._policy_change_blocked()
 
     def _policy_change_blocked(self) -> str | None:
         """Policy content may only change while both accounts are proven empty."""
@@ -8546,6 +8558,8 @@ class PairExecutionCell:
             rediscovery_failure=self._rediscovery_failure,
             recovering=self._recovering,
             timing=dict(self._last_timing),
+            local_broker_verified_empty=self._broker_verified_empty(),
+            peer_empty_claim=self._peer_empty_claim,
         )
 
 

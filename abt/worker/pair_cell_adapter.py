@@ -1935,6 +1935,8 @@ class PairCellRuntime:
         self._next_safe_unpair_probe = epoch_placeholder
         self._next_assertion_heartbeat_at = epoch_placeholder
         self._next_acceptance_diagnostic = epoch_placeholder
+        self._next_policy_blocked_diagnostic = epoch_placeholder
+        self._last_policy_blocked_reason: str | None = None
         self._last_state_diagnostic: tuple[object, ...] | None = None
         self._pending_budget: tuple[str, StartupBalance] | None = None
         self._pairing_deadline: datetime | None = None
@@ -3522,6 +3524,8 @@ class PairCellRuntime:
             status.needs_human,
             status.needs_human_reason,
             status.metadata_reconciliation,
+            status.local_broker_verified_empty,
+            status.peer_empty_claim,
             diagnostic,
         )
         if snapshot == self._last_state_diagnostic:
@@ -3529,7 +3533,7 @@ class PairCellRuntime:
         self._last_state_diagnostic = snapshot
         _LOGGER.debug(
             "%s evt=state route=%s rstate=%s gen=%s st=%s des=%s att=%s ready=%s why=%s "
-            "pol=%s plan=%s pair=%s human=%s hwhy=%s adm=%s",
+            "pol=%s plan=%s pair=%s human=%s hwhy=%s lempty=%s peerempty=%s adm=%s",
             _RTAG,
             _short(status.route_id),
             status.route_state,
@@ -3544,6 +3548,8 @@ class PairCellRuntime:
             status.pair_confirmed,
             status.needs_human,
             status.needs_human_reason or "-",
+            status.local_broker_verified_empty,
+            status.peer_empty_claim,
             diagnostic,
         )
 
@@ -3645,9 +3651,28 @@ class PairCellRuntime:
             return None
         try:
             result = cell.accept_policy(policy)
-        except PairExecutionCellError:
+        except PairExecutionCellError as error:
             # Policy content may only be adopted while both accounts are
-            # broker-verified empty; this retries quietly.
+            # broker-verified empty.  Retrying quietly here used to hide the
+            # blocker forever (endless pairing_acceptance republish with
+            # pol=False and no kind=policy), so emit a throttled warning with
+            # the exact gate reason plus both empty flags.
+            reason = str(error) or "policy change refused"
+            blocker = cell.policy_publish_blocker()
+            detail = blocker or reason
+            now = self._now()
+            if detail != self._last_policy_blocked_reason or now >= self._next_policy_blocked_diagnostic:
+                self._last_policy_blocked_reason = detail
+                self._next_policy_blocked_diagnostic = now + self._polling.acceptance_republish_interval
+                empty = cell.status()
+                _LOGGER.warning(
+                    "%s evt=policy_publish_blocked route=%s why=%s lempty=%s peerempty=%s",
+                    _RTAG,
+                    _short(record.route_id),
+                    detail,
+                    empty.local_broker_verified_empty,
+                    empty.peer_empty_claim,
+                )
             return None
         self._published_policy = True
         _LOGGER.info("%s evt=policy_adopted %s", _RTAG, _short(policy.policy_version))
