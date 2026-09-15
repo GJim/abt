@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 import logging
 import math
+import signal
 from time import monotonic, sleep as _sleep
 from typing import ContextManager, Protocol
 
@@ -19,6 +20,40 @@ from .wine_mt5_client import BridgeClientError
 
 _LOGGER = logging.getLogger(__name__)
 _RECONNECT_BACKOFF_RESET_SECONDS = 5 * 60
+
+
+def _termination_to_keyboard_interrupt(signum: int, frame: object) -> None:
+    """Funnel a termination signal into the graceful shutdown path.
+
+    The relay loop below already turns the first ``KeyboardInterrupt`` into a
+    coordinated pair close (``request_close`` + wait for both legs to go
+    terminal; a second interrupt force-exits). Console Ctrl+C arrives as
+    SIGINT with this behavior by default, but Ctrl+Break (Windows SIGBREAK)
+    and ``taskkill``/systemd SIGTERM do not -- map them onto the same path.
+    """
+
+    raise KeyboardInterrupt
+
+
+def install_graceful_signal_handlers() -> dict[int, object]:
+    """Map SIGBREAK/SIGTERM onto ``KeyboardInterrupt`` in the main thread.
+
+    Returns the previous handlers so tests (or an embedding host) can restore
+    them. Signals missing on this platform are skipped; installing outside the
+    main thread (or where the platform refuses) keeps the default behavior.
+    """
+
+    previous: dict[int, object] = {}
+    for name in ("SIGBREAK", "SIGTERM"):
+        signum = getattr(signal, name, None)
+        if signum is None:
+            continue
+        try:
+            previous[signum] = signal.getsignal(signum)
+            signal.signal(signum, _termination_to_keyboard_interrupt)
+        except (OSError, ValueError, RuntimeError):
+            previous.pop(signum, None)
+    return previous
 
 
 class ReadOnlyMT5(Protocol):
@@ -440,6 +475,7 @@ def reconnect_worker_session(
 ) -> None:
     """Reconnect an interrupted proved WSS session with a bounded exponential backoff."""
 
+    install_graceful_signal_handlers()
     attempts = 0
     graceful_shutdown = _GracefulShutdown()
     while True:

@@ -55,6 +55,52 @@ class _UtcLogFormatter(logging.Formatter):
         )
 
 
+class _ConsoleLogHandler(logging.StreamHandler):
+    """A console handler that survives a dead console or pipe.
+
+    When the operator closes the console window or kills a downstream pipe
+    (e.g. ``... | Tee-Object``), the next write raises ``BrokenPipeError`` /
+    ``OSError``. Logging must never take the worker down: drop the record and
+    keep going so the file handler (if any) stays alive.
+    """
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            super().emit(record)
+        except (BrokenPipeError, OSError, ValueError):
+            try:
+                self.handleError(record)
+            except Exception:
+                pass
+
+
+def _configure_logging(*, verbose: bool, log_file: Path | None, error_output: TextIO) -> None:
+    """Mirror ``-v`` console logging to an optional log file (in-process tee).
+
+    Both handlers share one UTC formatter so the screen and the file show the
+    same lines. The file is opened in append mode with immediate flush per
+    record (inherited from ``StreamHandler.emit``), so a Ctrl+C / kill loses
+    nothing. ``--log-file`` implies verbose-style logging even without ``-v``.
+    """
+
+    if not verbose and log_file is None:
+        return
+    formatter = _UtcLogFormatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    handlers: list[logging.Handler] = []
+    console = _ConsoleLogHandler(error_output)
+    console.setFormatter(formatter)
+    handlers.append(console)
+    if log_file is not None:
+        file_handler = logging.FileHandler(log_file, mode="a", encoding="utf-8")
+        file_handler.setFormatter(formatter)
+        handlers.append(file_handler)
+    logging.basicConfig(
+        level=logging.INFO,
+        handlers=handlers,
+    )
+    logging.getLogger("abt").setLevel(logging.DEBUG)
+
+
 class HTTPEnrollmentTransport:
     """Submit enrollment only to an HTTPS controller origin."""
 
@@ -277,15 +323,17 @@ def main(
     else:
         pair_cell_options = PairCellStartupOptions()
     if arguments.verbose:
-        handler = logging.StreamHandler(error_output)
-        handler.setFormatter(
-            _UtcLogFormatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+        _configure_logging(
+            verbose=True,
+            log_file=getattr(arguments, "log_file", None),
+            error_output=error_output,
         )
-        logging.basicConfig(
-            level=logging.INFO,
-            handlers=[handler],
+    elif getattr(arguments, "log_file", None) is not None:
+        _configure_logging(
+            verbose=False,
+            log_file=arguments.log_file,
+            error_output=error_output,
         )
-        logging.getLogger("abt").setLevel(logging.DEBUG)
     cleanup_errors: list[Exception] = []
     try:
         provider = key_store_factory or default_key_store_provider(arguments.config)
@@ -892,6 +940,16 @@ def _parser() -> argparse.ArgumentParser:
     reconcile.add_argument("--wine-prefix", type=Path, default=Path.home() / ".mt5", help="Wine prefix directory")
     reconcile.add_argument("--windows-python", default=r"C:\abt-python313\python.exe", help="Windows python path in Wine")
     reconcile.add_argument("--bridge-timeout-seconds", type=float, default=15.0, help="Wine bridge request timeout")
+    reconcile.add_argument(
+        "--log-file",
+        type=Path,
+        default=None,
+        help=(
+            "mirror console logs to this file inside the worker (shows on screen and writes to file). "
+            "Prefer this over piping through Tee-Object: an external pipe swallows Ctrl+C so the "
+            "graceful shutdown never triggers."
+        ),
+    )
     unpair = commands.add_parser(
         "unpair",
         help="request a safe unpair of this Worker's current Pair Execution Cell route and wait until it is removed",
