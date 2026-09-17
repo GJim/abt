@@ -388,6 +388,12 @@ class WorkerEnrollmentTests(unittest.TestCase):
         self.assertEqual("quarantine", release.command)
         self.assertEqual("release", release.quarantine_action)
         self.assertEqual("EURUSD", release.symbol)
+        freeze = parser.parse_args(
+            ["quarantine", "freeze", "--symbol", "US2000", "--config", str(self.config_path)]
+        )
+        self.assertEqual("quarantine", freeze.command)
+        self.assertEqual("freeze", freeze.quarantine_action)
+        self.assertEqual("US2000", freeze.symbol)
 
     def test_an_omitted_pair_cell_role_means_available_follower(self) -> None:
         options = _pair_cell_startup_options(

@@ -299,7 +299,7 @@ def main(
     arguments = parser.parse_args(argv)
     if arguments.command == "symbols":
         return _run_symbols(arguments, output=output, error_output=error_output)
-    if arguments.command == "quarantine" and getattr(arguments, "quarantine_action", None) != "release":
+    if arguments.command == "quarantine" and getattr(arguments, "quarantine_action", None) not in ("release", "freeze"):
         print("Worker quarantine inspection failed: unknown action.", file=error_output)
         return 1
     if arguments.command not in {"enroll", "reconcile", "unpair", "rediscover", "quarantine"}:
@@ -439,6 +439,15 @@ def main(
                 )
                 return 0
             if arguments.command == "quarantine":
+                done = (
+                    _QuarantineFreezeCompletion(
+                        symbol=arguments.symbol, reason=arguments.reason or ""
+                    )
+                    if getattr(arguments, "quarantine_action", None) == "freeze"
+                    else _QuarantineReleaseCompletion(
+                        symbol=arguments.symbol, reason=arguments.reason or ""
+                    )
+                )
                 _reconcile_with_certificate_maintenance(
                     identity_path=arguments.config,
                     identity=identity,
@@ -450,9 +459,7 @@ def main(
                     pair_cell_config_path=getattr(arguments, "pair_cell_config", None),
                     pair_cell_options=pair_cell_options,
                     run_reconciliation=_one_shot_run(
-                        done=_QuarantineReleaseCompletion(
-                            symbol=arguments.symbol, reason=arguments.reason or ""
-                        ),
+                        done=done,
                         timeout_seconds=float(arguments.timeout),
                         output=output,
                     ),
@@ -491,13 +498,13 @@ def main(
         print("Worker reconciliation stopped.", file=error_output)
         return 130
     except WorkerEnrollmentError as error:
-        operation = _operation_name(arguments.command)
+        operation = _operation_name(arguments.command, action=getattr(arguments, "quarantine_action", None))
         print(f"Worker {operation} failed: {error}", file=error_output)
         if arguments.verbose:
             _print_diagnostic(error, error_output)
         return 1
     except Exception as error:
-        operation = _operation_name(arguments.command)
+        operation = _operation_name(arguments.command, action=getattr(arguments, "quarantine_action", None))
         print(f"Worker {operation} failed.", file=error_output)
         if arguments.verbose:
             _print_diagnostic(error, error_output)
@@ -601,13 +608,14 @@ def _reconcile_with_certificate_maintenance(
         _close(current_key)
 
 
-def _operation_name(command: str | None) -> str:
+def _operation_name(command: str | None, *, action: str | None = None) -> str:
+    if command == "quarantine":
+        return "quarantine freeze" if action == "freeze" else "quarantine release"
     return {
         "enroll": "registration",
         "reconcile": "reconciliation",
         "unpair": "unpair request",
         "rediscover": "policy rediscovery",
-        "quarantine": "quarantine release",
     }.get(command or "", "worker")
 
 
@@ -725,6 +733,44 @@ class _QuarantineReleaseCompletion:
             )
         raise WorkerEnrollmentError(
             f"Quarantine release rejected: {status.get('reason') or 'the release did not take effect'}."
+        )
+
+
+class _QuarantineFreezeCompletion:
+    """One-shot completion: freeze one symbol locally, then report."""
+
+    def __init__(self, *, symbol: str, reason: str = "") -> None:
+        self._symbol = symbol
+        self._reason = reason
+        self._done = False
+
+    def __call__(self, runtime: PairCellRuntime, result: object) -> str | None:
+        if runtime.cell is None:
+            if runtime.pairing_diagnostic:
+                raise WorkerEnrollmentError(
+                    f"Quarantine freeze cannot start: {runtime.pairing_diagnostic}"
+                )
+            return None
+        if self._done:
+            return None
+        try:
+            applied = runtime.request_manual_freeze(self._symbol, reason=self._reason)
+        except PairExecutionCellError as error:
+            raise WorkerEnrollmentError(f"Quarantine freeze is refused: {error}") from error
+        if applied is None:
+            raise WorkerEnrollmentError(
+                runtime.pairing_diagnostic or "Quarantine freeze cannot start on this route."
+            )
+        self._done = True
+        if not applied:
+            return (
+                f"Quarantine freeze had nothing new for {self._symbol} on route {runtime.route_id}:"
+                " already frozen."
+            )
+        return (
+            f"Quarantine freeze applied for {self._symbol} on route {runtime.route_id}:"
+            f" local={list(applied)} (propagates to the peer via readiness;"
+            " run the same command on the peer if it is offline)."
         )
 
 
@@ -1013,6 +1059,25 @@ def _parser() -> argparse.ArgumentParser:
     release.add_argument("--wine-prefix", type=Path, default=Path.home() / ".mt5", help="Wine prefix directory")
     release.add_argument("--windows-python", default=r"C:\abt-python313\python.exe", help="Windows python path in Wine")
     release.add_argument("--bridge-timeout-seconds", type=float, default=15.0, help="Wine bridge request timeout")
+    freeze = quarantine_actions.add_parser(
+        "freeze",
+        help="manually freeze one symbol (durable pair-wide quarantine, propagates to the peer)",
+    )
+    freeze.add_argument("--config", type=Path, default=default_identity_path(), help="worker identity configuration path")
+    freeze.add_argument(
+        "--pair-cell-config",
+        type=Path,
+        default=None,
+        help="optional Pair Execution Cell tunables file; absent means the documented defaults are synthesized",
+    )
+    freeze.add_argument("--symbol", required=True, help="symbol to freeze (e.g. US2000)")
+    freeze.add_argument("--reason", default="", help="operator reason recorded with the manual freeze")
+    freeze.add_argument(
+        "--timeout", type=float, default=60.0, help="seconds to wait for the local freeze to apply"
+    )
+    freeze.add_argument("--wine-prefix", type=Path, default=Path.home() / ".mt5", help="Wine prefix directory")
+    freeze.add_argument("--windows-python", default=r"C:\abt-python313\python.exe", help="Windows python path in Wine")
+    freeze.add_argument("--bridge-timeout-seconds", type=float, default=15.0, help="Wine bridge request timeout")
     symbols = commands.add_parser(
         "symbols",
         help="inspect durable Pair Execution Cell symbols state offline, without any session or broker",

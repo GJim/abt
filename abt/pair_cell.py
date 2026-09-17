@@ -113,6 +113,11 @@ RouteState = Literal["ACTIVE", "UNPAIRING"]
 PROTOCOL_VERSION = 4
 NEW_YORK = ZoneInfo("America/New_York")
 PRICE_OFF_RETCODE = 10021
+#: Receipt marker for an operator-initiated manual freeze (``quarantine freeze``).
+#: It reuses the durable pair-wide ``cell_product_quarantine`` gate so a frozen
+#: symbol is excluded from ``_candidates()`` immediately, and it propagates to
+#: the peer through the same readiness records as the automatic 10021 path.
+MANUAL_FREEZE_RETCODE = "manual_freeze"
 _SUCCESS_RETCODES = (10008, 10009)
 _NO_CHANGES_RETCODE = 10025
 _SIZING_REFRESH_SECONDS = 3600.0
@@ -7856,7 +7861,8 @@ class PairExecutionCell:
             ),
         ).rowcount
         if inserted:
-            self._transition("product_quarantined", f"{product_id}: MT5 retcode 10021")
+            label = evidence.get("retcode", PRICE_OFF_RETCODE)
+            self._transition("product_quarantined", f"{product_id}: retcode {label}")
             self._last_published_readiness = None
         if commit and inserted:
             self._db.commit()
@@ -7894,7 +7900,7 @@ class PairExecutionCell:
                 or not isinstance(attempt_id, str)
                 or item.get("offending_worker_id") != self._peer_worker_id
                 or not isinstance(receipt, dict)
-                or receipt.get("retcode") != PRICE_OFF_RETCODE
+                or receipt.get("retcode") not in (PRICE_OFF_RETCODE, MANUAL_FREEZE_RETCODE)
             ):
                 continue
             changed = self._quarantine_product(
@@ -7939,6 +7945,40 @@ class PairExecutionCell:
             "SELECT marker FROM cell_product_release_marker WHERE product_id = ?", (product_id,)
         ).fetchone()
         return None if row is None else str(row[0])
+
+    # -- operator-initiated manual freeze ---------------------------------- #
+    #
+    # A manual freeze reuses the durable pair-wide quarantine gate so the
+    # symbol leaves ``_candidates()`` immediately on this Worker and then
+    # propagates to the peer through the regular readiness records (the peer
+    # accepts ``manual_freeze`` receipts the same way as automatic 10021
+    # ones).  Freezing is idempotent; releasing one uses the existing
+    # pair-coordinated ``quarantine release`` round trip.
+
+    def freeze_products(self, symbol: str, *, reason: str = "") -> list[str]:
+        """Freeze one symbol's derived products locally; returns applied ids."""
+
+        if not isinstance(symbol, str) or not symbol:
+            raise PairExecutionCellError("A manual freeze requires a symbol.")
+        if not isinstance(reason, str):
+            raise PairExecutionCellError("A manual freeze requires a text reason.")
+        targets = self._release_target_product_ids(symbol)
+        if not targets:
+            raise PairExecutionCellError(f"No known product for symbol {symbol}.")
+        applied: list[str] = []
+        for product_id in targets:
+            if self._quarantine_product(
+                product_id,
+                offending_worker_id=self._worker_id,
+                attempt_id=f"manual:{uuid4().hex[:8]}",
+                receipt={"retcode": MANUAL_FREEZE_RETCODE, "reason": reason, "symbol": symbol},
+                local_evidence=True,
+            ):
+                applied.append(product_id)
+        if applied:
+            self._db.commit()
+            self._last_published_readiness = None
+        return applied
 
     # -- worker-initiated quarantine release (peer-coordinated) ---------------- #
     #

@@ -2155,6 +2155,15 @@ class PairCellRuntime:
             return None
         return cell.quarantine_release_status(proposal_id)
 
+    def request_manual_freeze(self, symbol: str, *, reason: str = "") -> list[str] | None:
+        """Freeze one symbol's products locally; propagates via readiness."""
+
+        cell = self._cell
+        if cell is None:
+            self._pairing_reason = "this Worker is not on a Pair Execution Cell route"
+            return None
+        return cell.freeze_products(symbol, reason=reason)
+
     def _send_unpair_command(self, action: str) -> bool:
         record = self._durable_route
         if record is None:

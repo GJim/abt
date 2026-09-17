@@ -4405,6 +4405,53 @@ class WorkerInitiatedReleaseTests(PairCellTestCase):
         }
 
 
+class ManualFreezeTests(PairCellTestCase):
+    """Operator-initiated ``freeze_products``: local gate plus peer propagation."""
+
+    def test_manual_freeze_applies_locally_and_propagates_to_the_peer(self) -> None:
+        self.prime()
+        product = self.product_id()
+        applied = self.leader.cell.freeze_products(SYMBOL, reason="cross-broker gap")
+        self.assertEqual(applied, [product])
+        self.assertEqual(self.leader.cell.quarantined_products(), (product,))
+        self.net.pump()
+        self.tick()
+        self.assertEqual(self.follower.cell.quarantined_products(), (product,))
+
+    def test_manual_freeze_blocks_entry_candidates(self) -> None:
+        self.prime()
+        self.leader.cell.freeze_products(SYMBOL, reason="cross-broker gap")
+        self.feed_quotes()
+        self.assertEqual(self.attempt_payloads(), [])
+        self.assertTrue(
+            self.leader.cell.is_quarantined(self.product_id(), symbol=SYMBOL)
+        )
+
+    def test_manual_freeze_is_idempotent_and_releasable(self) -> None:
+        self.prime()
+        product = self.product_id()
+        self.leader.cell.freeze_products(SYMBOL, reason="cross-broker gap")
+        self.assertEqual(self.leader.cell.freeze_products(SYMBOL, reason="again"), [])
+        self.net.pump()
+        self.tick()
+        proposal = self.leader.cell.request_quarantine_release(SYMBOL, reason="gap gone")
+        proposal_id = cast(str, proposal["proposal_id"])
+        self.net.pump()
+        self.tick()
+        self.net.pump()
+        self.tick()
+        status = self.leader.cell.quarantine_release_status(proposal_id)
+        assert status is not None
+        self.assertEqual("applied", status["state"])
+        self.assertEqual(self.leader.cell.quarantined_products(), ())
+        self.assertEqual(self.follower.cell.quarantined_products(), ())
+
+    def test_manual_freeze_rejects_an_unknown_symbol(self) -> None:
+        self.prime()
+        with self.assertRaises(PairExecutionCellError):
+            self.leader.cell.freeze_products("NOPE", reason="typo")
+
+
 # --------------------------------------------------------------------------- #
 # Exit convergence
 # --------------------------------------------------------------------------- #

@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from abt.worker.cli import (
+    _QuarantineFreezeCompletion,
     _QuarantineReleaseCompletion,
     _RediscoverCompletion,
     _UnpairCompletion,
@@ -278,6 +279,7 @@ class FakeRuntime:
         self.rediscover_result: object = "started"
         self.release_proposal: object = None
         self.release_statuses: dict[str, dict[str, object]] = {}
+        self.freeze_result: object = ["US2000:abc"]
         self.closed = False
 
     @property
@@ -296,6 +298,9 @@ class FakeRuntime:
 
     def request_quarantine_release(self, symbol: str, *, reason: str = "") -> object:
         return self.release_proposal
+
+    def request_manual_freeze(self, symbol: str, *, reason: str = "") -> object:
+        return self.freeze_result
 
     def quarantine_release_status(self, proposal_id: str) -> dict[str, object] | None:
         return self.release_statuses.get(proposal_id)
@@ -407,6 +412,24 @@ class WatcherTests(unittest.TestCase):
         runtime.cell = object()
         runtime.release_proposal = None
         watcher = _QuarantineReleaseCompletion(symbol="EURUSD")
+        with self.assertRaises(WorkerEnrollmentError):
+            watcher(runtime, None)
+
+    def test_freeze_waits_for_the_cell_then_reports(self) -> None:
+        runtime = FakeRuntime()
+        runtime.route_id = "route-1"
+        watcher = _QuarantineFreezeCompletion(symbol="US2000", reason="gap")
+        self.assertIsNone(watcher(runtime, None))
+        runtime.cell = object()
+        message = watcher(runtime, None)
+        self.assertIn("freeze applied", message or "")
+        self.assertIn("US2000", message or "")
+
+    def test_freeze_without_a_route_raises(self) -> None:
+        runtime = FakeRuntime()
+        runtime.cell = object()
+        runtime.freeze_result = None
+        watcher = _QuarantineFreezeCompletion(symbol="US2000")
         with self.assertRaises(WorkerEnrollmentError):
             watcher(runtime, None)
 
