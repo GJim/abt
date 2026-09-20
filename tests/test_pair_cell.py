@@ -849,6 +849,19 @@ class PairCellTestCase(unittest.TestCase):
             side.cell.handle_event(PeerSessionEvent(connected=connected, observed_at=self.now))
         self.net.pump()
 
+    def wait_out_cooldown(self, seconds: float = 301.0) -> None:
+        """Advance past the post-reconnect quiet window with live handshake.
+
+        Relay traffic at the advanced time records fresh peer proof, and the
+        quiet time lets both Workers exit the window, mirroring a link that
+        recovered and stayed healthy.  Quotes fed before the wait are stale
+        afterwards; feed fresh quotes before expecting an entry.
+        """
+
+        self.tick(seconds=seconds)
+        self.net.pump()
+        self.tick()
+
 
 # --------------------------------------------------------------------------- #
 # Removed architecture and removed configuration model
@@ -949,6 +962,7 @@ class RemovedArchitectureTests(unittest.TestCase):
                 "quote_max_skew_seconds",
                 "trend_quote_max_age_seconds",
                 "follower_confirmation_timeout_seconds",
+                "post_reconnect_cooldown_seconds",
                 "sizing_refresh_seconds",
                 "relay_handling_timeout_seconds",
                 "maximum_holding_seconds",
@@ -960,6 +974,7 @@ class RemovedArchitectureTests(unittest.TestCase):
             },
         )
         self.assertEqual(policy.follower_confirmation_timeout_seconds, 5.0)
+        self.assertEqual(policy.post_reconnect_cooldown_seconds, 300.0)
 
     def test_a_canonical_policy_round_trips_through_its_relay_form(self) -> None:
         acceptance = build_pairing_acceptance(
@@ -1072,6 +1087,7 @@ class ConfigurationAuthorityTests(unittest.TestCase):
             ("quote_max_age_seconds", 1.0),
             ("quote_max_skew_seconds", 1.0),
             ("follower_confirmation_timeout_seconds", 5.0),
+            ("post_reconnect_cooldown_seconds", 300.0),
             ("sizing_refresh_seconds", 600.0),
             ("relay_handling_timeout_seconds", 5.0),
             ("trading_blackout_start_ny", "16:30"),
@@ -1130,6 +1146,7 @@ class DefaultMaterializationTests(unittest.TestCase):
                 "quote_max_skew_seconds": 1.0,
                 "trend_quote_max_age_seconds": 60.0,
                 "follower_confirmation_timeout_seconds": 5.0,
+                "post_reconnect_cooldown_seconds": 300.0,
                 "sizing_refresh_seconds": 3600.0,
                 "relay_handling_timeout_seconds": 5.0,
                 "trading_blackout_start_ny": "16:30",
@@ -1984,6 +2001,11 @@ class PolicyPersistenceTests(PairCellTestCase):
         self.assertEqual(len(self.net.payloads("policy_ack", FOLLOWER)), acks_before)
         cell.handle_event(self.follower.facts(self.now))
         self.feed_quotes()
+        # A rebuild waits out the quiet window first: no entry yet on either side.
+        self.assertEqual(len(self.follower.entry_requests()), 0)
+        self.assertEqual(self.attempt_payloads(), [])
+        self.wait_out_cooldown()
+        self.feed_quotes(sequence=3)
         self.assertEqual(len(self.follower.entry_requests()), 1)
 
     def test_the_policy_hash_covers_the_frozen_startup_balance(self) -> None:
@@ -2971,6 +2993,11 @@ class LossPolicyTests(PairCellTestCase):
         self.net.register(LEADER, self.leader.cell)
         self.leader.cell.recover()
         self.leader.cell.handle_event(self.leader.facts(self.now))
+        result = self.leader.cell.handle_event(ClockTickEvent(self.now))
+        # A rebuild cools down first, but the reason is the quiet window, not drift.
+        self.assertFalse(result.ready)
+        self.assertIn("peer reconnect cooldown", result.ready_reason)
+        self.wait_out_cooldown()
         self.assertTrue(self.leader.cell.handle_event(ClockTickEvent(self.now)).ready)
 
 
@@ -4106,6 +4133,12 @@ class RecoveryTests(PairCellTestCase):
         self.assertEqual(result.role, "leader")
         self.assertEqual(result.universe_generation, 1)
         cell.handle_event(self.leader.facts(self.now))
+        restarted = cell.handle_event(ClockTickEvent(self.now))
+        # The route and universe survive, but a rebuild waits out the quiet
+        # window before entries resume.
+        self.assertFalse(restarted.ready)
+        self.assertIn("peer reconnect cooldown", restarted.ready_reason)
+        self.wait_out_cooldown()
         self.assertTrue(cell.handle_event(ClockTickEvent(self.now)).ready)
 
     def test_a_restarted_worker_resumes_its_role_and_frozen_universe(self) -> None:
@@ -5200,6 +5233,10 @@ class CrashBoundaryTests(PairCellTestCase):
         self.assertEqual(result.state, "EMPTY")
         self.assertFalse(result.needs_human)
         cell.handle_event(self.leader.facts(self.now))
+        contained = cell.handle_event(ClockTickEvent(self.now))
+        self.assertFalse(contained.ready)
+        self.assertIn("peer reconnect cooldown", contained.ready_reason)
+        self.wait_out_cooldown()
         self.assertTrue(cell.handle_event(ClockTickEvent(self.now)).ready)
 
     def test_crash_after_prepare_with_unattributable_exposure_is_loud(self) -> None:
@@ -5402,6 +5439,9 @@ class PeerRebuildReconnectTests(PairCellTestCase):
         self.net.pump()
         self.tick()
         self.feed_quotes()
+        self.assertEqual(self.attempt_payloads(), [], "no attempt inside the quiet window")
+        self.wait_out_cooldown()
+        self.feed_quotes(sequence=3)
         attempt = self.last_attempt()
         self.assertEqual(Decimal(attempt.follower_allowed_loss_usd), Decimal("60"))
         self.assertEqual(len(self.leader.entry_requests()), 1)
@@ -5445,7 +5485,12 @@ class PeerRebuildReconnectTests(PairCellTestCase):
         self.net.pump()
         self.tick()
         self.assertIsNotNone(self.leader.cell.peer_remaining_allowance())
+        # The reseeded summary is necessary but no longer sufficient: the
+        # flap also opened a quiet window that must elapse with live handshake.
         self.feed_quotes(sequence=3)
+        self.assertEqual(self.attempt_payloads(), [], "no attempt inside the quiet window")
+        self.wait_out_cooldown()
+        self.feed_quotes(sequence=4)
         self.assertEqual(len(self.attempt_payloads()), 1)
 
     def test_a_reconnect_republishes_all_peer_required_state_idempotently(self) -> None:
@@ -5466,11 +5511,15 @@ class PeerRebuildReconnectTests(PairCellTestCase):
         self.assertIn("universe", leader_kinds)
         # Re-publication is idempotent: nothing about the pair actually changed.
         result = self.leader.cell.handle_event(ClockTickEvent(self.now))
-        self.assertTrue(result.ready, result.ready_reason)
+        self.assertFalse(result.ready, "a flap opens the quiet window first")
+        self.assertIn("peer reconnect cooldown", result.ready_reason)
         self.assertEqual(result.universe_generation, 1)
         self.assertEqual(result.policy_hash, cast(StrategyPolicy, self.accepted_policy).hash)
         self.assertIsNone(result.metadata_reconciliation)
         self.feed_quotes()
+        self.assertEqual(self.attempt_payloads(), [])
+        self.wait_out_cooldown()
+        self.feed_quotes(sequence=3)
         self.assertEqual(len(self.attempt_payloads()), 1)
         self.assertEqual(len(self.follower.entry_requests()), 1)
 
@@ -5486,6 +5535,9 @@ class PeerRebuildReconnectTests(PairCellTestCase):
         self.tick()
         self.assertIsNotNone(self.leader.cell.peer_remaining_allowance())
         self.feed_quotes()
+        self.assertEqual(self.attempt_payloads(), [], "no attempt inside the quiet window")
+        self.wait_out_cooldown()
+        self.feed_quotes(sequence=3)
         self.assertEqual(len(self.attempt_payloads()), 1)
         self.assertEqual(len(self.leader.entry_requests()), 1)
         self.assertEqual(len(self.follower.entry_requests()), 1)
@@ -5628,6 +5680,9 @@ class OneSidedReconnectTests(PairCellTestCase):
             self.assertIn(kind, follower_kinds, f"the follower did not re-publish {kind}")
         self.assertIsNotNone(self.leader.cell.peer_remaining_allowance())
         self.feed_quotes()
+        self.assertEqual(self.attempt_payloads(), [], "no attempt inside the quiet window")
+        self.wait_out_cooldown()
+        self.feed_quotes(sequence=3)
         self.assertEqual(len(self.attempt_payloads()), 1)
         self.assertEqual(len(self.follower.entry_requests()), 1)
 
@@ -5662,6 +5717,299 @@ class OneSidedReconnectTests(PairCellTestCase):
             [],
             "a repeated nonce re-seeds nothing at all",
         )
+
+
+class ReconnectCooldownTests(PairCellTestCase):
+    """A flap opens a quiet window; entries resume only after it exits.
+
+    Exit needs both a flap-free window (``post_reconnect_cooldown_seconds``,
+    sliding on every new trigger) and a peer handshake observed strictly
+    after the last trigger.
+    """
+
+    def test_flap_blocks_entry_until_quiet_window_with_fresh_handshake(self) -> None:
+        self.prime(shared={"post_reconnect_cooldown_seconds": 60.0})
+        self.peer_session(False)
+        self.peer_session(True)
+        self.tick()
+        self.feed_quotes()
+        self.assertEqual(self.attempt_payloads(), [], "no attempt inside the quiet window")
+        leader_events = [row["event"] for row in self.leader.cell.transition_history()]
+        self.assertIn("reconnect_cooldown_started", leader_events)
+        result = self.leader.cell.handle_event(ClockTickEvent(self.now))
+        self.assertFalse(result.ready)
+        self.assertIn("peer reconnect cooldown", result.ready_reason)
+        # Half the window with live handshake is still blocked.
+        self.tick(seconds=30)
+        self.feed_quotes(sequence=3)
+        self.assertEqual(self.attempt_payloads(), [])
+        # Past the window with post-flap proof, entry resumes on both sides.
+        self.tick(seconds=31)
+        self.feed_quotes(sequence=4)
+        self.assertEqual(len(self.attempt_payloads()), 1)
+        self.assertEqual(len(self.follower.entry_requests()), 1)
+        cleared = [row["event"] for row in self.leader.cell.transition_history()]
+        self.assertIn("reconnect_cooldown_cleared", cleared)
+
+    def test_repeated_flaps_slide_the_window(self) -> None:
+        self.prime(shared={"post_reconnect_cooldown_seconds": 60.0})
+        self.peer_session(False)
+        self.peer_session(True)
+        self.tick(seconds=50)
+        self.peer_session(False)
+        self.peer_session(True)
+        self.tick(seconds=50)
+        # 100s after the first flap but only 50s after the second: blocked.
+        self.feed_quotes()
+        self.assertEqual(self.attempt_payloads(), [])
+        self.tick(seconds=15)
+        self.feed_quotes(sequence=3)
+        self.assertEqual(len(self.attempt_payloads()), 1)
+
+    def test_follower_rejects_an_in_flight_attempt_inside_the_window(self) -> None:
+        self.prime(shared={"post_reconnect_cooldown_seconds": 60.0})
+        # Only the follower sees this outage. Hold its re-seed evidence so
+        # the leader still dispatches on its stale peer-ready snapshot while
+        # the follower refuses the in-flight attempt.
+        self.net.hold_kinds.add("reseed_request")
+        self.net.hold_kinds.add("readiness")
+        self.follower.cell.handle_event(PeerSessionEvent(connected=False, observed_at=self.now))
+        self.follower.cell.handle_event(PeerSessionEvent(connected=True, observed_at=self.now))
+        self.feed_quotes()
+        self.assertEqual(len(self.attempt_payloads()), 1, "the leader dispatched in flight")
+        self.assertEqual(
+            len(self.follower.entry_requests()), 0, "the follower admitted nothing"
+        )
+        rejected = [
+            row
+            for row in self.follower.cell.transition_history()
+            if row["event"] == "attempt_rejected"
+        ]
+        self.assertTrue(rejected, "the refusal is durable")
+        self.assertIn("peer reconnect cooldown", str(rejected[-1]["detail"]))
+        # Release the held evidence so both sides observe the flap, let the
+        # orphaned leader attempt time out, then resume after the window.
+        self.net.release_held()
+        self.net.hold_kinds.clear()
+        self.tick()
+        self.clock.advance(6.0)
+        self.tick()
+        self.wait_out_cooldown(seconds=61.0)
+        self.feed_quotes(sequence=3)
+        self.assertEqual(len(self.follower.entry_requests()), 1)
+
+    def test_cooldown_survives_a_restart(self) -> None:
+        self.prime()
+        self.peer_session(False)
+        self.peer_session(True)
+        # Reopen the same durable state without recovering: the in-memory
+        # window is gone, so only the persisted flap can still block entry.
+        self.leader.restart()
+        self.tick()
+        result = self.leader.cell.handle_event(ClockTickEvent(self.now))
+        self.assertFalse(result.ready)
+        self.assertIn("peer reconnect cooldown", result.ready_reason)
+        self.leader.cell.recover()
+        # Deliver the recovery re-seed before the time jump, so the peer's
+        # window starts at the recovery instead of after it.
+        self.tick()
+        self.wait_out_cooldown()
+        self.feed_quotes()
+        self.assertEqual(len(self.attempt_payloads()), 1)
+
+    def test_quiet_time_without_fresh_handshake_does_not_exit(self) -> None:
+        self.prime(shared={"post_reconnect_cooldown_seconds": 60.0})
+        # Hold (not drop) the handshake so nothing is lost, only delayed:
+        # time passes with no post-flap proof arriving.
+        for kind in (
+            "pairing_acceptance",
+            "policy",
+            "policy_ack",
+            "universe",
+            "sizing_plans",
+            "readiness",
+            "remaining_allowance",
+        ):
+            self.net.hold_kinds.add(kind)
+        self.peer_session(False)
+        self.peer_session(True)
+        self.tick(seconds=61)
+        result = self.leader.cell.handle_event(ClockTickEvent(self.now))
+        self.assertFalse(result.ready)
+        self.assertIn("awaiting fresh peer handshake", result.ready_reason)
+        # The delayed handshake arrives and releases entry on both sides.
+        self.net.release_held()
+        self.net.hold_kinds.clear()
+        self.tick()
+        self.feed_quotes()
+        self.assertEqual(len(self.attempt_payloads()), 1)
+
+    def test_zero_disables_the_gate(self) -> None:
+        self.prime(shared={"post_reconnect_cooldown_seconds": 0})
+        self.peer_session(False)
+        self.peer_session(True)
+        self.tick()
+        self.feed_quotes()
+        self.assertEqual(len(self.attempt_payloads()), 1)
+
+    def test_out_of_range_cooldown_values_fail_closed(self) -> None:
+        self.prime()
+        for bad in (-1.0, -0.5, 86400.0 + 1, float("nan"), float("inf")):
+            with self.subTest(value=bad):
+                with self.assertRaises(PairExecutionCellError):
+                    self.policy(**{"post_reconnect_cooldown_seconds": bad})
+        for good in (0, 0.5, 60.0, 300.0, 86400.0):
+            with self.subTest(value=good):
+                policy = self.policy(**{"post_reconnect_cooldown_seconds": good})
+                self.assertEqual(policy.post_reconnect_cooldown_seconds, float(good))
+
+
+class RetransmissionTests(PairCellTestCase):
+    """Lost relay is retried end-to-end; execution intents never are.
+
+    Queries and state sync (proof probes, reseed asks) retry on a monotonic
+    cadence while the session is up, pause while it is down, and reset on
+    every reconnect.  A dispatched attempt is never retried: its timeout
+    contains instead.
+    """
+
+    def _leader_probes(self) -> int:
+        return self.net.kinds(LEADER).count("leg_status_request")
+
+    def _reseed_asks(self) -> list[dict[str, object]]:
+        return self.net.payloads("reseed_request", LEADER)
+
+    def test_lost_attempt_recovers_via_probed_no_attempt_record(self) -> None:
+        self.prime()
+        # The attempt relay is lost exactly like 2026-09-18: the leader fills
+        # while the follower never sees a thing.
+        self.net.drop_kinds.add("attempt")
+        self.feed_quotes()
+        self.assertEqual(len(self.leader.entry_requests()), 1)
+        self.clock.advance(6.0)
+        self.leader.cell.handle_event(ClockTickEvent(self.now))
+        self.assertEqual(self.leader.mt5.positions, [])
+        # The empty leader probes; the follower answers no-attempt-record from
+        # durable facts; the leader finalizes instead of latching.
+        self.clock.advance(5.0)
+        self.tick()
+        self.clock.advance(5.0)
+        self.tick()
+        self.assertGreaterEqual(self._leader_probes(), 1)
+        result = self.leader.cell.handle_event(ClockTickEvent(self.now))
+        self.assertEqual(result.state, "EMPTY")
+        self.assertFalse(result.needs_human)
+        events = [row["event"] for row in self.leader.cell.transition_history()]
+        self.assertIn("both_empty_verified", events)
+        self.assertNotIn("close_needs_human", events)
+
+    def test_probes_continue_while_peer_traffic_flows(self) -> None:
+        self.prime()
+        self.net.drop_kinds.add("attempt")
+        self.net.drop_kinds.add("leg_status")
+        self.feed_quotes()
+        self.clock.advance(6.0)
+        self.leader.cell.handle_event(ClockTickEvent(self.now))
+        before = self._leader_probes()
+        # Answers are dropped but sizing/readiness keep flowing: the probe
+        # cadence must not be suppressed by steady traffic.
+        for _ in range(3):
+            self.clock.advance(5.0)
+            self.tick()
+        self.assertGreaterEqual(self._leader_probes() - before, 2)
+        # Once an answer gets through, the wait finalizes without a latch.
+        self.net.drop_kinds.discard("leg_status")
+        self.clock.advance(5.0)
+        self.tick()
+        events = [row["event"] for row in self.leader.cell.transition_history()]
+        self.assertIn("both_empty_verified", events)
+        self.assertNotIn("close_needs_human", events)
+
+    def test_probes_pause_while_down_and_fire_on_reconnect(self) -> None:
+        self.prime()
+        self.net.drop_kinds.add("attempt")
+        self.net.drop_kinds.add("leg_status")
+        self.feed_quotes()
+        self.clock.advance(6.0)
+        self.leader.cell.handle_event(ClockTickEvent(self.now))
+        self.clock.advance(5.0)
+        self.tick()
+        sent = self._leader_probes()
+        self.assertGreaterEqual(sent, 1)
+        # While the session is down nothing is sent, however long it lasts.
+        self.leader.cell.handle_event(PeerSessionEvent(connected=False, observed_at=self.now))
+        self.clock.advance(20.0)
+        self.tick()
+        self.tick()
+        self.assertEqual(self._leader_probes(), sent)
+        # Reconnect sends one probe at once instead of waiting out a cadence.
+        self.leader.cell.handle_event(PeerSessionEvent(connected=True, observed_at=self.now))
+        self.assertEqual(self._leader_probes(), sent + 1)
+        # The answer still finalizes the wait afterwards.
+        self.net.drop_kinds.discard("leg_status")
+        self.tick()
+        events = [row["event"] for row in self.leader.cell.transition_history()]
+        self.assertIn("both_empty_verified", events)
+
+    def test_reseed_ask_retries_same_nonce_to_budget_then_abandons(self) -> None:
+        self.prime()
+        # The allowance never arrives, so the need never clears.
+        self.net.drop_kinds.add("remaining_allowance")
+        self.leader.cell.handle_event(PeerSessionEvent(connected=False, observed_at=self.now))
+        self.leader.cell.handle_event(PeerSessionEvent(connected=True, observed_at=self.now))
+        self.tick()
+        self.assertEqual(len(self._reseed_asks()), 1)
+        nonce = self._reseed_asks()[0]["nonce"]
+        for _ in range(5):
+            self.clock.advance(10.0)
+            self.tick()
+        asks = self._reseed_asks()
+        self.assertEqual(len(asks), 6)
+        self.assertTrue(all(ask["nonce"] == nonce for ask in asks))
+        # Past the budget the ask is abandoned once, not retried forever.
+        self.clock.advance(10.0)
+        self.tick()
+        self.assertEqual(len(self._reseed_asks()), 6)
+        events = [row["event"] for row in self.leader.cell.transition_history()]
+        self.assertIn("reseed_ask_abandoned", events)
+
+    def test_reseed_ask_holds_while_down_and_resets_on_reconnect(self) -> None:
+        self.prime()
+        self.net.drop_kinds.add("remaining_allowance")
+        self.leader.cell.handle_event(PeerSessionEvent(connected=False, observed_at=self.now))
+        self.leader.cell.handle_event(PeerSessionEvent(connected=True, observed_at=self.now))
+        self.tick()
+        first = self._reseed_asks()
+        self.assertEqual(len(first), 1)
+        # Down time burns no budget.
+        self.leader.cell.handle_event(PeerSessionEvent(connected=False, observed_at=self.now))
+        self.clock.advance(30.0)
+        self.tick()
+        self.tick()
+        self.assertEqual(len(self._reseed_asks()), 1)
+        # Reconnect starts a fresh budget with a fresh nonce.
+        self.leader.cell.handle_event(PeerSessionEvent(connected=True, observed_at=self.now))
+        self.tick()
+        asks = self._reseed_asks()
+        self.assertEqual(len(asks), 2)
+        self.assertNotEqual(asks[0]["nonce"], asks[1]["nonce"])
+        for _ in range(5):
+            self.clock.advance(10.0)
+            self.tick()
+        self.assertEqual(len(self._reseed_asks()), 1 + 6)
+
+    def test_reseed_ask_clears_once_allowance_reseeded(self) -> None:
+        self.prime()
+        self.leader.cell.handle_event(PeerSessionEvent(connected=False, observed_at=self.now))
+        self.leader.cell.handle_event(PeerSessionEvent(connected=True, observed_at=self.now))
+        self.tick()
+        self.assertEqual(len(self._reseed_asks()), 1)
+        # The peer's republication arrives; no further asks are needed.
+        self.tick()
+        self.tick()
+        self.clock.advance(30.0)
+        self.tick()
+        self.assertEqual(len(self._reseed_asks()), 1)
 
 
 class RediscoveryDeliveryTests(PairCellTestCase):

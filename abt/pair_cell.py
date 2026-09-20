@@ -147,6 +147,12 @@ FULL_TRADING_MODE = 4
 # silence.
 _PEER_PROOF_PROBE_MULTIPLIER = 1.0
 _PEER_PROOF_ESCALATION_MULTIPLIER = 6.0
+# Bounded re-seed asks: same nonce retried while the peer's allowance is
+# missing or stale, paused while the session is down, budget reset on every
+# reconnect or peer rebuild.  The nonce dedup on the answering side makes
+# retries idempotent; exhaustion just stops asking (admission stays blocked).
+_RESEED_ASK_RETRY_SECONDS = 10.0
+_RESEED_ASK_MAX_RETRIES = 6
 # Statuses that are durable proof the peer created no broker exposure.
 _PEER_NON_SEND_STATUSES = ("rejected", "expired_not_started", "no_attempt_record")
 _PEER_TERMINAL_STATUSES = _PEER_NON_SEND_STATUSES + ("empty",)
@@ -614,6 +620,12 @@ _ADMISSION_STATS_RETENTION_SECONDS = 7 * 24 * 3600
 _ADMISSION_STATS_PERSIST_SECONDS = 60.0
 _TAPE_FLUSH_SECONDS = 1.0
 DEFAULT_FOLLOWER_CONFIRMATION_TIMEOUT_SECONDS = 5.0
+#: Quiet window after any relay/rebuild instability before either side may
+#: enter a new pair: the flap-free time plus a fresh peer handshake that must
+#: both hold before entries resume.  Zero disables the gate.
+DEFAULT_POST_RECONNECT_COOLDOWN_SECONDS = 300.0
+#: Upper bound for the post-reconnect quiet window (fail-closed operator range).
+_MAX_POST_RECONNECT_COOLDOWN_SECONDS = 24 * 3600.0
 DEFAULT_TRADING_BLACKOUT_START_NY = "16:30"
 DEFAULT_TRADING_BLACKOUT_END_NY = "18:30"
 DEFAULT_MAXIMUM_HOLDING_SECONDS: float | None = None
@@ -638,6 +650,7 @@ SHARED_POLICY_KEYS = (
     "quote_max_skew_seconds",
     "trend_quote_max_age_seconds",
     "follower_confirmation_timeout_seconds",
+    "post_reconnect_cooldown_seconds",
     "sizing_refresh_seconds",
     "relay_handling_timeout_seconds",
     "trading_blackout_start_ny",
@@ -684,6 +697,7 @@ def default_shared_policy_values() -> dict[str, object]:
         "quote_max_skew_seconds": DEFAULT_QUOTE_MAX_SKEW_SECONDS,
         "trend_quote_max_age_seconds": DEFAULT_TREND_QUOTE_MAX_AGE_SECONDS,
         "follower_confirmation_timeout_seconds": DEFAULT_FOLLOWER_CONFIRMATION_TIMEOUT_SECONDS,
+        "post_reconnect_cooldown_seconds": DEFAULT_POST_RECONNECT_COOLDOWN_SECONDS,
         "sizing_refresh_seconds": _SIZING_REFRESH_SECONDS,
         "relay_handling_timeout_seconds": RELAY_HANDLING_WINDOW_SECONDS,
         "trading_blackout_start_ny": DEFAULT_TRADING_BLACKOUT_START_NY,
@@ -956,6 +970,7 @@ class StrategyPolicy:
     follower_risk: WorkerRiskLimits
     trend_quote_max_age_seconds: float = DEFAULT_TREND_QUOTE_MAX_AGE_SECONDS
     follower_confirmation_timeout_seconds: float = DEFAULT_FOLLOWER_CONFIRMATION_TIMEOUT_SECONDS
+    post_reconnect_cooldown_seconds: float = DEFAULT_POST_RECONNECT_COOLDOWN_SECONDS
     sizing_refresh_seconds: float = _SIZING_REFRESH_SECONDS
     relay_handling_timeout_seconds: float = RELAY_HANDLING_WINDOW_SECONDS
     maximum_holding_seconds: float | None = None
@@ -1035,6 +1050,18 @@ class StrategyPolicy:
                 or value <= 0
             ):
                 raise PairExecutionCellError(f"{name} must be a positive number.")
+        cooldown = self.post_reconnect_cooldown_seconds
+        if (
+            not isinstance(cooldown, (int, float))
+            or isinstance(cooldown, bool)
+            or not math.isfinite(cooldown)
+            or cooldown < 0
+            or cooldown > _MAX_POST_RECONNECT_COOLDOWN_SECONDS
+        ):
+            raise PairExecutionCellError(
+                "post_reconnect_cooldown_seconds must be a finite number of seconds"
+                f" in [0, {_MAX_POST_RECONNECT_COOLDOWN_SECONDS:.0f}] (0 disables the gate)."
+            )
         for name in ("leader_risk", "follower_risk"):
             if not isinstance(getattr(self, name), WorkerRiskLimits):
                 raise PairExecutionCellError(f"{name} must be a WorkerRiskLimits.")
@@ -1089,6 +1116,7 @@ class StrategyPolicy:
             "quote_max_skew_seconds": self.quote_max_skew_seconds,
             "trend_quote_max_age_seconds": self.trend_quote_max_age_seconds,
             "follower_confirmation_timeout_seconds": self.follower_confirmation_timeout_seconds,
+            "post_reconnect_cooldown_seconds": self.post_reconnect_cooldown_seconds,
             "sizing_refresh_seconds": self.sizing_refresh_seconds,
             "relay_handling_timeout_seconds": self.relay_handling_timeout_seconds,
             "maximum_holding_seconds": self.maximum_holding_seconds,
@@ -1156,6 +1184,15 @@ def _policy_from_canonical(value: Mapping[str, object]) -> StrategyPolicy:
         follower_risk=_risk_from_canonical(cast(Mapping[str, object], value["follower_risk"])),
         follower_confirmation_timeout_seconds=float(
             cast(float, value["follower_confirmation_timeout_seconds"])
+        ),
+        post_reconnect_cooldown_seconds=float(
+            cast(
+                float,
+                value.get(
+                    "post_reconnect_cooldown_seconds",
+                    DEFAULT_POST_RECONNECT_COOLDOWN_SECONDS,
+                ),
+            )
         ),
         sizing_refresh_seconds=float(
             cast(float, value.get("sizing_refresh_seconds", _SIZING_REFRESH_SECONDS))
@@ -1227,6 +1264,9 @@ def canonical_policy_from_acceptance(
         follower_risk=_risk_with_unified_budget(acceptance.risk_limits(), unified_budget),
         follower_confirmation_timeout_seconds=float(
             cast(float, values["follower_confirmation_timeout_seconds"])
+        ),
+        post_reconnect_cooldown_seconds=float(
+            cast(float, values["post_reconnect_cooldown_seconds"])
         ),
         sizing_refresh_seconds=float(cast(float, values["sizing_refresh_seconds"])),
         relay_handling_timeout_seconds=float(cast(float, values["relay_handling_timeout_seconds"])),
@@ -2771,6 +2811,8 @@ class PairExecutionCell:
         self._peer_publisher_epoch = 0
         self._reseed_requested = False
         self._reseed_ask_nonce: str | None = None
+        self._reseed_ask_last_sent: float | None = None
+        self._reseed_ask_retries = 0
         self._served_reseed_nonces: list[str] = []
         self._foreign_route_attempt: str | None = None
         self._local_acceptance: PairingAcceptance | None = None
@@ -2838,6 +2880,15 @@ class PairExecutionCell:
         self._peer_session = True
         self._peer_ready = False
         self._peer_ready_reason = "no peer readiness observed yet"
+        # Post-reconnect entry cooldown: wall-clock instant of the last
+        # relay/rebuild instability plus the last peer handshake observed
+        # strictly after it.  Both survive restarts via
+        # ``cell_reconnect_cooldown``; exit needs a flap-free quiet window
+        # (policy ``post_reconnect_cooldown_seconds``) *and* fresh peer
+        # proof, so a still-flapping link cannot time its way back in.
+        self._cooldown_flap_at: datetime | None = None
+        self._cooldown_proof_at: datetime | None = None
+        self._cooldown_cleared_logged = True
         self._attempt: Attempt | None = None
         self._leg: LegState | None = None
         self._peer_leg = PeerLegView()
@@ -3017,6 +3068,12 @@ class PairExecutionCell:
                 detail TEXT,
                 at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS cell_reconnect_cooldown (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                flap_at TEXT NOT NULL,
+                proof_at TEXT,
+                updated_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS cell_market_tape_1s (
                 product_id TEXT NOT NULL,
                 source TEXT NOT NULL,
@@ -3134,6 +3191,17 @@ class PairExecutionCell:
             # never has to re-request the policy to know what it agreed to.
             self._policy = _policy_from_canonical(json.loads(policy_row[0]))
             self._policy_accepted = True
+        cooldown_row = self._db.execute(
+            "SELECT flap_at, proof_at FROM cell_reconnect_cooldown WHERE id = 1"
+        ).fetchone()
+        if cooldown_row is not None:
+            # A restart must not bypass a quiet window in progress: the flap
+            # instant is wall-clock, so the remaining window is exact.
+            self._cooldown_flap_at = _parse_utc(cooldown_row[0])
+            self._cooldown_proof_at = (
+                None if cooldown_row[1] is None else _parse_utc(cooldown_row[1])
+            )
+            self._cooldown_cleared_logged = False
         self._load_persisted_plans()
         self._isolate_foreign_route_attempt()
         attempt_row = self._db.execute(
@@ -3359,6 +3427,12 @@ class PairExecutionCell:
             self._peer_allowance = None
         if previous:
             self._transition("peer_publisher_epoch_advanced", f"{previous} -> {epoch}")
+            # A greater epoch means the peer was rebuilt behind this link.
+            self._note_cooldown_trigger(f"peer publisher epoch {previous} -> {epoch}")
+            # A rebuilt peer serves asks with an empty nonce memory: any
+            # outstanding ask gets a fresh retry budget for the new session.
+            self._reseed_ask_retries = 0
+            self._reseed_ask_last_sent = None
         self._request_reseed(f"peer publisher epoch {epoch}")
 
     def _request_reseed(self, reason: str, *, ask_peer: bool = False) -> None:
@@ -3378,6 +3452,10 @@ class PairExecutionCell:
         self._published_allowance = None
         if ask_peer:
             self._reseed_ask_nonce = str(uuid4())
+            # A new ask starts a fresh retry budget; a rebuilt peer serves it
+            # even if an older nonce with the same intent was lost.
+            self._reseed_ask_retries = 0
+            self._reseed_ask_last_sent = None
         self._transition("republish_peer_state", reason)
 
     def _accept_reseed_request(self, payload: Mapping[str, object]) -> None:
@@ -3389,6 +3467,9 @@ class PairExecutionCell:
         self._served_reseed_nonces.append(nonce)
         del self._served_reseed_nonces[:-64]
         self._request_reseed(f"the peer asked for a re-seed: {payload.get('reason') or nonce}")
+        # The peer observed a relay transition this Worker did not see, so the
+        # link state is uncertain on at least one side: cool down as well.
+        self._note_cooldown_trigger("the peer asked for a re-seed")
 
     def _republish_peer_state(self) -> None:
         """Resend the state a peer cannot derive locally.  Idempotent.
@@ -3410,6 +3491,99 @@ class PairExecutionCell:
                     "pairing_acceptance", {"acceptance": self._local_acceptance.canonical()}
                 )
             )
+
+    # -- post-reconnect entry cooldown ---------------------------------- #
+
+    #: Peer relay kinds that prove a live, post-flap handshake.  A
+    #: ``reseed_request`` is deliberately absent: receiving one means the peer
+    #: observed instability itself, so it re-triggers the window instead (see
+    #: :meth:`_accept_reseed_request`).
+    _COOLDOWN_PROOF_RELAY_KINDS = frozenset(
+        {
+            "pairing_acceptance",
+            "policy",
+            "policy_ack",
+            "universe",
+            "sizing_plans",
+            "readiness",
+            "remaining_allowance",
+        }
+    )
+
+    def _cooldown_seconds(self) -> float:
+        policy = self._policy
+        if policy is None:
+            return DEFAULT_POST_RECONNECT_COOLDOWN_SECONDS
+        return policy.post_reconnect_cooldown_seconds
+
+    def _persist_cooldown(self) -> None:
+        self._db.execute(
+            "INSERT INTO cell_reconnect_cooldown (id, flap_at, proof_at, updated_at)"
+            " VALUES (1, ?, ?, ?)"
+            " ON CONFLICT(id) DO UPDATE SET flap_at = excluded.flap_at,"
+            " proof_at = excluded.proof_at, updated_at = excluded.updated_at",
+            (
+                None if self._cooldown_flap_at is None else _iso(self._cooldown_flap_at),
+                None if self._cooldown_proof_at is None else _iso(self._cooldown_proof_at),
+                _iso(self._now),
+            ),
+        )
+        self._db.commit()
+
+    def _note_cooldown_trigger(self, reason: str) -> None:
+        """Open (or slide) the quiet window: every instability restarts it."""
+
+        self._cooldown_flap_at = self._now
+        self._cooldown_proof_at = None
+        self._cooldown_cleared_logged = False
+        self._persist_cooldown()
+        self._transition("reconnect_cooldown_started", reason)
+
+    def _note_cooldown_proof(self) -> None:
+        if self._cooldown_flap_at is None:
+            return
+        first = self._cooldown_proof_at is None
+        self._cooldown_proof_at = self._now
+        if first:
+            # One durable write per episode; the in-memory instant keeps
+            # tracking the latest proof until the window exits.
+            self._persist_cooldown()
+
+    def _reconnect_cooldown_reason(self) -> str | None:
+        """Block reason while the post-reconnect quiet window has not exited.
+
+        Exit needs both a flap-free window (``post_reconnect_cooldown_seconds``,
+        sliding on every new trigger) and a peer handshake observed strictly
+        after the last trigger.  Strings are episode-static (no countdown) so
+        the change-only state diagnostic does not tick every pump.
+        """
+
+        flap_at = self._cooldown_flap_at
+        if flap_at is None:
+            return None
+        seconds = self._cooldown_seconds()
+        if seconds <= 0:
+            return None
+        until = flap_at + timedelta(seconds=seconds)
+        if self._now < until:
+            return f"peer reconnect cooldown until {_iso(until)}"
+        proof_at = self._cooldown_proof_at
+        if proof_at is None or proof_at <= flap_at:
+            return "peer reconnect cooldown awaiting fresh peer handshake"
+        return None
+
+    def _maybe_clear_reconnect_cooldown(self) -> None:
+        if (
+            self._cooldown_flap_at is None
+            or self._cooldown_cleared_logged
+            or self._reconnect_cooldown_reason() is not None
+        ):
+            return
+        self._cooldown_cleared_logged = True
+        self._transition(
+            "reconnect_cooldown_cleared",
+            f"quiet {self._cooldown_seconds():.0f}s with fresh peer handshake",
+        )
 
     def _persist_route(self) -> None:
         payload = dict(self._route.canonical())
@@ -3724,6 +3898,9 @@ class PairExecutionCell:
                 self._begin_close("unresolved_attempt_after_restart")
         self._transition("recovered", self._state)
         self._recovering = False
+        # A restart is instability by definition: entries wait for a fresh,
+        # flap-free handshake even if the relay never reported an outage.
+        self._note_cooldown_trigger("local Worker recovered")
         self._recover_terminal_proof_stop()
         self._recover_terminalized_containment_stop()
         # A running peer may have published an unchanged readiness snapshot
@@ -4631,10 +4808,15 @@ class PairExecutionCell:
                 # its last published allowance stops being usable evidence.
                 self._peer_allowance = None
                 self._transition("peer_session_lost")
+                self._note_cooldown_trigger("authenticated peer session lost")
             elif not connected_before:
                 # The peer may have been rebuilt while it was gone, and may not
                 # have observed this transition at all; ask it to re-seed.
                 self._request_reseed("peer session reconnected", ask_peer=True)
+                self._note_cooldown_trigger("peer session reconnected")
+                # A proof wait interrupted by the outage resumes at once
+                # instead of waiting out a full probe interval.
+                self._probe_peer_terminal_proof_now()
         elif isinstance(event, RealizedPnLEvent):
             self._record_realized_pnl(event)
         elif isinstance(event, BrokerSnapshotEvent):
@@ -5148,6 +5330,12 @@ class PairExecutionCell:
             return False, "the New York daily realized-loss allowance is exhausted"
         if self._attempt is not None and self._state not in ("EMPTY", "IDLE"):
             return False, "an attempt is unresolved"
+        # Last blanket gate: every durable safety reason above keeps its
+        # precedence, so a fully-ready cell only waits out recent
+        # relay/rebuild instability here.
+        cooldown = self._reconnect_cooldown_reason()
+        if cooldown is not None:
+            return False, cooldown
         return True, "ready"
 
     def _broker_verified_empty(self) -> bool:
@@ -5532,18 +5720,66 @@ class PairExecutionCell:
             )
         )
 
+    def _reseed_ask_still_needed(self) -> bool:
+        """Whether the peer's remaining-loss allowance is missing or stale.
+
+        The allowance reseed is the sharp, admission-blocking need behind a
+        reseed ask; the rest of the republication rides along with it.
+        """
+
+        allowance = self._peer_allowance
+        return allowance is None or allowance.publisher_epoch < self._peer_publisher_epoch
+
+    def _maybe_send_reseed_ask(self) -> None:
+        """Send (or retry) the outstanding reseed ask, at most once per call.
+
+        The same nonce is reused so the answering side's dedup keeps retries
+        idempotent.  Nothing is sent while the session is down (reconnect
+        resets the budget instead of burning it), and the ask is dropped as
+        soon as the allowance is reseeded.  Past the retry budget the ask is
+        abandoned with one audit event; admission stays blocked regardless.
+        """
+
+        if self._reseed_ask_nonce is None:
+            return
+        if not self._peer_session:
+            return
+        if not self._reseed_ask_still_needed():
+            self._reseed_ask_nonce = None
+            self._reseed_ask_retries = 0
+            self._reseed_ask_last_sent = None
+            return
+        now = self._monotonic()
+        if self._reseed_ask_last_sent is not None and (
+            now - self._reseed_ask_last_sent < _RESEED_ASK_RETRY_SECONDS
+        ):
+            return
+        if self._reseed_ask_retries >= _RESEED_ASK_MAX_RETRIES:
+            self._reseed_ask_nonce = None
+            self._reseed_ask_retries = 0
+            self._reseed_ask_last_sent = None
+            self._transition(
+                "reseed_ask_abandoned",
+                f"{_RESEED_ASK_MAX_RETRIES} unanswered asks",
+            )
+            return
+        self._relay.send(
+            self._envelope(
+                "reseed_request",
+                {
+                    "nonce": self._reseed_ask_nonce,
+                    "reason": "this Worker observed a relay transition",
+                },
+            )
+        )
+        self._reseed_ask_last_sent = now
+        self._reseed_ask_retries += 1
+
     def _maybe_publish_state(self) -> None:
         if self._reseed_requested:
             self._reseed_requested = False
             self._republish_peer_state()
-        if self._reseed_ask_nonce is not None:
-            nonce, self._reseed_ask_nonce = self._reseed_ask_nonce, None
-            self._relay.send(
-                self._envelope(
-                    "reseed_request",
-                    {"nonce": nonce, "reason": "this Worker observed a relay transition"},
-                )
-            )
+        self._maybe_send_reseed_ask()
         self._publish_catalog_summary()
         self._publish_remaining_allowance()
         if self._plan_set_version != self._last_published_plan_version:
@@ -5707,6 +5943,10 @@ class PairExecutionCell:
             return
         if envelope.get("to_worker_id") != self._worker_id:
             return
+        if envelope.get("kind") in self._COOLDOWN_PROOF_RELAY_KINDS:
+            # A live peer handshake observed after the last flap; the quiet
+            # window still has to elapse before entries resume.
+            self._note_cooldown_proof()
         # Any authenticated peer envelope on this route proves the peer is
         # alive and managing its side -- including while it intentionally
         # withholds terminal proof (e.g. a solo-running leader that keeps its
@@ -5868,6 +6108,7 @@ class PairExecutionCell:
             self._maybe_publish_state()
             self._maybe_flush_tape()
             return
+        self._maybe_clear_reconnect_cooldown()
         if self._role == "follower":
             self._maybe_install_pending_universe()
         self._update_daily_loss_warning()
@@ -8305,10 +8546,12 @@ class PairExecutionCell:
     def _await_peer_terminal_proof(self) -> None:
         """Probe while waiting; escalate only on genuine peer silence.
 
-        Never infers a peer ``EMPTY``: while authenticated peer envelopes keep
-        arriving (reset by :meth:`_accept_relay_envelope`) this only probes.
-        Escalation fires after the bounded window with no peer evidence at
-        all.
+        The two clocks are decoupled on purpose: every authenticated peer
+        envelope restarts the bounded escalation window (never infer a dead
+        peer while it keeps talking), but the probe cadence runs on its own
+        clock so steady traffic can never suppress probing.  Probes are only
+        *sent* while the session is up; the escalation window keeps running
+        while down so a permanently dead peer still escalates.
         """
 
         attempt, leg = self._attempt, self._leg
@@ -8327,7 +8570,11 @@ class PairExecutionCell:
         timeout = attempt.confirmation_timeout_seconds
         if self._peer_proof_wait_started is None:
             self._peer_proof_wait_started = now
-            self._peer_proof_last_probe = now
+            if self._peer_proof_last_probe is None:
+                # First cycle only: afterwards the probe cadence is
+                # independent, so a reconnected peer's steady traffic
+                # restarts escalation but never silences probing.
+                self._peer_proof_last_probe = now
             return
         if now - self._peer_proof_wait_started >= timeout * _PEER_PROOF_ESCALATION_MULTIPLIER:
             self._set_needs_human(
@@ -8336,15 +8583,48 @@ class PairExecutionCell:
             )
             return
         if self._peer_proof_last_probe is None or now - self._peer_proof_last_probe >= timeout * _PEER_PROOF_PROBE_MULTIPLIER:
-            self._peer_proof_last_probe = now
-            self._peer_proof_probes_sent += 1
-            self._report_leg_status(
-                "empty", reason=self._empty_leg_status_reason(attempt.attempt_id)
-            )
-            self._relay.send(
-                self._envelope("leg_status_request", {"attempt_id": attempt.attempt_id})
-            )
-            self._transition("peer_terminal_proof_probe", attempt.attempt_id)
+            if not self._peer_session:
+                # Requests cannot arrive while the session is down; hold the
+                # probe for the reconnect instead of burning sends, and let
+                # the escalation window above keep running.
+                return
+            self._send_proof_probe(attempt)
+
+    def _send_proof_probe(self, attempt: Attempt) -> None:
+        """Emit one terminal-proof probe for an empty local leg."""
+
+        self._peer_proof_last_probe = self._monotonic()
+        self._peer_proof_probes_sent += 1
+        self._report_leg_status(
+            "empty", reason=self._empty_leg_status_reason(attempt.attempt_id)
+        )
+        self._relay.send(
+            self._envelope("leg_status_request", {"attempt_id": attempt.attempt_id})
+        )
+        self._transition("peer_terminal_proof_probe", attempt.attempt_id)
+
+    def _probe_peer_terminal_proof_now(self) -> None:
+        """Send one probe immediately, e.g. on peer session reconnect.
+
+        Uses the cadence path's preconditions so a reconnect never probes a
+        settled attempt or under an unrelated stop; the steady cadence then
+        continues from this send.
+        """
+
+        attempt, leg = self._attempt, self._leg
+        if attempt is None or leg is None or not leg.empty_verified:
+            return
+        if not self._peer_send_possible() or self._peer_leg.status in _PEER_TERMINAL_STATUSES:
+            return
+        if (
+            self._needs_human is not None
+            and self._needs_human != self._peer_terminal_proof_stop_reason(attempt.attempt_id)
+        ):
+            return
+        if not self._peer_session:
+            return
+        self._peer_proof_wait_started = None
+        self._send_proof_probe(attempt)
 
     def _handle_leg_status_request(self, payload: Mapping[str, object]) -> None:
         """Answer an explicit peer probe from durable local facts only."""

@@ -223,6 +223,7 @@ ROUTE_SCOPED_TABLES = (
     "cell_product_suspend",
     "cell_discovery_excluded",
     "cell_operator_stop",
+    "cell_reconnect_cooldown",
 )
 #: Attempt evidence, cleared **as one set** and only once every attempt is
 #: provably terminal.  ``cell_desired_state`` and ``cell_active_state`` belong

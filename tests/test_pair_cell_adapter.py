@@ -1818,8 +1818,13 @@ class PairingTestCase(unittest.TestCase):
         # Lifecycle tests exercise the live execution path; pass
         # ``default_pair_cell_config()`` explicitly for the synthesized
         # (shadow) production default, covered by ModeAuthorityTests.
+        # The post-reconnect quiet window is shortened for the virtual clock
+        # (0.05s per pump round): it still gates entries after every
+        # rebuild/reconnect, but exits inside ordinary pump budgets.
         if leader_config is None:
-            leader_config = parse_pair_cell_config({"mode": "live"})
+            leader_config = parse_pair_cell_config(
+                {"mode": "live", "post_reconnect_cooldown_seconds": 5.0}
+            )
         follower = self.worker(
             FOLLOWER,
             bid=1.10100,
@@ -2484,7 +2489,12 @@ class SafeUnpairTests(PairingTestCase):
         """A paired, entry-ready pair whose edge threshold admits nothing."""
 
         leader, follower = self.paired(
-            leader_config=parse_pair_cell_config({"edge_min_net_points": "100000"}),
+            leader_config=parse_pair_cell_config(
+                {
+                    "edge_min_net_points": "100000",
+                    "post_reconnect_cooldown_seconds": 5.0,
+                }
+            ),
             polling_config=polling_config,
         )
         self.assertTrue(

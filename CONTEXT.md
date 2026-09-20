@@ -135,6 +135,10 @@ _Avoid_: 配對的逐腿獨立操作
 **失聯安全平倉**:
 一個帳戶工作者無法經主控台 relay 與配對對側保持有效通訊超過心跳寬限時間後，停止新進場並依本機 broker observation 進入帳戶復原生命週期。已受 broker SL/TP 保護的曝險不因短暫失聯盲目重送或修改，重連後必須重新觀測。
 
+**重連後冷靜（Post-Reconnect Cooldown）**:
+任一側觀測到 relay/重建不穩定（對側 session 遺失或重連、對側 publisher epoch 推進、收到對側 re-seed 請求、本機重啟恢復）即開啟冷靜窗口並持久化；每次新的不穩定滑動延長窗口。退出需同時滿足無中斷靜默達 shared 政策 `post_reconnect_cooldown_seconds`（預設 300 秒，0 停用）與在最後一次觸發之後觀測到對側 handshake（pairing_acceptance／policy／universe／sizing／readiness／allowance）。窗口內雙方皆不建立新進場（leader 不建嘗試、follower 拒收嘗試並回報拒絕），只發布未就緒；平倉與收斂路徑不受影響。
+_Avoid_: 重連後立即進場、只計時不驗 handshake、重啟繞過冷靜
+
 **撤銷安全平倉**:
 撤銷工作者裝置憑證是緊急安全事件；工作者收到撤銷或無法再建立有效工作階段後，依本機帳戶復原生命週期停止新進場並處理未受保護曝險。主控台只執行身分撤銷與通知，不選擇 broker 操作。
 
@@ -203,11 +207,11 @@ _Avoid_: 最大 raw price edge
 _Avoid_: 暫時沒有報價、報價過期
 
 **策略政策雜湊（Canonical Policy Hash）**:
-leader 持有並發布之唯一 canonical 策略與風控政策版本雜湊，涵蓋執行模式、雙方各自的 strategy budget 與逐商品量規劃依據、雙方各自的紐約已實現虧損預算、edge 淨利差下限（`edge_min_net_points`）、報價新鮮度與 skew 上限、趨勢模式寬限報價年齡（`trend_quote_max_age_seconds`）、follower 確認逾時秒數與生命週期退出政策；它不預先選定單一商品或方向，也不列舉商品篩選清單。政策撰寫權責分明：shared 政策（`mode`、`edge_min_net_points`、`quote_max_age_seconds`、`quote_max_skew_seconds`、`follower_confirmation_timeout_seconds`、`trading_blackout_start_ny`、`trading_blackout_end_ny`、`maximum_holding_seconds`）由 leader 獨自撰寫；`leader_risk` 由 leader 為自身撰寫；`follower_risk` 與 follower 的凍結啟動餘額只來自配對接受載荷並由 leader 逐字複製。紐約週一至週五的半開區間 `[trading_blackout_start_ny, trading_blackout_end_ny)` 禁止進場並使既有配對由兩個 Worker 各自進入 desired-`EMPTY`，紐約週六與週日全天禁止交易；holiday 暫由操作員處理。未提供設定檔時政策由執行期以預設值合成，其中每台工作者的 strategy budget 預設為其啟動時的 broker 帳戶**餘額**（必須為 USD 帳戶且餘額為正，否則失效關閉）並凍結於該次配對。follower 先逐位元組驗證自身區塊與所送內容相同，再只在自身帳戶已 broker 驗證空倉時依雜湊持久接受該政策。雙方必須持久保存**完整 canonical 政策內容**，而非僅保存雜湊；雜湊只是對雙方各自已持有內容的完整性檢查，重啟後不需重新索取政策即可驗證嘗試。政策內容變更需要新雜湊及兩台帳戶工作者的 broker 驗證空倉事實，主控台全程不解讀政策內容。
+leader 持有並發布之唯一 canonical 策略與風控政策版本雜湊，涵蓋執行模式、雙方各自的 strategy budget 與逐商品量規劃依據、雙方各自的紐約已實現虧損預算、edge 淨利差下限（`edge_min_net_points`）、報價新鮮度與 skew 上限、趨勢模式寬限報價年齡（`trend_quote_max_age_seconds`）、follower 確認逾時秒數、重連後冷靜秒數與生命週期退出政策；它不預先選定單一商品或方向，也不列舉商品篩選清單。政策撰寫權責分明：shared 政策（`mode`、`edge_min_net_points`、`quote_max_age_seconds`、`quote_max_skew_seconds`、`follower_confirmation_timeout_seconds`、`post_reconnect_cooldown_seconds`、`trading_blackout_start_ny`、`trading_blackout_end_ny`、`maximum_holding_seconds`）由 leader 獨自撰寫；`leader_risk` 由 leader 為自身撰寫；`follower_risk` 與 follower 的凍結啟動餘額只來自配對接受載荷並由 leader 逐字複製。紐約週一至週五的半開區間 `[trading_blackout_start_ny, trading_blackout_end_ny)` 禁止進場並使既有配對由兩個 Worker 各自進入 desired-`EMPTY`，紐約週六與週日全天禁止交易；holiday 暫由操作員處理。未提供設定檔時政策由執行期以預設值合成，其中每台工作者的 strategy budget 預設為其啟動時的 broker 帳戶**餘額**（必須為 USD 帳戶且餘額為正，否則失效關閉）並凍結於該次配對。follower 先逐位元組驗證自身區塊與所送內容相同，再只在自身帳戶已 broker 驗證空倉時依雜湊持久接受該政策。雙方必須持久保存**完整 canonical 政策內容**，而非僅保存雜湊；雜湊只是對雙方各自已持有內容的完整性檢查，重啟後不需重新索取政策即可驗證嘗試。政策內容變更需要新雜湊及兩台帳戶工作者的 broker 驗證空倉事實，主控台全程不解讀政策內容。
 _Avoid_: 配對合約、配對租約、商品白名單、只保存政策雜湊
 
 **配對設定檔權責（Role-Specific Configuration Authority）**:
-配對執行單元不要求設定檔，缺少設定檔即由執行期合成預設值並可運作。若提供設定檔，其權限依該工作者實際取得的角色而定：follower 設定檔只能設定自身四項風險參數（`maximum_margin_fraction`、`daily_loss_fraction`、`trade_loss_fraction`、`maximum_loss_per_trade_usd`）與自身 `allow_live` 安全開關，不得設定 `edge_min_net_points`、`quote_max_age_seconds`、`quote_max_skew_seconds`、`follower_confirmation_timeout_seconds`、`trading_blackout_start_ny`、`trading_blackout_end_ny`、`maximum_holding_seconds` 或 `mode`；leader 設定檔可設定 shared 政策與自身風險，但永遠不得設定 follower 的風險參數或預算。任何設定檔都不得含路由、`route_id`、`trader_id`、`built_products` 或 `eligible_products`。上述違反皆為啟動設定錯誤而非靜默忽略；取得的角色與設定檔權限不符時失效關閉，不得部分套用。
+配對執行單元不要求設定檔，缺少設定檔即由執行期合成預設值並可運作。若提供設定檔，其權限依該工作者實際取得的角色而定：follower 設定檔只能設定自身四項風險參數（`maximum_margin_fraction`、`daily_loss_fraction`、`trade_loss_fraction`、`maximum_loss_per_trade_usd`）與自身 `allow_live` 安全開關，不得設定 `edge_min_net_points`、`quote_max_age_seconds`、`quote_max_skew_seconds`、`follower_confirmation_timeout_seconds`、`post_reconnect_cooldown_seconds`、`trading_blackout_start_ny`、`trading_blackout_end_ny`、`maximum_holding_seconds` 或 `mode`；leader 設定檔可設定 shared 政策與自身風險，但永遠不得設定 follower 的風險參數或預算。任何設定檔都不得含路由、`route_id`、`trader_id`、`built_products` 或 `eligible_products`。上述違反皆為啟動設定錯誤而非靜默忽略；取得的角色與設定檔權限不符時失效關閉，不得部分套用。
 _Avoid_: 設定檔一律可覆寫任意 tunable、follower 覆寫共享政策
 
 **執行模式權責與 allow_live**:
