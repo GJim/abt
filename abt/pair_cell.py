@@ -153,6 +153,9 @@ _PEER_PROOF_ESCALATION_MULTIPLIER = 6.0
 # retries idempotent; exhaustion just stops asking (admission stays blocked).
 _RESEED_ASK_RETRY_SECONDS = 10.0
 _RESEED_ASK_MAX_RETRIES = 6
+# Stale-peer policy re-push cadence: the mismatch condition itself bounds the
+# loop (it stops once aligned), so no retry budget is needed, only spacing.
+_POLICY_RESEND_SECONDS = 30.0
 # Statuses that are durable proof the peer created no broker exposure.
 _PEER_NON_SEND_STATUSES = ("rejected", "expired_not_started", "no_attempt_record")
 _PEER_TERMINAL_STATUSES = _PEER_NON_SEND_STATUSES + ("empty",)
@@ -2813,6 +2816,8 @@ class PairExecutionCell:
         self._reseed_ask_nonce: str | None = None
         self._reseed_ask_last_sent: float | None = None
         self._reseed_ask_retries = 0
+        self._policy_resend_last_sent: float | None = None
+        self._policy_resend_last_peer_hash: str | None = None
         self._served_reseed_nonces: list[str] = []
         self._foreign_route_attempt: str | None = None
         self._local_acceptance: PairingAcceptance | None = None
@@ -5739,7 +5744,6 @@ class PairExecutionCell:
         soon as the allowance is reseeded.  Past the retry budget the ask is
         abandoned with one audit event; admission stays blocked regardless.
         """
-
         if self._reseed_ask_nonce is None:
             return
         if not self._peer_session:
@@ -5775,11 +5779,47 @@ class PairExecutionCell:
         self._reseed_ask_last_sent = now
         self._reseed_ask_retries += 1
 
+    def _maybe_resend_policy(self) -> None:
+        """Re-push the current policy while the peer reports a different one.
+
+        Only the current version is ever re-pushed (last-writer-wins holds
+        trivially), and only while the peer has not explicitly refused it: a
+        stale or never-seen hash means the publication was lost, but an
+        explicit refusal means re-sending cannot help until the operator (or
+        the peer's own state change) resolves it.  The mismatch condition
+        itself bounds the loop; nothing is sent while the session is down.
+        """
+
+        policy = self._policy
+        if self._role != "leader" or policy is None or not self._policy_accepted:
+            return
+        if not self._peer_session:
+            return
+        peer_hash = self._peer_policy_hash
+        if peer_hash == policy.hash:
+            return
+        if (self._peer_ready_reason or "").startswith("peer refused the canonical policy"):
+            return
+        now = self._monotonic()
+        if self._policy_resend_last_sent is not None and (
+            now - self._policy_resend_last_sent < _POLICY_RESEND_SECONDS
+        ):
+            return
+        self._publish_policy()
+        self._policy_resend_last_sent = now
+        if self._policy_resend_last_peer_hash != peer_hash:
+            self._policy_resend_last_peer_hash = peer_hash
+            self._transition(
+                "policy_resend_for_stale_peer",
+                f"peer={peer_hash[:8] if peer_hash else '-'} mine={policy.hash[:8]}",
+            )
+
     def _maybe_publish_state(self) -> None:
         if self._reseed_requested:
             self._reseed_requested = False
             self._republish_peer_state()
         self._maybe_send_reseed_ask()
+        self._maybe_resend_policy()
         self._publish_catalog_summary()
         self._publish_remaining_allowance()
         if self._plan_set_version != self._last_published_plan_version:

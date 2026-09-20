@@ -6011,6 +6011,72 @@ class RetransmissionTests(PairCellTestCase):
         self.tick()
         self.assertEqual(len(self._reseed_asks()), 1)
 
+    def _leader_policy_sends(self) -> list[dict[str, object]]:
+        return self.net.payloads("policy", LEADER)
+
+    def test_stale_peer_gets_current_policy_resent_then_aligns(self) -> None:
+        self.prime()
+        old_hash = cast(StrategyPolicy, self.accepted_policy).hash
+        # The new publication is lost exactly once; the follower stays stale.
+        self.net.drop_kinds.add("policy")
+        new_policy = self.policy(edge_min_net_points="9")
+        self.assertNotEqual(new_policy.hash, old_hash)
+        self.leader.cell.accept_policy(new_policy)
+        self.tick()
+        self.assertEqual(len(self._leader_policy_sends()), 3)
+        self.assertTrue(
+            all(p["policy_hash"] == new_policy.hash for p in self._leader_policy_sends()[-2:])
+        )
+        self.clock.advance(30.0)
+        self.tick()
+        self.assertEqual(len(self._leader_policy_sends()), 4)
+        # Once the publication gets through, the follower accepts and the
+        # resends stop on their own.
+        self.net.drop_kinds.discard("policy")
+        self.clock.advance(30.0)
+        self.tick()
+        accepted = [
+            row
+            for row in self.follower.cell.transition_history()
+            if row["event"] == "policy_accepted" and row["detail"] == new_policy.hash
+        ]
+        self.assertTrue(accepted, "the follower accepted the resent policy")
+        self.feed_quotes()
+        self.assertEqual(len(self.attempt_payloads()), 1)
+        self.clock.advance(60.0)
+        self.tick()
+        self.tick()
+        self.assertEqual(len(self._leader_policy_sends()), 5)
+        events = [row["event"] for row in self.leader.cell.transition_history()]
+        self.assertEqual(events.count("policy_resend_for_stale_peer"), 1)
+
+    def test_refused_policy_is_not_resent(self) -> None:
+        self.prime()
+        sent_before = len(self._leader_policy_sends())
+        self.leader.cell.handle_event(
+            RelayEnvelopeReceived(
+                {
+                    "protocol_version": pair_cell.PROTOCOL_VERSION,
+                    "kind": "policy_ack",
+                    "route_id": ROUTE_ID,
+                    "from_worker_id": FOLLOWER,
+                    "from_role": "follower",
+                    "to_worker_id": LEADER,
+                    "payload": {
+                        "policy_hash": cast(StrategyPolicy, self.accepted_policy).hash,
+                        "accepted": False,
+                        "reason": "unit test refusal",
+                    },
+                }
+            )
+        )
+        # No pump: the refusal reason must still be current when publishing.
+        self.clock.advance(30.0)
+        self.leader.cell.handle_event(ClockTickEvent(self.now))
+        self.clock.advance(30.0)
+        self.leader.cell.handle_event(ClockTickEvent(self.now))
+        self.assertEqual(len(self._leader_policy_sends()), sent_before)
+
 
 class RediscoveryDeliveryTests(PairCellTestCase):
     """A requested rediscovery is a bounded round trip, not a one-shot hope."""

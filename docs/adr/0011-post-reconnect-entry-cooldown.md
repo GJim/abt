@@ -70,3 +70,8 @@ Retransmission now lives at the cell layer, over the unreliable relay:
   while down, reset on reconnect/rebuild, and are abandoned with one audit
   event past budget. Admission stays blocked throughout, and NEEDS_HUMAN
   remains the backstop for genuine silence.
+- Stale-peer policy re-push: the leader re-sends the *current* policy every
+  30s while the peer reports a different-but-accepted hash (or nothing, with
+  no refusal on record). Explicit refusals stop resends; alignment stops
+  them. Only the current version is ever re-pushed, so last-writer-wins
+  holds without version ordering.
