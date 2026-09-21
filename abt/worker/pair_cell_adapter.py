@@ -151,7 +151,14 @@ def _short(value: object) -> str:
 
 
 def _is_new_york_weekend(observed_at: datetime) -> bool:
-    """Whether the New York calendar day is Saturday/Sunday (market closed)."""
+    """Whether the New York calendar day is Saturday/Sunday (market closed).
+
+    This intentionally still covers Sunday while the *trading* blackout in
+    :meth:`abt.pair_cell.PairExecutionCell` is Saturday-only: a frozen feed
+    on a closed market is legitimate quiet, not a dead terminal, so the
+    data-health watch must not alert on it.  Entries need no such cover --
+    stale quotes fail the freshness gates on their own.
+    """
 
     try:
         local = observed_at.astimezone(NEW_YORK)

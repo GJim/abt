@@ -4547,6 +4547,16 @@ class ExitConvergenceTests(PairCellTestCase):
             self.leader.cell.handle_event(ClockTickEvent(self.now)).ready_reason,
         )
 
+    def test_new_york_sunday_is_tradable_for_the_asian_open(self) -> None:
+        self.prime()
+        self.now = datetime(2026, 3, 8, 17, 0, tzinfo=UTC)  # Sunday 1pm New York
+        self.feed_quotes()
+        self.assertEqual(len(self.attempt_payloads()), 1)
+        self.assertNotIn(
+            "weekend",
+            self.leader.cell.handle_event(ClockTickEvent(self.now)).ready_reason,
+        )
+
     def test_new_york_weekend_closes_an_existing_pair(self) -> None:
         self.run_entry()
         self.now = datetime(2026, 3, 7, 17, 0, tzinfo=UTC)  # Saturday noon New York

@@ -6211,7 +6211,11 @@ class PairExecutionCell:
         if policy is None:
             return None
         local = self._now.astimezone(NEW_YORK)
-        if local.weekday() >= 5:
+        if local.weekday() == 5:
+            # Saturday New York only: by Sunday evening New York the Asian
+            # Monday session is already open.  A still-closed market needs no
+            # calendar gate here -- stale quotes fail the freshness gates and
+            # the data-health watch stays quiet through its own weekend skip.
             return "new_york_weekend", "New York weekend trading blackout"
         start = _parse_ny_time(
             policy.trading_blackout_start_ny, "trading_blackout_start_ny"
