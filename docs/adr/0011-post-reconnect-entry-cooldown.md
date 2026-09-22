@@ -75,3 +75,26 @@ Retransmission now lives at the cell layer, over the unreliable relay:
   no refusal on record). Explicit refusals stop resends; alignment stops
   them. Only the current version is ever re-pushed, so last-writer-wins
   holds without version ordering.
+
+## Follow-up: containment verdicts from broker ground truth (accepted 2026-09-22)
+
+The 2026-09-21 post-mortem showed two parks with the same signature: a
+cancel met an already-gone ticket (INVALID), and the two replay evaluations
+ran milliseconds apart, so the second one re-read the same unsettled broker
+state and latched NEEDS_HUMAN while the account emptied seconds later
+(106 and 24 minutes parked-while-empty, both healed only by restart):
+
+- A repeat replay evaluation no longer latches: the verdict waits out a
+  10s broker-settlement window (`_CONTAINMENT_REPLAY_SETTLE_SECONDS`) and
+  then checks one fresh broker read. A target the broker no longer shows is
+  recovered cleanly no matter what the receipt said; a persisting target
+  latches loudly exactly once. No retcodes are classified -- ground truth
+  only, so settlement lag can never latch.
+- A latched containment stop re-checks its durable `both_empty_verified`
+  proof on every broker snapshot and peer reconnect, not just on restart.
+- Parked reasons ride the per-second readiness (`needs_human_reason`), so
+  the surviving side's admission diagnostic names the exact effect instead
+  of a generic parked flag; old peers omit it without harm.
+- A peer `empty` carrying the operator-shutdown marker clears that side's
+  peer-ready immediately, so no entry can race the shutdown handshake on a
+  stale ready snapshot.

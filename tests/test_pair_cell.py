@@ -3979,7 +3979,10 @@ class RecoveryTests(PairCellTestCase):
         self.net.pump()
 
         result = self.follower.cell.handle_event(ClockTickEvent(self.now))
-
+        # The first replay only defers; the verdict needs broker settlement.
+        self.assertFalse(result.needs_human)
+        self.clock.advance(11.0)
+        result = self.follower.cell.handle_event(ClockTickEvent(self.now))
         self.assertTrue(result.needs_human)
         self.assertIn("non-success replay evidence", str(result.needs_human_reason))
         self.assertEqual(
@@ -4079,6 +4082,8 @@ class RecoveryTests(PairCellTestCase):
         self.follower.cell.handle_event(
             BrokerSnapshotEvent(orders=stale_orders, positions=owned, observed_at=self.now)
         )
+        # The verdict needs broker settlement time, not just another snapshot.
+        self.clock.advance(11.0)
         result = self.follower.cell.handle_event(
             BrokerSnapshotEvent(orders=stale_orders, positions=owned, observed_at=self.now)
         )
@@ -4086,9 +4091,10 @@ class RecoveryTests(PairCellTestCase):
         self.assertIn("non-success replay evidence", str(result.needs_human_reason))
         self.assertEqual(len(self.follower.cancel_requests()), 1)
 
-    def test_restart_clears_a_replay_evidence_stop_after_both_empty_verified(self) -> None:
-        # The parked 2026-09-09 worker carries exactly this stop shape; a
-        # restart must clear it once the attempt terminalized both-empty.
+    def test_snapshot_clears_a_replay_stop_and_restart_stays_clear(self) -> None:
+        # The parked 2026-09-09 worker carries exactly this stop shape; once
+        # the attempt terminalizes both-empty, the next snapshot clears it
+        # live -- a restart is only idempotency, not the recovery itself.
         self.run_entry()
         self.follower.mt5.reads_unavailable = True
         self.follower.mt5.reject_next_cancel_retcode = _REJECTED
@@ -4107,20 +4113,25 @@ class RecoveryTests(PairCellTestCase):
         self.follower.cell.handle_event(
             BrokerSnapshotEvent(orders=stale_orders, positions=owned, observed_at=self.now)
         )
+        self.clock.advance(11.0)
         latched = self.follower.cell.handle_event(
             BrokerSnapshotEvent(orders=stale_orders, positions=owned, observed_at=self.now)
         )
         self.assertTrue(latched.needs_human)
 
         # The broker then takes the ticket; the attempt terminalizes
-        # both-empty while the stop latch remains (the incident shape).
+        # both-empty and the next snapshot clears the stop with no restart.
         self.follower.cell.handle_event(
             BrokerSnapshotEvent(orders=[], positions=[], observed_at=self.now)
         )
-        # A restart recovers the durable terminal proof and clears the stop.
+        cleared = self.follower.cell.handle_event(
+            BrokerSnapshotEvent(orders=[], positions=[], observed_at=self.now)
+        )
+        self.assertFalse(cleared.needs_human)
+        self.assertEqual(cleared.state, "EMPTY")
+        # A restart stays clear.
         result = self.follower.restart().recover()
         self.assertFalse(result.needs_human)
-        self.assertEqual(result.state, "EMPTY")
 
     def test_restart_before_any_attempt_restores_readiness_and_the_route(self) -> None:
         self.prime()
@@ -6086,6 +6097,162 @@ class RetransmissionTests(PairCellTestCase):
         self.clock.advance(30.0)
         self.leader.cell.handle_event(ClockTickEvent(self.now))
         self.assertEqual(len(self._leader_policy_sends()), sent_before)
+
+
+class ContainmentRecoveryTests(PairCellTestCase):
+    """Containment replay verdicts come from broker ground truth, with grace.
+
+    A non-success receipt defers; the verdict waits out broker settlement and
+    then checks whether the ticket is still there.  A gone ticket recovers
+    cleanly (the 2026-09-21 follower parks); a persisting one latches loudly.
+    A latched stop clears itself the moment durable both-empty proof lands,
+    without waiting for a restart.
+    """
+
+    def test_settled_gone_ticket_recovers_without_latching(self) -> None:
+        self.run_entry()
+        self.follower.mt5.reads_unavailable = True
+        self.follower.mt5.reject_next_cancel_retcode = _REJECTED
+
+        self.leader.mt5.positions = []
+        self.leader.cell.handle_event(
+            BrokerSnapshotEvent(orders=[], positions=[], observed_at=self.now)
+        )
+        self.net.pump()
+
+        stale_orders = [{"ticket": 123, "symbol": SYMBOL}]
+        owned = [dict(self.follower.mt5.positions[0])]
+        self.follower.cell.handle_event(
+            BrokerSnapshotEvent(orders=stale_orders, positions=owned, observed_at=self.now)
+        )
+        self.follower.cell.handle_event(
+            BrokerSnapshotEvent(orders=stale_orders, positions=owned, observed_at=self.now)
+        )
+        # The broker took the ticket while settling and reads recover: it
+        # vanishes from direct reads even though the fed snapshots are stale.
+        self.follower.mt5.orders = [
+            o for o in self.follower.mt5.orders if str(o.get("ticket")) != "123"
+        ]
+        self.follower.mt5.reads_unavailable = False
+        self.clock.advance(11.0)
+        result = self.follower.cell.handle_event(
+            BrokerSnapshotEvent(orders=stale_orders, positions=owned, observed_at=self.now)
+        )
+        self.assertFalse(result.needs_human)
+        self.assertIn(
+            "containment_receipt_recovered",
+            [row["event"] for row in self.follower.cell.transition_history()],
+        )
+        self.assertEqual(len(self.follower.cancel_requests()), 1)
+
+    def test_peer_park_reason_surfaces_in_admission_diagnostic(self) -> None:
+        self.prime()
+        self.leader.cell.handle_event(
+            RelayEnvelopeReceived(
+                {
+                    "protocol_version": pair_cell.PROTOCOL_VERSION,
+                    "kind": "readiness",
+                    "route_id": ROUTE_ID,
+                    "from_worker_id": FOLLOWER,
+                    "from_role": "follower",
+                    "to_worker_id": LEADER,
+                    "payload": {
+                        "ready": False,
+                        "reason": "operator intervention is required",
+                        "needs_human_reason": "containment effect abc has non-success replay evidence",
+                    },
+                }
+            )
+        )
+        diagnostic = self.leader.cell.entry_admission_diagnostic()
+        self.assertIn("peer admission blocked: operator intervention is required", diagnostic)
+        self.assertIn("(peer: containment effect abc", diagnostic)
+        # Older peers omit the field: no suffix, same block.
+        self.leader.cell.handle_event(
+            RelayEnvelopeReceived(
+                {
+                    "protocol_version": pair_cell.PROTOCOL_VERSION,
+                    "kind": "readiness",
+                    "route_id": ROUTE_ID,
+                    "from_worker_id": FOLLOWER,
+                    "from_role": "follower",
+                    "to_worker_id": LEADER,
+                    "payload": {"ready": True, "reason": "ready"},
+                }
+            )
+        )
+        self.leader.cell.handle_event(
+            RelayEnvelopeReceived(
+                {
+                    "protocol_version": pair_cell.PROTOCOL_VERSION,
+                    "kind": "readiness",
+                    "route_id": ROUTE_ID,
+                    "from_worker_id": FOLLOWER,
+                    "from_role": "follower",
+                    "to_worker_id": LEADER,
+                    "payload": {"ready": False, "reason": "operator intervention is required"},
+                }
+            )
+        )
+        self.assertNotIn(
+            "(peer:",
+            self.leader.cell.entry_admission_diagnostic(),
+        )
+
+    def test_peer_shutdown_marker_blocks_new_entries_until_ready(self) -> None:
+        self.run_entry()
+        attempt = self.last_attempt()
+        self.leader.cell.handle_event(
+            RelayEnvelopeReceived(
+                {
+                    "protocol_version": pair_cell.PROTOCOL_VERSION,
+                    "kind": "leg_status",
+                    "route_id": ROUTE_ID,
+                    "from_worker_id": FOLLOWER,
+                    "from_role": "follower",
+                    "to_worker_id": LEADER,
+                    "payload": {
+                        "status": "empty",
+                        "reason": "operator_shutdown",
+                        "attempt_id": attempt.attempt_id,
+                    },
+                }
+            )
+        )
+        self.assertFalse(self.leader.cell._peer_ready)
+        self.assertIn("shutdown", self.leader.cell._peer_ready_reason)
+        # Hold the follower's readiness back so the marker verdict is what
+        # the next entry decision sees.
+        self.net.drop_from.add((FOLLOWER, "readiness"))
+        # The joint close still converges; entries wait for a fresh ready.
+        self.leader.mt5.positions = []
+        self.leader.cell.handle_event(
+            BrokerSnapshotEvent(orders=[], positions=[], observed_at=self.now)
+        )
+        self.net.pump()
+        self.feed_quotes(sequence=3)
+        self.assertEqual(self.attempt_payloads()[1:], [])
+        self.net.drop_from.clear()
+        self.leader.cell.handle_event(
+            RelayEnvelopeReceived(
+                {
+                    "protocol_version": pair_cell.PROTOCOL_VERSION,
+                    "kind": "readiness",
+                    "route_id": ROUTE_ID,
+                    "from_worker_id": FOLLOWER,
+                    "from_role": "follower",
+                    "to_worker_id": LEADER,
+                    "payload": {
+                        "ready": True,
+                        "reason": "ready",
+                        "policy_hash": cast(StrategyPolicy, self.accepted_policy).hash,
+                        "policy_accepted": True,
+                    },
+                }
+            )
+        )
+        self.feed_quotes(sequence=4)
+        self.assertEqual(len(self.attempt_payloads()), 2)
 
 
 class RediscoveryDeliveryTests(PairCellTestCase):

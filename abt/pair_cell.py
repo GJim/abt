@@ -159,6 +159,11 @@ _POLICY_RESEND_SECONDS = 30.0
 # Statuses that are durable proof the peer created no broker exposure.
 _PEER_NON_SEND_STATUSES = ("rejected", "expired_not_started", "no_attempt_record")
 _PEER_TERMINAL_STATUSES = _PEER_NON_SEND_STATUSES + ("empty",)
+# Grace period between a deferred containment replay and its verdict: the
+# broker needs real time to settle a raced cancel/close, and re-reading the
+# same millisecond-old state proves nothing.  Genuinely stuck tickets still
+# latch once this elapses and the ticket persists.
+_CONTAINMENT_REPLAY_SETTLE_SECONDS = 10.0
 # Operator-initiated shutdown must close both legs together: a peer that sees
 # this marker in an ``empty`` leg status skips the winner-only solo path and
 # contains immediately, even when its own leg is profitable.
@@ -2885,6 +2890,10 @@ class PairExecutionCell:
         self._peer_session = True
         self._peer_ready = False
         self._peer_ready_reason = "no peer readiness observed yet"
+        # The peer's specific stop reason, when it reports one: readiness
+        # carries it so the surviving side can see *why* the peer is parked
+        # without its logs.  Absent on older peers (read tolerated).
+        self._peer_needs_human_reason: str | None = None
         # Post-reconnect entry cooldown: wall-clock instant of the last
         # relay/rebuild instability plus the last peer handshake observed
         # strictly after it.  Both survive restarts via
@@ -2904,13 +2913,21 @@ class PairExecutionCell:
         self._peer_proof_last_probe: float | None = None
         self._peer_proof_probes_sent = 0
         # Containment effects whose journal replay already holds a non-success
-        # receipt and were therefore deferred once to the next broker
-        # snapshot.  A second consecutive replay for the same effect means the
-        # ticket genuinely persists and latches NEEDS_HUMAN instead of
-        # deferring forever.  Best-effort memory only: it is cleared with the
-        # attempt, and after a restart the first replay defers once more
-        # before latching.
-        self._replay_deferred: set[str] = set()
+        # receipt and therefore wait out broker settlement before any verdict:
+        # the value is the monotonic defer instant.  Once
+        # ``_CONTAINMENT_REPLAY_SETTLE_SECONDS`` elapse,
+        # ``_maybe_resolve_deferred_containment`` checks broker ground truth --
+        # a target the broker no longer shows is recovered cleanly no matter
+        # what the receipt said, a persisting target latches NEEDS_HUMAN.
+        # Best-effort memory only: it is cleared with the attempt, and after
+        # a restart the first replay defers once more before latching.
+        self._replay_deferred: dict[str, float] = {}
+        # Latest complete broker snapshot (orders/positions), refreshed on
+        # every snapshot event even with no live attempt: the deferred
+        # resolver above reads broker ground truth from here, never from
+        # readiness facts (which may legitimately be empty already).
+        self._last_broker_orders: list[object] | None = None
+        self._last_broker_positions: list[object] | None = None
         self._active_since: datetime | None = None
         self._state: PairState = "IDLE"
         self._desired: DesiredState = "NONE"
@@ -4822,10 +4839,18 @@ class PairExecutionCell:
                 # A proof wait interrupted by the outage resumes at once
                 # instead of waiting out a full probe interval.
                 self._probe_peer_terminal_proof_now()
+                self._recover_terminal_proof_stop()
+                self._recover_terminalized_containment_stop()
         elif isinstance(event, RealizedPnLEvent):
             self._record_realized_pnl(event)
         elif isinstance(event, BrokerSnapshotEvent):
             self._apply_broker_snapshot(event)
+            # Terminal proof may have completed while parked (e.g. the peer's
+            # proof arrived after the latch): re-check the durable stops here
+            # instead of only on restart.  Both are cheap string-gated
+            # indexed lookups when no stop is latched.
+            self._recover_terminal_proof_stop()
+            self._recover_terminalized_containment_stop()
         elif isinstance(event, QuarantineReleaseEvent):
             self._release_product_quarantine(event)
         elif isinstance(event, RelayEnvelopeReceived):
@@ -5850,6 +5875,7 @@ class PairExecutionCell:
                     "plan_set_version": self._plan_set_version,
                     "policy_hash": None if self._policy is None else self._policy.hash,
                     "policy_accepted": self._policy_accepted,
+                    "needs_human_reason": self._needs_human,
                     "broker_verified_empty": self._broker_verified_empty(),
                     "nothing_unresolved": self._unresolved_local_work() is None,
                     "route_state": self._route_state,
@@ -6058,6 +6084,10 @@ class PairExecutionCell:
         empty = payload.get("broker_verified_empty")
         if isinstance(empty, bool):
             self._peer_empty_claim = empty
+        needs_human = payload.get("needs_human_reason")
+        self._peer_needs_human_reason = (
+            needs_human if isinstance(needs_human, str) and needs_human else None
+        )
         unresolved = payload.get("nothing_unresolved")
         if isinstance(unresolved, bool):
             self._peer_nothing_unresolved = unresolved
@@ -6137,6 +6167,7 @@ class PairExecutionCell:
     # -- progress ----------------------------------------------------------- #
 
     def _progress(self) -> None:
+        self._maybe_resolve_deferred_containment()
         if self._needs_human is not None:
             self._state = "NEEDS_HUMAN"
             self._maybe_finalize_empty()
@@ -6509,7 +6540,13 @@ class PairExecutionCell:
         if not ready:
             return f"local admission blocked: {reason}"
         if not self._peer_ready:
-            return f"peer admission blocked: {self._peer_ready_reason or 'no current peer readiness'}"
+            reason = self._peer_ready_reason or "no current peer readiness"
+            if reason == "operator intervention is required" and self._peer_needs_human_reason:
+                reason = (
+                    "operator intervention is required"
+                    f" (peer: {self._peer_needs_human_reason[:80]})"
+                )
+            return f"peer admission blocked: {reason}"
         if not self._peer_session:
             return "peer admission blocked: authenticated peer session lost"
         policy = self._policy
@@ -7136,10 +7173,15 @@ class PairExecutionCell:
     # -- broker fact application --------------------------------------------- #
 
     def _apply_broker_snapshot(self, event: BrokerSnapshotEvent) -> None:
-        if self._attempt is None or self._leg is None:
-            return
         if event.orders is None or event.positions is None:
             return  # None/unavailable never establishes any fact
+        # Cache broker ground truth for the deferred-containment resolver
+        # below, even with no live attempt: readiness facts may already read
+        # empty while a raced ticket is still settling.
+        self._last_broker_orders = list(event.orders)
+        self._last_broker_positions = list(event.positions)
+        if self._attempt is None or self._leg is None:
+            return
         self._reconcile_entry_effect_state()
         attempt, leg = self._attempt, self._leg
         if leg is None:
@@ -8031,6 +8073,11 @@ class PairExecutionCell:
                 # attempt open (via _maybe_finalize_empty) until this side
                 # reports empty back, so graceful shutdown waits for both.
                 self._transition("peer_operator_shutdown", peer_reason or attempt_id)
+                # A shutting-down peer is about to go quiet: stop treating its
+                # last ready snapshot as entry permission until it says ready
+                # again, or the next candidate races its shutdown handshake.
+                self._peer_ready = False
+                self._peer_ready_reason = "peer reported operator shutdown"
                 self._begin_close(f"peer_{OPERATOR_SHUTDOWN_MARKER}")
                 self._maybe_finalize_empty()
                 return
@@ -8813,26 +8860,27 @@ class PairExecutionCell:
                 return
             if evidence.get("retcode") in _SUCCESS_RETCODES:
                 self._transition("containment_receipt_recovered", effect_id)
-                self._replay_deferred.discard(effect_id)
+                self._replay_deferred.pop(effect_id, None)
                 return
-            if payload.get("type") in ("cancel", "close") and effect_id not in self._replay_deferred:
+            if payload.get("type") not in ("cancel", "close"):
+                self._set_needs_human(
+                    f"containment effect {effect_id} has non-success replay evidence",
+                    "containment replay evidence was not successful",
+                )
+                return
+            if effect_id not in self._replay_deferred:
                 # The journal already holds a non-success receipt for this
                 # exact effect, but that receipt may be stale: the broker may
                 # have closed or cancelled the ticket itself (e.g. a TP/SL
                 # execution racing our containment write, which then rejects
-                # our close as FROZEN and our cancel as INVALID).  Defer to
-                # the next complete broker snapshot exactly like a fresh
-                # rejection: if the ticket is gone the snapshot proves empty
-                # and no human is needed; if it persists the second replay
-                # latches NEEDS_HUMAN below.
-                self._replay_deferred.add(effect_id)
+                # our close as FROZEN and our cancel as INVALID).
+                self._replay_deferred[effect_id] = self._monotonic()
                 self._transition("containment_receipt_reconciliation_pending", effect_id)
                 self._request_broker_read()
                 return
-            self._set_needs_human(
-                f"containment effect {effect_id} has non-success replay evidence",
-                "containment replay evidence was not successful",
-            )
+            # A repeat evaluation while deferred neither latches nor resends:
+            # _maybe_resolve_deferred_containment below settles it once the
+            # broker has had time to converge.
             return
         if effect_state == "send_started":
             # An effect that may have crossed send_started is never blindly resent.
@@ -8854,6 +8902,64 @@ class PairExecutionCell:
             self._set_needs_human(f"containment effect {effect_id} ended {outcome.category}", outcome.category)
             return
         self._request_broker_read()
+
+    def _maybe_resolve_deferred_containment(self) -> None:
+        """Settle deferred containment replays against broker ground truth.
+
+        Runs every progress cycle; an empty deferral set costs nothing.  Once
+        the settle window elapses, one fresh broker read decides: a target
+        the broker no longer shows is recovered cleanly no matter what the
+        receipt said (e.g. our cancel raced the broker's own SL/TP execution
+        and lost with INVALID); a persisting target latches loudly exactly
+        once.
+        """
+
+        if not self._replay_deferred:
+            return
+        now = self._monotonic()
+        for effect_id, deferred_at in list(self._replay_deferred.items()):
+            if now - deferred_at < _CONTAINMENT_REPLAY_SETTLE_SECONDS:
+                continue
+            self._request_broker_read()
+            self._replay_deferred.pop(effect_id, None)
+            if self._deferred_effect_target_absent(effect_id):
+                self._transition("containment_receipt_recovered", effect_id)
+                continue
+            self._set_needs_human(
+                f"containment effect {effect_id} has non-success replay evidence",
+                "containment replay evidence was not successful",
+            )
+
+    def _deferred_effect_target_absent(self, effect_id: str) -> bool:
+        """Whether the broker snapshot shows no trace of one effect's target.
+
+        Effect IDs are ``{attempt}:{worker}:{cancel|close}:{ticket}`` (neither
+        UUID part contains a colon).  Anything unparsable or never snapshotted
+        counts as present: the fail-closed direction is to latch, never to
+        assume a ticket away.
+        """
+
+        parts = effect_id.split(":")
+        if len(parts) != 4:
+            return False
+        kind, ticket = parts[2], parts[3]
+        if kind == "cancel":
+            orders = self._last_broker_orders
+            if orders is None:
+                return False
+            return all(
+                not isinstance(item, dict) or str(item.get("ticket")) != ticket
+                for item in orders
+            )
+        if kind == "close":
+            positions = self._last_broker_positions
+            if positions is None:
+                return False
+            return all(
+                not isinstance(item, dict) or str(item.get("ticket")) != ticket
+                for item in positions
+            )
+        return False
 
     def _await_post_failure_containment_observation(
         self,

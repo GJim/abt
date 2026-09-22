@@ -135,6 +135,10 @@ _Avoid_: 配對的逐腿獨立操作
 **失聯安全平倉**:
 一個帳戶工作者無法經主控台 relay 與配對對側保持有效通訊超過心跳寬限時間後，停止新進場並依本機 broker observation 進入帳戶復原生命週期。已受 broker SL/TP 保護的曝險不因短暫失聯盲目重送或修改，重連後必須重新觀測。
 
+**平倉收據對賬（Containment Receipt Reconciliation）**:
+平倉的 cancel/close 拿到非成功回執時，先記一次待定，不立即停機；裁決等 broker 結算寬限（10 秒）後，看一次新鮮的 broker 快照——單子已不在就乾淨恢復（常因自家 cancel 撞上 broker 自己的 SL/TP 執行），單子還在才大聲停機。停機中的 containment 止動在每個 broker 快照與對側重連時重驗 durable 的 `both_empty_verified` 證據，不必等重啟；停機理由隨每秒 readiness 帶給對側（`needs_human_reason`），舊版沒有該欄位時照常判讀。
+_Avoid_: 毫秒級連查兩次就停機、以回執碼推測代替看 broker、在途重發已送出的 effect
+
 **重連後冷靜（Post-Reconnect Cooldown）**:
 任一側觀測到 relay/重建不穩定（對側 session 遺失或重連、對側 publisher epoch 推進、收到對側 re-seed 請求、本機重啟恢復）即開啟冷靜窗口並持久化；每次新的不穩定滑動延長窗口。退出需同時滿足無中斷靜默達 shared 政策 `post_reconnect_cooldown_seconds`（預設 300 秒，0 停用）與在最後一次觸發之後觀測到對側 handshake（pairing_acceptance／policy／universe／sizing／readiness／allowance）。窗口內雙方皆不建立新進場（leader 不建嘗試、follower 拒收嘗試並回報拒絕），只發布未就緒；平倉與收斂路徑不受影響。
 _Avoid_: 重連後立即進場、只計時不驗 handshake、重啟繞過冷靜
