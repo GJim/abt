@@ -3787,6 +3787,45 @@ class PairExecutionCell:
         self._db.execute("DELETE FROM cell_operator_stop WHERE id = 1")
         self._transition("terminal_containment_recovered", attempt_id)
 
+    def _recover_latched_containment_replay_stop(self) -> None:
+        """Re-evaluate a latched containment-replay stop against fresh broker ground truth.
+
+        The deferred resolver (``_maybe_resolve_deferred_containment``) settles
+        a non-success receipt while it is still deferred: a target absent from
+        a complete broker snapshot means recovered, no matter what the receipt
+        said.  Once the settle window elapsed with the target still present,
+        the same receipt latched NEEDS_HUMAN -- but nothing ever revisits that
+        latch when the broker later converges (e.g. the broker's own TP/SL took
+        out the ticket our cancel raced, so our cancel was rejected as
+        INVALID/FROZEN and the ticket is now gone).
+
+        The latch's premise is "the target persists", so when a later complete
+        snapshot shows the exact target gone *and* the account fully
+        broker-verified empty, the stop is stale: clear it with the same
+        evidence bar the deferred resolver uses (strictly stronger, since the
+        account-empty check is added), without touching the attempt itself.
+        Any doubt -- an incomplete snapshot, the target still shown, or any
+        remaining exposure -- keeps the latch.
+        """
+
+        reason = self._needs_human
+        prefix = "containment effect "
+        suffix = "has non-success replay evidence"
+        if not isinstance(reason, str) or not reason.startswith(prefix) or suffix not in reason:
+            return
+        # The effect ID is the first whitespace-delimited token: it never
+        # contains spaces, while the suffix follows it.
+        effect_id = reason.removeprefix(prefix).split(" ")[0]
+        if not effect_id:
+            return
+        if not self._deferred_effect_target_absent(effect_id):
+            return
+        if not self._broker_verified_empty():
+            return
+        self._needs_human = None
+        self._db.execute("DELETE FROM cell_operator_stop WHERE id = 1")
+        self._transition("containment_receipt_recovered", effect_id)
+
     # -- pairing acceptance ------------------------------------------------ #
 
     def freeze_pairing_acceptance(
@@ -3925,6 +3964,7 @@ class PairExecutionCell:
         self._note_cooldown_trigger("local Worker recovered")
         self._recover_terminal_proof_stop()
         self._recover_terminalized_containment_stop()
+        self._recover_latched_containment_replay_stop()
         # A running peer may have published an unchanged readiness snapshot
         # while this Worker was offline. Explicitly request its state instead
         # of relying on a later epoch change or market event to trigger it.
@@ -4841,16 +4881,19 @@ class PairExecutionCell:
                 self._probe_peer_terminal_proof_now()
                 self._recover_terminal_proof_stop()
                 self._recover_terminalized_containment_stop()
+                self._recover_latched_containment_replay_stop()
         elif isinstance(event, RealizedPnLEvent):
             self._record_realized_pnl(event)
         elif isinstance(event, BrokerSnapshotEvent):
             self._apply_broker_snapshot(event)
             # Terminal proof may have completed while parked (e.g. the peer's
-            # proof arrived after the latch): re-check the durable stops here
-            # instead of only on restart.  Both are cheap string-gated
+            # proof arrived after the latch), or the broker may have converged
+            # under a latched replay stop: re-check the durable stops here
+            # instead of only on restart.  All are cheap string-gated
             # indexed lookups when no stop is latched.
             self._recover_terminal_proof_stop()
             self._recover_terminalized_containment_stop()
+            self._recover_latched_containment_replay_stop()
         elif isinstance(event, QuarantineReleaseEvent):
             self._release_product_quarantine(event)
         elif isinstance(event, RelayEnvelopeReceived):
@@ -8652,11 +8695,10 @@ class PairExecutionCell:
             return
         if not self._peer_send_possible() or self._peer_leg.status in _PEER_TERMINAL_STATUSES:
             return  # finalization handles this
-        if (
+        unrelated_stop = (
             self._needs_human is not None
             and self._needs_human != self._peer_terminal_proof_stop_reason(attempt.attempt_id)
-        ):
-            return
+        )
         now = self._monotonic()
         timeout = attempt.confirmation_timeout_seconds
         if self._peer_proof_wait_started is None:
@@ -8668,11 +8710,19 @@ class PairExecutionCell:
                 self._peer_proof_last_probe = now
             return
         if now - self._peer_proof_wait_started >= timeout * _PEER_PROOF_ESCALATION_MULTIPLIER:
-            self._set_needs_human(
-                self._peer_terminal_proof_stop_reason(attempt.attempt_id),
-                "peer terminal proof unavailable",
-            )
-            return
+            if unrelated_stop:
+                # A probe is read-only, but latching here would clobber the
+                # louder unrelated stop (e.g. a containment receipt latch)
+                # through _set_needs_human's overwrite: keep probing on the
+                # cadence below so a live peer can still unblock
+                # finalization, leaving the original stop intact.
+                pass
+            else:
+                self._set_needs_human(
+                    self._peer_terminal_proof_stop_reason(attempt.attempt_id),
+                    "peer terminal proof unavailable",
+                )
+                return
         if self._peer_proof_last_probe is None or now - self._peer_proof_last_probe >= timeout * _PEER_PROOF_PROBE_MULTIPLIER:
             if not self._peer_session:
                 # Requests cannot arrive while the session is down; hold the
@@ -8698,19 +8748,16 @@ class PairExecutionCell:
         """Send one probe immediately, e.g. on peer session reconnect.
 
         Uses the cadence path's preconditions so a reconnect never probes a
-        settled attempt or under an unrelated stop; the steady cadence then
-        continues from this send.
+        settled attempt; unlike escalation, the probe itself is read-only (a
+        request plus a truthful report of this side's own empty leg), so it
+        is also sent under an unrelated stop -- that is exactly what unblocks
+        finalization there.  The steady cadence then continues from this send.
         """
 
         attempt, leg = self._attempt, self._leg
         if attempt is None or leg is None or not leg.empty_verified:
             return
         if not self._peer_send_possible() or self._peer_leg.status in _PEER_TERMINAL_STATUSES:
-            return
-        if (
-            self._needs_human is not None
-            and self._needs_human != self._peer_terminal_proof_stop_reason(attempt.attempt_id)
-        ):
             return
         if not self._peer_session:
             return

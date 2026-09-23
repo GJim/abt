@@ -4133,6 +4133,168 @@ class RecoveryTests(PairCellTestCase):
         result = self.follower.restart().recover()
         self.assertFalse(result.needs_human)
 
+    def test_later_empty_snapshot_clears_latched_replay_stop_without_terminal_proof(self) -> None:
+        # The 2026-09-23 follower incident: a cancel raced the broker's own
+        # execution and latched NEEDS_HUMAN on its non-success receipt while
+        # the ticket still listed. The broker later converges -- the ticket is
+        # gone and the account reads empty -- but the peer never reports
+        # terminal proof, so no both_empty_verified proof exists. The next
+        # complete snapshot must clear the stale latch on broker ground truth
+        # alone; the attempt itself stays live for the normal peer-proof path.
+        self.run_entry()
+        self.follower.mt5.reads_unavailable = True
+        self.follower.mt5.reject_next_cancel_retcode = _REJECTED
+
+        self.leader.mt5.positions = []
+        self.leader.cell.handle_event(
+            BrokerSnapshotEvent(orders=[], positions=[], observed_at=self.now)
+        )
+        self.net.pump()
+
+        stale_orders = [{"ticket": 123, "symbol": SYMBOL}]
+        owned = [dict(self.follower.mt5.positions[0])]
+        self.follower.cell.handle_event(
+            BrokerSnapshotEvent(orders=stale_orders, positions=owned, observed_at=self.now)
+        )
+        self.follower.cell.handle_event(
+            BrokerSnapshotEvent(orders=stale_orders, positions=owned, observed_at=self.now)
+        )
+        self.clock.advance(11.0)
+        latched = self.follower.cell.handle_event(
+            BrokerSnapshotEvent(orders=stale_orders, positions=owned, observed_at=self.now)
+        )
+        self.assertTrue(latched.needs_human)
+        self.assertIn("non-success replay evidence", str(latched.needs_human_reason))
+
+        # The peer goes quiet without terminal proof: freeze its leg view on
+        # a non-terminal report (dropped afterwards) so only the local
+        # snapshot can move anything.
+        attempt_id = latched.attempt_id
+        self.assertIsNotNone(attempt_id)
+        self.net.drop_kinds.add("leg_status")
+        self.follower.cell.handle_event(
+            RelayEnvelopeReceived(
+                {
+                    "protocol_version": pair_cell.PROTOCOL_VERSION,
+                    "kind": "leg_status",
+                    "route_id": ROUTE_ID,
+                    "from_worker_id": LEADER,
+                    "from_role": "leader",
+                    "to_worker_id": FOLLOWER,
+                    "payload": {
+                        "attempt_id": attempt_id,
+                        "status": "filled",
+                        "ticket": "9000",
+                        "symbol": SYMBOL,
+                        "side": "SHORT",
+                        "volume": "2",
+                        "fill_price": "1.10040",
+                    },
+                }
+            )
+        )
+        # The broker took the ticket; the account reads empty on every cycle.
+        cleared = self.follower.cell.handle_event(
+            BrokerSnapshotEvent(orders=[], positions=[], observed_at=self.now)
+        )
+        self.assertFalse(cleared.needs_human)
+        self.assertIn(
+            "containment_receipt_recovered",
+            [row["event"] for row in self.follower.cell.transition_history()],
+        )
+        # The stop is gone but the attempt is untouched: still unresolved and
+        # still converging, waiting on the peer the normal way.
+        self.assertIsNotNone(cleared.attempt_id)
+        self.assertNotEqual(cleared.state, "EMPTY")
+
+    def test_probe_continues_under_containment_stop_without_clobbering_it(self) -> None:
+        # Same latch as above, but broker ground truth stays doubtful (the
+        # account facts still list exposure), so the replay stop must hold.
+        # Once the local leg verifies empty, the cell must still probe the
+        # peer for terminal proof -- a read-only request -- while the
+        # escalation deadline passes WITHOUT replacing the louder containment
+        # stop with the peer-proof one.
+        self.run_entry()
+        self.follower.mt5.reads_unavailable = True
+        self.follower.mt5.reject_next_cancel_retcode = _REJECTED
+
+        self.leader.mt5.positions = []
+        self.leader.cell.handle_event(
+            BrokerSnapshotEvent(orders=[], positions=[], observed_at=self.now)
+        )
+        self.net.pump()
+
+        stale_orders = [{"ticket": 123, "symbol": SYMBOL}]
+        owned = [dict(self.follower.mt5.positions[0])]
+        self.follower.cell.handle_event(
+            BrokerSnapshotEvent(orders=stale_orders, positions=owned, observed_at=self.now)
+        )
+        self.follower.cell.handle_event(
+            BrokerSnapshotEvent(orders=stale_orders, positions=owned, observed_at=self.now)
+        )
+        self.clock.advance(11.0)
+        latched = self.follower.cell.handle_event(
+            BrokerSnapshotEvent(orders=stale_orders, positions=owned, observed_at=self.now)
+        )
+        self.assertTrue(latched.needs_human)
+
+        # The peer goes quiet without terminal proof: freeze its leg view on
+        # a non-terminal report (dropped afterwards). The account facts keep
+        # listing the exposure, so the latch has no ground truth to
+        # re-evaluate against and must hold.
+        attempt_id = latched.attempt_id
+        self.assertIsNotNone(attempt_id)
+        self.net.drop_kinds.add("leg_status")
+        self.follower.cell.handle_event(
+            RelayEnvelopeReceived(
+                {
+                    "protocol_version": pair_cell.PROTOCOL_VERSION,
+                    "kind": "leg_status",
+                    "route_id": ROUTE_ID,
+                    "from_worker_id": LEADER,
+                    "from_role": "leader",
+                    "to_worker_id": FOLLOWER,
+                    "payload": {
+                        "attempt_id": attempt_id,
+                        "status": "filled",
+                        "ticket": "9000",
+                        "symbol": SYMBOL,
+                        "side": "SHORT",
+                        "volume": "2",
+                        "fill_price": "1.10040",
+                    },
+                }
+            )
+        )
+        self.follower.cell.handle_event(
+            self.follower.facts(self.now, orders=stale_orders, positions=owned)
+        )
+        converging = self.follower.cell.handle_event(
+            BrokerSnapshotEvent(orders=[], positions=[], observed_at=self.now)
+        )
+        self.assertTrue(converging.needs_human)
+        self.assertIn("non-success replay evidence", str(converging.needs_human_reason))
+        # The first proof cycle only opens the bounded window; the probe goes
+        # out on the next cadence tick even under the stop.
+        self.clock.advance(5.1)
+        probed = self.follower.cell.handle_event(ClockTickEvent(self.now))
+        self.assertTrue(probed.needs_human)
+        self.assertIn("non-success replay evidence", str(probed.needs_human_reason))
+        # The empty leg still asks the peer: probing is read-only.
+        self.assertIn(
+            "peer_terminal_proof_probe",
+            [row["event"] for row in self.follower.cell.transition_history()],
+        )
+        self.assertIn("leg_status_request", self.net.kinds(FOLLOWER))
+
+        # Past the escalation window (5s confirmation x6) the louder stop is
+        # left intact instead of being overwritten by the peer-proof one.
+        self.clock.advance(31.0)
+        escalated = self.follower.cell.handle_event(ClockTickEvent(self.now))
+        self.assertTrue(escalated.needs_human)
+        self.assertIn("non-success replay evidence", str(escalated.needs_human_reason))
+        self.assertNotIn("no peer terminal proof", str(escalated.needs_human_reason))
+
     def test_restart_before_any_attempt_restores_readiness_and_the_route(self) -> None:
         self.prime()
         cell = self.leader.restart()
