@@ -46,8 +46,6 @@ from abt.pair_cell import (
     RouteAssignment,
     RouteMetadataEvent,
     StrategyPolicy,
-    TrendSeedEvent,
-    TrendSeedPoint,
     WorkerRiskLimits,
     RELEASE_PROPOSAL_TIMEOUT_SECONDS,
     build_pairing_acceptance,
@@ -56,10 +54,8 @@ from abt.pair_cell import (
     default_shared_policy_values,
     default_worker_risk_limits,
     discover_compatible_products,
-    donchian_bias,
     floor_to_volume_step,
     is_derived_product_identity,
-    momentum_bias,
     validate_configuration_authority,
 )
 from abt.worker.effect_journal import EffectJournalError, WorkerEffectJournal
@@ -729,48 +725,6 @@ class PairCellTestCase(unittest.TestCase):
         self.prime()
         self.feed_quotes()
 
-    def run_momentum_entry(self) -> None:
-        """Entry through momentum mode: flat history, then one impulse jump.
-
-        Trend protection assertions (asymmetric SL-only, trailing, solo)
-        must run in a trend mode, since edge mode now uses the mirrored box
-        and never solos.  The impulse jumps the leader mid 100 points while
-        volatility is flat, so momentum admits a LONG with the same sizing
-        and allowances as the edge fixture.
-        """
-
-        self.prime(
-            shared={
-                "entry_mode": "momentum",
-                "trend_momentum_T_seconds": 60.0,
-                "trend_vol_window_seconds": 300.0,
-                "trend_momentum_k": "2.0",
-                "trend_min_mom_points": "5",
-                "trend_max_spread_points": "20",
-                "trend_min_coverage": 0.3,
-            }
-        )
-        point = Decimal("0.00001")
-        mid = Decimal("1.10000")
-        sequence = 10
-        for _ in range(32):
-            self.now += timedelta(seconds=10)
-            self.feed_quotes(
-                leader_bid=str(mid - Decimal("0.00005")),
-                leader_ask=str(mid + Decimal("0.00005")),
-                follower_bid="1.10000",
-                follower_ask="1.10010",
-                sequence=sequence,
-            )
-            sequence += 1
-        self.feed_quotes(
-            leader_bid="1.10095",
-            leader_ask="1.10105",
-            follower_bid="1.10000",
-            follower_ask="1.10010",
-            sequence=sequence,
-        )
-
     def attempt_payloads(self) -> list[dict[str, object]]:
         return self.net.payloads("attempt", LEADER)
 
@@ -948,19 +902,8 @@ class RemovedArchitectureTests(unittest.TestCase):
                 "policy_version",
                 "strategy_budget_usd",
                 "edge_min_net_points",
-                "entry_mode",
-                "trend_lookback_seconds",
-                "trend_breakout_buffer_points",
-                "trend_min_range_points",
-                "trend_momentum_T_seconds",
-                "trend_vol_window_seconds",
-                "trend_momentum_k",
-                "trend_min_mom_points",
-                "trend_max_spread_points",
-                "trend_min_coverage",
                 "quote_max_age_seconds",
                 "quote_max_skew_seconds",
-                "trend_quote_max_age_seconds",
                 "follower_confirmation_timeout_seconds",
                 "post_reconnect_cooldown_seconds",
                 "sizing_refresh_seconds",
@@ -973,8 +916,63 @@ class RemovedArchitectureTests(unittest.TestCase):
                 "follower_risk",
             },
         )
-        self.assertEqual(policy.follower_confirmation_timeout_seconds, 5.0)
+        self.assertEqual(policy.follower_confirmation_timeout_seconds, 60.0)
         self.assertEqual(policy.post_reconnect_cooldown_seconds, 300.0)
+
+    def test_removed_entry_mode_and_trend_keys_are_rejected(self) -> None:
+        acceptance = build_pairing_acceptance(
+            proposal_id=PROPOSAL,
+            worker_id=FOLLOWER,
+            startup_balance_usd="4000",
+            account_currency="USD",
+        )
+        for key, value in (
+            ("entry_mode", "edge"),
+            ("entry_mode", "momentum"),
+            ("trend_lookback_seconds", 1800.0),
+            ("trend_breakout_buffer_points", "2"),
+            ("trend_min_range_points", "12"),
+            ("trend_momentum_T_seconds", 120.0),
+            ("trend_vol_window_seconds", 600.0),
+            ("trend_momentum_k", "2.0"),
+            ("trend_min_mom_points", "5"),
+            ("trend_max_spread_points", "8"),
+            ("trend_min_coverage", 0.8),
+            ("trend_quote_max_age_seconds", 60.0),
+        ):
+            with self.subTest(key=key):
+                with self.assertRaises(PairExecutionCellError):
+                    canonical_policy_from_acceptance(
+                        policy_version="policy-1",
+                        leader_risk=LEADER_RISK,
+                        acceptance=acceptance,
+                        shared={key: value},
+                    )
+        policy = canonical_policy_from_acceptance(
+            policy_version="policy-1",
+            leader_risk=LEADER_RISK,
+            acceptance=acceptance,
+            shared={"maximum_holding_seconds": 60.0},
+        )
+        restored = dict(policy.canonical())
+        for removed in (
+            "entry_mode",
+            "trend_lookback_seconds",
+            "trend_breakout_buffer_points",
+            "trend_min_range_points",
+            "trend_momentum_T_seconds",
+            "trend_vol_window_seconds",
+            "trend_momentum_k",
+            "trend_min_mom_points",
+            "trend_max_spread_points",
+            "trend_min_coverage",
+            "trend_quote_max_age_seconds",
+        ):
+            restored[removed] = 0
+        with self.assertRaises(PairExecutionCellError):
+            pair_cell._policy_from_canonical(restored)
+        with self.assertRaises(PairExecutionCellError):
+            pair_cell._policy_from_canonical({**policy.canonical(), "edge_min_net_point": "1"})
 
     def test_a_canonical_policy_round_trips_through_its_relay_form(self) -> None:
         acceptance = build_pairing_acceptance(
@@ -1082,8 +1080,6 @@ class ConfigurationAuthorityTests(unittest.TestCase):
         for key, value in (
             ("strategy_budget_usd", "5000"),
             ("edge_min_net_points", "4"),
-            ("entry_mode", "donchian"),
-            ("trend_lookback_seconds", 1800.0),
             ("quote_max_age_seconds", 1.0),
             ("quote_max_skew_seconds", 1.0),
             ("follower_confirmation_timeout_seconds", 5.0),
@@ -1131,44 +1127,33 @@ class DefaultMaterializationTests(unittest.TestCase):
             {
                 "mode": "shadow",
                 "strategy_budget_usd": "0",
-                "edge_min_net_points": "-3",
-                "entry_mode": "edge",
-                "trend_lookback_seconds": 1800.0,
-                "trend_breakout_buffer_points": "2",
-                "trend_min_range_points": "12",
-                "trend_momentum_T_seconds": 120.0,
-                "trend_vol_window_seconds": 600.0,
-                "trend_momentum_k": "2.0",
-                "trend_min_mom_points": "5",
-                "trend_max_spread_points": "8",
-                "trend_min_coverage": 0.8,
-                "quote_max_age_seconds": 1.0,
-                "quote_max_skew_seconds": 1.0,
-                "trend_quote_max_age_seconds": 60.0,
-                "follower_confirmation_timeout_seconds": 5.0,
+                "edge_min_net_points": "-4",
+                "quote_max_age_seconds": 6.0,
+                "quote_max_skew_seconds": 6.0,
+                "follower_confirmation_timeout_seconds": 60.0,
                 "post_reconnect_cooldown_seconds": 300.0,
                 "sizing_refresh_seconds": 3600.0,
-                "relay_handling_timeout_seconds": 5.0,
-                "trading_blackout_start_ny": "16:30",
-                "trading_blackout_end_ny": "18:30",
+                "relay_handling_timeout_seconds": 30.0,
+                "trading_blackout_start_ny": "19:30",
+                "trading_blackout_end_ny": "20:30",
                 "maximum_holding_seconds": None,
             },
         )
         limits = default_worker_risk_limits(startup_balance_usd=12345.0, account_currency="USD")
         self.assertEqual(limits.strategy_budget_usd, "12345")
-        self.assertEqual(limits.maximum_margin_fraction, "0.01")
+        self.assertEqual(limits.maximum_margin_fraction, "0.15")
         self.assertEqual(limits.daily_loss_fraction, "0.02")
         self.assertEqual(limits.trade_loss_fraction, "0.01")
-        self.assertEqual(limits.maximum_loss_per_trade_usd, "40")
+        self.assertEqual(limits.maximum_loss_per_trade_usd, "60")
 
     def test_the_default_budget_is_the_startup_balance_with_no_margin_headroom(self) -> None:
         limits = default_worker_risk_limits(startup_balance_usd="10000", account_currency="USD")
-        # 0.01 is the whole margin budget; legacy's extra 20% headroom is gone.
-        self.assertEqual(limits.margin_budget_usd, Decimal("100.00"))
+        # 0.15 is the whole margin budget; legacy's extra 20% headroom is gone.
+        self.assertEqual(limits.margin_budget_usd, Decimal("1500.00"))
         self.assertEqual(limits.daily_loss_limit_usd, Decimal("200.00"))
         self.assertEqual(limits.trade_loss_limit_usd, Decimal("100.00"))
-        # 40 is a hard per-trade admission cap, not an emergency stop trigger.
-        self.assertEqual(limits.leg_loss_cap_usd, Decimal("40"))
+        # 60 is a hard per-trade admission cap, not an emergency stop trigger.
+        self.assertEqual(limits.leg_loss_cap_usd, Decimal("60"))
 
     def test_a_non_usd_or_non_positive_balance_fails_closed(self) -> None:
         for balance, currency in (
@@ -2237,8 +2222,8 @@ class SharedTimingTests(PairCellTestCase):
         self.feed_catalogs()
         policy = self.policy()
         self.assertEqual(policy.sizing_refresh_seconds, 3600.0)
-        self.assertEqual(policy.relay_handling_timeout_seconds, 5.0)
-        self.assertEqual(policy.plan_retention_seconds, 10.0)
+        self.assertEqual(policy.relay_handling_timeout_seconds, 30.0)
+        self.assertEqual(policy.plan_retention_seconds, 35.0)
         tuned = self.policy(sizing_refresh_seconds=600.0, relay_handling_timeout_seconds=9.0)
         self.assertEqual(tuned.sizing_refresh_seconds, 600.0)
         self.assertEqual(tuned.plan_retention_seconds, 14.0)
@@ -2268,7 +2253,7 @@ class SharedTimingTests(PairCellTestCase):
         del raw["strategy_budget_usd"]
         loaded = pair_cell._policy_from_canonical(raw)
         self.assertEqual(loaded.sizing_refresh_seconds, 3600.0)
-        self.assertEqual(loaded.relay_handling_timeout_seconds, 5.0)
+        self.assertEqual(loaded.relay_handling_timeout_seconds, 30.0)
         self.assertEqual(loaded.strategy_budget_usd, "0")
         self.assertEqual(loaded.hash, policy.hash)
 
@@ -2387,12 +2372,12 @@ class RemainingAllowanceTests(PairCellTestCase):
     def test_a_lower_published_allowance_lowers_the_assigned_leg_loss(self) -> None:
         self.prime()
         self.follower.cell.handle_event(
-            RealizedPnLEvent(attempt_id="a1", realized_usd="-90", closed_at=self.now)
+            RealizedPnLEvent(attempt_id="a1", realized_usd="-80", closed_at=self.now)
         )
         self.tick()
-        self.assertEqual(self.follower.cell.allowed_leg_loss_usd(), Decimal("30"))
+        self.assertEqual(self.follower.cell.allowed_leg_loss_usd(), Decimal("40"))
         self.feed_quotes()
-        self.assertEqual(Decimal(self.last_attempt().follower_allowed_loss_usd), Decimal("30"))
+        self.assertEqual(Decimal(self.last_attempt().follower_allowed_loss_usd), Decimal("40"))
 
     def test_the_follower_rejects_an_over_assignment_against_its_current_allowance(self) -> None:
         from dataclasses import replace
@@ -2582,8 +2567,8 @@ class PlanRetentionTests(PairCellTestCase):
     def test_the_retention_window_is_the_timeout_plus_the_relay_handling_window(self) -> None:
         self.prime()
         policy = cast(StrategyPolicy, self.accepted_policy)
-        self.assertEqual(pair_cell.RELAY_HANDLING_WINDOW_SECONDS, 5.0)
-        self.assertEqual(policy.plan_retention_seconds, 10.0)
+        self.assertEqual(pair_cell.RELAY_HANDLING_WINDOW_SECONDS, 30.0)
+        self.assertEqual(policy.plan_retention_seconds, 35.0)
 
     def test_an_attempt_in_flight_across_a_refresh_validates_against_its_version(self) -> None:
         self.net.hold_kinds = {"attempt"}
@@ -2681,195 +2666,18 @@ class LossPolicyTests(PairCellTestCase):
         # 2% of 10000 is 200; the hard cap of 40 wins before any order is sent.
         self.assertEqual(limits.leg_loss_cap_usd, Decimal("40"))
 
-    def test_sl_only_protection_caps_loss_without_a_take_profit_cap(self) -> None:
-        from abt.pair_cell import NO_TAKE_PROFIT, SizingPlan, compute_sl_only
-
-        plan = SizingPlan(
-            universe_generation=1,
-            product_id="EURUSD:x",
-            symbol=SYMBOL,
-            direction="LONG",
-            margin_per_lot="1000",
-            local_max_lots="5",
-            canonical_point="0.00001",
-            point="0.00001",
-            tick_size="0.00001",
-            profit_tick_value="1",
-            loss_tick_value="1",
-            volume_min="0.01",
-            volume_step="0.01",
-            volume_max="50",
-            filling_mode="FOK",
-            minimum_stop_distance="0",
-            usd_per_point_per_lot="1",
-        )
-        # 150 USD over 2 lots at 1 USD/tick is 75 ticks of 0.00001.
-        result = compute_sl_only(
-            entry=Decimal("1.10010"),
-            direction="LONG",
-            volume=Decimal("2"),
-            plan=plan,
-            allowed_loss_usd=Decimal("150"),
-        )
-        assert result is not None
-        self.assertEqual(Decimal(result[0]), Decimal("1.09935"))
-        self.assertEqual(result[1], NO_TAKE_PROFIT)
-
-    def test_trailing_stop_only_advances_favorably_within_the_loss_cap(self) -> None:
-        from abt.pair_cell import SizingPlan, compute_trailing_sl
-
-        plan = SizingPlan(
-            universe_generation=1,
-            product_id="EURUSD:x",
-            symbol=SYMBOL,
-            direction="LONG",
-            margin_per_lot="1000",
-            local_max_lots="5",
-            canonical_point="0.00001",
-            point="0.00001",
-            tick_size="0.00001",
-            profit_tick_value="1",
-            loss_tick_value="1",
-            volume_min="0.01",
-            volume_step="0.01",
-            volume_max="50",
-            filling_mode="FOK",
-            minimum_stop_distance="0",
-            usd_per_point_per_lot="1",
-        )
-        # Profitable: the stop follows half risk distance (37.5 ticks) behind.
-        advanced = compute_trailing_sl(
-            direction="LONG",
-            fill_price=Decimal("1.10030"),
-            initial_sl=Decimal("1.09955"),
-            current_price=Decimal("1.10130"),
-            plan=plan,
-            volume=Decimal("2"),
-            allowed_loss_usd=Decimal("150"),
-        )
-        self.assertEqual(None if advanced is None else Decimal(advanced), Decimal("1.10092"))
-        # Adverse or flat markets never move the stop.
-        self.assertIsNone(
-            compute_trailing_sl(
-                direction="LONG",
-                fill_price=Decimal("1.10030"),
-                initial_sl=Decimal("1.09955"),
-                current_price=Decimal("1.10020"),
-                plan=plan,
-                volume=Decimal("2"),
-                allowed_loss_usd=Decimal("150"),
-            )
-        )
-        # SHORT mirrors: advance downward only when profitable.
-        short_advanced = compute_trailing_sl(
-            direction="SHORT",
-            fill_price=Decimal("1.10045"),
-            initial_sl=Decimal("1.10120"),
-            current_price=Decimal("1.09960"),
-            plan=plan,
-            volume=Decimal("2"),
-            allowed_loss_usd=Decimal("150"),
-        )
-        self.assertEqual(
-            None if short_advanced is None else Decimal(short_advanced), Decimal("1.09998")
-        )
-
-    def test_solo_lock_prefers_breakeven_then_half_risk_then_hold(self) -> None:
-        from abt.pair_cell import SizingPlan, compute_solo_lock_sl
-
-        plan = SizingPlan(
-            universe_generation=1,
-            product_id="EURUSD:x",
-            symbol=SYMBOL,
-            direction="LONG",
-            margin_per_lot="1000",
-            local_max_lots="5",
-            canonical_point="0.00001",
-            point="0.00001",
-            tick_size="0.00001",
-            profit_tick_value="1",
-            loss_tick_value="1",
-            volume_min="0.01",
-            volume_step="0.01",
-            volume_max="50",
-            filling_mode="FOK",
-            minimum_stop_distance="0",
-            usd_per_point_per_lot="1",
-        )
-        # Profitable: breakeven is executable and tightens.
-        locked = compute_solo_lock_sl(
-            direction="LONG",
-            fill_price=Decimal("1.10010"),
-            initial_sl=Decimal("1.09935"),
-            current_sl=Decimal("1.09935"),
-            current_price=Decimal("1.10050"),
-            plan=plan,
-        )
-        self.assertEqual(None if locked is None else Decimal(locked), Decimal("1.10010"))
-        # Breakeven blocked by minimum distance: falls back to half-risk.
-        plan_far = SizingPlan(
-            universe_generation=1,
-            product_id="EURUSD:x",
-            symbol=SYMBOL,
-            direction="LONG",
-            margin_per_lot="1000",
-            local_max_lots="5",
-            canonical_point="0.00001",
-            point="0.00001",
-            tick_size="0.00001",
-            profit_tick_value="1",
-            loss_tick_value="1",
-            volume_min="0.01",
-            volume_step="0.01",
-            volume_max="50",
-            filling_mode="FOK",
-            minimum_stop_distance="0.00050",
-            usd_per_point_per_lot="1",
-        )
-        locked = compute_solo_lock_sl(
-            direction="LONG",
-            fill_price=Decimal("1.10010"),
-            initial_sl=Decimal("1.09935"),
-            current_sl=Decimal("1.09935"),
-            current_price=Decimal("1.10030"),
-            plan=plan_far,
-        )
-        # breakeven needs 0.00020 < 0.00050: blocked; half (1.09972) keeps
-        # 0.00058 distance: executable.
-        self.assertEqual(None if locked is None else Decimal(locked), Decimal("1.09972"))
-        # Thin profit where even half-risk is too close: hold, never widen.
-        locked = compute_solo_lock_sl(
-            direction="LONG",
-            fill_price=Decimal("1.10010"),
-            initial_sl=Decimal("1.09935"),
-            current_sl=Decimal("1.09935"),
-            current_price=Decimal("1.09980"),
-            plan=plan_far,
-        )
-        self.assertIsNone(locked)
-        # SHORT mirrors around the fill.
-        locked = compute_solo_lock_sl(
-            direction="SHORT",
-            fill_price=Decimal("1.10040"),
-            initial_sl=Decimal("1.10115"),
-            current_sl=Decimal("1.10115"),
-            current_price=Decimal("1.09960"),
-            plan=plan,
-        )
-        self.assertEqual(None if locked is None else Decimal(locked), Decimal("1.10040"))
-
     def test_rough_protection_targets_the_computed_allowance_not_a_constant(self) -> None:
         self.prime()
         self.follower.cell.handle_event(
-            RealizedPnLEvent(attempt_id="a1", realized_usd="-90", closed_at=self.now)
+            RealizedPnLEvent(attempt_id="a1", realized_usd="-80", closed_at=self.now)
         )
         self.tick()
         self.feed_quotes()
         attempt = self.last_attempt()
-        self.assertEqual(Decimal(attempt.follower_allowed_loss_usd), Decimal("30"))
-        # 30 USD over 2 lots at 1 USD/tick is 15 ticks of 0.00001.
+        self.assertEqual(Decimal(attempt.follower_allowed_loss_usd), Decimal("40"))
+        # 40 USD over 2 lots at 1 USD/tick is 20 ticks of 0.00001.
         self.assertEqual(
-            Decimal(attempt.follower_rough_sl), Decimal("1.10050") + Decimal("0.00015")
+            Decimal(attempt.follower_rough_sl), Decimal("1.10050") + Decimal("0.00020")
         )
 
     def test_remaining_daily_allowance_caps_the_leg_loss(self) -> None:
@@ -3042,6 +2850,40 @@ class CandidateAdmissionTests(PairCellTestCase):
         self.feed_quotes()
         self.assertEqual(self.leader.cell.entry_candidates(), [])
         self.assertEqual(self.attempt_payloads(), [])
+
+    def test_candidates_keep_the_edge_only_shape(self) -> None:
+        self.prime()
+        self.leader.cell.handle_event(PeerSessionEvent(connected=False, observed_at=self.now))
+        self.feed_quotes()
+        candidates = self.leader.cell.entry_candidates()
+        self.assertTrue(candidates)
+        self.assertIn("net_points", candidates[0])
+        self.assertNotIn("entry_mode", candidates[0])
+        self.assertNotIn("trend_strength", candidates[0])
+
+    def test_stale_or_skewed_quotes_admit_no_candidate(self) -> None:
+        """Regression guard: quotes admit only on the shared freshness budget."""
+
+        self.prime()
+        self.leader.cell.handle_event(PeerSessionEvent(connected=False, observed_at=self.now))
+        self.now += timedelta(seconds=10)
+        edge = {"leader_bid": "1.10000", "leader_ask": "1.10010",
+                "follower_bid": "1.10050", "follower_ask": "1.10060"}
+        # 30s-old quotes on both legs: stale under the 2s edge budget.
+        self.feed_quotes(
+            **edge,  # type: ignore[arg-type]
+            sequence=10,
+            leader_broker_time=self.now - timedelta(seconds=30),
+            follower_broker_time=self.now - timedelta(seconds=30),
+        )
+        self.assertEqual(self.leader.cell.entry_candidates(), [])
+        # Fresh local leg but a 30s skew: rejected under the 1s skew budget.
+        self.feed_quotes(
+            **edge,  # type: ignore[arg-type]
+            sequence=11,
+            follower_broker_time=self.now - timedelta(seconds=30),
+        )
+        self.assertEqual(self.leader.cell.entry_candidates(), [])
 
     def test_a_fresh_coherent_quote_pair_creates_exactly_one_attempt(self) -> None:
         self.prime()
@@ -3256,18 +3098,13 @@ class ImmediateEntryTests(PairCellTestCase):
             [row["event"] for row in self.leader.cell.transition_history()],
         )
 
-        # Edge mode never trails: without a box revision the modify counts
-        # stay flat even after the trail cadence passes.
+        # The box is one-shot: the modify counts stay flat afterwards.
         leader_count = len(self.leader.modify_requests())
         follower_count = len(self.follower.modify_requests())
         self.tick(seconds=300)
 
         self.assertEqual(len(self.leader.modify_requests()), leader_count)
         self.assertEqual(len(self.follower.modify_requests()), follower_count)
-        self.assertNotIn(
-            "profit_trail_applied",
-            [row["event"] for row in self.leader.cell.transition_history()],
-        )
 
     def test_both_legs_apply_the_mirrored_box(self) -> None:
         self.leader.mt5.fill_price = 1.10030
@@ -3312,8 +3149,8 @@ class ImmediateEntryTests(PairCellTestCase):
         self.assertEqual(len(self.follower.mt5.positions), 1)
 
     def test_edge_mode_follows_when_the_peer_leg_empties(self) -> None:
-        # Edge mode never solos: when the follower hedge leg disappears, the
-        # leader market-closes at once instead of running on.
+        # When the follower leg disappears, the leader market-closes at once
+        # instead of running on.
         self.run_entry()
         self.assertEqual(self.leader.cell.handle_event(ClockTickEvent(self.now)).state, "ACTIVE")
 
@@ -3329,107 +3166,6 @@ class ImmediateEntryTests(PairCellTestCase):
         self.assertNotEqual(self.leader.close_requests(), [])
         history = [row["event"] for row in self.leader.cell.transition_history()]
         self.assertIn("peer_leg_empty_edge_follow", history)
-        self.assertNotIn("peer_leg_empty_leader_continues_solo", history)
-
-    def test_leader_profit_trail_advances_after_five_minutes(self) -> None:
-        # Trailing is a trend-mode behavior: edge legs hold the mirrored box
-        # and never trail.
-        self.leader.mt5.fill_price = 1.10030
-        self.follower.mt5.fill_price = 1.10050
-        self.run_momentum_entry()
-        self.assertEqual(len(self.leader.modify_requests()), 1)
-        self.assertEqual(len(self.follower.modify_requests()), 1)
-
-        # The market runs in the leader LONG direction: the profit leg trails
-        # its stop half the initial risk distance (37.5 ticks) behind the bid.
-        # Advances smaller than _SOLO_TRAIL_MIN_STEP_TICKS are held; the
-        # follower hedge leg only trails on its own favorable move.
-        self.feed_quotes(
-            leader_bid="1.10130",
-            leader_ask="1.10140",
-            follower_bid="1.10050",
-            follower_ask="1.10060",
-            sequence=300,
-        )
-        self.tick(seconds=300)
-
-        leader_modify = self.leader.modify_requests()[-1]
-        self.assertEqual(Decimal(str(leader_modify["sl"])), Decimal("1.10092"))
-        self.assertEqual(str(leader_modify["tp"]), "0")
-        self.assertEqual(len(self.follower.modify_requests()), 1)
-        self.assertIn(
-            "profit_trail_applied",
-            [row["event"] for row in self.leader.cell.transition_history()],
-        )
-
-    def test_leader_continues_solo_after_the_follower_hedge_leg_stops_out(self) -> None:
-        # Solo continuation is a trend-mode behavior: edge legs always follow.
-        self.run_momentum_entry()
-        self.assertEqual(self.leader.cell.handle_event(ClockTickEvent(self.now)).state, "ACTIVE")
-
-        # The capped follower leg stops out first while the leader profit leg
-        # is still holding: the leader keeps running solo under its trailing
-        # stop instead of being contained with the loser.  Solo entry applies
-        # one immediate lock (breakeven, else half-risk), so the survivor may
-        # sit in PROTECTING rather than ACTIVE while still holding.
-        self.feed_quotes(
-            leader_bid="1.10150",
-            leader_ask="1.10160",
-            follower_bid="1.10050",
-            follower_ask="1.10060",
-            sequence=300,
-        )
-        self.tick()
-        self.follower.mt5.positions = []
-        self.follower.cell.handle_event(
-            BrokerSnapshotEvent(orders=[], positions=[], observed_at=self.now)
-        )
-        self.net.pump()
-
-        result = self.leader.cell.handle_event(ClockTickEvent(self.now))
-        self.assertIn(result.state, ("ACTIVE", "PROTECTING"))
-        self.assertEqual(self.leader.close_requests(), [])
-        self.assertIn(
-            "peer_leg_empty_leader_continues_solo",
-            [row["event"] for row in self.leader.cell.transition_history()],
-        )
-        self.assertIn(
-            "solo_lock_applied",
-            [row["event"] for row in self.leader.cell.transition_history()],
-        )
-
-    def test_follower_continues_solo_after_the_leader_leg_stops_out(self) -> None:
-        # Dual-solo contract: either leg may outlive the peer.  The follower
-        # keeps running under its own trailing stop with one immediate solo
-        # lock instead of being contained with the empty leader leg.
-        self.run_momentum_entry()
-        self.assertEqual(self.follower.cell.handle_event(ClockTickEvent(self.now)).state, "ACTIVE")
-
-        self.feed_quotes(
-            leader_bid="1.10000",
-            leader_ask="1.10010",
-            follower_bid="1.09950",
-            follower_ask="1.09960",
-            sequence=300,
-        )
-        self.tick()
-        self.leader.mt5.positions = []
-        self.leader.cell.handle_event(
-            BrokerSnapshotEvent(orders=[], positions=[], observed_at=self.now)
-        )
-        self.net.pump()
-
-        result = self.follower.cell.handle_event(ClockTickEvent(self.now))
-        self.assertIn(result.state, ("ACTIVE", "PROTECTING"))
-        self.assertEqual(self.follower.close_requests(), [])
-        self.assertIn(
-            "peer_leg_empty_follower_continues_solo",
-            [row["event"] for row in self.follower.cell.transition_history()],
-        )
-        self.assertIn(
-            "solo_lock_applied",
-            [row["event"] for row in self.follower.cell.transition_history()],
-        )
 
     def test_peer_protection_rejection_rolls_back_the_accepted_leg_to_rough(self) -> None:
         self.leader.mt5.fill_price = 1.10030
@@ -3921,11 +3657,9 @@ class EntryResultTests(PairCellTestCase):
 
 
 class RecoveryTests(PairCellTestCase):
-    # NOTE: either leg may keep running solo after the peer empties, but only
-    # as a winner (own exit price strictly beyond fill).  Flat or adverse
-    # legs still contain with the peer, so the containment-recheck paths below
-    # -- which run at flat harness quotes -- are still exercised from the
-    # follower side when the leader leg empties.
+    # NOTE: a peer-empty always contains with the peer, so the
+    # containment-recheck paths below -- which run at flat harness quotes --
+    # are still exercised from the follower side when the leader leg empties.
     def test_rejected_containment_cancel_rechecks_broker_before_stopping(self) -> None:
         self.run_entry()
         self.follower.mt5.orders.append({"ticket": 123, "symbol": SYMBOL})
@@ -4783,10 +4517,10 @@ class ExitConvergenceTests(PairCellTestCase):
         self.assertEqual(self.follower.mt5.positions, [])
         self.assertEqual(self.leader.cell.handle_event(ClockTickEvent(self.now)).state, "EMPTY")
 
-    def test_operator_shutdown_closes_a_profitable_peer_instead_of_solo(self) -> None:
+    def test_operator_shutdown_closes_a_profitable_peer_immediately(self) -> None:
         self.run_entry()
         # The follower SHORT is strictly profitable once ask drops below its
-        # fill, which is exactly when a plain peer-empty would go solo.
+        # fill; the joint close still flattens it at once.
         self.feed_quotes(
             leader_bid="1.10050",
             leader_ask="1.10060",
@@ -4812,7 +4546,6 @@ class ExitConvergenceTests(PairCellTestCase):
         )
         follower_events = [row["event"] for row in self.follower.cell.transition_history()]
         self.assertIn("peer_operator_shutdown", follower_events)
-        self.assertNotIn("peer_leg_empty_follower_continues_solo", follower_events)
         # Freeze quotes so no fresh attempt follows the joint close.
         self.now += timedelta(seconds=30)
         for _ in range(5):
@@ -4820,7 +4553,7 @@ class ExitConvergenceTests(PairCellTestCase):
         remaining = [p["ticket"] for p in self.follower.mt5.positions]
         self.assertFalse(
             any(ticket in remaining for ticket in old_follower_tickets),
-            "the profitable peer leg must be flattened, not left solo",
+            "the profitable peer leg must be flattened, not left running",
         )
 
     def test_operator_shutdown_marker_survives_leader_restart(self) -> None:
@@ -5061,87 +4794,6 @@ class PeerTerminalProofTests(PairCellTestCase):
             [row["event"] for row in self.leader.cell.transition_history()],
         )
 
-    def test_a_live_peer_resets_the_terminal_proof_window(self) -> None:
-        # The 2026-09-09 solo runs parked the follower ~60s after every peer
-        # empty: the leader intentionally withholds terminal proof while it
-        # keeps managing its profit leg. While authenticated peer envelopes
-        # keep arriving, the follower must keep probing without escalating.
-        # Solo is winner-only, so run the leader quote profitable first.
-        # (Solo continuation only exists in trend modes.)
-        self.run_momentum_entry()
-        self.assertEqual(self.leader.cell.handle_event(ClockTickEvent(self.now)).state, "ACTIVE")
-        self.assertEqual(self.follower.cell.handle_event(ClockTickEvent(self.now)).state, "ACTIVE")
-
-        self.feed_quotes(
-            leader_bid="1.10150",
-            leader_ask="1.10160",
-            follower_bid="1.10050",
-            follower_ask="1.10060",
-            sequence=300,
-        )
-        self.tick()
-        self.follower.mt5.positions = []
-        self.follower.cell.handle_event(
-            BrokerSnapshotEvent(orders=[], positions=[], observed_at=self.now)
-        )
-        self.net.pump()
-
-        for _ in range(15):
-            self.clock.advance(5.1)
-            self.now += timedelta(seconds=5.1)
-            self.leader.cell.handle_event(ClockTickEvent(self.now))
-            result = self.follower.cell.handle_event(ClockTickEvent(self.now))
-            self.net.pump()
-            self.assertFalse(result.needs_human)
-
-        self.assertIn(
-            "peer_terminal_proof_probe",
-            [row["event"] for row in self.follower.cell.transition_history()],
-        )
-        self.assertNotIn(
-            "close_needs_human",
-            [row["event"] for row in self.follower.cell.transition_history()],
-        )
-        self.assertEqual(len(self.leader.mt5.positions), 1, "the solo profit leg keeps running")
-
-    def test_repeated_peer_empty_reports_log_solo_once(self) -> None:
-        self.run_momentum_entry()
-        self.assertEqual(self.leader.cell.handle_event(ClockTickEvent(self.now)).state, "ACTIVE")
-
-        # Winner-only solo: run the leader quote profitable before the peer
-        # empties so the survivor path (not containment) is exercised.
-        self.feed_quotes(
-            leader_bid="1.10150",
-            leader_ask="1.10160",
-            follower_bid="1.10050",
-            follower_ask="1.10060",
-            sequence=300,
-        )
-        self.tick()
-        self.follower.mt5.positions = []
-        self.follower.cell.handle_event(
-            BrokerSnapshotEvent(orders=[], positions=[], observed_at=self.now)
-        )
-        self.net.pump()
-        attempt_id = self.last_attempt().attempt_id
-        solo = [
-            row for row in self.leader.cell.transition_history()
-            if row["event"] == "peer_leg_empty_leader_continues_solo"
-        ]
-        self.assertEqual(len(solo), 1)
-
-        for _ in range(2):
-            self.leader.cell.handle_event(
-                RelayEnvelopeReceived(
-                    self._leg_status({"attempt_id": attempt_id, "status": "empty"})
-                )
-            )
-        solo = [
-            row for row in self.leader.cell.transition_history()
-            if row["event"] == "peer_leg_empty_leader_continues_solo"
-        ]
-        self.assertEqual(len(solo), 1, "duplicate empty reports must not re-log solo")
-
     def test_repeated_identical_stop_latches_only_once(self) -> None:
         self.run_entry()
         cell = self.leader.cell
@@ -5265,7 +4917,7 @@ class PeerTerminalProofTests(PairCellTestCase):
         self.assertIn("empty", [str(p["status"]) for p in self.net.payloads("leg_status", LEADER)])
 
     def test_live_peer_chatter_resets_the_terminal_proof_window(self) -> None:
-        # Solo-era contract: any authenticated peer envelope proves liveness,
+        # Liveness contract: any authenticated peer envelope proves liveness,
         # so even identical chatter restarts the bounded window -- a peer that
         # explicitly keeps reporting "filled" is holding, not gone. Only total
         # silence escalates (see test_a_truly_unavailable_peer...). The wait
@@ -6940,6 +6592,65 @@ class LegacySchemaMigrationTests(PairCellTestCase):
             pair_cell.durable_quarantined_products(self.tmp / f"{LEADER}-cell.db"), ()
         )
 
+    def test_retired_evidence_columns_and_tape_drop_in_place(self) -> None:
+        import sqlite3
+
+        path = self.tmp / "evidence-cell.db"
+        connection = sqlite3.connect(path)
+        connection.executescript(
+            """
+            CREATE TABLE cell_market_tape_1s (
+                product_id TEXT NOT NULL,
+                source TEXT NOT NULL,
+                epoch_sec INTEGER NOT NULL,
+                mid TEXT NOT NULL,
+                spread TEXT NOT NULL,
+                bid TEXT NOT NULL,
+                ask TEXT NOT NULL,
+                recorded_at TEXT NOT NULL,
+                PRIMARY KEY (product_id, source, epoch_sec)
+            );
+            CREATE TABLE cell_admission_stats (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                recorded_at TEXT NOT NULL,
+                entry_mode TEXT NOT NULL,
+                products INTEGER NOT NULL DEFAULT 0,
+                trend_bias INTEGER NOT NULL DEFAULT 0,
+                admitted INTEGER NOT NULL DEFAULT 0
+            );
+            INSERT INTO cell_admission_stats
+                (recorded_at, entry_mode, products, trend_bias, admitted)
+                VALUES ('2026-09-26T00:00:00+00:00', 'edge', 1, 0, 0);
+            """
+        )
+        connection.commit()
+        connection.close()
+        applied = pair_cell.migrate_pair_cell_database(path)
+        self.assertEqual(
+            applied,
+            [
+                "cell_admission_stats.drop_entry_mode",
+                "cell_admission_stats.drop_trend_bias",
+                "cell_market_tape_1s.drop",
+            ],
+        )
+        self.assertEqual(pair_cell.migrate_pair_cell_database(path), [], "migration is idempotent")
+        connection = sqlite3.connect(path)
+        self.addCleanup(connection.close)
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(cell_admission_stats)").fetchall()}
+        self.assertNotIn("entry_mode", columns)
+        self.assertNotIn("trend_bias", columns)
+        self.assertEqual(
+            connection.execute("SELECT products, admitted FROM cell_admission_stats").fetchall(),
+            [(1, 0)],
+        )
+        self.assertEqual(
+            connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'cell_market_tape_1s'"
+            ).fetchall(),
+            [],
+        )
+
 
 class LegacyQuarantineScopeTests(PairCellTestCase):
     """A migrated bare-symbol quarantine covers every product on that symbol.
@@ -7108,551 +6819,8 @@ class LegacyQuarantineScopeTests(PairCellTestCase):
         self.assertTrue(self.leader.cell.is_quarantined(other))
 
 
-# --------------------------------------------------------------------------- #
-# Trend-following entry (Donchian breakout / normalized momentum)
-# --------------------------------------------------------------------------- #
-
-
-def _trend_history(seconds: int, start_mid: str, step: str, *, base: int = 1_000_000) -> list[tuple[int, Decimal]]:
-    """A deterministic 1-second mid series rising by ``step`` per second."""
-
-    mid = Decimal(start_mid)
-    increment = Decimal(step)
-    series: list[tuple[int, Decimal]] = []
-    for offset in range(seconds):
-        series.append((base + offset, mid + increment * offset))
-    return series
-
-
-class TrendBiasTests(unittest.TestCase):
-    def test_donchian_long_breakout_above_the_rolling_high(self) -> None:
-        history = _trend_history(120, "1.10000", "0.00001")
-        bias, distance, reason = donchian_bias(
-            history,
-            Decimal("1.10150"),
-            now_epoch=1_000_000 + 120,
-            lookback_seconds=120.0,
-            buffer_points=Decimal("0.00002"),
-            min_range_points=Decimal("0.00012"),
-            min_coverage=0.8,
-        )
-        self.assertEqual(bias, "LONG")
-        self.assertGreater(distance, Decimal(0))
-        self.assertIn("breakout", reason)
-
-    def test_donchian_short_breakdown_below_the_rolling_low(self) -> None:
-        history = _trend_history(120, "1.10200", "-0.00001")
-        bias, distance, _ = donchian_bias(
-            history,
-            Decimal("1.10000"),
-            now_epoch=1_000_000 + 120,
-            lookback_seconds=120.0,
-            buffer_points=Decimal("0.00002"),
-            min_range_points=Decimal("0.00012"),
-            min_coverage=0.8,
-        )
-        self.assertEqual(bias, "SHORT")
-        self.assertGreater(distance, Decimal(0))
-
-    def test_donchian_inside_the_range_is_no_bias(self) -> None:
-        history = _trend_history(120, "1.10000", "0.00001")
-        bias, _, _ = donchian_bias(
-            history,
-            Decimal("1.10050"),
-            now_epoch=1_000_000 + 120,
-            lookback_seconds=120.0,
-            buffer_points=Decimal("0.00002"),
-            min_range_points=Decimal("0.00012"),
-            min_coverage=0.8,
-        )
-        self.assertIsNone(bias)
-
-    def test_donchian_flat_range_is_no_bias(self) -> None:
-        history = [(1_000_000 + offset, Decimal("1.10000")) for offset in range(120)]
-        bias, _, reason = donchian_bias(
-            history,
-            Decimal("1.10050"),
-            now_epoch=1_000_000 + 120,
-            lookback_seconds=120.0,
-            buffer_points=Decimal("0.00002"),
-            min_range_points=Decimal("0.00012"),
-            min_coverage=0.8,
-        )
-        self.assertIsNone(bias)
-        self.assertIn("flat", reason)
-
-    def test_donchian_thin_buffer_stays_warming(self) -> None:
-        history = _trend_history(5, "1.10000", "0.00001")
-        bias, _, reason = donchian_bias(
-            history,
-            Decimal("1.10150"),
-            now_epoch=1_000_000 + 120,
-            lookback_seconds=120.0,
-            buffer_points=Decimal("0.00002"),
-            min_range_points=Decimal("0.00012"),
-            min_coverage=0.8,
-        )
-        self.assertIsNone(bias)
-        self.assertIn("warming", reason)
-
-    def test_momentum_impulse_scores_above_threshold(self) -> None:
-        history = _trend_history(600, "1.10000", "0.000001")
-        bias, score, _ = momentum_bias(
-            history,
-            Decimal("1.10100"),
-            now_epoch=1_000_000 + 600,
-            t_seconds=120.0,
-            vol_window_seconds=600.0,
-            k=Decimal("2.0"),
-            min_mom_points=Decimal("0.00005"),
-            min_coverage=0.5,
-        )
-        self.assertEqual(bias, "LONG")
-        self.assertGreaterEqual(score, Decimal("2.0"))
-
-    def test_momentum_drift_below_threshold_is_no_bias(self) -> None:
-        history = _trend_history(600, "1.10000", "0.00001")
-        # Reference 120s ago sits 120 steps back; a 10-point nudge above it
-        # clears min_mom but scores far below k against the ramp's volatility.
-        bias, _, _ = momentum_bias(
-            history,
-            Decimal("1.10490"),
-            now_epoch=1_000_000 + 600,
-            t_seconds=120.0,
-            vol_window_seconds=600.0,
-            k=Decimal("2.0"),
-            min_mom_points=Decimal("0.00005"),
-            min_coverage=0.5,
-        )
-        self.assertIsNone(bias)
-
-    def test_momentum_without_a_reference_point_stays_warming(self) -> None:
-        history = _trend_history(30, "1.10000", "0.00001")
-        bias, _, reason = momentum_bias(
-            history,
-            Decimal("1.10100"),
-            now_epoch=1_000_000 + 30,
-            t_seconds=120.0,
-            vol_window_seconds=600.0,
-            k=Decimal("2.0"),
-            min_mom_points=Decimal("0.00005"),
-            min_coverage=0.5,
-        )
-        self.assertIsNone(bias)
-        self.assertIn("warming", reason)
-
-
-class TrendEntryTests(PairCellTestCase):
-    def _feed_trend(
-        self, *, start_mid: str, step_points: int, count: int, step_seconds: int = 10, sequence_start: int = 10
-    ) -> None:
-        """Advance a 1-second-resampled leader mid series through live quotes."""
-
-        point = Decimal("0.00001")
-        mid = Decimal(start_mid)
-        sequence = sequence_start
-        for _ in range(count):
-            self.now += timedelta(seconds=step_seconds)
-            bid = mid - Decimal("0.00005")
-            ask = mid + Decimal("0.00005")
-            self.feed_quotes(
-                leader_bid=str(bid),
-                leader_ask=str(ask),
-                follower_bid="1.10000",
-                follower_ask="1.10010",
-                sequence=sequence,
-            )
-            sequence += 1
-            mid += point * step_points
-
-    def test_donchian_breakout_creates_a_trend_candidate(self) -> None:
-        self.prime(
-            shared={
-                "entry_mode": "donchian",
-                "trend_lookback_seconds": 120.0,
-                "trend_breakout_buffer_points": "2",
-                "trend_min_range_points": "5",
-                "trend_max_spread_points": "20",
-                "trend_min_coverage": 0.5,
-            }
-        )
-        # Rising mids build the rolling high, then one jump clears it.
-        self._feed_trend(start_mid="1.10000", step_points=1, count=14)
-        self.leader.cell.handle_event(PeerSessionEvent(connected=False, observed_at=self.now))
-        self.now += timedelta(seconds=10)
-        self.feed_quotes(
-            leader_bid="1.10245",
-            leader_ask="1.10255",
-            follower_bid="1.10000",
-            follower_ask="1.10010",
-            sequence=100,
-        )
-        candidates = self.leader.cell.entry_candidates()
-        self.assertTrue(candidates, "a breakout should admit a trend candidate")
-        self.assertEqual(candidates[0]["leader_direction"], "LONG")
-        self.assertEqual(candidates[0]["entry_mode"], "donchian")
-
-    def test_donchian_counter_trend_direction_is_excluded(self) -> None:
-        self.prime(
-            shared={
-                "entry_mode": "donchian",
-                "trend_lookback_seconds": 120.0,
-                "trend_breakout_buffer_points": "2",
-                "trend_min_range_points": "5",
-                "trend_max_spread_points": "20",
-                "trend_min_coverage": 0.5,
-            }
-        )
-        self._feed_trend(start_mid="1.10000", step_points=1, count=14)
-        self.leader.cell.handle_event(PeerSessionEvent(connected=False, observed_at=self.now))
-        self.now += timedelta(seconds=10)
-        # A mid inside the rolling range breaks out in neither direction.
-        self.feed_quotes(
-            leader_bid="1.10002",
-            leader_ask="1.10012",
-            follower_bid="1.10000",
-            follower_ask="1.10010",
-            sequence=100,
-        )
-        self.assertEqual(self.leader.cell.entry_candidates(), [])
-
-    def test_donchian_wide_spread_blocks_the_breakout(self) -> None:
-        self.prime(
-            shared={
-                "entry_mode": "donchian",
-                "trend_lookback_seconds": 120.0,
-                "trend_breakout_buffer_points": "2",
-                "trend_min_range_points": "12",
-                "trend_max_spread_points": "2",
-                "trend_min_coverage": 0.5,
-            }
-        )
-        self._feed_trend(start_mid="1.10000", step_points=1, count=14)
-        self.leader.cell.handle_event(PeerSessionEvent(connected=False, observed_at=self.now))
-        self.now += timedelta(seconds=10)
-        self.feed_quotes(
-            leader_bid="1.10245",
-            leader_ask="1.10285",
-            follower_bid="1.10000",
-            follower_ask="1.10010",
-            sequence=100,
-        )
-        self.assertEqual(self.leader.cell.entry_candidates(), [])
-
-    def test_momentum_impulse_creates_a_trend_candidate(self) -> None:
-        self.prime(
-            shared={
-                "entry_mode": "momentum",
-                "trend_momentum_T_seconds": 60.0,
-                "trend_vol_window_seconds": 300.0,
-                "trend_momentum_k": "2.0",
-                "trend_min_mom_points": "5",
-                "trend_max_spread_points": "20",
-                "trend_min_coverage": 0.3,
-            }
-        )
-        self._feed_trend(start_mid="1.10000", step_points=0, count=32, step_seconds=10)
-        self.leader.cell.handle_event(PeerSessionEvent(connected=False, observed_at=self.now))
-        self.now += timedelta(seconds=10)
-        self.feed_quotes(
-            leader_bid="1.10095",
-            leader_ask="1.10105",
-            follower_bid="1.10000",
-            follower_ask="1.10010",
-            sequence=200,
-        )
-        candidates = self.leader.cell.entry_candidates()
-        self.assertTrue(candidates, "an impulse should admit a momentum candidate")
-        self.assertEqual(candidates[0]["leader_direction"], "LONG")
-        self.assertEqual(candidates[0]["entry_mode"], "momentum")
-
-    def test_momentum_live_point_count_thresholds_admit_an_impulse(self) -> None:
-        """Regression: production point-count config must fire on a real impulse.
-
-        ``trend_min_mom_points="5"`` means five canonical points, not five
-        price units; unscaled, no FX impulse could ever clear it.
-        """
-
-        self.prime(
-            shared={
-                "entry_mode": "momentum",
-                "trend_momentum_T_seconds": 120.0,
-                "trend_vol_window_seconds": 600.0,
-                "trend_momentum_k": "2.0",
-                "trend_min_mom_points": "5",
-                "trend_max_spread_points": "8",
-                "trend_min_coverage": 0.8,
-            }
-        )
-        # Flat ramp inside a 4-point spread, then an 80-point jump.
-        point = Decimal("0.00001")
-        mid = Decimal("1.10000")
-        sequence = 10
-        for _ in range(55):
-            self.now += timedelta(seconds=10)
-            self.feed_quotes(
-                leader_bid=str(mid - 2 * point),
-                leader_ask=str(mid + 2 * point),
-                follower_bid="1.10000",
-                follower_ask="1.10004",
-                sequence=sequence,
-            )
-            sequence += 1
-        self.leader.cell.handle_event(PeerSessionEvent(connected=False, observed_at=self.now))
-        self.now += timedelta(seconds=10)
-        jumped = mid + 80 * point
-        self.feed_quotes(
-            leader_bid=str(jumped - 2 * point),
-            leader_ask=str(jumped + 2 * point),
-            follower_bid="1.10000",
-            follower_ask="1.10004",
-            sequence=200,
-        )
-        candidates = self.leader.cell.entry_candidates()
-        self.assertTrue(candidates, "live point-count thresholds must admit an 80-point impulse")
-        self.assertEqual(candidates[0]["leader_direction"], "LONG")
-        self.assertEqual(candidates[0]["entry_mode"], "momentum")
-
-    def test_trend_seed_prefills_the_buffer_without_publishing_quotes(self) -> None:
-        self.prime(
-            shared={
-                "entry_mode": "donchian",
-                "trend_lookback_seconds": 120.0,
-                "trend_breakout_buffer_points": "2",
-                "trend_min_range_points": "12",
-                "trend_max_spread_points": "20",
-                "trend_min_coverage": 0.5,
-            }
-        )
-        product = self.product_id()
-        quotes_before = self.net.kinds(LEADER).count("quote")
-        base = self.now - timedelta(seconds=100)
-        points = tuple(
-            TrendSeedPoint(
-                broker_time=base + timedelta(seconds=offset),
-                bid=Decimal("1.10000") + Decimal(offset) * Decimal("0.00001"),
-                ask=Decimal("1.10010") + Decimal(offset) * Decimal("0.00001"),
-            )
-            for offset in range(90)
-        )
-        self.leader.cell.handle_event(
-            TrendSeedEvent(product_id=product, points=points, degraded=False)
-        )
-        # A seed never looks like fresh market evidence on the relay.
-        self.assertEqual(self.net.kinds(LEADER).count("quote"), quotes_before)
-        self.assertEqual(self.attempt_payloads(), [])
-        # But the buffer is warm: a live breakout above the seeded high admits.
-        self.leader.cell.handle_event(PeerSessionEvent(connected=False, observed_at=self.now))
-        self.now += timedelta(seconds=10)
-        self.feed_quotes(
-            leader_bid="1.10245",
-            leader_ask="1.10255",
-            follower_bid="1.10000",
-            follower_ask="1.10010",
-            sequence=100,
-        )
-        candidates = self.leader.cell.entry_candidates()
-        self.assertTrue(candidates, "seeded history should warm the trend buffer")
-        self.assertEqual(candidates[0]["leader_direction"], "LONG")
-
-    def test_invalid_entry_mode_is_rejected(self) -> None:
-        self.tick()
-        self.accept()
-        self.feed_catalogs()
-        with self.assertRaises(PairExecutionCellError):
-            self.policy(entry_mode="breakout")
-
-    def test_edge_mode_keeps_legacy_candidate_shape(self) -> None:
-        self.prime()
-        self.leader.cell.handle_event(PeerSessionEvent(connected=False, observed_at=self.now))
-        self.feed_quotes()
-        candidates = self.leader.cell.entry_candidates()
-        self.assertTrue(candidates)
-        self.assertEqual(candidates[0]["entry_mode"], "edge")
-        self.assertIn("net_points", candidates[0])
-
-
-class TrendRelaxedGatesTests(PairCellTestCase):
-    """Trend modes gate on their own timescale, not the edge arbitrage budget."""
-
-    def _momentum_prime(self, **extra: object) -> None:
-        shared: dict[str, object] = {
-            "entry_mode": "momentum",
-            "trend_momentum_T_seconds": 60.0,
-            "trend_vol_window_seconds": 300.0,
-            "trend_momentum_k": "2.0",
-            "trend_min_mom_points": "5",
-            "trend_max_spread_points": "20",
-            "trend_min_coverage": 0.3,
-        }
-        shared.update(extra)
-        self.prime(shared=shared)
-
-    def _flat_run(self, *, count: int = 32, sequence_start: int = 10) -> int:
-        point = Decimal("0.00001")
-        mid = Decimal("1.10000")
-        sequence = sequence_start
-        for _ in range(count):
-            self.now += timedelta(seconds=10)
-            self.feed_quotes(
-                leader_bid=str(mid - Decimal("0.00005")),
-                leader_ask=str(mid + Decimal("0.00005")),
-                follower_bid="1.10000",
-                follower_ask="1.10010",
-                sequence=sequence,
-            )
-            sequence += 1
-        return sequence
-
-    def test_momentum_admits_quotes_within_trend_age_budget(self) -> None:
-        """30s-old quotes pass the 60s trend budget (edge would reject them)."""
-
-        self._momentum_prime()
-        self._flat_run()
-        self.leader.cell.handle_event(PeerSessionEvent(connected=False, observed_at=self.now))
-        self.now += timedelta(seconds=10)
-        stale = self.now - timedelta(seconds=30)
-        self.feed_quotes(
-            leader_bid="1.10095",
-            leader_ask="1.10105",
-            follower_bid="1.10000",
-            follower_ask="1.10010",
-            sequence=200,
-            leader_broker_time=stale,
-            follower_broker_time=stale,
-        )
-        candidates = self.leader.cell.entry_candidates()
-        self.assertTrue(candidates, "30s-old quotes must pass the 60s trend budget")
-        self.assertEqual(candidates[0]["leader_direction"], "LONG")
-        self.assertEqual(candidates[0]["entry_mode"], "momentum")
-
-    def test_momentum_skips_the_cross_broker_skew_gate(self) -> None:
-        """A 30s calibrated skew must not block a trend decision (edge: reject)."""
-
-        self._momentum_prime()
-        self._flat_run()
-        self.leader.cell.handle_event(PeerSessionEvent(connected=False, observed_at=self.now))
-        self.now += timedelta(seconds=10)
-        self.feed_quotes(
-            leader_bid="1.10095",
-            leader_ask="1.10105",
-            follower_bid="1.10000",
-            follower_ask="1.10010",
-            sequence=200,
-            follower_broker_time=self.now - timedelta(seconds=30),
-        )
-        candidates = self.leader.cell.entry_candidates()
-        self.assertTrue(candidates, "trend modes must skip the skew gate")
-        self.assertEqual(candidates[0]["leader_direction"], "LONG")
-
-    def test_edge_mode_still_enforces_freshness_and_skew(self) -> None:
-        """Regression guard: the relaxed budget must never leak into edge mode."""
-
-        self.prime()
-        self.leader.cell.handle_event(PeerSessionEvent(connected=False, observed_at=self.now))
-        self.now += timedelta(seconds=10)
-        edge = {"leader_bid": "1.10000", "leader_ask": "1.10010",
-                "follower_bid": "1.10050", "follower_ask": "1.10060"}
-        # 30s-old quotes on both legs: stale under the 2s edge budget.
-        self.feed_quotes(
-            **edge,  # type: ignore[arg-type]
-            sequence=10,
-            leader_broker_time=self.now - timedelta(seconds=30),
-            follower_broker_time=self.now - timedelta(seconds=30),
-        )
-        self.assertEqual(self.leader.cell.entry_candidates(), [])
-        # Fresh local leg but a 30s skew: rejected under the 1s skew budget.
-        self.feed_quotes(
-            **edge,  # type: ignore[arg-type]
-            sequence=11,
-            follower_broker_time=self.now - timedelta(seconds=30),
-        )
-        self.assertEqual(self.leader.cell.entry_candidates(), [])
-
-    def test_trend_quote_age_budget_defaults_and_validates(self) -> None:
-        self.assertEqual(default_shared_policy_values()["trend_quote_max_age_seconds"], 60.0)
-        self.tick()
-        self.accept()
-        self.feed_catalogs()
-        with self.assertRaises(PairExecutionCellError):
-            self.policy(entry_mode="momentum", trend_quote_max_age_seconds=-5)
-
-    def test_quoted_products_respects_trend_age_budget(self) -> None:
-        """The plan precondition must admit the same quotes the entry gate admits."""
-
-        self._momentum_prime()
-        self.now += timedelta(seconds=30)
-        self.feed_quotes(
-            sequence=100,
-            leader_broker_time=self.now - timedelta(seconds=30),
-            follower_broker_time=self.now - timedelta(seconds=30),
-        )
-        self.assertTrue(
-            self.leader.cell._quoted_products(),
-            "30s-old quotes keep plans under the trend budget",
-        )
-
-
 class DebugEvidenceTests(PairCellTestCase):
-    """The 1-second tape and the admission gate counters for post-hoc replay."""
-
-    def test_tape_records_live_mids_with_last_wins_dedup(self) -> None:
-        self.prime()
-        self.leader.cell.handle_event(PeerSessionEvent(connected=False, observed_at=self.now))
-        product = self.product_id()
-        bucket = int(self.now.timestamp())
-        self.feed_quotes(
-            leader_bid="1.10000", leader_ask="1.10010",
-            follower_bid="1.10000", follower_ask="1.10010",
-            sequence=10,
-        )
-        self.feed_quotes(
-            leader_bid="1.10020", leader_ask="1.10030",
-            follower_bid="1.10000", follower_ask="1.10010",
-            sequence=11,
-        )
-        # The 1s flush throttle needs the pump to advance before asserting.
-        self.tick(seconds=2)
-        rows = self.leader.cell._db.execute(
-            "SELECT mid, bid, ask FROM cell_market_tape_1s"
-            " WHERE product_id = ? AND source = 'live' AND epoch_sec = ?",
-            (product, bucket),
-        ).fetchall()
-        self.assertEqual(len(rows), 1, "one second keeps one tape row")
-        self.assertEqual(rows[0][0], str((Decimal("1.10020") + Decimal("1.10030")) / 2))
-        self.assertEqual(rows[0][1], "1.10020")
-
-    def test_trend_seed_stages_gap_fill_tape_rows(self) -> None:
-        self.prime(
-            shared={
-                "entry_mode": "donchian",
-                "trend_lookback_seconds": 120.0,
-                "trend_breakout_buffer_points": "2",
-                "trend_min_range_points": "12",
-                "trend_max_spread_points": "20",
-                "trend_min_coverage": 0.5,
-            }
-        )
-        product = self.product_id()
-        base = self.now - timedelta(seconds=100)
-        points = tuple(
-            TrendSeedPoint(
-                broker_time=base + timedelta(seconds=offset),
-                bid=Decimal("1.10000") + Decimal(offset) * Decimal("0.00001"),
-                ask=Decimal("1.10010") + Decimal(offset) * Decimal("0.00001"),
-            )
-            for offset in range(90)
-        )
-        self.leader.cell.handle_event(
-            TrendSeedEvent(product_id=product, points=points, degraded=False)
-        )
-        # The 1s flush throttle needs the pump to advance before asserting.
-        self.tick(seconds=2)
-        count = self.leader.cell._db.execute(
-            "SELECT COUNT(*) FROM cell_market_tape_1s WHERE product_id = ? AND source = 'seed'",
-            (product,),
-        ).fetchone()[0]
-        self.assertGreaterEqual(count, 80, "seed history must land gap-fill tape rows")
+    """The admission gate counters for post-hoc replay."""
 
     def test_gate_stats_name_the_blocking_gate(self) -> None:
         self.prime()
@@ -7689,83 +6857,6 @@ class DebugEvidenceTests(PairCellTestCase):
         ).fetchone()
         self.assertEqual(latest[0], 1)
         self.assertEqual(latest[1], 0)
-
-
-class TrendClockTests(PairCellTestCase):
-    """The trend buffer and its evaluation share the calibrated UTC timeline.
-
-    Production brokers report server-clock ticks hours ahead of UTC; bucketing
-    those raw epochs parks the whole buffer in the future where the reference
-    and volatility windows never overlap it, so trend entries stay warming
-    forever.  These tests pin the calibrated behavior.
-    """
-
-    SHIFT_SECONDS = 10800.0
-
-    def _momentum_prime(self) -> None:
-        self.prime(
-            shared={
-                "entry_mode": "momentum",
-                "trend_momentum_T_seconds": 60.0,
-                "trend_vol_window_seconds": 300.0,
-                "trend_momentum_k": "2.0",
-                "trend_min_mom_points": "5",
-                "trend_max_spread_points": "20",
-                "trend_min_coverage": 0.3,
-            }
-        )
-
-    def _shifted_feed(self, *, leader_mid: Decimal, sequence: int) -> None:
-        """One flat quote pair on a UTC+3 broker: shifted epochs, measured offset."""
-
-        shift = timedelta(seconds=self.SHIFT_SECONDS)
-        calibration = BrokerClockCalibration(offset_seconds=self.SHIFT_SECONDS)
-        self.feed_quotes(
-            leader_bid=str(leader_mid - Decimal("0.00005")),
-            leader_ask=str(leader_mid + Decimal("0.00005")),
-            follower_bid="1.10000",
-            follower_ask="1.10010",
-            sequence=sequence,
-            leader_broker_time=self.now + shift,
-            follower_broker_time=self.now + shift,
-            leader_calibration=calibration,
-            follower_calibration=calibration,
-        )
-
-    def test_momentum_fires_on_broker_clock_shifted_ticks(self) -> None:
-        self._momentum_prime()
-        sequence = 10
-        for _ in range(32):
-            self.now += timedelta(seconds=10)
-            self._shifted_feed(leader_mid=Decimal("1.10000"), sequence=sequence)
-            sequence += 1
-        self.leader.cell.handle_event(PeerSessionEvent(connected=False, observed_at=self.now))
-        self.now += timedelta(seconds=10)
-        self._shifted_feed(leader_mid=Decimal("1.10100"), sequence=200)
-        candidates = self.leader.cell.entry_candidates()
-        self.assertTrue(candidates, "shifted broker ticks must evaluate on wall UTC")
-        self.assertEqual(candidates[0]["leader_direction"], "LONG")
-        # No bucket may sit in the future: the buffer shares the wall timeline.
-        product = self.product_id()
-        history = self.leader.cell._trend_history[product]
-        self.assertTrue(history)
-        self.assertLessEqual(history[-1][0], int(self.now.timestamp()))
-
-    def test_uncalibrated_quotes_stay_out_of_the_trend_buffer(self) -> None:
-        self.prime()
-        product = self.product_id()
-        before = list(self.leader.cell._trend_history.get(product, ()))
-        self.assertTrue(before, "prime must leave a calibrated buffer behind")
-        self.now += timedelta(seconds=10)
-        self.feed_quotes(
-            sequence=50,
-            leader_calibration=BrokerClockCalibration(status="uncalibrated"),
-        )
-        self.assertEqual(
-            list(self.leader.cell._trend_history.get(product, ())),
-            before,
-            "an unplaceable clock must not corrupt the shared timeline",
-        )
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -59,7 +59,6 @@ discovery, unpair, and crash races are reproducible without a live broker.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
-from collections import deque
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_EVEN
@@ -105,7 +104,6 @@ class PairExecutionCellError(RuntimeError):
 
 Role = Literal["leader", "follower"]
 ExecutionMode = Literal["live", "shadow"]
-EntryMode = Literal["edge", "donchian", "momentum"]
 Direction = Literal["LONG", "SHORT"]
 FillingMode = Literal["FOK", "IOC"]
 RouteState = Literal["ACTIVE", "UNPAIRING"]
@@ -127,7 +125,7 @@ _MAXIMUM_HOLDING_SECONDS = 7 * 24 * 60 * 60
 # sizing-plan versions stay valid for validating an already-dispatched attempt
 # for the confirmation timeout *plus* this window, so a routine hourly refresh
 # never guarantees rejection of an attempt that is already in flight.
-RELAY_HANDLING_WINDOW_SECONDS = 5.0
+RELAY_HANDLING_WINDOW_SECONDS = 30.0
 # An explicit rediscovery is one bounded round trip.  The requesting Worker
 # resends its idempotent request on this cadence and gives up at the deadline,
 # so a dropped request or a leader restart mid-attempt can never strand it.
@@ -165,7 +163,7 @@ _PEER_TERMINAL_STATUSES = _PEER_NON_SEND_STATUSES + ("empty",)
 # latch once this elapses and the ticket persists.
 _CONTAINMENT_REPLAY_SETTLE_SECONDS = 10.0
 # Operator-initiated shutdown must close both legs together: a peer that sees
-# this marker in an ``empty`` leg status skips the winner-only solo path and
+# this marker in an ``empty`` leg status takes the joint-close route and
 # contains immediately, even when its own leg is profitable.
 OPERATOR_SHUTDOWN_MARKER = "operator_shutdown"
 
@@ -390,6 +388,30 @@ def _pair_cell_schema_migrations(connection: sqlite3.Connection) -> list[tuple[s
                 "ALTER TABLE cell_product_quarantine ADD COLUMN universe_generation INTEGER",
             )
         )
+    # Debugging evidence from retired revisions: the 1-second mid tape fed
+    # the removed trend modes, and the admission counters no longer record a
+    # strategy choice.  Shed them so old rows keep working under the new
+    # writer; fresh databases never create them (see the DDL below).
+    evidence = _table_columns(connection, "cell_admission_stats")
+    for retired in ("entry_mode", "trend_bias"):
+        if evidence and retired in evidence:
+            steps.append(
+                (
+                    f"cell_admission_stats.drop_{retired}",
+                    f"ALTER TABLE cell_admission_stats DROP COLUMN {retired}",
+                )
+            )
+    try:
+        tape_tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+    except sqlite3.Error:  # pragma: no cover - an unreadable catalog reads as no tape
+        tape_tables = set()
+    if "cell_market_tape_1s" in tape_tables:
+        steps.append(("cell_market_tape_1s.drop", "DROP TABLE cell_market_tape_1s"))
     return steps
 
 
@@ -590,52 +612,33 @@ _RISK_FIELDS = (
 )
 
 DEFAULT_MODE: ExecutionMode = "shadow"
-DEFAULT_ENTRY_MODE: EntryMode = "edge"
-DEFAULT_TREND_LOOKBACK_SECONDS = 1800.0
-DEFAULT_TREND_BREAKOUT_BUFFER_POINTS = "2"
-DEFAULT_TREND_MIN_RANGE_POINTS = "12"
-DEFAULT_TREND_MOMENTUM_T_SECONDS = 120.0
-DEFAULT_TREND_VOL_WINDOW_SECONDS = 600.0
-DEFAULT_TREND_MOMENTUM_K = "2.0"
-DEFAULT_TREND_MIN_MOM_POINTS = "5"
-DEFAULT_TREND_MAX_SPREAD_POINTS = "8"
-DEFAULT_TREND_MIN_COVERAGE = 0.8
 DEFAULT_STRATEGY_BUDGET_USD = "0"
 #: Edge-mode admission floor: (edge - mean bilateral spread) in canonical
 #: points.  May be negative -- a slightly negative net is a bounded micro-loss
 #: traded for entry frequency, since the mirrored box caps every pair at
 #: roughly its entry net.  Replaces the old entry_edge_points threshold.
-DEFAULT_EDGE_MIN_NET_POINTS = "-3"
-DEFAULT_MAXIMUM_MARGIN_FRACTION = "0.01"
+DEFAULT_EDGE_MIN_NET_POINTS = "-4"
+DEFAULT_MAXIMUM_MARGIN_FRACTION = "0.15"
 DEFAULT_DAILY_LOSS_FRACTION = "0.02"
 DEFAULT_TRADE_LOSS_FRACTION = "0.01"
-DEFAULT_MAXIMUM_LOSS_PER_TRADE_USD = "40"
-DEFAULT_DAILY_LOSS_WARNING_THRESHOLD_USD = "20"
-DEFAULT_QUOTE_MAX_AGE_SECONDS = 1.0
-DEFAULT_QUOTE_MAX_SKEW_SECONDS = 1.0
-#: Quote-age budget for trend (donchian/momentum) decisions.  Trend bias is
-#: computed from the leader-local 1-second mid buffer over a minutes-long
-#: window, so it needs a staleness bound on the decision's own timescale --
-#: not the sub-second budget edge arbitrage requires.  The peer quote keeps a
-#: bound too (the follower's rough protection is priced off it), only looser.
-DEFAULT_TREND_QUOTE_MAX_AGE_SECONDS = 60.0
-#: How long 1-second tape rows and admission counters are kept for post-hoc
-#: debugging.  The tape is decision input, not an audit trail: 48h of mids
-#: and 7d of per-minute gate counters bound the database while covering any
-#: realistic incident review.
-_TAPE_RETENTION_SECONDS = 48 * 3600
+DEFAULT_MAXIMUM_LOSS_PER_TRADE_USD = "60"
+DEFAULT_DAILY_LOSS_WARNING_THRESHOLD_USD = "30"
+DEFAULT_QUOTE_MAX_AGE_SECONDS = 6.0
+DEFAULT_QUOTE_MAX_SKEW_SECONDS = 6.0
+#: How long admission gate counters are kept for post-hoc debugging: 7d of
+#: per-minute gate counters bound the database while covering any realistic
+#: incident review.
 _ADMISSION_STATS_RETENTION_SECONDS = 7 * 24 * 3600
 _ADMISSION_STATS_PERSIST_SECONDS = 60.0
-_TAPE_FLUSH_SECONDS = 1.0
-DEFAULT_FOLLOWER_CONFIRMATION_TIMEOUT_SECONDS = 5.0
+DEFAULT_FOLLOWER_CONFIRMATION_TIMEOUT_SECONDS = 60.0
 #: Quiet window after any relay/rebuild instability before either side may
 #: enter a new pair: the flap-free time plus a fresh peer handshake that must
 #: both hold before entries resume.  Zero disables the gate.
 DEFAULT_POST_RECONNECT_COOLDOWN_SECONDS = 300.0
 #: Upper bound for the post-reconnect quiet window (fail-closed operator range).
 _MAX_POST_RECONNECT_COOLDOWN_SECONDS = 24 * 3600.0
-DEFAULT_TRADING_BLACKOUT_START_NY = "16:30"
-DEFAULT_TRADING_BLACKOUT_END_NY = "18:30"
+DEFAULT_TRADING_BLACKOUT_START_NY = "19:30"
+DEFAULT_TRADING_BLACKOUT_END_NY = "20:30"
 DEFAULT_MAXIMUM_HOLDING_SECONDS: float | None = None
 REQUIRED_ACCOUNT_CURRENCY = "USD"
 
@@ -644,19 +647,8 @@ SHARED_POLICY_KEYS = (
     "mode",
     "strategy_budget_usd",
     "edge_min_net_points",
-    "entry_mode",
-    "trend_lookback_seconds",
-    "trend_breakout_buffer_points",
-    "trend_min_range_points",
-    "trend_momentum_T_seconds",
-    "trend_vol_window_seconds",
-    "trend_momentum_k",
-    "trend_min_mom_points",
-    "trend_max_spread_points",
-    "trend_min_coverage",
     "quote_max_age_seconds",
     "quote_max_skew_seconds",
-    "trend_quote_max_age_seconds",
     "follower_confirmation_timeout_seconds",
     "post_reconnect_cooldown_seconds",
     "sizing_refresh_seconds",
@@ -691,19 +683,8 @@ def default_shared_policy_values() -> dict[str, object]:
         "mode": DEFAULT_MODE,
         "strategy_budget_usd": DEFAULT_STRATEGY_BUDGET_USD,
         "edge_min_net_points": DEFAULT_EDGE_MIN_NET_POINTS,
-        "entry_mode": DEFAULT_ENTRY_MODE,
-        "trend_lookback_seconds": DEFAULT_TREND_LOOKBACK_SECONDS,
-        "trend_breakout_buffer_points": DEFAULT_TREND_BREAKOUT_BUFFER_POINTS,
-        "trend_min_range_points": DEFAULT_TREND_MIN_RANGE_POINTS,
-        "trend_momentum_T_seconds": DEFAULT_TREND_MOMENTUM_T_SECONDS,
-        "trend_vol_window_seconds": DEFAULT_TREND_VOL_WINDOW_SECONDS,
-        "trend_momentum_k": DEFAULT_TREND_MOMENTUM_K,
-        "trend_min_mom_points": DEFAULT_TREND_MIN_MOM_POINTS,
-        "trend_max_spread_points": DEFAULT_TREND_MAX_SPREAD_POINTS,
-        "trend_min_coverage": DEFAULT_TREND_MIN_COVERAGE,
         "quote_max_age_seconds": DEFAULT_QUOTE_MAX_AGE_SECONDS,
         "quote_max_skew_seconds": DEFAULT_QUOTE_MAX_SKEW_SECONDS,
-        "trend_quote_max_age_seconds": DEFAULT_TREND_QUOTE_MAX_AGE_SECONDS,
         "follower_confirmation_timeout_seconds": DEFAULT_FOLLOWER_CONFIRMATION_TIMEOUT_SECONDS,
         "post_reconnect_cooldown_seconds": DEFAULT_POST_RECONNECT_COOLDOWN_SECONDS,
         "sizing_refresh_seconds": _SIZING_REFRESH_SECONDS,
@@ -976,7 +957,6 @@ class StrategyPolicy:
     quote_max_skew_seconds: float
     leader_risk: WorkerRiskLimits
     follower_risk: WorkerRiskLimits
-    trend_quote_max_age_seconds: float = DEFAULT_TREND_QUOTE_MAX_AGE_SECONDS
     follower_confirmation_timeout_seconds: float = DEFAULT_FOLLOWER_CONFIRMATION_TIMEOUT_SECONDS
     post_reconnect_cooldown_seconds: float = DEFAULT_POST_RECONNECT_COOLDOWN_SECONDS
     sizing_refresh_seconds: float = _SIZING_REFRESH_SECONDS
@@ -986,66 +966,15 @@ class StrategyPolicy:
     trading_blackout_end_ny: str = DEFAULT_TRADING_BLACKOUT_END_NY
     mode: ExecutionMode = DEFAULT_MODE
     strategy_budget_usd: str = DEFAULT_STRATEGY_BUDGET_USD
-    entry_mode: EntryMode = DEFAULT_ENTRY_MODE
-    trend_lookback_seconds: float = DEFAULT_TREND_LOOKBACK_SECONDS
-    # All ``*_points`` trend thresholds are point counts in canonical-point
-    # units (like edge_min_net_points): the cell scales them by the product's
-    # canonical point before comparing against price-unit buffer mids.
-    trend_breakout_buffer_points: str = DEFAULT_TREND_BREAKOUT_BUFFER_POINTS
-    trend_min_range_points: str = DEFAULT_TREND_MIN_RANGE_POINTS
-    trend_momentum_T_seconds: float = DEFAULT_TREND_MOMENTUM_T_SECONDS
-    trend_vol_window_seconds: float = DEFAULT_TREND_VOL_WINDOW_SECONDS
-    trend_momentum_k: str = DEFAULT_TREND_MOMENTUM_K
-    trend_min_mom_points: str = DEFAULT_TREND_MIN_MOM_POINTS
-    trend_max_spread_points: str = DEFAULT_TREND_MAX_SPREAD_POINTS
-    trend_min_coverage: float = DEFAULT_TREND_MIN_COVERAGE
-    # Trend decisions read the leader-local minutes-long mid buffer, never a
-    # cross-broker price comparison, so both legs use this trend-timescale
-    # quote-age budget instead of the sub-second edge budget, and the skew
-    # gate (which only edge arbitrage needs) is skipped for trend modes.
-    trend_quote_max_age_seconds: float = DEFAULT_TREND_QUOTE_MAX_AGE_SECONDS
 
     def __post_init__(self) -> None:
         if not self.policy_version:
             raise PairExecutionCellError("A strategy policy requires a version.")
         if _to_decimal(self.edge_min_net_points) is None:
             raise PairExecutionCellError("edge_min_net_points must be a finite number.")
-        if self.entry_mode not in ("edge", "donchian", "momentum"):
-            raise PairExecutionCellError("entry_mode must be 'edge', 'donchian' or 'momentum'.")
-        for name in (
-            "trend_lookback_seconds",
-            "trend_momentum_T_seconds",
-            "trend_vol_window_seconds",
-        ):
-            value = getattr(self, name)
-            if (
-                not isinstance(value, (int, float))
-                or isinstance(value, bool)
-                or not math.isfinite(value)
-                or value <= 0
-            ):
-                raise PairExecutionCellError(f"{name} must be a positive number.")
-        for name in (
-            "trend_breakout_buffer_points",
-            "trend_min_range_points",
-            "trend_momentum_k",
-            "trend_min_mom_points",
-            "trend_max_spread_points",
-        ):
-            if _to_decimal(getattr(self, name)) is None:
-                raise PairExecutionCellError(f"{name} must be a finite number.")
-        coverage = self.trend_min_coverage
-        if (
-            not isinstance(coverage, (int, float))
-            or isinstance(coverage, bool)
-            or not math.isfinite(coverage)
-            or not 0 < coverage <= 1
-        ):
-            raise PairExecutionCellError("trend_min_coverage must be in (0, 1].")
         for name in (
             "quote_max_age_seconds",
             "quote_max_skew_seconds",
-            "trend_quote_max_age_seconds",
             "follower_confirmation_timeout_seconds",
             "sizing_refresh_seconds",
             "relay_handling_timeout_seconds",
@@ -1110,19 +1039,8 @@ class StrategyPolicy:
         "policy_version": self.policy_version,
         "strategy_budget_usd": self.strategy_budget_usd,
         "edge_min_net_points": self.edge_min_net_points,
-        "entry_mode": self.entry_mode,
-            "trend_lookback_seconds": self.trend_lookback_seconds,
-            "trend_breakout_buffer_points": self.trend_breakout_buffer_points,
-            "trend_min_range_points": self.trend_min_range_points,
-            "trend_momentum_T_seconds": self.trend_momentum_T_seconds,
-            "trend_vol_window_seconds": self.trend_vol_window_seconds,
-            "trend_momentum_k": self.trend_momentum_k,
-            "trend_min_mom_points": self.trend_min_mom_points,
-            "trend_max_spread_points": self.trend_max_spread_points,
-            "trend_min_coverage": self.trend_min_coverage,
             "quote_max_age_seconds": self.quote_max_age_seconds,
             "quote_max_skew_seconds": self.quote_max_skew_seconds,
-            "trend_quote_max_age_seconds": self.trend_quote_max_age_seconds,
             "follower_confirmation_timeout_seconds": self.follower_confirmation_timeout_seconds,
             "post_reconnect_cooldown_seconds": self.post_reconnect_cooldown_seconds,
             "sizing_refresh_seconds": self.sizing_refresh_seconds,
@@ -1146,48 +1064,37 @@ def _policy_from_canonical(value: Mapping[str, object]) -> StrategyPolicy:
             "The persisted policy uses removed flatten_at_ny semantics; "
             "both accounts must be empty and accept a fresh policy."
         )
-    raw_entry_mode = str(value.get("entry_mode", DEFAULT_ENTRY_MODE))
-    if raw_entry_mode not in ("edge", "donchian", "momentum"):
-        raise PairExecutionCellError("entry_mode must be 'edge', 'donchian' or 'momentum'.")
+    for removed in (
+        "entry_mode",
+        "trend_lookback_seconds",
+        "trend_breakout_buffer_points",
+        "trend_min_range_points",
+        "trend_momentum_T_seconds",
+        "trend_vol_window_seconds",
+        "trend_momentum_k",
+        "trend_min_mom_points",
+        "trend_max_spread_points",
+        "trend_min_coverage",
+        "trend_quote_max_age_seconds",
+    ):
+        if removed in value:
+            raise PairExecutionCellError(
+                f"The persisted policy uses removed {removed} semantics; "
+                "both accounts must be empty and accept a fresh policy."
+            )
+    unknown = sorted(set(value) - set(StrategyPolicy.__dataclass_fields__))
+    if unknown:
+        raise PairExecutionCellError(
+            f"The persisted policy carries unknown keys ({', '.join(unknown)}); "
+            "both accounts must be empty and accept a fresh policy."
+        )
     return StrategyPolicy(
         policy_version=cast(str, value["policy_version"]),
         edge_min_net_points=str(
             value.get("edge_min_net_points", DEFAULT_EDGE_MIN_NET_POINTS)
         ),
-        entry_mode=cast(EntryMode, raw_entry_mode),
-        trend_lookback_seconds=float(
-            cast(float, value.get("trend_lookback_seconds", DEFAULT_TREND_LOOKBACK_SECONDS))
-        ),
-        trend_breakout_buffer_points=str(
-            value.get("trend_breakout_buffer_points", DEFAULT_TREND_BREAKOUT_BUFFER_POINTS)
-        ),
-        trend_min_range_points=str(
-            value.get("trend_min_range_points", DEFAULT_TREND_MIN_RANGE_POINTS)
-        ),
-        trend_momentum_T_seconds=float(
-            cast(float, value.get("trend_momentum_T_seconds", DEFAULT_TREND_MOMENTUM_T_SECONDS))
-        ),
-        trend_vol_window_seconds=float(
-            cast(float, value.get("trend_vol_window_seconds", DEFAULT_TREND_VOL_WINDOW_SECONDS))
-        ),
-        trend_momentum_k=str(value.get("trend_momentum_k", DEFAULT_TREND_MOMENTUM_K)),
-        trend_min_mom_points=str(value.get("trend_min_mom_points", DEFAULT_TREND_MIN_MOM_POINTS)),
-        trend_max_spread_points=str(
-            value.get("trend_max_spread_points", DEFAULT_TREND_MAX_SPREAD_POINTS)
-        ),
-        trend_min_coverage=float(
-            cast(float, value.get("trend_min_coverage", DEFAULT_TREND_MIN_COVERAGE))
-        ),
         quote_max_age_seconds=float(cast(float, value["quote_max_age_seconds"])),
         quote_max_skew_seconds=float(cast(float, value["quote_max_skew_seconds"])),
-        trend_quote_max_age_seconds=float(
-            cast(
-                float,
-                value.get(
-                    "trend_quote_max_age_seconds", DEFAULT_TREND_QUOTE_MAX_AGE_SECONDS
-                ),
-            )
-        ),
         leader_risk=_risk_from_canonical(cast(Mapping[str, object], value["leader_risk"])),
         follower_risk=_risk_from_canonical(cast(Mapping[str, object], value["follower_risk"])),
         follower_confirmation_timeout_seconds=float(
@@ -1248,26 +1155,12 @@ def canonical_policy_from_acceptance(
             "strategy_budget_usd must be '0' (each leg uses its own startup balance)"
             " or a positive USD amount."
         )
-    raw_entry_mode = str(values["entry_mode"])
-    if raw_entry_mode not in ("edge", "donchian", "momentum"):
-        raise PairExecutionCellError("entry_mode must be 'edge', 'donchian' or 'momentum'.")
     return StrategyPolicy(
         policy_version=policy_version,
         strategy_budget_usd=unified_budget,
         edge_min_net_points=str(values["edge_min_net_points"]),
-        entry_mode=cast(EntryMode, raw_entry_mode),
-        trend_lookback_seconds=float(cast(float, values["trend_lookback_seconds"])),
-        trend_breakout_buffer_points=str(values["trend_breakout_buffer_points"]),
-        trend_min_range_points=str(values["trend_min_range_points"]),
-        trend_momentum_T_seconds=float(cast(float, values["trend_momentum_T_seconds"])),
-        trend_vol_window_seconds=float(cast(float, values["trend_vol_window_seconds"])),
-        trend_momentum_k=str(values["trend_momentum_k"]),
-        trend_min_mom_points=str(values["trend_min_mom_points"]),
-        trend_max_spread_points=str(values["trend_max_spread_points"]),
-        trend_min_coverage=float(cast(float, values["trend_min_coverage"])),
         quote_max_age_seconds=float(cast(float, values["quote_max_age_seconds"])),
         quote_max_skew_seconds=float(cast(float, values["quote_max_skew_seconds"])),
-        trend_quote_max_age_seconds=float(cast(float, values["trend_quote_max_age_seconds"])),
         leader_risk=_risk_with_unified_budget(leader_risk, unified_budget),
         follower_risk=_risk_with_unified_budget(acceptance.risk_limits(), unified_budget),
         follower_confirmation_timeout_seconds=float(
@@ -1850,97 +1743,6 @@ def edge_value(
     return leader_quote.bid - follower_quote.ask
 
 
-# -- trend-following entry (leader-only, 1-second resampled mid buffer) ------ #
-#
-# Both trend modes read the same per-product deque of ``(epoch_second, mid)``
-# built from live leader ticks plus Phase-B seed points.  Resampling to one
-# point per second bounds memory deterministically (``lookback + grace``
-# entries) so a burst tick rate can never shrink coverage -- the failure mode
-# a raw-tick ``maxlen`` cap would have.
-
-_TREND_SEED_GRACE_SECONDS = 5.0
-_TREND_BUFFER_MAXLEN = 4096
-
-
-def _trend_bucket(epoch_seconds: float) -> int:
-    return int(epoch_seconds)
-
-
-def donchian_bias(
-    history: object,
-    mid_now: Decimal,
-    *,
-    now_epoch: float,
-    lookback_seconds: float,
-    buffer_points: Decimal,
-    min_range_points: Decimal,
-    min_coverage: float,
-) -> tuple[Direction | None, Decimal, str]:
-    """Donchian breakout bias from 1-second mids, excluding the current bucket."""
-
-    points: list[tuple[int, Decimal]] = list(history)  # type: ignore[arg-type]
-    current_bucket = _trend_bucket(now_epoch)
-    window = [(sec, mid) for sec, mid in points if current_bucket - lookback_seconds <= sec < current_bucket]
-    if len(window) < 10:
-        return None, Decimal(0), "warming: too few samples"
-    span = window[-1][0] - window[0][0]
-    coverage = span / lookback_seconds if lookback_seconds > 0 else 0
-    if coverage < min_coverage:
-        return None, Decimal(0), f"warming: coverage {coverage:.2f} below minimum"
-    mids = [mid for _, mid in window]
-    upper = max(mids)
-    lower = min(mids)
-    price_range = upper - lower
-    if price_range < min_range_points:
-        return None, Decimal(0), "flat: range below minimum"
-    if mid_now - upper > buffer_points:
-        return "LONG", mid_now - upper, "breakout long"
-    if lower - mid_now > buffer_points:
-        return "SHORT", lower - mid_now, "breakout short"
-    return None, Decimal(0), "no breakout"
-
-
-def momentum_bias(
-    history: object,
-    mid_now: Decimal,
-    *,
-    now_epoch: float,
-    t_seconds: float,
-    vol_window_seconds: float,
-    k: Decimal,
-    min_mom_points: Decimal,
-    min_coverage: float,
-) -> tuple[Direction | None, Decimal, str]:
-    """Normalized-momentum bias: ``score = (mid_now - mid_{now-T}) / stdev``."""
-
-    points: list[tuple[int, Decimal]] = list(history)  # type: ignore[arg-type]
-    current_bucket = _trend_bucket(now_epoch)
-    if not points:
-        return None, Decimal(0), "warming: no samples"
-    ref_candidates = [(sec, mid) for sec, mid in points if sec <= current_bucket - t_seconds]
-    if not ref_candidates:
-        return None, Decimal(0), "warming: no reference point"
-    ref_mid = ref_candidates[-1][1]
-    mom = mid_now - ref_mid
-    vol_points = [float(mid) for sec, mid in points if current_bucket - vol_window_seconds <= sec < current_bucket]
-    if len(vol_points) < 10:
-        return None, Decimal(0), "warming: too few volatility samples"
-    vol_span = points[-1][0] - points[0][0]
-    if vol_span / vol_window_seconds < min_coverage:
-        return None, Decimal(0), "warming: volatility coverage below minimum"
-    mean = sum(vol_points) / len(vol_points)
-    variance = sum((x - mean) ** 2 for x in vol_points) / len(vol_points)
-    vol = Decimal(str(variance**0.5)) if variance > 0 else Decimal(0)
-    if vol <= 0:
-        if abs(mom) >= min_mom_points:
-            return ("LONG" if mom > 0 else "SHORT"), abs(mom), "impulse on flat volatility"
-        return None, Decimal(0), "flat volatility"
-    score = mom / vol
-    if abs(score) >= k and abs(mom) >= min_mom_points:
-        return ("LONG" if mom > 0 else "SHORT"), abs(score), f"momentum score {score:.2f}"
-    return None, Decimal(0), f"score {score:.2f} below threshold"
-
-
 def compute_protection(
     *,
     entry: Decimal,
@@ -1988,168 +1790,6 @@ def compute_protection(
     return str(sl), str(tp)
 
 
-# MT5 encodes "no take profit" as a zero price.  The asymmetric profit-max
-# model (leader maximizes, follower only caps loss) therefore expresses "no
-# TP cap" as this sentinel rather than omitting the field: the broker-write
-# translation requires both SL and TP strings, and broker observations report
-# an absent TP back as 0.0, which compares equal to this value on any tick.
-NO_TAKE_PROFIT = "0"
-
-# How often either solo/paired profit leg may advance its trailing stop.  A
-# trailing stop only ever moves favorably, so reacting at this cadence locks
-# profit without ever widening risk.  Five minutes keeps broker modify
-# frequency low per the platform operation rules; tiny advances are skipped
-# separately by _SOLO_TRAIL_MIN_STEP_TICKS.
-_PROFIT_TRAIL_SECONDS = 300.0
-
-# Minimum favorable advance for a trailing revision, in ticks.  Smaller
-# advances are held rather than sent.
-_SOLO_TRAIL_MIN_STEP_TICKS = 5
-
-
-def compute_sl_only(
-    *,
-    entry: Decimal,
-    direction: Direction,
-    volume: Decimal,
-    plan: SizingPlan,
-    allowed_loss_usd: Decimal,
-) -> tuple[str, str] | None:
-    """SL at the allowed loss with take profit removed.
-
-    The stop distance targets the current computed ``allowed_leg_loss_usd``
-    for that leg (``min(trade_loss_fraction, maximum_loss_per_trade_usd,
-    remaining daily allowance)``), exactly as :func:`compute_protection`
-    does -- only the 1:1 symmetric take-profit cap is dropped so the winning
-    leg can run.  Returns ``(sl, "0")`` or ``None`` when no executable stop
-    exists.
-    """
-
-    result = compute_protection(
-        entry=entry,
-        direction=direction,
-        volume=volume,
-        plan=plan,
-        allowed_loss_usd=allowed_loss_usd,
-    )
-    if result is None:
-        return None
-    return result[0], NO_TAKE_PROFIT
-
-
-def compute_trailing_sl(
-    *,
-    direction: Direction,
-    fill_price: Decimal,
-    initial_sl: Decimal,
-    current_price: Decimal,
-    plan: SizingPlan,
-    volume: Decimal,
-    allowed_loss_usd: Decimal,
-) -> str | None:
-    """Advance a profit-leg stop toward the market without widening risk.
-
-    The trail keeps half the initial risk distance from the current exit
-    price (bid for LONG, ask for SHORT): as the market moves favorably the
-    stop follows and locks profit; when the market moves adversely the
-    existing stop is kept.  Returns the new SL string, or ``None`` when no
-    favorable, executable advance exists (including when the candidate would
-    breach the broker minimum stop distance, leave the tick grid, or exceed
-    the leg's allowed loss).
-    """
-
-    tick_size = _to_decimal(plan.tick_size)
-    minimum_stop_distance = _to_decimal(plan.minimum_stop_distance)
-    loss_tick_value = _to_decimal(plan.loss_tick_value)
-    if (
-        tick_size is None or tick_size <= 0
-        or minimum_stop_distance is None or minimum_stop_distance < 0
-        or loss_tick_value is None or loss_tick_value <= 0
-        or volume <= 0 or allowed_loss_usd <= 0
-    ):
-        return None
-    risk_distance = abs(fill_price - initial_sl)
-    if risk_distance <= 0:
-        return None
-    trail_distance = risk_distance / 2
-    if direction == "LONG":
-        if current_price <= fill_price:
-            return None  # no profit to lock yet
-        candidate = _round_to_tick(current_price - trail_distance, tick_size, ROUND_FLOOR)
-        if candidate <= initial_sl:
-            return None  # only advances past the initial stop ever move
-        if current_price - candidate < minimum_stop_distance:
-            return None
-        if candidate <= 0:
-            return None
-    else:
-        if current_price >= fill_price:
-            return None  # no profit to lock yet
-        candidate = _round_to_tick(current_price + trail_distance, tick_size, ROUND_CEILING)
-        if candidate >= initial_sl:
-            return None  # only advances past the initial stop ever move
-        if candidate - current_price < minimum_stop_distance:
-            return None
-        if candidate <= 0:
-            return None
-    loss_ticks = abs(fill_price - candidate) / tick_size
-    if loss_ticks * loss_tick_value * volume > allowed_loss_usd:
-        return None
-    return str(candidate)
-
-
-def compute_solo_lock_sl(
-    *,
-    direction: Direction,
-    fill_price: Decimal,
-    initial_sl: Decimal,
-    current_sl: Decimal,
-    current_price: Decimal,
-    plan: SizingPlan,
-) -> str | None:
-    """One immediate solo tightening: breakeven first, half-risk fallback.
-
-    Candidates are tried in order ``[breakeven, half-risk]`` where half-risk
-    is ``(fill + initial_sl) / 2``.  Only a strictly favorable, executable
-    revision is returned: it must tighten (never widen) versus ``current_sl``,
-    sit on the tick grid, and keep ``minimum_stop_distance`` from the current
-    exit price.  Returns ``None`` to hold when neither candidate is executable
-    (thin-profit solo): callers must keep the existing stop, never widen it.
-    """
-
-    tick_size = _to_decimal(plan.tick_size)
-    minimum_stop_distance = _to_decimal(plan.minimum_stop_distance)
-    if (
-        tick_size is None or tick_size <= 0
-        or minimum_stop_distance is None or minimum_stop_distance < 0
-    ):
-        return None
-    if direction == "LONG":
-        breakeven = _round_to_tick(fill_price, tick_size, ROUND_FLOOR)
-        half = _round_to_tick((fill_price + initial_sl) / 2, tick_size, ROUND_FLOOR)
-        for candidate in (breakeven, half):
-            if candidate <= current_sl:
-                continue  # tighten only
-            if candidate <= 0:
-                continue
-            if current_price - candidate < minimum_stop_distance:
-                continue
-            return str(candidate)
-        return None
-    else:
-        breakeven = _round_to_tick(fill_price, tick_size, ROUND_CEILING)
-        half = _round_to_tick((fill_price + initial_sl) / 2, tick_size, ROUND_CEILING)
-        for candidate in (breakeven, half):
-            if candidate >= current_sl:
-                continue  # tighten only
-            if candidate <= 0:
-                continue
-            if candidate - current_price < minimum_stop_distance:
-                continue
-            return str(candidate)
-        return None
-
-
 #: Admission gate counters in their fixed report/store order.  ``products``
 #: counts universe-matched plan products entering evaluation; every other key
 #: counts products blocked at that gate; ``admitted`` counts ranked entries.
@@ -2163,7 +1803,6 @@ _GATE_STAT_KEYS = (
     "skew",
     "decided_quote",
     "no_plan",
-    "trend_bias",
     "no_sizing",
     "below_edge",
     "symbol_mismatch",
@@ -2404,34 +2043,6 @@ class QuarantineReleaseEvent:
 
 
 @dataclass(frozen=True, slots=True)
-class TrendSeedPoint:
-    """One Phase-B historical tick used only to prefill the trend buffer.
-
-    ``broker_time`` is calibrated UTC (broker-server time minus the measured
-    clock offset), never a raw server epoch: the buffer and the trend bias
-    share the wall-clock timeline, and raw epochs would park history hours
-    in the future where no evaluation window overlaps it.
-    """
-
-    broker_time: datetime
-    bid: Decimal
-    ask: Decimal
-
-
-@dataclass(frozen=True, slots=True)
-class TrendSeedEvent:
-    """Phase-B history prefill: fills the 1-second trend buffer, nothing else.
-
-    Never touches ``_local_quotes``/relay/``_decided_quotes``: a seed point can
-    never look like fresh market evidence or trigger an attempt by itself.
-    """
-
-    product_id: str
-    points: tuple[TrendSeedPoint, ...]
-    degraded: bool = False
-
-
-@dataclass(frozen=True, slots=True)
 class RelayEnvelopeReceived:
     """An authenticated, already identity/route-validated opaque envelope."""
 
@@ -2441,7 +2052,6 @@ class RelayEnvelopeReceived:
 PairCellEvent = (
     LocalQuoteEvent
     | LocalQuoteBatchEvent
-    | TrendSeedEvent
     | LocalCatalogEvent
     | RouteMetadataEvent
     | RediscoveryRequestEvent
@@ -2695,8 +2305,6 @@ class LegState:
     precise_sl: str | None = None
     precise_tp: str | None = None
     last_protection_update_at: str | None = None
-    previous_precise_sl: str | None = None
-    previous_precise_tp: str | None = None
     close_effect_id: str | None = None
     empty_verified: bool = False
     timer_started_at: str | None = None
@@ -2872,17 +2480,10 @@ class PairExecutionCell:
         self._local_quotes: dict[str, QuoteSnapshot] = {}
         self._peer_quotes: dict[str, QuoteSnapshot] = {}
         self._decided_quotes: dict[str, tuple[str, int, str, int]] = {}
-        self._trend_history: dict[str, deque[tuple[int, Decimal]]] = {}
         self._quote_epochs: dict[str, list[str]] = {}
-        # Post-hoc debugging evidence.  The 1-second tape mirrors the
-        # in-memory trend buffer merge (one row per product/source/second,
-        # last writer wins for live rows, seed rows never overwrite live
-        # ones); gate counters record *which* admission gate blocks each
-        # product every time candidates are evaluated.  Both are bounded by
-        # retention, never read on the decision path.
-        self._tape_replace: dict[tuple[str, str, int], tuple[str, str, str, str]] = {}
-        self._tape_ignore: dict[tuple[str, str, int], tuple[str, str, str, str]] = {}
-        self._tape_last_flush: datetime | None = None
+        # Post-hoc debugging evidence.  Gate counters record *which* admission
+        # gate blocks each product every time candidates are evaluated.
+        # Bounded by retention, never read on the decision path.
         self._last_gate_stats: dict[str, int] | None = None
         self._last_gate_stats_at: datetime | None = None
         self._last_gate_stats_persisted_at: datetime | None = None
@@ -2933,7 +2534,7 @@ class PairExecutionCell:
         self._desired: DesiredState = "NONE"
         # Attempt IDs that entered containment via operator shutdown.  These
         # legs report ``empty`` with the shutdown marker so the peer takes the
-        # joint-close route instead of winner-only solo continuation.
+        # joint-close route even when its own leg is profitable.
         self._operator_shutdown_attempts: set[str] = set()
         self._needs_human: str | None = None
         self._now = datetime(1970, 1, 1, tzinfo=UTC)
@@ -3096,23 +2697,9 @@ class PairExecutionCell:
                 proof_at TEXT,
                 updated_at TEXT NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS cell_market_tape_1s (
-                product_id TEXT NOT NULL,
-                source TEXT NOT NULL,
-                epoch_sec INTEGER NOT NULL,
-                mid TEXT NOT NULL,
-                spread TEXT NOT NULL,
-                bid TEXT NOT NULL,
-                ask TEXT NOT NULL,
-                recorded_at TEXT NOT NULL,
-                PRIMARY KEY (product_id, source, epoch_sec)
-            );
-            CREATE INDEX IF NOT EXISTS idx_cell_market_tape_1s_epoch
-                ON cell_market_tape_1s (epoch_sec);
             CREATE TABLE IF NOT EXISTS cell_admission_stats (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 recorded_at TEXT NOT NULL,
-                entry_mode TEXT NOT NULL,
                 products INTEGER NOT NULL DEFAULT 0,
                 quarantined INTEGER NOT NULL DEFAULT 0,
                 no_local_quote INTEGER NOT NULL DEFAULT 0,
@@ -3122,7 +2709,6 @@ class PairExecutionCell:
                 skew INTEGER NOT NULL DEFAULT 0,
                 decided_quote INTEGER NOT NULL DEFAULT 0,
                 no_plan INTEGER NOT NULL DEFAULT 0,
-                trend_bias INTEGER NOT NULL DEFAULT 0,
                 no_sizing INTEGER NOT NULL DEFAULT 0,
                 below_edge INTEGER NOT NULL DEFAULT 0,
                 symbol_mismatch INTEGER NOT NULL DEFAULT 0,
@@ -3238,7 +2824,13 @@ class PairExecutionCell:
             "SELECT payload FROM cell_leg_state WHERE attempt_id = ?", (attempt_row[0],)
         ).fetchone()
         if leg_row is not None:
-            self._leg = LegState(**json.loads(leg_row[0]))
+            # Tolerate payload keys from retired revisions: recovery keeps the
+            # known fields rather than failing closed on an in-flight attempt
+            # across an upgrade.
+            payload = json.loads(leg_row[0])
+            self._leg = LegState(
+                **{key: payload[key] for key in LegState.__dataclass_fields__ if key in payload}
+            )
         peer_row = self._db.execute(
             "SELECT payload FROM cell_peer_leg WHERE attempt_id = ?", (attempt_row[0],)
         ).fetchone()
@@ -4120,26 +3712,6 @@ class PairExecutionCell:
     def discovered_universe(self) -> DiscoveredUniverse | None:
         return self._universe
 
-    def trend_seed_request(self) -> tuple[str, float] | None:
-        """Phase-B prefill hint: ``(entry_mode, window_seconds)`` or ``None``.
-
-        ``None`` when no universe is installed or the effective entry mode is
-        the legacy ``edge`` gate, which reads no history at all.  Before a
-        policy is accepted the documented defaults size the window so the
-        buffer is already warm when the policy lands.
-        """
-
-        if self._universe is None:
-            return None
-        if self._policy is None:
-            return ("edge", max(DEFAULT_TREND_LOOKBACK_SECONDS, DEFAULT_TREND_VOL_WINDOW_SECONDS))
-        if self._policy.entry_mode == "edge":
-            return None
-        return (
-            self._policy.entry_mode,
-            max(self._policy.trend_lookback_seconds, self._policy.trend_vol_window_seconds),
-        )
-
     def discovery_reason(self) -> str:
         return self._discovery_reason
 
@@ -4527,11 +4099,6 @@ class PairExecutionCell:
         self._suspended_products = {}
         self._plans_policy_hash = None
         self._decided_quotes = {}
-        self._trend_history = {
-            product_id: history
-            for product_id, history in self._trend_history.items()
-            if universe.product(product_id) is not None
-        }
         self._local_quotes = {
             product_id: quote
             for product_id, quote in self._local_quotes.items()
@@ -4846,8 +4413,6 @@ class PairExecutionCell:
 
         if isinstance(event, LocalQuoteEvent):
             self._accept_local_quote(event)
-        elif isinstance(event, TrendSeedEvent):
-            self._apply_trend_seed(event)
         elif isinstance(event, LocalQuoteBatchEvent):
             accepted = tuple(q for q in event.quotes if self._accept_local_quote(q, publish=False))
             if accepted:
@@ -4925,14 +4490,10 @@ class PairExecutionCell:
         policy = self._policy
         if policy is None or self._universe is None:
             return frozenset()
-        # Admit the same quotes the entry gate admits: trend decisions run on
-        # the relaxed trend budget, so the plan precondition must too, or
-        # plans would flap absent exactly when trend entries could use them.
-        max_age = (
-            policy.trend_quote_max_age_seconds
-            if policy.entry_mode != "edge"
-            else policy.quote_max_age_seconds
-        )
+        # The entry gate admits quotes on the cross-broker freshness budget;
+        # the plan precondition matches it so plans never flap absent while
+        # entries could use them.
+        max_age = policy.quote_max_age_seconds
         return frozenset(
             product.product_id
             for product in self._universe.products
@@ -5106,16 +4667,8 @@ class PairExecutionCell:
         self._prune_debug_evidence()
 
     def _prune_debug_evidence(self) -> None:
-        """Bound the post-hoc debugging tables; never part of a decision."""
+        """Bound the post-hoc debugging table; never part of a decision."""
 
-        try:
-            now_epoch = _as_utc(self._now).timestamp()
-        except PairExecutionCellError:
-            return
-        self._db.execute(
-            "DELETE FROM cell_market_tape_1s WHERE epoch_sec < ?",
-            (int(now_epoch) - _TAPE_RETENTION_SECONDS,),
-        )
         cutoff = _iso(self._now - timedelta(seconds=_ADMISSION_STATS_RETENTION_SECONDS))
         self._db.execute(
             "DELETE FROM cell_admission_stats WHERE recorded_at < ?", (cutoff,)
@@ -5481,200 +5034,9 @@ class PairExecutionCell:
             calibration=event.calibration,
         )
         self._local_quotes[event.product_id] = quote
-        self._record_trend_mid(
-            event.product_id, quote.bid, quote.ask, quote.broker_time, quote.calibration
-        )
         if publish:
             self._publish_quote(quote)
         return True
-
-    def _trend_window_seconds(self) -> float:
-        policy = self._policy
-        if policy is None:
-            return max(DEFAULT_TREND_LOOKBACK_SECONDS, DEFAULT_TREND_VOL_WINDOW_SECONDS)
-        return max(policy.trend_lookback_seconds, policy.trend_vol_window_seconds)
-
-    def _record_trend_mid(
-        self,
-        product_id: str,
-        bid: Decimal,
-        ask: Decimal,
-        broker_time: datetime,
-        calibration: BrokerClockCalibration,
-    ) -> None:
-        """Append one 1-second resampled mid; time-eviction is the only trim.
-
-        Buckets live on the *calibrated* broker timeline (broker time minus
-        the measured clock offset): the same wall-clock timeline the trend
-        bias evaluates its reference and volatility windows on.  Bucketing raw
-        broker-server time instead puts the whole buffer hours in the future
-        on a typical UTC+2/+3 broker, so those windows never overlap it and
-        trend entries stay in ``warming`` forever.  A quote whose clock cannot
-        be placed (uncalibrated or stale calibration) is staged nowhere: it
-        can never pass the freshness gate either, so admitting it would only
-        corrupt the timeline its neighbors share.
-
-        Every kept point is also staged for the 1-second debug tape (flushed
-        once per second by :meth:`_maybe_flush_tape`): the tape key is the
-        same ``(product_id, source, epoch_sec)`` the buffer merges on, so a
-        post-hoc replay sees exactly the decision input.  Dropped points
-        (invalid, uncalibrated, or regressed ticks) are staged nowhere,
-        mirroring the buffer.
-        """
-
-        if bid <= 0 or ask <= 0 or ask < bid:
-            return
-        if not calibration.usable:
-            return
-        try:
-            epoch = (
-                _as_utc(broker_time) - timedelta(seconds=calibration.offset_seconds)
-            ).timestamp()
-        except PairExecutionCellError:
-            return
-        bucket = _trend_bucket(epoch)
-        mid = (bid + ask) / 2
-        history = self._trend_history.get(product_id)
-        if history is None:
-            history = deque(maxlen=_TREND_BUFFER_MAXLEN)
-            self._trend_history[product_id] = history
-        if history and history[-1][0] == bucket:
-            history[-1] = (bucket, mid)
-            self._stage_tape_row(product_id, "live", bucket, mid, bid, ask)
-            return
-        if history and bucket < history[-1][0]:
-            return  # regressed tick: never move the buffer backwards
-        history.append((bucket, mid))
-        self._stage_tape_row(product_id, "live", bucket, mid, bid, ask)
-        cutoff = bucket - int(self._trend_window_seconds()) - int(_TREND_SEED_GRACE_SECONDS)
-        while history and history[0][0] < cutoff:
-            history.popleft()
-
-    def _stage_tape_row(
-        self,
-        product_id: str,
-        source: str,
-        epoch_sec: int,
-        mid: Decimal,
-        bid: Decimal,
-        ask: Decimal,
-    ) -> None:
-        """Stage one tape row; live rows overwrite, seed rows never do.
-
-        Seed history only fills gaps: a live row for the same second is the
-        fresher evidence and must survive a later seed for that bucket, while
-        a live row always supersedes an earlier seed row for its own second.
-        """
-
-        row = (str(mid), str(ask - bid), str(bid), str(ask))
-        if source == "seed":
-            self._tape_ignore.setdefault((product_id, source, epoch_sec), row)
-        else:
-            self._tape_replace[(product_id, source, epoch_sec)] = row
-
-    def _maybe_flush_tape(self) -> None:
-        """Durably write staged tape rows at most once per second.
-
-        A failed flush drops the staged rows with a warning rather than
-        breaking the decision pump: the tape is debugging evidence, never
-        trade state.  Admission counters are flushed on their own cadence by
-        :meth:`_maybe_persist_gate_stats`.
-        """
-
-        if not self._tape_replace and not self._tape_ignore:
-            return
-        if (
-            self._tape_last_flush is not None
-            and (self._now - self._tape_last_flush).total_seconds() < _TAPE_FLUSH_SECONDS
-        ):
-            return
-        recorded_at = _iso(self._now)
-        try:
-            if self._tape_replace:
-                self._db.executemany(
-                    "INSERT INTO cell_market_tape_1s"
-                    " (product_id, source, epoch_sec, mid, spread, bid, ask, recorded_at)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-                    " ON CONFLICT(product_id, source, epoch_sec) DO UPDATE SET"
-                    " mid=excluded.mid, spread=excluded.spread,"
-                    " bid=excluded.bid, ask=excluded.ask, recorded_at=excluded.recorded_at",
-                    [
-                        (product_id, source, epoch_sec, mid, spread, bid, ask, recorded_at)
-                        for (product_id, source, epoch_sec), (mid, spread, bid, ask)
-                        in self._tape_replace.items()
-                    ],
-                )
-            if self._tape_ignore:
-                self._db.executemany(
-                    "INSERT INTO cell_market_tape_1s"
-                    " (product_id, source, epoch_sec, mid, spread, bid, ask, recorded_at)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
-                    [
-                        (product_id, source, epoch_sec, mid, spread, bid, ask, recorded_at)
-                        for (product_id, source, epoch_sec), (mid, spread, bid, ask)
-                        in self._tape_ignore.items()
-                    ],
-                )
-            self._db.commit()
-        except sqlite3.Error:
-            _LOGGER.warning("%s evt=tape_flush_fail rows=%s", _TAG,
-                            len(self._tape_replace) + len(self._tape_ignore), exc_info=True)
-        finally:
-            self._tape_replace.clear()
-            self._tape_ignore.clear()
-            self._tape_last_flush = self._now
-
-    def _apply_trend_seed(self, event: TrendSeedEvent) -> None:
-        """Phase-B prefill: merge historical mids into the 1-second buffer only."""
-
-        if self._universe is not None and self._universe.product(event.product_id) is None:
-            return
-        if not event.points:
-            return
-        history = self._trend_history.get(event.product_id)
-        if history is None:
-            history = deque(maxlen=_TREND_BUFFER_MAXLEN)
-            self._trend_history[event.product_id] = history
-        merged: dict[int, Decimal] = {sec: mid for sec, mid in history}
-        for point in event.points:
-            if point.bid <= 0 or point.ask <= 0 or point.ask < point.bid:
-                continue
-            try:
-                epoch = _as_utc(point.broker_time).timestamp()
-            except PairExecutionCellError:
-                continue
-            merged[_trend_bucket(epoch)] = (point.bid + point.ask) / 2
-        if not merged:
-            return
-        try:
-            now_bucket = _trend_bucket(_as_utc(self._now).timestamp())
-        except PairExecutionCellError:
-            now_bucket = max(merged)
-        cutoff = now_bucket - int(self._trend_window_seconds()) - int(_TREND_SEED_GRACE_SECONDS)
-        kept = sorted(sec for sec in merged if sec >= cutoff)
-        history.clear()
-        for sec in kept[-_TREND_BUFFER_MAXLEN:]:
-            history.append((sec, merged[sec]))
-        # Stage the same kept buckets for the debug tape (seed rows never
-        # overwrite live rows for their second; see _stage_tape_row).
-        kept_set = set(kept[-_TREND_BUFFER_MAXLEN:])
-        for point in event.points:
-            if point.bid <= 0 or point.ask <= 0 or point.ask < point.bid:
-                continue
-            try:
-                epoch = _as_utc(point.broker_time).timestamp()
-            except PairExecutionCellError:
-                continue
-            bucket = _trend_bucket(epoch)
-            if bucket in kept_set:
-                self._stage_tape_row(
-                    event.product_id, "seed", bucket,
-                    (point.bid + point.ask) / 2, point.bid, point.ask,
-                )
-        self._transition(
-            "trend_seed_applied",
-            f"{event.product_id} points={len(history)} degraded={int(event.degraded)}",
-        )
 
     def _note_epoch(self, product_id: str, epoch: str) -> None:
         seen = self._quote_epochs.setdefault(product_id, [])
@@ -5724,20 +5086,6 @@ class PairExecutionCell:
             sequence=sequence,
             calibration=peer_calibration,
         )
-        if bid > 0 and ask >= bid and peer_calibration.usable:
-            try:
-                bucket = _trend_bucket(
-                    (_as_utc(broker_time) - timedelta(seconds=peer_calibration.offset_seconds)).timestamp()
-                )
-            except PairExecutionCellError:
-                bucket = None
-            if bucket is not None:
-                # The peer's own live view, staged on the shared wall-clock
-                # timeline so a post-hoc replay can re-derive the
-                # freshness/skew gates exactly as evaluated.
-                self._stage_tape_row(
-                    product_id, "peer", bucket, (bid + ask) / 2, bid, ask
-                )
 
     # -- relay publication -------------------------------------------------- #
 
@@ -6058,8 +5406,8 @@ class PairExecutionCell:
             self._note_cooldown_proof()
         # Any authenticated peer envelope on this route proves the peer is
         # alive and managing its side -- including while it intentionally
-        # withholds terminal proof (e.g. a solo-running leader that keeps its
-        # profit leg open after the follower emptied).  Restart the bounded
+        # withholds terminal proof (e.g. converging its own close after the
+        # peer emptied).  Restart the bounded
         # terminal-proof window so only genuine peer silence escalates to
         # NEEDS_HUMAN; periodic probes below still continue while waiting.
         # The worst quiet wait is therefore bounded by the peer's own exit
@@ -6220,7 +5568,6 @@ class PairExecutionCell:
             # still need its current fail-closed readiness to avoid waiting
             # indefinitely for a state snapshot after reconnect or restart.
             self._maybe_publish_state()
-            self._maybe_flush_tape()
             return
         self._maybe_clear_reconnect_cooldown()
         if self._role == "follower":
@@ -6246,7 +5593,6 @@ class PairExecutionCell:
         self._maybe_finalize_empty()
         self._await_peer_terminal_proof()
         self._maybe_declare_active()
-        self._maybe_flush_tape()
 
     def _update_daily_loss_warning(self) -> None:
         """Pause new entries once, and clear the pause automatically at NY reset."""
@@ -6322,70 +5668,16 @@ class PairExecutionCell:
 
     # -- leader: candidate admission and ranking ----------------------------- #
 
-    def _trend_bias_for_product(
-        self,
-        product_id: str,
-        local_quote: QuoteSnapshot,
-        point: Decimal,
-    ) -> tuple[Direction | None, Decimal, str]:
-        """Leader-only trend bias from the 1-second mid buffer plus spread gate."""
-
-        policy = self._policy
-        assert policy is not None
-        spread_points = (local_quote.ask - local_quote.bid) / point if point > 0 else Decimal(0)
-        max_spread = _to_decimal(policy.trend_max_spread_points)
-        if max_spread is not None and spread_points > max_spread:
-            return None, Decimal(0), f"spread {spread_points:.1f} above maximum"
-        history = self._trend_history.get(product_id, ())
-        mid_now = (local_quote.bid + local_quote.ask) / 2
-        try:
-            now_epoch = _as_utc(self._now).timestamp()
-        except PairExecutionCellError:
-            return None, Decimal(0), "clock unavailable"
-        if policy.entry_mode == "donchian":
-            # Config thresholds are point counts (like edge_min_net_points);
-            # scale by the canonical point into the price units the buffer holds.
-            buffer_points = (_to_decimal(policy.trend_breakout_buffer_points) or Decimal(0)) * point
-            min_range = (_to_decimal(policy.trend_min_range_points) or Decimal(0)) * point
-            return donchian_bias(
-                history,
-                mid_now,
-                now_epoch=now_epoch,
-                lookback_seconds=policy.trend_lookback_seconds,
-                buffer_points=buffer_points,
-                min_range_points=min_range,
-                min_coverage=policy.trend_min_coverage,
-            )
-        if policy.entry_mode == "momentum":
-            k = _to_decimal(policy.trend_momentum_k) or Decimal(0)
-            # Point counts into price units, mirroring the donchian branch above.
-            min_mom = (_to_decimal(policy.trend_min_mom_points) or Decimal(0)) * point
-            return momentum_bias(
-                history,
-                mid_now,
-                now_epoch=now_epoch,
-                t_seconds=policy.trend_momentum_T_seconds,
-                vol_window_seconds=policy.trend_vol_window_seconds,
-                k=k,
-                min_mom_points=min_mom,
-                min_coverage=policy.trend_min_coverage,
-            )
-        return None, Decimal(0), f"unknown entry_mode {policy.entry_mode}"
-
     def _candidates(self) -> list[tuple[Decimal, Decimal, str, Direction]]:
         """Leader-side admitted candidates ordered by the specification's keys.
 
         No candidate is evaluated, ranked, or selected while any valid positive
         plan is missing, and none at all while the route is ``UNPAIRING``.
-        ``entry_mode=edge`` keeps the legacy cross-broker spread gate;
-        ``donchian``/``momentum`` replace it with a leader-only trend gate.
-        Trend decisions read the leader-local minutes-long mid buffer, never a
-        cross-broker price comparison, so they use the trend-timescale quote
-        age budget (``trend_quote_max_age_seconds``) on both legs and skip the
-        skew gate that only edge arbitrage needs.  Both legs still need a bound
-        because the follower's rough protection is priced off its own quote.
-        Every evaluation records per-gate counters (see ``_note_gate_stats``)
-        so a silent no-candidate state names its blocking gate.
+        Admission is the cross-broker spread gate only: both legs are checked
+        on the shared freshness budget plus the skew gate, sized, and ranked
+        by conservative expected net USD.  Every evaluation records per-gate
+        counters (see ``_note_gate_stats``) so a silent no-candidate state
+        names its blocking gate.
         """
 
         policy = self._policy
@@ -6393,18 +5685,13 @@ class PairExecutionCell:
         if policy is None or self._universe is None or self._route_state == "UNPAIRING":
             self._note_gate_stats(stats, persist=False)
             return []
-        trend_mode = policy.entry_mode != "edge"
-        max_age = (
-            policy.trend_quote_max_age_seconds if trend_mode else policy.quote_max_age_seconds
-        )
-        min_net: Decimal | None = None
-        if not trend_mode:
-            # Fail closed on a non-finite floor: the policy validator
-            # guarantees finiteness, so None here means corrupted state.
-            min_net = _to_decimal(policy.edge_min_net_points)
-            if min_net is None:
-                self._note_gate_stats(stats, persist=True)
-                return []
+        max_age = policy.quote_max_age_seconds
+        # Fail closed on a non-finite floor: the policy validator
+        # guarantees finiteness, so None here means corrupted state.
+        min_net = _to_decimal(policy.edge_min_net_points)
+        if min_net is None:
+            self._note_gate_stats(stats, persist=True)
+            return []
         ranked: list[tuple[Decimal, Decimal, str, Direction]] = []
         for product_id in sorted({key[0] for key in self._plans}):
             product = self._universe.product(product_id)
@@ -6428,45 +5715,12 @@ class PairExecutionCell:
             if not peer_quote.fresh(self._now, max_age):
                 stats["stale_peer_quote"] += 1
                 continue
-            if not trend_mode and calibrated_skew_seconds(local_quote, peer_quote) > policy.quote_max_skew_seconds:
+            if calibrated_skew_seconds(local_quote, peer_quote) > policy.quote_max_skew_seconds:
                 stats["skew"] += 1
                 continue
             if self._decided_quotes.get(product_id) == _quote_key(local_quote, peer_quote):
                 stats["decided_quote"] += 1
                 continue  # one attempt per decision quote revision; never a retry storm
-            if policy.entry_mode != "edge":
-                plan_for_point = self._plans.get((product_id, "LONG")) or self._plans.get(
-                    (product_id, "SHORT")
-                )
-                if plan_for_point is None:
-                    stats["no_plan"] += 1
-                    continue
-                point = _to_decimal(plan_for_point.canonical_point)
-                if point is None or point <= 0:
-                    stats["no_plan"] += 1
-                    continue
-                bias, strength, _reason = self._trend_bias_for_product(
-                    product_id, local_quote, point
-                )
-                if bias is None:
-                    stats["trend_bias"] += 1
-                    continue
-                sized = self._pair_lots(product_id, bias)
-                if sized is None:
-                    stats["no_sizing"] += 1
-                    continue
-                lots, leader_plan, follower_plan = sized
-                if local_quote.symbol != leader_plan.symbol or peer_quote.symbol != follower_plan.symbol:
-                    stats["symbol_mismatch"] += 1
-                    continue
-                conservative_usd_per_point = min(
-                    cast(Decimal, _to_decimal(leader_plan.usd_per_point_per_lot)),
-                    cast(Decimal, _to_decimal(follower_plan.usd_per_point_per_lot)),
-                )
-                expected_move_usd = strength * conservative_usd_per_point * lots
-                ranked.append((expected_move_usd, strength, product_id, bias))
-                stats["admitted"] += 1
-                continue
             for leader_direction in ("LONG", "SHORT"):
                 direction = cast(Direction, leader_direction)
                 sized = self._pair_lots(product_id, direction)
@@ -6526,14 +5780,13 @@ class PairExecutionCell:
         try:
             self._db.execute(
                 "INSERT INTO cell_admission_stats"
-                " (recorded_at, entry_mode, products, quarantined,"
+                " (recorded_at, products, quarantined,"
                 " no_local_quote, stale_local_quote, no_peer_quote, stale_peer_quote,"
-                " skew, decided_quote, no_plan, trend_bias, no_sizing, below_edge,"
+                " skew, decided_quote, no_plan, no_sizing, below_edge,"
                 " symbol_mismatch, admitted)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     _iso(self._last_gate_stats_at),
-                    self._policy.entry_mode,
                     *(stats[key] for key in _GATE_STAT_KEYS),
                 ),
             )
@@ -6555,16 +5808,12 @@ class PairExecutionCell:
     def entry_candidates(self) -> list[dict[str, object]]:
         """Observable, deterministically ranked leader candidate admission."""
 
-        policy = self._policy
-        entry_mode = policy.entry_mode if policy is not None else DEFAULT_ENTRY_MODE
-        score_key = "net_points" if entry_mode == "edge" else "trend_strength"
         return [
             {
                 "expected_edge_usd": str(edge_usd),
-                score_key: str(points),
+                "net_points": str(points),
                 "product_id": product_id,
                 "leader_direction": direction,
-                "entry_mode": entry_mode,
             }
             for edge_usd, points, product_id, direction in self._candidates()
         ]
@@ -6602,24 +5851,15 @@ class PairExecutionCell:
         candidates = self._candidates()
         if not candidates:
             gates = self._format_gate_stats()
-            if policy.entry_mode == "edge":
-                return (
-                    "no entry candidate passed sizing, quote freshness/skew, quarantine, "
-                    f"and edge net gates (edge_min_net_points={policy.edge_min_net_points}) "
-                    f"{gates}"
-                )
             return (
-                "no entry candidate passed sizing, quote freshness, quarantine, "
-                f"and trend gates (entry_mode={policy.entry_mode} "
-                f"trend_quote_max_age_s={policy.trend_quote_max_age_seconds} skew_gate=off) "
+                "no entry candidate passed sizing, quote freshness/skew, quarantine, "
+                f"and edge net gates (edge_min_net_points={policy.edge_min_net_points}) "
                 f"{gates}"
             )
         candidate = candidates[0]
-        score_key = "net_points" if policy.entry_mode == "edge" else "trend_strength"
         return (
             f"entry candidate selected: product_id={candidate[2]} direction={candidate[3]} "
-            f"{score_key}={candidate[1]} expected_edge_usd={candidate[0]} "
-            f"entry_mode={policy.entry_mode}"
+            f"net_points={candidate[1]} expected_edge_usd={candidate[0]}"
         )
 
     # -- leader: immediate entry -------------------------------------------- #
@@ -7390,7 +6630,7 @@ class PairExecutionCell:
                 return "the observed take profit does not match the attached rough protection"
         return None
 
-    # -- pair confirmation and asymmetric protection ----------------------------- #
+    # -- pair confirmation and mirrored protection ----------------------------- #
 
     def _peer_evidence_state(self) -> tuple[bool, str | None]:
         """``(exact, inconsistency)`` for the peer's self-reported leg evidence."""
@@ -7533,130 +6773,8 @@ class PairExecutionCell:
         self._request_broker_read()
         self._report_leg_status("protection_rough_fallback", sl=sl, tp=tp, reason=reason)
 
-    def _restore_previous_precise_protection(self, reason: str) -> None:
-        """Undo a partially accepted trail revision before freezing protection."""
-
-        attempt, leg = self._attempt, self._leg
-        if (
-            attempt is None
-            or leg is None
-            or leg.protection_status != "precise"
-            or leg.previous_precise_sl is None
-            or leg.previous_precise_tp is None
-        ):
-            return
-        sl, tp = leg.previous_precise_sl, leg.previous_precise_tp
-        effect_id = f"{attempt.attempt_id}:{self._worker_id}:protection:restore"
-        payload = {
-            "type": "modify_sl_tp",
-            "symbol": attempt.symbol_of(leg.role),
-            "position": leg.ticket,
-            "sl": sl,
-            "tp": tp,
-        }
-        try:
-            self._journal.prepare(effect_id, payload)
-        except EffectJournalError as error:
-            self._transition("precise_protection_restore_failed", str(error))
-            self._begin_close("precise_protection_restore_prepare_failed")
-            return
-        outcome = self._run_broker_write(effect_id, payload, priority="protection")
-        if outcome.category != "completed":
-            self._transition("precise_protection_restore_failed", outcome.category)
-            self._begin_close("precise_protection_restore_failed")
-            return
-        leg.protection_effect_id = effect_id
-        leg.precise_sl, leg.precise_tp = sl, tp
-        leg.previous_precise_sl = None
-        leg.previous_precise_tp = None
-        leg.protection_status = "frozen"
-        self._persist_leg()
-        self._transition("precise_protection_restore_applied", reason)
-        self._request_broker_read()
-        self._report_leg_status("protection_frozen", sl=sl, tp=tp, reason=reason)
-
-    def _asymmetric_precise_protection(self) -> tuple[str, str, str] | None:
-        """This Worker's half of the solo-capable profit protection revision.
-
-        Returns ``(sl, tp, kind)`` where ``kind`` is ``"initial"`` for the
-        first SL-only precise revision or ``"trail"`` for a trailing
-        advance, or ``None`` when the current protection should simply be
-        held (no favorable advance yet, or no fresh quote to trail from).
-        ``None`` here is a hold, never a failure: callers only freeze on an
-        ``"initial"`` miss or a broker rejection.
-
-        Model: either leg may keep running solo after the peer empties --
-        SL-only stop at its allowed loss, no take-profit cap, then a trailing
-        stop that only ever moves favorably (at most every
-        ``_PROFIT_TRAIL_SECONDS`` and only for advances of at least
-        ``_SOLO_TRAIL_MIN_STEP_TICKS``).
-        """
-
-        attempt, leg = self._attempt, self._leg
-        if attempt is None or leg is None:
-            return None
-        plan = self._attempt_plan_for_role(attempt, leg.role)
-        fill = _to_decimal(leg.fill_price)
-        allowed = _to_decimal(
-            attempt.leader_allowed_loss_usd if leg.role == "leader" else attempt.follower_allowed_loss_usd
-        )
-        volume = _to_decimal(attempt.lots)
-        if plan is None or fill is None or allowed is None or volume is None:
-            return None
-        direction = attempt.direction_of(leg.role)
-        if leg.protection_status != "precise":
-            initial = compute_sl_only(
-                entry=fill,
-                direction=direction,
-                volume=volume,
-                plan=plan,
-                allowed_loss_usd=allowed,
-            )
-            if initial is None:
-                return None
-            return initial[0], initial[1], "initial"
-        quote = self._local_quotes.get(attempt.product_id)
-        if quote is None:
-            return None
-        current_price = quote.bid if direction == "LONG" else quote.ask
-        current_sl = _to_decimal(leg.precise_sl)
-        if current_sl is None:
-            return None
-        initial = compute_sl_only(
-            entry=fill,
-            direction=direction,
-            volume=volume,
-            plan=plan,
-            allowed_loss_usd=allowed,
-        )
-        if initial is None:
-            return None
-        advanced = compute_trailing_sl(
-            direction=direction,
-            fill_price=fill,
-            initial_sl=_to_decimal(initial[0]),
-            current_price=current_price,
-            plan=plan,
-            volume=volume,
-            allowed_loss_usd=allowed,
-        )
-        if advanced is None:
-            return None
-        advanced_dec = _to_decimal(advanced)
-        assert advanced_dec is not None
-        if direction == "LONG" and advanced_dec <= current_sl:
-            return None
-        if direction == "SHORT" and advanced_dec >= current_sl:
-            return None
-        tick_size = _to_decimal(plan.tick_size)
-        if tick_size is not None and tick_size > 0:
-            step_ticks = abs(advanced_dec - current_sl) / tick_size
-            if step_ticks < _SOLO_TRAIL_MIN_STEP_TICKS:
-                return None  # too small to be worth a broker modify
-        return advanced, NO_TAKE_PROFIT, "trail"
-
     def _mirrored_precise_protection(self) -> tuple[str, str] | None:
-        """Edge-mode half of the joint box exit: shared absolute SL/TP prices.
+        """This Worker's half of the joint box exit: shared absolute SL/TP prices.
 
         Both Workers derive identical ``P_low``/``P_high`` deterministically
         from the immutable attempt (both fills, both plans, both allowed
@@ -7667,7 +6785,7 @@ class PairExecutionCell:
         Either box boundary locks the pair net at roughly the entry net,
         whichever side triggers first; the relay follow-close is only the
         backstop for a leg whose broker feed never touches its mirrored
-        level.  There is no trailing in edge mode: the box is one-shot.
+        level.  There is no trailing: the box is one-shot.
 
         Returns this Worker's own ``(sl, tp)`` on its own tick grid, or
         ``None`` when no box contains both fills (fail closed: callers keep
@@ -7677,7 +6795,7 @@ class PairExecutionCell:
         attempt, leg = self._attempt, self._leg
         if attempt is None or leg is None or leg.protection_status != "rough":
             return None
-        if self._policy is None or self._policy.entry_mode != "edge":
+        if self._policy is None:
             return None
         peer_role: Role = "follower" if leg.role == "leader" else "leader"
         plan_own = self._attempt_plan_for_role(attempt, leg.role)
@@ -7750,76 +6868,36 @@ class PairExecutionCell:
         return str(sl), str(tp)
 
     def _maybe_apply_precise_protection(self) -> None:
-        """Apply precise protection after confirmation; trail momentum legs only.
+        """Apply the one-shot mirrored box after confirmation; never trail.
 
-        Trend (momentum/donchian) legs get the asymmetric SL-only revision
-        and keep trailing while solo-capable.  Edge legs get the one-shot
-        mirrored box instead and never trail: the box exit is the strategy.
+        Both legs share the same absolute price boundaries; either boundary
+        locks the pair net at roughly the entry net.  The box is applied once
+        at confirmation: the box exit is the strategy.
         """
 
         attempt, leg = self._attempt, self._leg
         if attempt is None or leg is None or not self._pair_confirmed or self._desired != "ACTIVE":
             return
-        edge_mode = self._policy is not None and self._policy.entry_mode == "edge"
-        model = "mirrored" if edge_mode else "asymmetric"
         initial = leg.protection_status == "rough"
-        if edge_mode:
-            # The mirrored box is one-shot: applied once at confirmation,
-            # never trailed afterwards.
-            if not initial:
-                return
-            mirrored = self._mirrored_precise_protection()
-            if mirrored is None:
-                self._freeze_or_fallback_protection("no executable mirrored protection exists")
-                return
-            sl, tp, kind = mirrored[0], mirrored[1], "mirrored"
-        else:
-            trail_due = (
-                not initial
-                and leg.protection_status == "precise"
-                and self._active_since is not None
-                and (
-                    leg.last_protection_update_at is None
-                    or self._now >= _parse_utc(leg.last_protection_update_at) + timedelta(seconds=_PROFIT_TRAIL_SECONDS)
-                )
-            )
-            if not initial and not trail_due:
-                return
-            computed = self._asymmetric_precise_protection()
-            if computed is None:
-                if initial:
-                    self._freeze_or_fallback_protection("no executable asymmetric protection exists")
-                return
-            sl, tp, kind = computed
-        is_trail = kind == "trail"
-        if not is_trail and not initial:
+        # The mirrored box is one-shot: applied once at confirmation,
+        # never trailed afterwards.
+        if not initial:
             return
-        if not is_trail:
-            _LOGGER.info(
-                "%s evt=prot_%s role=%s tkt=%s sl=%s tp=%s att=%s",
-                _TAG,
-                "mirror" if kind == "mirrored" else "asym",
-                leg.role,
-                leg.ticket,
-                sl,
-                tp,
-                _short_id(attempt.attempt_id),
-            )
-        else:
-            _LOGGER.info(
-                "%s evt=prot_trail role=%s tkt=%s sl=%s>%s att=%s",
-                _TAG,
-                leg.role,
-                leg.ticket,
-                leg.precise_sl,
-                sl,
-                _short_id(attempt.attempt_id),
-            )
+        mirrored = self._mirrored_precise_protection()
+        if mirrored is None:
+            self._freeze_or_fallback_protection("no executable mirrored protection exists")
+            return
+        sl, tp = mirrored[0], mirrored[1]
+        _LOGGER.info(
+            "%s evt=prot_mirror role=%s tkt=%s sl=%s tp=%s att=%s",
+            _TAG,
+            leg.role,
+            leg.ticket,
+            sl,
+            tp,
+            _short_id(attempt.attempt_id),
+        )
         effect_id = f"{attempt.attempt_id}:{self._worker_id}:protection"
-        if is_trail:
-            effect_id += f":{int(self._now.timestamp())}"
-            leg.previous_precise_sl, leg.previous_precise_tp = leg.precise_sl, leg.precise_tp
-            self._persist_leg()
         leg.protection_effect_id = effect_id
         payload = {
             "type": "modify_sl_tp",
@@ -7838,7 +6916,7 @@ class PairExecutionCell:
         try:
             self._journal.prepare(effect_id, payload)
         except EffectJournalError as error:
-            self._freeze_or_fallback_protection(f"{model} protection could not be journaled: {error}")
+            self._freeze_or_fallback_protection(f"mirrored protection could not be journaled: {error}")
             return
         outcome = self._run_broker_write(effect_id, payload, priority="protection")
         if outcome.category == "completed":
@@ -7846,137 +6924,12 @@ class PairExecutionCell:
             leg.last_protection_update_at = _iso(self._now)
             self._persist_leg()
             self._state = "PROTECTING"
-            event = (
-                "mirrored_protection_applied"
-                if kind == "mirrored"
-                else ("profit_trail_applied" if is_trail else "asymmetric_protection_applied")
-            )
-            self._transition(event, attempt.attempt_id)
-            self._record_timing(event)
+            self._transition("mirrored_protection_applied", attempt.attempt_id)
+            self._record_timing("mirrored_protection_applied")
             self._report_leg_status("protection_precise", sl=sl, tp=tp)
             self._request_broker_read()
         else:
-            self._freeze_or_fallback_protection(f"{model} protection broker result: {outcome.category}")
-
-    def _apply_solo_lock(self) -> None:
-        """One immediate solo tightening outside the trail cadence.
-
-        Tries breakeven first, then half-risk ``(fill + initial) / 2`` via
-        :func:`compute_solo_lock_sl`.  Tightens only; holds when neither
-        candidate is executable (thin-profit solo).  Bypasses
-        ``_PROFIT_TRAIL_SECONDS`` so the surviving leg locks what it can the
-        moment the peer empties; later advances still honor the cadence and
-        the minimum tick step.
-        """
-
-        attempt, leg = self._attempt, self._leg
-        if attempt is None or leg is None or not self._pair_confirmed or self._desired != "ACTIVE":
-            return
-        if leg.protection_status != "precise" or not leg.ticket or leg.empty_verified:
-            return
-        plan = self._attempt_plan_for_role(attempt, leg.role)
-        fill = _to_decimal(leg.fill_price)
-        current_sl = _to_decimal(leg.precise_sl)
-        if plan is None or fill is None or current_sl is None:
-            return
-        initial = compute_sl_only(
-            entry=fill,
-            direction=attempt.direction_of(leg.role),
-            volume=_to_decimal(attempt.lots),
-            plan=plan,
-            allowed_loss_usd=_to_decimal(
-                attempt.leader_allowed_loss_usd if leg.role == "leader" else attempt.follower_allowed_loss_usd
-            ),
-        )
-        if initial is None:
-            return
-        initial_sl = _to_decimal(initial[0])
-        if initial_sl is None:
-            return
-        quote = self._local_quotes.get(attempt.product_id)
-        if quote is None:
-            return
-        direction = attempt.direction_of(leg.role)
-        current_price = quote.bid if direction == "LONG" else quote.ask
-        locked = compute_solo_lock_sl(
-            direction=direction,
-            fill_price=fill,
-            initial_sl=initial_sl,
-            current_sl=current_sl,
-            current_price=current_price,
-            plan=plan,
-        )
-        if locked is None:
-            return
-        _LOGGER.info(
-            "%s evt=solo_lock role=%s tkt=%s sl=%s>%s att=%s",
-            _TAG,
-            leg.role,
-            leg.ticket,
-            leg.precise_sl,
-            locked,
-            _short_id(attempt.attempt_id),
-        )
-        effect_id = f"{attempt.attempt_id}:{self._worker_id}:protection:solo:{int(self._now.timestamp())}"
-        leg.previous_precise_sl, leg.previous_precise_tp = leg.precise_sl, leg.precise_tp
-        self._persist_leg()
-        leg.protection_effect_id = effect_id
-        payload = {
-            "type": "modify_sl_tp",
-            "symbol": attempt.symbol_of(leg.role),
-            "position": leg.ticket,
-            "sl": locked,
-            "tp": NO_TAKE_PROFIT,
-        }
-        if self._policy is not None and self._policy.mode == "shadow":
-            leg.precise_sl, leg.precise_tp, leg.protection_status = locked, NO_TAKE_PROFIT, "precise"
-            leg.observed_sl, leg.observed_tp = locked, NO_TAKE_PROFIT
-            leg.last_protection_update_at = _iso(self._now)
-            self._persist_leg()
-            self._report_leg_status("protection_precise", sl=locked, tp=NO_TAKE_PROFIT)
-            self._transition("solo_lock_applied", attempt.attempt_id)
-            return
-        try:
-            self._journal.prepare(effect_id, payload)
-        except EffectJournalError:
-            return  # hold the existing stop; the trail cadence retries later
-        outcome = self._run_broker_write(effect_id, payload, priority="protection")
-        if outcome.category == "completed":
-            leg.precise_sl, leg.precise_tp, leg.protection_status = locked, NO_TAKE_PROFIT, "precise"
-            leg.last_protection_update_at = _iso(self._now)
-            self._persist_leg()
-            self._state = "PROTECTING"
-            self._transition("solo_lock_applied", attempt.attempt_id)
-            self._record_timing("solo_lock_applied")
-            self._report_leg_status("protection_precise", sl=locked, tp=NO_TAKE_PROFIT)
-            self._request_broker_read()
-        # Non-completed broker results hold the existing stop; no freeze here
-        # because the leg already carries executable precise protection.
-
-    def _own_leg_in_profit(self) -> bool:
-        """Whether this Worker's own leg is strictly profitable right now.
-
-        Solo continuation is winner-only: the survivor keeps running only when
-        the current exit price (bid for LONG, ask for SHORT) is strictly
-        beyond its fill.  Flat, adverse, or quote-less legs fall through to
-        containment with the peer, which keeps operator close, timed exit,
-        blackout, and integrity paths working.
-        """
-
-        attempt, leg = self._attempt, self._leg
-        if attempt is None or leg is None:
-            return False
-        fill = _to_decimal(leg.fill_price)
-        if fill is None:
-            return False
-        quote = self._local_quotes.get(attempt.product_id)
-        if quote is None:
-            return False
-        direction = attempt.direction_of(leg.role)
-        current_price = quote.bid if direction == "LONG" else quote.ask
-        if direction == "LONG":
-            return current_price > fill
-        return current_price < fill
+            self._freeze_or_fallback_protection(f"mirrored protection broker result: {outcome.category}")
 
     def _maybe_declare_active(self) -> None:
         attempt, leg = self._attempt, self._leg
@@ -8098,23 +7051,23 @@ class PairExecutionCell:
         if status == "protection_rough_fallback" and self._leg is not None:
             self._restore_rough_protection("peer retained rough protection")
         elif status == "protection_frozen" and self._leg is not None and self._leg.protection_status == "precise":
-            self._restore_previous_precise_protection("peer stopped further trailing")
-            if self._leg.protection_status == "precise":
-                self._leg.protection_status = "frozen"
-                self._persist_leg()
-                self._transition("protection_frozen", "peer stopped further trailing")
-                self._report_leg_status("protection_frozen", sl=self._leg.precise_sl, tp=self._leg.precise_tp)
+            # The peer froze its box while this side still holds precise
+            # protection: freeze as well so neither side revises alone.
+            self._leg.protection_status = "frozen"
+            self._persist_leg()
+            self._transition("protection_frozen", "peer froze its protection")
+            self._report_leg_status("protection_frozen", sl=self._leg.precise_sl, tp=self._leg.precise_tp)
         elif status in ("rejected", "expired_not_started", "protection_failed", "inconsistent", "no_attempt_record"):
             self._begin_close(f"peer_leg_{status}")
             self._maybe_finalize_empty()
         elif status == "empty":
             peer_reason = cast(str, payload.get("reason") or "")
             if _is_operator_shutdown_reason(peer_reason):
-                # Operator shutdown is a joint-close route, never a solo
-                # opportunity: both legs flatten together even when the
-                # survivor is profitable.  The shutdown initiator keeps its
-                # attempt open (via _maybe_finalize_empty) until this side
-                # reports empty back, so graceful shutdown waits for both.
+                # Operator shutdown is a joint-close route: both legs flatten
+                # together even when the survivor is profitable.  The shutdown
+                # initiator keeps its attempt open (via _maybe_finalize_empty)
+                # until this side reports empty back, so graceful shutdown
+                # waits for both.
                 self._transition("peer_operator_shutdown", peer_reason or attempt_id)
                 # A shutting-down peer is about to go quiet: stop treating its
                 # last ready snapshot as entry permission until it says ready
@@ -8130,40 +7083,15 @@ class PairExecutionCell:
                 and not self._leg.empty_verified
                 and self._leg.ticket
             ):
-                if self._policy is not None and self._policy.entry_mode == "edge":
-                    # Edge mode never solos: one flat leg means the mirrored
-                    # box is broken, so the survivor market-closes at once.
-                    # The broker-side mirrored stops are the first line; this
-                    # relay follow is the backstop for a leg whose broker feed
-                    # never touched its mirrored level.
-                    self._transition("peer_leg_empty_edge_follow", attempt_id)
-                    self._begin_close("peer_leg_empty")
-                    self._maybe_finalize_empty()
-                    return
-                if self._own_leg_in_profit():
-                    # Either leg may outlive the peer, but only as a winner: the
-                    # capped loser stops out while the profitable survivor keeps
-                    # running solo under its trailing stop instead of being
-                    # contained with it.  A flat or adverse leg still contains
-                    # with the peer (operator close, timed exit, blackout, and
-                    # integrity paths all keep working).  The pair finalizes when
-                    # both legs are empty (own SL/trail, timed exit, blackout).
-                    if previous_status != "empty":
-                        _LOGGER.info(
-                            "%s evt=solo att=%s tkt=%s role=%s",
-                            _TAG,
-                            _short_id(attempt_id),
-                            self._leg.ticket,
-                            self._role,
-                        )
-                        event = (
-                            "peer_leg_empty_leader_continues_solo"
-                            if self._role == "leader"
-                            else "peer_leg_empty_follower_continues_solo"
-                        )
-                        self._transition(event, attempt_id)
-                        self._apply_solo_lock()
-                    return
+                # A flat leg means the mirrored box is broken, so the survivor
+                # market-closes at once.
+                # The broker-side mirrored stops are the first line; this
+                # relay follow is the backstop for a leg whose broker feed
+                # never touched its mirrored level.
+                self._transition("peer_leg_empty_edge_follow", attempt_id)
+                self._begin_close("peer_leg_empty")
+                self._maybe_finalize_empty()
+                return
             self._begin_close("peer_leg_empty")
             self._maybe_finalize_empty()
 

@@ -62,7 +62,6 @@ from abt.worker.pair_cell_adapter import (
     default_pair_cell_config,
     ensure_pair_cell_config_template,
     evaluate_follower_acceptance,
-    fetch_trend_seed_points,
     load_durable_route,
     load_frozen_acceptance,
     load_frozen_budget,
@@ -902,13 +901,13 @@ class PairCellConfigurationTests(unittest.TestCase):
         config = load_pair_cell_config(self.directory / "missing.json")
         self.assertEqual({}, dict(config.risk_overrides))
         self.assertEqual({}, dict(config.shared_policy))
-        self.assertEqual("20", config.daily_loss_warning_threshold_usd)
+        self.assertEqual("30", config.daily_loss_warning_threshold_usd)
         limits = worker_risk_limits(StartupBalance(amount_usd="2500"), config)
         self.assertEqual("2500", limits.strategy_budget_usd)
-        self.assertEqual("0.01", limits.maximum_margin_fraction)
+        self.assertEqual("0.15", limits.maximum_margin_fraction)
         self.assertEqual("0.02", limits.daily_loss_fraction)
         self.assertEqual("0.01", limits.trade_loss_fraction)
-        self.assertEqual("40", limits.maximum_loss_per_trade_usd)
+        self.assertEqual("60", limits.maximum_loss_per_trade_usd)
 
     def test_a_route_or_trader_or_built_product_key_is_a_startup_error(self) -> None:
         for key, value in (
@@ -954,8 +953,6 @@ class PairCellConfigurationTests(unittest.TestCase):
             ("mode", "shadow"),
             ("strategy_budget_usd", "5000"),
             ("edge_min_net_points", "9"),
-            ("entry_mode", "donchian"),
-            ("trend_lookback_seconds", 900.0),
             ("quote_max_age_seconds", 2.0),
             ("quote_max_skew_seconds", 2.0),
             ("follower_confirmation_timeout_seconds", 9.0),
@@ -1010,53 +1007,25 @@ class PairCellConfigurationTests(unittest.TestCase):
                 with self.assertRaises(WorkerEnrollmentError):
                     parse_pair_cell_config({key: bad})
 
-    def test_trend_entry_mode_is_leader_authored(self) -> None:
-        for mode in ("edge", "donchian", "momentum"):
-            with self.subTest(mode=mode):
-                config = parse_pair_cell_config({"entry_mode": mode})
-                self.assertTrue(config.declares_shared_policy)
-                self.assertIsNone(config.role_authority_error("leader"))
-                reason = config.role_authority_error("follower")
-                self.assertIsNotNone(reason)
-                self.assertIn("entry_mode", cast(str, reason))
-        with self.assertRaises(WorkerEnrollmentError):
-            parse_pair_cell_config({"entry_mode": "breakout"})
-
-    def test_trend_tunables_must_be_usable_numbers(self) -> None:
-        config = parse_pair_cell_config(
-            {
-                "trend_lookback_seconds": 900.0,
-                "trend_momentum_T_seconds": 60.0,
-                "trend_vol_window_seconds": 300.0,
-                "trend_breakout_buffer_points": "3",
-                "trend_min_range_points": "10",
-                "trend_momentum_k": "1.5",
-                "trend_min_mom_points": "4",
-                "trend_max_spread_points": "9",
-                "trend_min_coverage": 0.5,
-            }
-        )
-        self.assertEqual(900.0, config.shared_policy["trend_lookback_seconds"])
-        self.assertEqual("3", config.shared_policy["trend_breakout_buffer_points"])
-        for key, bad in (
-            ("trend_lookback_seconds", 0),
-            ("trend_lookback_seconds", -5.0),
-            ("trend_lookback_seconds", "long"),
-            ("trend_momentum_T_seconds", True),
-            ("trend_vol_window_seconds", 0.0),
-            ("trend_breakout_buffer_points", "wide"),
-            ("trend_breakout_buffer_points", True),
-            ("trend_min_range_points", "NaN"),
-            ("trend_momentum_k", "steep"),
-            ("trend_min_mom_points", ""),
-            ("trend_max_spread_points", True),
-            ("trend_min_coverage", 0),
-            ("trend_min_coverage", 1.5),
-            ("trend_min_coverage", "most"),
+    def test_removed_entry_mode_and_trend_keys_are_rejected(self) -> None:
+        for key, value in (
+            ("entry_mode", "edge"),
+            ("entry_mode", "momentum"),
+            ("trend_lookback_seconds", 900.0),
+            ("trend_momentum_T_seconds", 60.0),
+            ("trend_vol_window_seconds", 300.0),
+            ("trend_breakout_buffer_points", "3"),
+            ("trend_min_range_points", "10"),
+            ("trend_momentum_k", "1.5"),
+            ("trend_min_mom_points", "4"),
+            ("trend_max_spread_points", "9"),
+            ("trend_min_coverage", 0.5),
+            ("trend_quote_max_age_seconds", 60.0),
         ):
-            with self.subTest(key=key, bad=bad):
-                with self.assertRaises(WorkerEnrollmentError):
-                    parse_pair_cell_config({key: bad})
+            with self.subTest(key=key):
+                with self.assertRaises(WorkerEnrollmentError) as raised:
+                    parse_pair_cell_config({key: value})
+                self.assertIn(f"unknown settings {key}", str(raised.exception))
 
     def test_a_malformed_file_is_a_startup_error(self) -> None:
         path = self.directory / "pair.json"
@@ -1088,7 +1057,7 @@ class PairCellConfigurationTests(unittest.TestCase):
         self.assertTrue(ensure_pair_cell_config_template(path, desired_role="leader"))
         template = json.loads(path.read_text(encoding="utf-8"))
         self.assertEqual("shadow", template["mode"])
-        self.assertIn("entry_mode", template)
+        self.assertNotIn("entry_mode", template)
         config = load_pair_cell_config(path)
         self.assertTrue(config.declares_shared_policy)
         # A freshly generated file behaves exactly like no file: identical limits.
@@ -1108,285 +1077,6 @@ class PairCellConfigurationTests(unittest.TestCase):
         self.assertFalse(ensure_pair_cell_config_template(None, desired_role="leader"))
         config = load_pair_cell_config(None)
         self.assertEqual({}, dict(config.shared_policy))
-
-
-class TrendSeedTests(unittest.TestCase):
-    def test_lossless_ticks_win_over_bars(self) -> None:
-        now = datetime(2024, 1, 2, 14, 0, tzinfo=UTC)
-        ticks = [
-            {
-                "time": int((now - timedelta(seconds=300 - offset)).timestamp()),
-                "time_msc": int((now - timedelta(seconds=300 - offset)).timestamp() * 1000),
-                "bid": 1.10000 + offset * 0.00001,
-                "ask": 1.10010 + offset * 0.00001,
-            }
-            for offset in range(300)
-        ]
-
-        class TickMT5:
-            COPY_TICKS_ALL = 3
-
-            def copy_ticks_range(self, symbol: str, start: datetime, end: datetime, flags: int) -> object:
-                assert symbol == SYMBOL
-                assert flags == 3
-                return ticks
-
-            def copy_rates_from_pos(self, *args: object) -> object:  # pragma: no cover
-                raise AssertionError("bars must not be read when ticks succeed")
-
-        points, degraded = fetch_trend_seed_points(
-            TickMT5(), SYMBOL, window_seconds=300.0, now=now
-        )
-        self.assertFalse(degraded)
-        self.assertEqual(300, len(points))
-        self.assertLess(points[0].broker_time, points[-1].broker_time)
-        self.assertLess(points[0].bid, points[-1].bid)
-
-    def test_bars_are_a_degraded_fallback(self) -> None:
-        now = datetime(2024, 1, 2, 14, 0, tzinfo=UTC)
-
-        class BarMT5:
-            def copy_ticks_range(self, *args: object) -> object:
-                raise RuntimeError("no tick history")
-
-            def copy_rates_from_pos(self, symbol: str, timeframe: object, start_pos: int, count: int) -> object:
-                assert symbol == SYMBOL
-                return [
-                    {
-                        "time": int((now - timedelta(minutes=3 - offset)).timestamp()),
-                        "high": 1.10050,
-                        "low": 1.10030,
-                    }
-                    for offset in range(3)
-                ]
-
-        points, degraded = fetch_trend_seed_points(
-            BarMT5(), SYMBOL, window_seconds=300.0, now=now
-        )
-        self.assertTrue(degraded)
-        self.assertEqual(3, len(points))
-        self.assertEqual(points[0].bid, points[0].ask)
-
-    def test_total_history_failure_is_an_empty_degraded_seed(self) -> None:
-        class DeadMT5:
-            def copy_ticks_range(self, *args: object) -> object:
-                raise RuntimeError("down")
-
-            def copy_rates_from_pos(self, *args: object) -> object:
-                raise RuntimeError("down")
-
-        points, degraded = fetch_trend_seed_points(
-            DeadMT5(), SYMBOL, window_seconds=300.0, now=datetime(2024, 1, 2, 14, 0, tzinfo=UTC)
-        )
-        self.assertEqual([], points)
-        self.assertTrue(degraded)
-
-    def test_malformed_ticks_are_skipped_not_fatal(self) -> None:
-        now = datetime(2024, 1, 2, 14, 0, tzinfo=UTC)
-
-        class RaggedMT5:
-            COPY_TICKS_ALL = 3
-
-            def copy_ticks_range(self, symbol: str, start: datetime, end: datetime, flags: int) -> object:
-                good = {
-                    "time": int(now.timestamp()),
-                    "time_msc": int(now.timestamp() * 1000),
-                    "bid": 1.1,
-                    "ask": 1.1001,
-                }
-                return [None, {"bid": "x"}, good] + [dict(good, time_msc=int(now.timestamp() * 1000) - offset * 1000, bid=1.1, ask=1.1001) for offset in range(1, 20)]
-
-            def copy_rates_from_pos(self, *args: object) -> object:  # pragma: no cover
-                raise AssertionError("bars must not be read when ticks succeed")
-
-        points, degraded = fetch_trend_seed_points(
-            RaggedMT5(), SYMBOL, window_seconds=300.0, now=now
-        )
-        self.assertFalse(degraded)
-        self.assertEqual(20, len(points))
-
-    def test_tick_window_is_placed_on_the_broker_clock(self) -> None:
-        """History is indexed by server-clock epochs, not UTC."""
-
-        now = datetime(2024, 1, 2, 14, 0, tzinfo=UTC)
-        captured: dict[str, object] = {}
-
-        class WindowMT5:
-            COPY_TICKS_ALL = 3
-
-            def copy_ticks_range(self, symbol: str, start: datetime, end: datetime, flags: int) -> object:
-                captured["start"], captured["end"] = start, end
-                return []
-
-            def copy_rates_from_pos(self, *args: object) -> object:
-                return []
-
-        fetch_trend_seed_points(
-            WindowMT5(), SYMBOL, window_seconds=300.0, now=now, broker_offset_seconds=10800.0
-        )
-        self.assertEqual(now - timedelta(seconds=360) + timedelta(seconds=10800), captured["start"])
-        self.assertEqual(now + timedelta(seconds=10800), captured["end"])
-
-    def test_tick_window_without_calibration_stays_utc(self) -> None:
-        now = datetime(2024, 1, 2, 14, 0, tzinfo=UTC)
-        captured: dict[str, object] = {}
-
-        class WindowMT5:
-            COPY_TICKS_ALL = 3
-
-            def copy_ticks_range(self, symbol: str, start: datetime, end: datetime, flags: int) -> object:
-                captured["start"], captured["end"] = start, end
-                return []
-
-            def copy_rates_from_pos(self, *args: object) -> object:
-                return []
-
-        fetch_trend_seed_points(WindowMT5(), SYMBOL, window_seconds=300.0, now=now)
-        self.assertEqual(now - timedelta(seconds=360), captured["start"])
-        self.assertEqual(now, captured["end"])
-
-    def test_seed_points_are_returned_on_the_calibrated_timeline(self) -> None:
-        """Seed stamps land on wall UTC: broker epochs minus the measured offset.
-
-        The cell buckets trend history on the wall-clock timeline its windows
-        run on; raw server epochs would park the buffer hours in the future.
-        """
-
-        now = datetime(2024, 1, 2, 14, 0, tzinfo=UTC)
-        ticks = [
-            {
-                "time": int(now.timestamp()) + 10800 - offset,
-                "time_msc": int(now.timestamp() * 1000) + 10800000 - offset * 1000,
-                "bid": 1.10000,
-                "ask": 1.10010,
-            }
-            for offset in range(60, 360, 10)
-        ]
-
-        class ShiftedMT5:
-            COPY_TICKS_ALL = 3
-
-            def copy_ticks_range(self, *args: object) -> object:
-                return ticks
-
-            def copy_rates_from_pos(self, *args: object) -> object:  # pragma: no cover
-                raise AssertionError("bars must not be read when ticks succeed")
-
-        points, degraded = fetch_trend_seed_points(
-            ShiftedMT5(), SYMBOL, window_seconds=300.0, now=now, broker_offset_seconds=10800.0
-        )
-        self.assertFalse(degraded)
-        self.assertEqual(30, len(points))
-        for point in points:
-            self.assertLessEqual(point.broker_time, now)
-        self.assertGreaterEqual((now - points[0].broker_time).total_seconds(), 50)
-
-    def test_native_structured_array_ticks_are_parsed(self) -> None:
-        """Real MT5 returns numpy structured arrays, not dicts."""
-
-        now = datetime(2024, 1, 2, 14, 0, tzinfo=UTC)
-
-        class Scalar:
-            def __init__(self, value: object) -> None:
-                self._value = value
-
-            def item(self) -> object:
-                return self._value
-
-        class VoidRow:
-            def __init__(self, values: dict[str, object]) -> None:
-                self._values = values
-
-            def __getitem__(self, name: str) -> Scalar:
-                return Scalar(self._values[name])
-
-        class StructuredArray:
-            dtype = SimpleNamespace(names=("time", "bid", "ask", "time_msc", "flags"))
-
-            def __init__(self, rows: list[VoidRow]) -> None:
-                self._rows = rows
-
-            def __iter__(self):  # type: ignore[no-untyped-def]
-                return iter(self._rows)
-
-        class NativeMT5:
-            COPY_TICKS_ALL = 3
-
-            def copy_ticks_range(self, symbol: str, start: datetime, end: datetime, flags: int) -> object:
-                base_ms = int(now.timestamp() * 1000)
-                return StructuredArray(
-                    [
-                        VoidRow(
-                            {
-                                "time": int(now.timestamp()) - offset,
-                                "bid": 1.10000,
-                                "ask": 1.10010,
-                                "time_msc": base_ms - offset * 1000,
-                                "flags": 6,
-                            }
-                        )
-                        for offset in range(20)
-                    ]
-                )
-
-            def copy_rates_from_pos(self, *args: object) -> object:  # pragma: no cover
-                raise AssertionError("bars must not be read when ticks succeed")
-
-        points, degraded = fetch_trend_seed_points(
-            NativeMT5(), SYMBOL, window_seconds=300.0, now=now
-        )
-        self.assertFalse(degraded)
-        self.assertEqual(20, len(points))
-
-    def test_native_structured_array_bars_degrade_gracefully(self) -> None:
-        now = datetime(2024, 1, 2, 14, 0, tzinfo=UTC)
-
-        class Scalar:
-            def __init__(self, value: object) -> None:
-                self._value = value
-
-            def item(self) -> object:
-                return self._value
-
-        class VoidRow:
-            def __init__(self, values: dict[str, object]) -> None:
-                self._values = values
-
-            def __getitem__(self, name: str) -> Scalar:
-                return Scalar(self._values[name])
-
-        class StructuredArray:
-            dtype = SimpleNamespace(names=("time", "high", "low"))
-
-            def __init__(self, rows: list[VoidRow]) -> None:
-                self._rows = rows
-
-            def __iter__(self):  # type: ignore[no-untyped-def]
-                return iter(self._rows)
-
-        class NativeMT5:
-            def copy_ticks_range(self, *args: object) -> object:
-                return []
-
-            def copy_rates_from_pos(self, symbol: str, timeframe: object, start_pos: int, count: int) -> object:
-                return StructuredArray(
-                    [
-                        VoidRow(
-                            {
-                                "time": int(now.timestamp()) - offset * 60,
-                                "high": 1.10050,
-                                "low": 1.10030,
-                            }
-                        )
-                        for offset in range(3)
-                    ]
-                )
-
-        points, degraded = fetch_trend_seed_points(
-            NativeMT5(), SYMBOL, window_seconds=300.0, now=now
-        )
-        self.assertTrue(degraded)
-        self.assertEqual(3, len(points))
 
 
 class StartupBalanceTests(unittest.TestCase):
@@ -1426,7 +1116,7 @@ class StartupBalanceTests(unittest.TestCase):
 
     def test_no_margin_headroom_beyond_the_margin_fraction(self) -> None:
         limits = worker_risk_limits(StartupBalance(amount_usd="10000"), default_pair_cell_config())
-        self.assertEqual(Decimal("100.00"), limits.margin_budget_usd)
+        self.assertEqual(Decimal("1500.00"), limits.margin_budget_usd)
 
 
 # --------------------------------------------------------------------------- #
@@ -2296,7 +1986,7 @@ class DurableRouteAndAuthorityTests(PairingTestCase):
         leader_risk = leader.runtime.enforced_risk_limits()
         assert leader_risk is not None
         self.assertEqual("10000", leader_risk.strategy_budget_usd)
-        self.assertEqual("0.01", leader_risk.maximum_margin_fraction)
+        self.assertEqual("0.15", leader_risk.maximum_margin_fraction)
 
 
 class DiscoveryLifecycleTests(PairingTestCase):
@@ -2341,8 +2031,8 @@ class DiscoveryLifecycleTests(PairingTestCase):
         assert leader.runtime.cell is not None
         plans = leader.runtime.cell.sizing_plans()
         self.assertEqual({("LONG"), ("SHORT")}, {direction for _, direction in plans})
-        # 10 000 * 0.01 / 1 000 = 0.1 lots for the leader.
-        self.assertEqual({"0.1"}, {plan.local_max_lots for plan in plans.values()})
+        # 10 000 * 0.15 / 1 000 = 1.5 lots for the leader.
+        self.assertEqual({"1.5"}, {plan.local_max_lots for plan in plans.values()})
         _ = follower
 
     def test_the_hourly_refresh_never_admits_a_newly_appeared_symbol(self) -> None:
@@ -3619,7 +3309,17 @@ class DurablePersistenceTests(PairingTestCase):
 
 class FullLifecycleTests(PairingTestCase):
     def test_pairing_then_discovery_then_immediate_entry_active_close_and_safe_unpair(self) -> None:
-        leader, follower = self.paired()
+        # Pin the loss economics explicitly so this mirror-behavior test does
+        # not follow production default changes: small lots and a small cap
+        # keep both rough boxes wide enough to contain the two fills, which is
+        # the precondition for the mirrored box.
+        pinned_risk = {"maximum_margin_fraction": "0.01", "maximum_loss_per_trade_usd": "40"}
+        leader, follower = self.paired(
+            leader_config=parse_pair_cell_config(
+                {"mode": "live", "post_reconnect_cooldown_seconds": 5.0, **pinned_risk}
+            ),
+            follower_config=parse_pair_cell_config(pinned_risk),
+        )
 
         self.assertTrue(
             pump_until(
@@ -3665,8 +3365,8 @@ class FullLifecycleTests(PairingTestCase):
         follower.mt5.prices[SYMBOL] = leader.mt5.prices[SYMBOL]
         pump_until([leader, follower], lambda: False, rounds=40)
         leader.runtime.request_close("timed_exit")
-        # Edge mode never solos: the leader empties on its own close and the
-        # follower follows at once instead of running on.
+        # The leader empties on its own close and the follower follows at
+        # once instead of running on.
         self.assertTrue(
             pump_until([leader, follower], lambda: not leader.mt5.positions, rounds=100),
             "the leader never closed on its own timed exit",
@@ -3678,10 +3378,6 @@ class FullLifecycleTests(PairingTestCase):
         assert follower.runtime.cell is not None
         self.assertIn(
             "peer_leg_empty_edge_follow",
-            [row["event"] for row in follower.runtime.cell.transition_history()],
-        )
-        self.assertNotIn(
-            "peer_leg_empty_follower_continues_solo",
             [row["event"] for row in follower.runtime.cell.transition_history()],
         )
         self.assertTrue(
@@ -3726,7 +3422,7 @@ class DataHealthWatchTests(PairingTestCase):
         )
         return leader, follower
 
-    def test_frozen_feed_alerts_once_then_recovery_rewarms(self) -> None:
+    def test_frozen_feed_alerts_once_then_recovery_logs(self) -> None:
         leader, follower = self._active_pair()
         assert leader.runtime.cell is not None
         # Freeze the leader's only symbol: live ticks stop advancing while
@@ -3740,21 +3436,14 @@ class DataHealthWatchTests(PairingTestCase):
         self.assertIn("evt=data_health_frozen", output)
         # Watch-only: trading state is never latched by the observer.
         self.assertFalse(leader.runtime.cell.status().needs_human)
-        # Thaw: the next genuinely new tick recovers with one INFO and
-        # clears this generation's trend-seed markers so history backfills.
+        # Thaw: the next genuinely new tick recovers with one INFO.
         leader.mt5.frozen_symbols.discard(SYMBOL)
-        generation = leader.runtime.cell.discovered_universe().universe_generation
         # Let the quote gate elapse so the thawed tick is actually observed.
         self.clock.advance(1.0)
         with self.assertLogs("abt.worker.pair_cell_adapter", level="INFO") as logs:
             leader.runtime.pump(self.clock())
         output = "\n".join(logs.output)
         self.assertIn("evt=data_health_recovered", output)
-        seeded = leader.runtime._trend_seeded
-        self.assertFalse(
-            any(key[0] == generation for key in seeded),
-            "recovery must drop this generation's seed markers for backfill",
-        )
 
     def test_weekend_freeze_stays_quiet(self) -> None:
         leader, follower = self._active_pair()

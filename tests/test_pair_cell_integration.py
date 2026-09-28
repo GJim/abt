@@ -534,7 +534,18 @@ class PairExecutionCellEndToEndTests(unittest.TestCase):
         plane, discover their compatible universe, and complete one protected
         two-leg entry."""
 
-        pair = _Pair(self, self.server, Path(self._tmp.name))
+        pair = _Pair(
+            self,
+            self.server,
+            Path(self._tmp.name),
+            # Pin the follower loss economics explicitly so this mirror-behavior
+            # test does not follow production default changes: small lots and
+            # a small cap keep the rough boxes wide enough to contain the two
+            # fills, which is the precondition for the mirrored box.
+            follower_config=parse_pair_cell_config(
+                {"maximum_margin_fraction": "0.01", "maximum_loss_per_trade_usd": "40"}
+            ),
+        )
 
         self.assertTrue(
             pair.wait_for(lambda: pair.both_states("ACTIVE")),
@@ -668,7 +679,7 @@ class PairExecutionCellEndToEndTests(unittest.TestCase):
         self.assertEqual("25", follower_risk.maximum_loss_per_trade_usd)
         # ... and the leader authored only its own.
         self.assertEqual("10000", leader_risk.strategy_budget_usd)
-        self.assertEqual("40", leader_risk.maximum_loss_per_trade_usd)
+        self.assertEqual("60", leader_risk.maximum_loss_per_trade_usd)
 
     def test_a_worker_initiated_quarantine_release_applies_on_both_sides(self) -> None:
         """Freezing a symbol is each Worker's own job: one side proposes a

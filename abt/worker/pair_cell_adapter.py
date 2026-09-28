@@ -70,18 +70,7 @@ from ..pair_cell import (
     PROTOCOL_VERSION as PAIR_CELL_ENVELOPE_VERSION,
     DEFAULT_DAILY_LOSS_WARNING_THRESHOLD_USD,
     DEFAULT_EDGE_MIN_NET_POINTS,
-    DEFAULT_ENTRY_MODE,
     DEFAULT_STRATEGY_BUDGET_USD,
-    DEFAULT_TREND_BREAKOUT_BUFFER_POINTS,
-    DEFAULT_TREND_LOOKBACK_SECONDS,
-    DEFAULT_TREND_MAX_SPREAD_POINTS,
-    DEFAULT_TREND_MIN_COVERAGE,
-    DEFAULT_TREND_MIN_MOM_POINTS,
-    DEFAULT_TREND_MIN_RANGE_POINTS,
-    DEFAULT_TREND_MOMENTUM_K,
-    DEFAULT_TREND_MOMENTUM_T_SECONDS,
-    DEFAULT_TREND_QUOTE_MAX_AGE_SECONDS,
-    DEFAULT_TREND_VOL_WINDOW_SECONDS,
     LOCAL_SETTING_KEYS,
     RELAY_HANDLING_WINDOW_SECONDS,
     REQUIRED_ACCOUNT_CURRENCY,
@@ -110,8 +99,6 @@ from ..pair_cell import (
     RouteAssignment,
     RouteMetadataEvent,
     RouteState,
-    TrendSeedEvent,
-    TrendSeedPoint,
     WorkerRiskLimits,
     _resolve_unified_budget,
     build_pairing_acceptance,
@@ -252,7 +239,7 @@ ATTEMPT_SCOPED_TABLES = (
 #: MT5 ``10021`` quarantine (and its release audit) is keyed by derived product
 #: identity and has no automatic expiry, and the local attempt/effect state
 #: version and publisher epoch must never
-#: move backwards.  The 1-second market tape and the admission gate counters
+#: move backwards.  The admission gate counters
 #: are post-hoc debugging evidence in the same class: they are never read on
 #: the decision path, and clearing them with the route would destroy exactly
 #: the incident replay they exist for (retention bounds them instead).  The
@@ -267,7 +254,6 @@ PRESERVED_SAFETY_TABLES = (
     "cell_state_version",
     "cell_publisher_epoch",
     "cell_transitions",
-    "cell_market_tape_1s",
     "cell_admission_stats",
 )
 
@@ -455,10 +441,6 @@ def parse_pair_cell_config(raw: object, *, source: object = "<memory>") -> PairC
     for key, default in (
         ("sizing_refresh_seconds", _SIZING_REFRESH_SECONDS),
         ("relay_handling_timeout_seconds", RELAY_HANDLING_WINDOW_SECONDS),
-        ("trend_lookback_seconds", DEFAULT_TREND_LOOKBACK_SECONDS),
-        ("trend_momentum_T_seconds", DEFAULT_TREND_MOMENTUM_T_SECONDS),
-        ("trend_quote_max_age_seconds", DEFAULT_TREND_QUOTE_MAX_AGE_SECONDS),
-        ("trend_vol_window_seconds", DEFAULT_TREND_VOL_WINDOW_SECONDS),
     ):
         candidate = shared_policy.get(key, default)
         if (
@@ -471,40 +453,15 @@ def parse_pair_cell_config(raw: object, *, source: object = "<memory>") -> PairC
                 f"The Pair Execution Cell configuration is invalid: {source}: "
                 f"{key} must be a positive number of seconds."
             )
-    trend_coverage = shared_policy.get("trend_min_coverage", DEFAULT_TREND_MIN_COVERAGE)
-    if (
-        isinstance(trend_coverage, bool)
-        or not isinstance(trend_coverage, (int, float))
-        or not math.isfinite(trend_coverage)
-        or not 0 < trend_coverage <= 1
-    ):
+    candidate = shared_policy.get("edge_min_net_points", DEFAULT_EDGE_MIN_NET_POINTS)
+    try:
+        if isinstance(candidate, bool) or not Decimal(str(candidate)).is_finite():
+            raise InvalidOperation
+    except (InvalidOperation, ValueError, TypeError) as error:
         raise WorkerEnrollmentError(
             f"The Pair Execution Cell configuration is invalid: {source}: "
-            "trend_min_coverage must be in (0, 1]."
-        )
-    entry_mode = shared_policy.get("entry_mode", DEFAULT_ENTRY_MODE)
-    if entry_mode not in ("edge", "donchian", "momentum"):
-        raise WorkerEnrollmentError(
-            f"The Pair Execution Cell configuration is invalid: {source}: "
-            "entry_mode must be 'edge', 'donchian' or 'momentum'."
-        )
-    for key, default in (
-        ("edge_min_net_points", DEFAULT_EDGE_MIN_NET_POINTS),
-        ("trend_breakout_buffer_points", DEFAULT_TREND_BREAKOUT_BUFFER_POINTS),
-        ("trend_min_range_points", DEFAULT_TREND_MIN_RANGE_POINTS),
-        ("trend_momentum_k", DEFAULT_TREND_MOMENTUM_K),
-        ("trend_min_mom_points", DEFAULT_TREND_MIN_MOM_POINTS),
-        ("trend_max_spread_points", DEFAULT_TREND_MAX_SPREAD_POINTS),
-    ):
-        candidate = shared_policy.get(key, default)
-        try:
-            if isinstance(candidate, bool) or not Decimal(str(candidate)).is_finite():
-                raise InvalidOperation
-        except (InvalidOperation, ValueError, TypeError) as error:
-            raise WorkerEnrollmentError(
-                f"The Pair Execution Cell configuration is invalid: {source}: "
-                f"{key} must be a finite number."
-            ) from error
+            "edge_min_net_points must be a finite number."
+        ) from error
     config = PairCellConfig(
         raw=values,
         risk_overrides=risk_overrides,
@@ -1249,154 +1206,6 @@ class BrokerClockSample:
     sampled_at: datetime
 
 
-_TREND_SEED_TICK_CAP = 20000
-
-
-def fetch_trend_seed_points(
-    mt5: object,
-    symbol: str,
-    *,
-    window_seconds: float,
-    now: datetime,
-    broker_offset_seconds: float | None = None,
-) -> tuple[list[TrendSeedPoint], bool]:
-    """Best-effort Phase-B history for one symbol: ``(points, degraded)``.
-
-    Preferred source is ``copy_ticks_range`` (lossless bid/ask ticks with
-    millisecond epochs).  The fallback is ``copy_rates_from_pos`` M1 bars,
-    whose bid-side ``(high + low) / 2`` mid approximation is marked
-    ``degraded``: good enough to place Donchian levels, never a trigger
-    itself.  Total failure returns ``([], True)`` and never raises -- the
-    live-tick buffer in the cell is always the recovery path.
-
-    The tick range is queried in the **broker clock**: MT5 indexes tick
-    history by server-clock epochs (the same +3h shift the clock calibration
-    measures), so a raw UTC window would read hours in the past -- typically
-    a closed-market gap yielding zero points.  ``broker_offset_seconds`` is
-    this broker's measured ``offset_seconds``; ``None`` means uncalibrated
-    and the UTC window is used as-is.
-
-    Returned points carry **calibrated UTC** (broker epochs minus the offset):
-    the cell buckets trend history on the wall-clock timeline its reference
-    and volatility windows run on, so storing raw server epochs would park
-    the whole buffer hours in the future and the windows would never overlap
-    it.  The query window above is the only place broker-clock epochs belong.
-    """
-
-    window = timedelta(seconds=max(60.0, window_seconds) + 60.0)
-    shift = timedelta(seconds=broker_offset_seconds) if broker_offset_seconds is not None else timedelta(0)
-    start, end = now - window + shift, now + shift
-    try:
-        flags = getattr(mt5, "COPY_TICKS_ALL", 3)
-        if not isinstance(flags, int) or isinstance(flags, bool):
-            flags = 3
-        raw_ticks = mt5.copy_ticks_range(symbol, start, end, flags)  # type: ignore[attr-defined]
-        points: list[TrendSeedPoint] = []
-        for item in _as_history_records(raw_ticks):
-            try:
-                evidence = _evidence(item, "tick")
-            except WorkerEnrollmentError:
-                continue
-            bid, ask = evidence.get("bid"), evidence.get("ask")
-            if (
-                isinstance(bid, bool) or not isinstance(bid, (int, float))
-                or isinstance(ask, bool) or not isinstance(ask, (int, float))
-                or bid <= 0 or ask <= 0 or ask < bid
-            ):
-                continue
-            epoch_ms = _history_epoch_milliseconds(evidence)
-            if epoch_ms is None:
-                continue
-            points.append(
-                TrendSeedPoint(
-                    broker_time=datetime.fromtimestamp(epoch_ms / 1000.0, UTC) - shift,
-                    bid=Decimal(str(bid)),
-                    ask=Decimal(str(ask)),
-                )
-            )
-            if len(points) >= _TREND_SEED_TICK_CAP:
-                break
-        if len(points) >= 10:
-            points.sort(key=lambda point: point.broker_time)
-            return points, False
-        _LOGGER.debug("%s evt=trend_seed_thin_ticks sym=%s n=%s", _RTAG, symbol, len(points))
-    except Exception:
-        _LOGGER.debug("%s evt=trend_seed_ticks_fail sym=%s", _RTAG, symbol, exc_info=True)
-    try:
-        timeframe = getattr(mt5, "TIMEFRAME_M1", "TIMEFRAME_M1")
-        count = int(max(60.0, window_seconds) / 60.0) + 3
-        raw_rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, count)  # type: ignore[attr-defined]
-        degraded: list[TrendSeedPoint] = []
-        for item in _as_history_records(raw_rates):
-            try:
-                evidence = _evidence(item, "rate")
-            except WorkerEnrollmentError:
-                continue
-            moment, high, low = evidence.get("time"), evidence.get("high"), evidence.get("low")
-            if (
-                isinstance(moment, bool) or not isinstance(moment, (int, float)) or moment <= 0
-                or isinstance(high, bool) or not isinstance(high, (int, float))
-                or isinstance(low, bool) or not isinstance(low, (int, float))
-                or high <= 0 or low <= 0 or low > high
-            ):
-                continue
-            mid = (Decimal(str(high)) + Decimal(str(low))) / 2
-            moment_dt = datetime.fromtimestamp(int(moment), UTC) - shift
-            degraded.append(TrendSeedPoint(broker_time=moment_dt, bid=mid, ask=mid))
-        degraded.sort(key=lambda point: point.broker_time)
-        return degraded, True
-    except Exception:
-        _LOGGER.debug("%s evt=trend_seed_rates_fail sym=%s", _RTAG, symbol, exc_info=True)
-    return [], True
-
-
-def _as_history_records(raw: object) -> list[object]:
-    names = getattr(getattr(raw, "dtype", None), "names", None)
-    if names:
-        # Real MT5 history calls return a numpy structured array whose rows
-        # are numpy.void scalars: neither Mapping nor _asdict covers them, so
-        # without this normalization every record would be silently dropped.
-        # (The Wine bridge JSON-round-trips rows into dicts, which is why
-        # only the native path starves.)  Mirror mt5.cli._structured_records.
-        try:
-            rows = list(raw)  # type: ignore[arg-type]
-        except TypeError:
-            return []
-        try:
-            return [
-                {
-                    name: (row[name].item() if hasattr(row[name], "item") else row[name])
-                    for name in names
-                }
-                for row in rows
-            ]
-        except (TypeError, ValueError, IndexError, KeyError):
-            return []
-    if raw is None:
-        return []
-    if isinstance(raw, (list, tuple)):
-        return list(raw)
-    try:
-        return list(raw)  # type: ignore[arg-type]
-    except TypeError:
-        return []
-
-
-def _history_epoch_milliseconds(evidence: Mapping[str, object]) -> int | None:
-    milliseconds = evidence.get("time_msc")
-    if isinstance(milliseconds, (int, float)) and not isinstance(milliseconds, bool) and milliseconds > 0:
-        return int(milliseconds)
-    seconds = evidence.get("time")
-    if isinstance(seconds, (int, float)) and not isinstance(seconds, bool) and seconds > 0:
-        # MT5 ticks report whole-second ``time`` alongside ``time_msc``;
-        # seconds above are already an epoch, unlike the datetime objects
-        # some wrappers return (handled by _evidence normalization).
-        if seconds > 1e12:
-            return int(seconds)
-        return int(seconds * 1000)
-    return None
-
-
 def sample_broker_clock_calibration(
     mt5: object,
     symbol: str,
@@ -1830,14 +1639,14 @@ class PairCellPollingConfig:
     assertion_heartbeat_interval: timedelta = timedelta(seconds=30)
     #: How often the market-data health observer runs.  Deliberately slow:
     #: entry is already protected by quote coverage and
-    #: ``trend_quote_max_age_seconds``, so this observer only watches,
-    #: alerts, and rewarms -- it never gates trading.  Occasional dropped
-    #: ticks must never trigger it.
+    #: ``quote_max_age_seconds``, so this observer only watches and
+    #: alerts -- it never gates trading.  Occasional dropped ticks must
+    #: never trigger it.
     data_health_interval: timedelta = timedelta(seconds=60)
     #: How long without any genuinely new local tick before the observer
-    #: raises one alert.  Keep aligned with ``trend_quote_max_age_seconds``
-    #: so the alert fires exactly when entries start blocking on stale
-    #: quotes, never earlier.
+    #: raises one alert.  Kept well above ``quote_max_age_seconds``
+    #: so the alert fires only on a genuinely frozen feed, never on
+    #: ordinary quote gaps.
     data_health_freeze_seconds: float = 180.0
 
 
@@ -1961,7 +1770,6 @@ class PairCellRuntime:
         self._realized_reported: dict[str, None] = {}
         self._observed_open: dict[str, None] = {}
         self._quote_cursors: dict[str, _TickCursor] = {}
-        self._trend_seeded: set[tuple[int, str]] = set()
         # Market-data health observer (watch-only: never gates trading).
         # Baseline is the last pump that observed a genuinely new tick;
         # everything here is in-memory timestamp comparison, no MT5 calls.
@@ -3151,7 +2959,6 @@ class PairCellRuntime:
         self._operator_requests_applied = True
         self._proposal_attempts = 0
         self._quote_cursors = {}
-        self._trend_seeded = set()
         self._owned_legs = {}
         self._observed_open = {}
         # The catalog feed generation is process-scoped while each cell's
@@ -3495,7 +3302,6 @@ class PairCellRuntime:
             except Exception:
                 _LOGGER.warning("Pair Execution Cell readiness read failed.", exc_info=True)
         result = self._maybe_publish_policy() or result
-        result = self._maybe_seed_trend(observed_at) or result
         if observed_at >= self._next_quote_at:
             self._next_quote_at = observed_at + self._polling.quote_interval
             quotes = self._read_quotes(observed_at)
@@ -3700,74 +3506,6 @@ class PairCellRuntime:
         _LOGGER.info("%s evt=policy_adopted %s", _RTAG, _short(policy.policy_version))
         return result
 
-    def _maybe_seed_trend(self, observed_at: datetime) -> PairResult | None:
-        """One-shot Phase-B prefill per universe generation and product.
-
-        Runs only when the accepted policy actually reads history (trend
-        modes); legacy ``edge`` mode skips MT5 history reads entirely.  Each
-        product seeds once per generation -- best effort, failures included --
-        so a broken history source can never stall the pump loop; the
-        live-tick buffer remains the recovery path either way.
-
-        At most one product is fetched per pump: a history read is a slow
-        broker round-trip, and seeding a whole universe synchronously would
-        stall quotes, relay traffic and readiness behind it.
-        """
-
-        cell = self._cell
-        if cell is None:
-            return None
-        request = cell.trend_seed_request()
-        if request is None or request[0] == "edge":
-            return None
-        universe = cell.discovered_universe()
-        if universe is None:
-            return None
-        generation = universe.universe_generation
-        self._trend_seeded = {key for key in self._trend_seeded if key[0] == generation}
-        calibration = self.broker_clock_calibration(observed_at)
-        if not calibration.usable:
-            # Without a measured offset the tick window cannot be placed on
-            # the broker clock; retry on a later pump instead of reading a
-            # wrong window and marking the product seeded.
-            return None
-        for product in universe.products:
-            key = (generation, product.product_id)
-            if key in self._trend_seeded:
-                continue
-            self._trend_seeded.add(key)
-            points, degraded = fetch_trend_seed_points(
-                self._raw_mt5,
-                product.symbol,
-                window_seconds=request[1],
-                now=observed_at,
-                broker_offset_seconds=calibration.offset_seconds,
-            )
-            if not points:
-                _LOGGER.debug(
-                    "%s evt=trend_seed_empty gen=%s sym=%s",
-                    _RTAG,
-                    generation,
-                    product.symbol,
-                )
-                return None
-            _LOGGER.debug(
-                "%s evt=trend_seed gen=%s sym=%s n=%s degraded=%s",
-                _RTAG,
-                generation,
-                product.symbol,
-                len(points),
-                int(degraded),
-            )
-            return cell.handle_event(
-                TrendSeedEvent(
-                    product_id=product.product_id,
-                    points=tuple(points),
-                    degraded=degraded,
-                )
-            )
-        return None
-
     def _read_quotes(self, observed_at: datetime) -> tuple[LocalQuoteEvent, ...]:
         """Only genuinely new market evidence becomes a quote event.
 
@@ -3813,13 +3551,11 @@ class PairCellRuntime:
         return BrokerSnapshotEvent(orders=orders, positions=positions, observed_at=observed_at)
 
     def _note_quote_advance(self, observed_at: datetime) -> None:
-        """Record a genuinely new tick; rewarm trend history after a freeze.
+        """Record a genuinely new tick.
 
         Runs only when the quote poll observed at least one advanced tick
         cursor, so occasional dropped ticks can never trigger anything here.
-        Recovery clears this generation's trend-seed markers so the existing
-        one-product-per-pump seed flow backfills the tape instead of waiting
-        for it to regrow organically.  Trading gates are never touched.
+        Trading gates are never touched.
         """
 
         if self._data_health_alerted:
@@ -3827,19 +3563,12 @@ class PairCellRuntime:
             if self._data_health_alert_at is not None:
                 stalled = (observed_at - self._data_health_alert_at).total_seconds()
             _LOGGER.info(
-                "%s evt=data_health_recovered stalled_s=%s; rewarming trend history",
+                "%s evt=data_health_recovered stalled_s=%s",
                 _RTAG,
                 "unknown" if stalled is None else f"{stalled:.0f}",
             )
             self._data_health_alerted = False
             self._data_health_alert_at = None
-            cell = self._cell
-            universe = None if cell is None else cell.discovered_universe()
-            if universe is not None:
-                generation = universe.universe_generation
-                self._trend_seeded = {
-                    key for key in self._trend_seeded if key[0] != generation
-                }
         self._last_quote_advance_at = observed_at
 
     def _check_data_health(self, observed_at: datetime) -> None:

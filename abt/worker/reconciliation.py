@@ -556,7 +556,7 @@ def _run_reconciliation_with_relay(
             if pair_cell is not None:
                 # Local protection first: advance the cell on local MT5
                 # evidence before any blocking network call, so a half-open
-                # connection can never starve trailing/protection. The pump
+                # connection can never starve protection. The pump
                 # at the bottom of this iteration is kept so relay messages
                 # received in this same iteration still turn around with
                 # minimum latency (quote/readiness/snapshot work inside pump
@@ -593,7 +593,7 @@ def _run_reconciliation_with_relay(
                 _LOGGER.warning(
                     "Pair Execution Cell graceful shutdown abandoned before both legs "
                     "were terminal; the peer keeps managing any surviving leg under "
-                    "its own trailing stop. Restarting now rejoins containment via "
+                    "its own protection. Restarting now rejoins containment via "
                     "the durable close history."
                 )
                 raise
