@@ -1134,8 +1134,8 @@ class DefaultMaterializationTests(unittest.TestCase):
                 "post_reconnect_cooldown_seconds": 300.0,
                 "sizing_refresh_seconds": 3600.0,
                 "relay_handling_timeout_seconds": 30.0,
-                "trading_blackout_start_ny": "19:30",
-                "trading_blackout_end_ny": "20:30",
+                "trading_blackout_start_ny": "16:30",
+                "trading_blackout_end_ny": "17:30",
                 "maximum_holding_seconds": None,
             },
         )
