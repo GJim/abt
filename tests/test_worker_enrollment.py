@@ -1007,3 +1007,37 @@ def _connect(
 ) -> FakeWebSocket:
     urls.append(url)
     return certificate_socket if url.endswith("/certificate") else password_socket
+
+
+class DefaultWorkerConnectorTests(unittest.TestCase):
+    def test_uses_stall_tolerant_keepalive(self) -> None:
+        from abt.worker.credentials import (
+            WORKER_PING_INTERVAL_SECONDS,
+            WORKER_PING_TIMEOUT_SECONDS,
+            default_worker_connector,
+        )
+
+        sentinel = object()
+        calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+        def fake_connect(*args: object, **kwargs: object) -> object:
+            calls.append((args, kwargs))
+            return sentinel
+
+        with patch("websockets.sync.client.connect", fake_connect):
+            result = default_worker_connector("wss://controller.example/api/worker/session")
+
+        self.assertIs(sentinel, result)
+        self.assertEqual(
+            [
+                (
+                    ("wss://controller.example/api/worker/session",),
+                    {
+                        "ping_interval": WORKER_PING_INTERVAL_SECONDS,
+                        "ping_timeout": WORKER_PING_TIMEOUT_SECONDS,
+                    },
+                )
+            ],
+            calls,
+        )
+        self.assertGreater(WORKER_PING_TIMEOUT_SECONDS, 20.0)

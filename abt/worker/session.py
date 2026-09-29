@@ -32,6 +32,7 @@ from .credentials import (
     _send,
     _send_proof,
     _worker_endpoint,
+    default_worker_connector,
 )
 from .enrollment import WorkerEnrollmentError, WorkerSessionDisconnected
 from .scheduler import DeadlineAwareTraderRpcScheduler, ScheduledTraderRpc, TraderRpcOutcome
@@ -766,9 +767,7 @@ def open_authenticated_worker_session(
     """Deliver the approved certificate, then prove the device key on one persistent WSS channel."""
 
     if connect is None:
-        from websockets.sync.client import connect as websocket_connect
-
-        connect = websocket_connect
+        connect = default_worker_connector
     try:
         with connect(_worker_endpoint(controller_url, "/api/worker/certificate")) as certificate_socket:
             _send(certificate_socket, {"enrollment_id": enrollment_id})

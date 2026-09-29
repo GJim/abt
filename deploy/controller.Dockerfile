@@ -18,4 +18,4 @@ COPY abt/ ./abt/
 RUN pip install --no-cache-dir uv && uv sync --frozen --no-dev
 COPY --from=web-build /src/web/dist /opt/abt/web
 
-CMD ["/opt/abt/.venv/bin/uvicorn", "abt.controlplane.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
+CMD ["/opt/abt/.venv/bin/uvicorn", "abt.controlplane.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--ws-ping-interval", "20", "--ws-ping-timeout", "60"]

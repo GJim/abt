@@ -24,6 +24,27 @@ class WorkerWebSocket(Protocol):
 
 WebSocketConnector = Callable[[str], WorkerWebSocket]
 
+#: Keepalive ping cadence for worker WSS channels. The interval stays at the
+#: library default; the timeout is relaxed so transient stalls on the
+#: Cloudflare path (observed 8s+ bursts, occasionally upstream-only) do not
+#: kill the session. Genuine liveness is still enforced by the 30-second
+#: application heartbeat (15s response timeout) and the five-minute
+#: lost-link safety state.
+WORKER_PING_INTERVAL_SECONDS = 20.0
+WORKER_PING_TIMEOUT_SECONDS = 60.0
+
+
+def default_worker_connector(url: str) -> WorkerWebSocket:
+    """Open a worker WSS channel with stall-tolerant keepalive settings."""
+
+    from websockets.sync.client import connect as websocket_connect
+
+    return websocket_connect(
+        url,
+        ping_interval=WORKER_PING_INTERVAL_SECONDS,
+        ping_timeout=WORKER_PING_TIMEOUT_SECONDS,
+    )
+
 
 def retrieve_mt5_password(
     *,
@@ -35,9 +56,7 @@ def retrieve_mt5_password(
     """Retrieve an approved worker's password without persisting or displaying it."""
 
     if connect is None:
-        from websockets.sync.client import connect as websocket_connect
-
-        connect = websocket_connect
+        connect = default_worker_connector
     certificate_url = _worker_endpoint(controller_url, "/api/worker/certificate")
     with connect(certificate_url) as socket:
         _send(socket, {"enrollment_id": enrollment_id})
