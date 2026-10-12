@@ -1010,7 +1010,7 @@ def _connect(
 
 
 class DefaultWorkerConnectorTests(unittest.TestCase):
-    def test_uses_stall_tolerant_keepalive(self) -> None:
+    def test_disables_library_keepalive(self) -> None:
         from abt.worker.credentials import (
             WORKER_PING_INTERVAL_SECONDS,
             WORKER_PING_TIMEOUT_SECONDS,
@@ -1040,4 +1040,5 @@ class DefaultWorkerConnectorTests(unittest.TestCase):
             ],
             calls,
         )
-        self.assertGreater(WORKER_PING_TIMEOUT_SECONDS, 20.0)
+        self.assertIsNone(WORKER_PING_INTERVAL_SECONDS)
+        self.assertIsNone(WORKER_PING_TIMEOUT_SECONDS)

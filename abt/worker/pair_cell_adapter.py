@@ -188,6 +188,13 @@ _STATE_RELAY_KINDS = frozenset(
         "universe",
     }
 )
+# Transport-level resend outbox bound: a stalled upstream can queue at most
+# this many unsent envelopes before the oldest is dropped (with a
+# relay_drop log). Periodic state (readiness, sizing_plans) is superseded
+# by the next publication; one-shot kinds are rare enough that this bound
+# is never hit in practice unless the link is dead, in which case the
+# session reconnects anyway.
+_MAX_RELAY_PENDING = 256
 # A pairing reservation lives for 30 seconds.  A Worker that is still waiting
 # on a one-shot decision reply or route-established notice keeps re-reading the
 # authoritative route until comfortably past that, so an in-flight pairing is
@@ -905,6 +912,21 @@ class WorkerPairCellRelay:
         self._observer = observer
         self.last_send_failed = False
         self._state_relay_request_ids: set[str] = set()
+        # Transport-level outbox: envelopes whose socket send raised are
+        # retained here (with their original request_id) and retried in
+        # FIFO order by flush_pending(). Without this, an upstream-only
+        # stall drops one-shot messages such as reseed_request while the
+        # downstream still flows, and the cell's own retry budget
+        # (6 unanswered asks -> abandon) burns on messages that never left
+        # this host. Retries reuse the same request_id so the controller
+        # and the peer observe at-most-one logical send per enqueue; the
+        # cell already deduplicates repeated state kinds (served nonces,
+        # same-content duplicate suppression).
+        self._pending: list[dict[str, object]] = []
+
+    @property
+    def pending_count(self) -> int:
+        return len(self._pending)
 
     def claim(self) -> dict[str, object]:
         return {
@@ -946,22 +968,77 @@ class WorkerPairCellRelay:
         }
         try:
             self._session.send_pair_relay(wire_envelope, request_id=request_id)
-            if kind in _STATE_RELAY_KINDS:
-                self._state_relay_request_ids.add(request_id)
-                _LOGGER.debug(
-                    "%s evt=relay_q kind=%s rid=%s to=%s",
-                    _RTAG,
-                    kind,
-                    _short(request_id),
-                    _short(wire_envelope["to_worker_id"]),
-                )
+            self._note_sent(kind, request_id, wire_envelope)
         except Exception:
             # A relay send never propagates into the cell's decision path: the
             # authenticated-session loss is reported as a peer-session event,
             # which removes entry readiness without touching exposure this
-            # Worker already owns.
+            # Worker already owns. The envelope is retained for retry so a
+            # transient stall does not silently burn the cell's own resend
+            # budget (e.g. reseed asks).
+            self._enqueue_pending(kind, request_id, wire_envelope)
             self.last_send_failed = True
             _LOGGER.warning("%s evt=relay_send_fail", _RTAG, exc_info=True)
+
+    def _note_sent(
+        self, kind: str, request_id: str, wire_envelope: dict[str, object]
+    ) -> None:
+        if kind in _STATE_RELAY_KINDS:
+            self._state_relay_request_ids.add(request_id)
+            _LOGGER.debug(
+                "%s evt=relay_q kind=%s rid=%s to=%s",
+                _RTAG,
+                kind,
+                _short(request_id),
+                _short(wire_envelope["to_worker_id"]),
+            )
+
+    def _enqueue_pending(
+        self, kind: str, request_id: str, wire_envelope: dict[str, object]
+    ) -> None:
+        if len(self._pending) >= _MAX_RELAY_PENDING:
+            dropped = self._pending.pop(0)
+            _LOGGER.warning(
+                "%s evt=relay_drop kind=%s rid=%s",
+                _RTAG,
+                dropped.get("kind"),
+                _short(dropped.get("request_id")),
+            )
+        self._pending.append(
+            {"kind": kind, "request_id": request_id, "wire_envelope": wire_envelope}
+        )
+
+    def flush_pending(self) -> int:
+        """Retry queued envelopes in FIFO order; stop at the first failure.
+
+        Returns the number of envelopes successfully resent. A still-dead
+        transport keeps the remainder queued without spamming the log once
+        per message: only one warning per flush call.
+        """
+
+        flushed = 0
+        while self._pending:
+            item = self._pending[0]
+            request_id = str(item["request_id"])
+            wire_envelope = cast(dict[str, object], item["wire_envelope"])
+            try:
+                self._session.send_pair_relay(wire_envelope, request_id=request_id)
+            except Exception:
+                self.last_send_failed = True
+                if flushed == 0:
+                    _LOGGER.warning("%s evt=relay_retry_fail pending=%s", _RTAG, len(self._pending), exc_info=True)
+                return flushed
+            self._pending.pop(0)
+            flushed += 1
+            self._note_sent(str(item["kind"]), request_id, wire_envelope)
+            _LOGGER.debug(
+                "%s evt=relay_retry kind=%s rid=%s to=%s",
+                _RTAG,
+                item["kind"],
+                _short(request_id),
+                _short(wire_envelope.get("to_worker_id")),
+            )
+        return flushed
 
     def consume_state_relay_ack(self, request_id: object) -> bool:
         """Whether an acknowledgement belongs to a logged state envelope."""
@@ -3209,6 +3286,12 @@ class PairCellRuntime:
 
         self._drain_control()
         result: PairResult | None = None
+        if self._relay is not None and self._relay.pending_count:
+            # A transient upstream stall queues sends while downstream Rx
+            # keeps flowing; retry now so one-shot messages (reseed_request,
+            # attempt, leg_status) leave before the cell's own retry budget
+            # burns. Stops at the first still-failing send to preserve order.
+            self._relay.flush_pending()
         for ack in self._session.drain_pair_relay_acks():
             request_id = ack.get("request_id")
             accepted = ack.get("accepted") is True

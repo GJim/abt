@@ -1330,6 +1330,60 @@ class RelayAndBrokerTranslationTests(unittest.TestCase):
             }
         )
         self.assertTrue(relay.last_send_failed)
+        # The failed envelope is retained for retry, not dropped.
+        self.assertEqual(1, relay.pending_count)
+
+    def test_a_queued_relay_is_retried_with_the_same_request_id(self) -> None:
+        calls: list[str] = []
+        real = self.session.send_pair_relay
+
+        def flaky(envelope: dict[str, object], *, request_id: str) -> None:
+            calls.append(request_id)
+            if len(calls) == 1:
+                raise WorkerEnrollmentError("upstream stall")
+            real(envelope, request_id=request_id)
+
+        self.session.send_pair_relay = flaky  # type: ignore[method-assign]
+        relay = WorkerPairCellRelay(self.session, route=self.route)
+        relay.send(
+            {
+                "kind": "reseed_request",
+                "route_id": "route-9",
+                "from_worker_id": LEADER,
+                "to_worker_id": FOLLOWER,
+                "payload": {"nonce": "n1"},
+            }
+        )
+        self.assertEqual(1, relay.pending_count)
+        flushed = relay.flush_pending()
+        self.assertEqual(1, flushed)
+        self.assertEqual(0, relay.pending_count)
+        # Retry reuses the original request_id so the controller/peer see
+        # one logical send; the wire envelope keeps the same id too.
+        self.assertEqual(2, len(calls))
+        self.assertEqual(calls[0], calls[1])
+        self.assertEqual(1, len(self.session.sent_envelopes))
+        self.assertEqual(calls[0], self.session.sent_envelopes[0]["request_id"])
+
+    def test_relay_flush_stops_at_first_failure_to_preserve_order(self) -> None:
+        def explode(envelope: dict[str, object], *, request_id: str) -> None:
+            raise WorkerEnrollmentError("still down")
+
+        self.session.send_pair_relay = explode  # type: ignore[method-assign]
+        relay = WorkerPairCellRelay(self.session, route=self.route)
+        for nonce in ("n1", "n2"):
+            relay.send(
+                {
+                    "kind": "readiness",
+                    "route_id": "route-9",
+                    "from_worker_id": LEADER,
+                    "to_worker_id": FOLLOWER,
+                    "payload": {"nonce": nonce},
+                }
+            )
+        self.assertEqual(2, relay.pending_count)
+        self.assertEqual(0, relay.flush_pending())
+        self.assertEqual(2, relay.pending_count)
 
     def test_order_calc_margin_uses_the_proven_trader_translation(self) -> None:
         mt5 = FakeMT5(clock=self.clock)

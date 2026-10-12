@@ -24,18 +24,20 @@ class WorkerWebSocket(Protocol):
 
 WebSocketConnector = Callable[[str], WorkerWebSocket]
 
-#: Keepalive ping cadence for worker WSS channels. The interval stays at the
-#: library default; the timeout is relaxed so transient stalls on the
-#: Cloudflare path (observed 8s+ bursts, occasionally upstream-only) do not
-#: kill the session. Genuine liveness is still enforced by the 30-second
-#: application heartbeat (15s response timeout) and the five-minute
-#: lost-link safety state.
-WORKER_PING_INTERVAL_SECONDS = 20.0
-WORKER_PING_TIMEOUT_SECONDS = 60.0
+#: Library-level WebSocket keepalive is disabled. On the Cloudflare path
+#: an upstream-only stall (client -> server Tx delayed while server ->
+#: client Rx keeps flowing) makes the library's ping/pong judge a
+#: transient stall as a dead session (1011 keepalive ping timeout) and
+#: kill a connection the application could have ridden out. Liveness is
+#: enforced instead by the application heartbeat (15s response timeout)
+#: and the five-minute lost-link safety state, both of which tolerate a
+#: short stall and only reconnect on a genuine failure.
+WORKER_PING_INTERVAL_SECONDS: float | None = None
+WORKER_PING_TIMEOUT_SECONDS: float | None = None
 
 
 def default_worker_connector(url: str) -> WorkerWebSocket:
-    """Open a worker WSS channel with stall-tolerant keepalive settings."""
+    """Open a worker WSS channel with library keepalive disabled."""
 
     from websockets.sync.client import connect as websocket_connect
 
