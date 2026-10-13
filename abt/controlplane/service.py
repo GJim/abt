@@ -132,6 +132,27 @@ class _WorkerSessionConnection:
     pending: dict[str, _WorkerRelayRequest] = field(default_factory=dict)
     session_id: str = field(default_factory=lambda: str(uuid4()))
     superseded: bool = False
+    # Attribution counters for the disconnect-episode log line: without
+    # them a dead session is anonymous ("disconnected with code %s") and a
+    # path-level RST that never reaches the app leaves no trace at all.
+    established_at: float = field(default_factory=monotonic)
+    messages_received: int = 0
+    relays_received: int = 0
+    relays_forwarded: int = 0
+    last_message_type: str = ""
+    recovery_epoch: str = ""
+
+
+def _connection_episode(connection: _WorkerSessionConnection) -> str:
+    """One-line attribution summary for a worker session that just ended."""
+
+    lifetime = max(0.0, monotonic() - connection.established_at)
+    return (
+        f"session={connection.session_id[:8]} lifetime={lifetime:.1f}s "
+        f"msgs={connection.messages_received} relays={connection.relays_received}/"
+        f"{connection.relays_forwarded} last={connection.last_message_type or '-'} "
+        f"epoch={connection.recovery_epoch[:8] if connection.recovery_epoch else '-'}"
+    )
 
 
 def create_app(
@@ -683,6 +704,12 @@ def create_app(
             await websocket.send_json(
                 {"type": "authenticated", "worker_id": worker.worker_id, "cursor": ledger.reconciliation_cursor(worker.worker_id)}
             )
+            _LOGGER.info(
+                "Worker session established worker=%s %s superseded=%d.",
+                worker.worker_id,
+                _connection_episode(connection),
+                len(previous_connections),
+            )
             while True:
                 try:
                     request = await asyncio.wait_for(websocket.receive_json(), timeout=30)
@@ -700,6 +727,8 @@ def create_app(
                     )
                     continue
                 message_type = request.get("type")
+                connection.messages_received += 1
+                connection.last_message_type = str(message_type) if isinstance(message_type, str) else ""
                 if message_type == "password_request" and set(request) == {"type"} and secret_store is not None:
                     await websocket.send_json(
                         {"type": "password", "password": secret_store.read_password(worker.password_secret_ref)}
@@ -715,6 +744,7 @@ def create_app(
                     ledger.record_worker_connection_audit(
                         worker.worker_id, "worker_recovery_sync", str(request["epoch"])
                     )
+                    connection.recovery_epoch = str(request["epoch"])
                     await websocket.send_json({"type": "recovery_sync_accepted", "epoch": request["epoch"]})
                 elif message_type == "heartbeat" and set(request) == {"type"}:
                     ledger.record_worker_heartbeat(worker.worker_id)
@@ -749,9 +779,11 @@ def create_app(
                     and isinstance(request.get("envelope"), dict)
                 ):
                     try:
+                        connection.relays_received += 1
                         result = await _relay_pair_cell_envelope(
                             ledger, worker_connections, worker.worker_id, cast(dict[str, Any], request["envelope"])
                         )
+                        connection.relays_forwarded += 1
                         await websocket.send_json(
                             {"type": "pair_relay_ack", "request_id": request["request_id"], "accepted": True, "result": result}
                         )
@@ -771,7 +803,15 @@ def create_app(
                 else:
                     raise ValueError("Invalid protocol message.")
         except WebSocketDisconnect as error:
-            _LOGGER.info("Worker session disconnected with code %s.", error.code)
+            if "worker" in locals() and "connection" in locals():
+                _LOGGER.info(
+                    "Worker session disconnected worker=%s code=%s %s.",
+                    worker.worker_id,
+                    error.code,
+                    _connection_episode(connection),
+                )
+            else:
+                _LOGGER.info("Worker session disconnected before authentication with code %s.", error.code)
             if "worker" in locals() and "connection" in locals():
                 ledger.record_worker_session_lifecycle(
                     "worker_session_disconnected",
@@ -790,7 +830,15 @@ def create_app(
                 )
             await _close_policy_violation(websocket)
         except (LedgerError, ProofError, SecretStoreError, ValueError) as error:
-            _LOGGER.warning("Worker session authentication or request failed: %s", error)
+            if "worker" in locals() and "connection" in locals():
+                _LOGGER.warning(
+                    "Worker session authentication or request failed worker=%s: %s %s.",
+                    worker.worker_id,
+                    error,
+                    _connection_episode(connection),
+                )
+            else:
+                _LOGGER.warning("Worker session authentication or request failed: %s", error)
             if "worker" in locals() and "connection" in locals():
                 ledger.record_worker_session_lifecycle(
                     "worker_session_failed",
@@ -808,8 +856,22 @@ def create_app(
                     worker_connections,
                 )
             await _close_policy_violation(websocket)
-        except Exception:
-            _LOGGER.exception("Worker session authentication or request failed unexpectedly.")
+        except Exception as error:
+            if isinstance(error, RuntimeError) and "websocket.close" in str(error):
+                # A relay ack racing a socket the app (or the path) already
+                # closed: the session episode below says who died, so one
+                # line suffices instead of a full traceback.
+                if "worker" in locals() and "connection" in locals():
+                    _LOGGER.info(
+                        "Worker relay ack raced a closed socket worker=%s: %s %s.",
+                        worker.worker_id,
+                        error,
+                        _connection_episode(connection),
+                    )
+                else:
+                    _LOGGER.info("Worker relay ack raced a closed socket: %s.", error)
+            else:
+                _LOGGER.exception("Worker session authentication or request failed unexpectedly.")
             if "worker" in locals() and "connection" in locals():
                 ledger.record_worker_session_lifecycle(
                     "worker_session_failed",

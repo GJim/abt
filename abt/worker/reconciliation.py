@@ -382,6 +382,12 @@ def reconcile_authenticated_worker(
 ) -> None:
     """Use an authenticated session's memory-only password for read-only MT5 reconciliation."""
 
+    _LOGGER.debug(
+        "Worker session started worker=%s epoch=%s cursor=%s.",
+        getattr(session, "worker_id", "-") or "-",
+        str(getattr(session, "recovery_epoch", "") or "")[:8] or "-",
+        getattr(session, "reconciliation_cursor", "-"),
+    )
     send_recovery_sync = getattr(session, "send_recovery_sync", None)
     if callable(send_recovery_sync):
         send_recovery_sync([] if effect_journal is None else effect_journal.unresolved())

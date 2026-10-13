@@ -923,6 +923,13 @@ class WorkerPairCellRelay:
         # cell already deduplicates repeated state kinds (served nonces,
         # same-content duplicate suppression).
         self._pending: list[dict[str, object]] = []
+        # Episode counters for the session-end summary line: with a flapping
+        # path, per-message relay_q/relay_send_fail lines alone cannot tell
+        # "how much got through before this session died".
+        self.sent_ok = 0
+        self.send_failed = 0
+        self.retried_ok = 0
+        self.pending_dropped = 0
 
     @property
     def pending_count(self) -> int:
@@ -976,13 +983,18 @@ class WorkerPairCellRelay:
             # Worker already owns. The envelope is retained for retry so a
             # transient stall does not silently burn the cell's own resend
             # budget (e.g. reseed asks).
+            self.send_failed += 1
             self._enqueue_pending(kind, request_id, wire_envelope)
             self.last_send_failed = True
             _LOGGER.warning("%s evt=relay_send_fail", _RTAG, exc_info=True)
 
     def _note_sent(
-        self, kind: str, request_id: str, wire_envelope: dict[str, object]
+        self, kind: str, request_id: str, wire_envelope: dict[str, object], *, retried: bool = False
     ) -> None:
+        if retried:
+            self.retried_ok += 1
+        else:
+            self.sent_ok += 1
         if kind in _STATE_RELAY_KINDS:
             self._state_relay_request_ids.add(request_id)
             _LOGGER.debug(
@@ -998,6 +1010,7 @@ class WorkerPairCellRelay:
     ) -> None:
         if len(self._pending) >= _MAX_RELAY_PENDING:
             dropped = self._pending.pop(0)
+            self.pending_dropped += 1
             _LOGGER.warning(
                 "%s evt=relay_drop kind=%s rid=%s",
                 _RTAG,
@@ -1030,7 +1043,7 @@ class WorkerPairCellRelay:
                 return flushed
             self._pending.pop(0)
             flushed += 1
-            self._note_sent(str(item["kind"]), request_id, wire_envelope)
+            self._note_sent(str(item["kind"]), request_id, wire_envelope, retried=True)
             _LOGGER.debug(
                 "%s evt=relay_retry kind=%s rid=%s to=%s",
                 _RTAG,
@@ -3816,5 +3829,20 @@ class PairCellRuntime:
         return self._cell.request_close(reason)
 
     def close(self) -> None:
+        if self._relay is not None:
+            # Session-end episode summary: with a flapping path this single
+            # line says how much got through before this session died
+            # (sent/failed/retried/dropped/still-queued), joining against
+            # the controller's worker-session episode via route and epoch.
+            _LOGGER.debug(
+                "%s evt=relay_episode route=%s sent=%s failed=%s retried=%s dropped=%s pending=%s",
+                _RTAG,
+                _short(self._durable_route.route_id if self._durable_route is not None else None),
+                self._relay.sent_ok,
+                self._relay.send_failed,
+                self._relay.retried_ok,
+                self._relay.pending_dropped,
+                self._relay.pending_count,
+            )
         if self._cell is not None:
             self._cell.close()
