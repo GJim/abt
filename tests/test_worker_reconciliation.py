@@ -19,6 +19,7 @@ from abt.worker.reconciliation import (
     _broker_order_request,
     _broker_receipt,
     _json_evidence,
+    _run_reconciliation_with_relay,
     reconnect_worker_session,
     reconcile_authenticated_worker,
 )
@@ -262,7 +263,7 @@ class WorkerReconciliationTests(unittest.TestCase):
         self.assertEqual(3, opened)
         self.assertEqual([5.0, 10.0], waits)
 
-    def test_resets_reconnect_backoff_after_five_minutes_of_connected_reconciliation(self) -> None:
+    def test_resets_reconnect_backoff_after_sixty_seconds_of_connected_reconciliation(self) -> None:
         elapsed_seconds = 0.0
         waits: list[float] = []
         runs = 0
@@ -271,7 +272,7 @@ class WorkerReconciliationTests(unittest.TestCase):
             nonlocal elapsed_seconds, runs
             runs += 1
             if runs == 2:
-                elapsed_seconds += 300
+                elapsed_seconds += 60
             if runs < 4:
                 raise WorkerSessionDisconnected("controller disconnected")
 
@@ -357,7 +358,73 @@ class WorkerReconciliationTests(unittest.TestCase):
             )
 
         self.assertEqual(11, opened)
-        self.assertEqual([float(5 * 2 ** attempt) for attempt in range(10)], waits)
+        self.assertEqual([5.0, 10.0, 20.0, 40.0] + [60.0] * 6, waits)
+
+    def test_logs_critical_before_giving_up_reconnect_budget(self) -> None:
+        with self.assertLogs("abt.worker.reconciliation", level="WARNING") as logs:
+            with self.assertRaisesRegex(WorkerSessionDisconnected, "controller disconnected"):
+                reconnect_worker_session(
+                    open_session=ReconnectSession,
+                    mt5=ReadOnlyMT5(),
+                    login=123456,
+                    server="Broker-Demo",
+                    sleep=lambda _: None,
+                    run_reconciliation=lambda **_: (_ for _ in ()).throw(WorkerSessionDisconnected("controller disconnected")),
+                )
+
+        self.assertTrue(
+            logs.output[-1].startswith("CRITICAL:abt.worker.reconciliation:Worker reconnect budget exhausted"),
+            logs.output[-1],
+        )
+
+    def test_gates_worker_heartbeat_to_thirty_second_cadence(self) -> None:
+        start = datetime(2026, 10, 13, tzinfo=UTC)
+        current = start
+        beats: list[datetime] = []
+
+        def now() -> datetime:
+            nonlocal current
+            value = current
+            current += timedelta(seconds=10)
+            return value
+
+        class GatedSafety:
+            def heartbeat(self, observed_at: datetime) -> bool:
+                beats.append(observed_at)
+                return True
+
+        class TickSession:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def receive_worker_relay(self, timeout: object = None) -> bool:
+                self.calls += 1
+                if self.calls > 6:
+                    raise KeyboardInterrupt
+                return False
+
+        class TickReconciliation:
+            def poll(self, _observed_at: object) -> None:
+                return None
+
+        with self.assertRaises(KeyboardInterrupt):
+            _run_reconciliation_with_relay(
+                TickReconciliation(),  # type: ignore[arg-type]
+                mt5=object(),
+                session=TickSession(),  # type: ignore[arg-type]
+                now=now,
+                safety=GatedSafety(),  # type: ignore[arg-type]
+                maintenance=None,
+                live_state=None,
+                effect_journal=None,
+                pair_cell=None,
+                graceful_shutdown=_GracefulShutdown(),
+            )
+
+        self.assertEqual(
+            [start + timedelta(seconds=20), start + timedelta(seconds=50), start + timedelta(seconds=80)],
+            beats,
+        )
 
     def test_retries_bridge_errors_with_the_same_bounded_backoff(self) -> None:
         """A broker-bridge blip during reconnect must not kill the worker."""
@@ -418,7 +485,7 @@ class WorkerReconciliationTests(unittest.TestCase):
             )
 
         self.assertEqual(11, opened)
-        self.assertEqual([float(5 * 2 ** attempt) for attempt in range(10)], waits)
+        self.assertEqual([5.0, 10.0, 20.0, 40.0] + [60.0] * 6, waits)
 
     def test_enters_read_only_lost_link_safety_after_five_missed_minutes_and_recovers(self) -> None:
         session = SafetySession([False, False, False, True])

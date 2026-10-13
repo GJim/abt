@@ -19,7 +19,25 @@ from .wine_mt5_client import BridgeClientError
 
 
 _LOGGER = logging.getLogger(__name__)
-_RECONNECT_BACKOFF_RESET_SECONDS = 5 * 60
+#: A session that survives this long has proven the path works: even at the
+#: gated heartbeat cadence below it completed successful round-trips, so the
+#: failure that ended it was a flap, not a startup defect, and the reconnect
+#: budget is forgiven. The previous five-minute window never reset on links
+#: that flap every ~2 minutes, letting the counter accumulate across healthy
+#: sessions until the worker exited for no local reason.
+_RECONNECT_BACKOFF_RESET_SECONDS = 60
+#: Upper bound for a single reconnect sleep. Without it ten consecutive
+#: young deaths back off to a 42-minute blackout before the budget gives
+#: up; the deaths we see are path-caused, so long sleeps only delay
+#: recovery without relieving anything.
+_RECONNECT_BACKOFF_MAX_DELAY_SECONDS = 60.0
+#: Application heartbeat cadence inside the relay loop. Heartbeats used to
+#: fire twice per loop iteration (~2/s) as an emergent property of the
+#: loop timing -- pure overhead, and every one is a blocking round-trip
+#: that stalls local protection while it waits. Thirty seconds keeps the
+#: controller's 30s receive tolerance, the 100s Cloudflare idle line and
+#: the 5-minute lost-link/stale thresholds all comfortable.
+_WORKER_HEARTBEAT_INTERVAL = timedelta(seconds=30)
 
 
 def _termination_to_keyboard_interrupt(signum: int, frame: object) -> None:
@@ -505,8 +523,11 @@ def reconnect_worker_session(
             if connected_at is not None and monotonic_clock() - connected_at >= _RECONNECT_BACKOFF_RESET_SECONDS:
                 attempts = 0
             if attempts >= 10:
+                _LOGGER.critical(
+                    "Worker reconnect budget exhausted after 10 attempts; exiting and requiring human restart."
+                )
                 raise
-            delay = float(5 * 2 ** attempts)
+            delay = min(float(5 * 2 ** attempts), _RECONNECT_BACKOFF_MAX_DELAY_SECONDS)
             _LOGGER.warning(
                 "Worker session disconnected (%s); reconnecting attempt %s/10 in %.0f seconds.",
                 error,
@@ -522,8 +543,11 @@ def reconnect_worker_session(
             if connected_at is not None and monotonic_clock() - connected_at >= _RECONNECT_BACKOFF_RESET_SECONDS:
                 attempts = 0
             if attempts >= 10:
+                _LOGGER.critical(
+                    "Worker reconnect budget exhausted after 10 attempts; exiting and requiring human restart."
+                )
                 raise
-            delay = float(5 * 2 ** attempts)
+            delay = min(float(5 * 2 ** attempts), _RECONNECT_BACKOFF_MAX_DELAY_SECONDS)
             _LOGGER.warning(
                 "Local broker bridge unavailable (%s); reconnecting attempt %s/10 in %.0f seconds.",
                 error,
@@ -549,6 +573,7 @@ def _run_reconciliation_with_relay(
 ) -> None:
     next_maintenance = now()
     next_reconciliation = next_maintenance
+    next_heartbeat = next_maintenance
     graceful_shutdown = graceful_shutdown or _GracefulShutdown()
     while True:
         try:
@@ -586,7 +611,10 @@ def _run_reconciliation_with_relay(
                     # rather than gated behind the outer polling cadence below.
                     pair_cell.drain_relay()
                 if safety is not None:
-                    safety.heartbeat(now())
+                    heartbeat_at = now()
+                    if heartbeat_at >= next_heartbeat:
+                        safety.heartbeat(heartbeat_at)
+                        next_heartbeat = heartbeat_at + _WORKER_HEARTBEAT_INTERVAL
             if pair_cell is not None:
                 pair_cell.pump(observed_at)
                 if bool(getattr(pair_cell, "should_exit", False)):
