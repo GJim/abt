@@ -34,3 +34,8 @@ strategy/*.json
 
 # Raw browser/source captures are reproducibility aids, not publishable research.
 .scratch/futures-prop-firm-rules/sources/
+
+# Graphify
+graphify-out/cache/
+graphify-out/2026-*/
+graphify-out/cost.json

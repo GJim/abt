@@ -1,3 +1,4 @@
 deploy/bootstrap-deployment.sh text eol=lf
 deploy/update-controller.sh text eol=lf
 deploy/openbao-entrypoint.sh text eol=lf
+graphify-out/graph.json merge=graphify
