@@ -4703,6 +4703,30 @@ class PairExecutionCell:
                 directions_built += 1
             if directions_built == 0:
                 suspended[product_id] = "no direction has a valid positive sizing plan"
+        quoted = self._quoted_products()
+        previously_planned = {product_id for product_id, _ in self._plans}
+        if self._plans_refreshed_at is None:
+            trigger = "first"
+        elif quoted - previously_planned:
+            trigger = "missing"
+        else:
+            trigger = "hourly"
+        reason_counts: dict[str, int] = {}
+        for reason in suspended.values():
+            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+        top_reasons = sorted(reason_counts.items(), key=lambda item: (-item[1], item[0]))[:3]
+        _LOGGER.debug(
+            "%s evt=sizing_rebuild trigger=%s quoted=%d planned_before=%d missing=%d built=%d suspended=%d retain=%s reasons=%s",
+            _TAG,
+            trigger,
+            len(quoted),
+            len(previously_planned),
+            len(quoted - previously_planned),
+            len(plans),
+            len(suspended),
+            bool(retain_prior),
+            ",".join(f"{count}x {reason[:60]}" for reason, count in top_reasons) or "-",
+        )
         self._install_plans(plans, suspended, policy)
         self._prune_debug_evidence()
 
