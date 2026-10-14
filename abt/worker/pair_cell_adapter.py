@@ -1704,8 +1704,8 @@ def evaluate_follower_acceptance(
 
 @dataclass(frozen=True, slots=True)
 class PairCellPollingConfig:
-    quote_interval: timedelta = timedelta(milliseconds=200)
-    readiness_interval: timedelta = timedelta(milliseconds=250)
+    quote_interval: timedelta = timedelta(seconds=1)
+    readiness_interval: timedelta = timedelta(seconds=1)
     broker_snapshot_interval: timedelta = timedelta(seconds=1)
     sizing_refresh_interval: timedelta = timedelta(hours=1)
     clock_sample_interval: timedelta = _CALIBRATION_SAMPLE_INTERVAL

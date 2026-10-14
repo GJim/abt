@@ -119,6 +119,15 @@ MANUAL_FREEZE_RETCODE = "manual_freeze"
 _SUCCESS_RETCODES = (10008, 10009)
 _NO_CHANGES_RETCODE = 10025
 _SIZING_REFRESH_SECONDS = 3600.0
+# Minimum spacing between quote-triggered sizing-plan rebuilds for
+# *previously priced* products.  The hourly shared-policy cadence is
+# unchanged and the first build is unaffected; this only debounces the
+# newly-quotable-product trigger when every missing product already has
+# known economics in this universe generation (an intermittently failing
+# margin/facts read oscillating, not a newcomer).  A product this Worker
+# has never priced is still admitted without delay -- delaying it would
+# hold back entries on a genuinely new product for the whole window.
+_MIN_PLAN_REBUILD_SECONDS = 30.0
 _MAXIMUM_HOLDING_SECONDS = 7 * 24 * 60 * 60
 # The bounded relay-handling window: the maximum time the design allows between
 # a leader's dispatch and the follower's admission decision on it.  Superseded
@@ -1683,6 +1692,26 @@ def _plan_from_canonical(value: Mapping[str, object]) -> SizingPlan:
         minimum_stop_distance=cast(str, value["minimum_stop_distance"]),
         usd_per_point_per_lot=cast(str, value["usd_per_point_per_lot"]),
     )
+
+
+#: Sizing-plan canonical fields that never participate in the plan-set
+#: version identity.  ``margin_per_lot`` is priced from the live quote on
+#: every rebuild, so hashing it turns each price micro-move into a new
+#: plan-set version (and a full republish) even when the stepped
+#: ``local_max_lots`` -- the only value the peer actually consumes, via
+#: :func:`_combine_pair_lots` -- did not move.  The field stays on the wire
+#: and in durable state untouched; it is only excluded from the version hash.
+_PLAN_SET_VERSION_IGNORED_FIELDS = frozenset({"margin_per_lot"})
+
+
+def _plan_set_version_of(canonical: list[dict[str, object]]) -> str:
+    """The relay identity of one plan set: stable across price micro-moves."""
+
+    stripped = [
+        {key: value for key, value in entry.items() if key not in _PLAN_SET_VERSION_IGNORED_FIELDS}
+        for entry in canonical
+    ]
+    return _hash(_canonical_json(stripped))[:16]
 
 
 @dataclass(frozen=True, slots=True)
@@ -4513,6 +4542,17 @@ class PairExecutionCell:
             return bool(quoted)
         missing = quoted - {product_id for product_id, _ in self._plans}
         if missing and quoted != self._last_plan_quote_set:
+            known = {plan.product_id for plan in self._plan_index.values()}
+            if set(missing) <= known:
+                # Oscillation among previously priced products only: wait out
+                # the debounce instead of re-sweeping every MT5 margin read
+                # each second.  A newcomer this Worker has never priced skips
+                # the wait so entries on it are never held back.
+                if (
+                    self._plans_refreshed_at is not None
+                    and (self._now - self._plans_refreshed_at).total_seconds() < _MIN_PLAN_REBUILD_SECONDS
+                ):
+                    return False
             return True
         # The rebuild cadence is leader-authored shared policy, so both legs
         # agree on it; without a policy yet, fall back to the module default.
@@ -4690,6 +4730,24 @@ class PairExecutionCell:
         """
 
         generation = cast(DiscoveredUniverse, self._universe).universe_generation
+        candidate = _plan_set_version_of([plan.canonical() for _, plan in sorted(plans.items())])
+        if (
+            candidate == self._plan_set_version
+            and self._plans_policy_hash == policy.hash
+            and set(suspended) == set(self._suspended_products)
+        ):
+            # No economic change since the installed set (a price micro-move
+            # that never crossed a volume step, or a quote-set flap that
+            # resolved back): skip the durable rewrite, the transition, and --
+            # via the unchanged version -- the republish.  Anchors still
+            # advance so the hourly cadence and the quote-set trigger keep
+            # working from the last observation, not from a stale instant.
+            # Retention expiry stays time-gated at read time, so skipping the
+            # purge here only leaves already-invisible rows for the next real
+            # install to collect.
+            self._plans_refreshed_at = self._now
+            self._last_plan_quote_set = self._quoted_products()
+            return
         new_versions = {plan.version for plan in plans.values()}
         self._db.execute(
             "UPDATE cell_sizing_plans SET superseded_at = ?"
@@ -4866,7 +4924,7 @@ class PairExecutionCell:
 
     def _recompute_plan_version(self, *, persist: bool = True) -> None:
         canonical = [plan.canonical() for _, plan in sorted(self._plans.items())]
-        version = _hash(_canonical_json(canonical))[:16]
+        version = _plan_set_version_of(canonical)
         if version == self._plan_set_version:
             return
         self._plan_set_version = version
@@ -5242,10 +5300,15 @@ class PairExecutionCell:
             self._last_published_plan_version = self._plan_set_version
             self._publish_plan_batches()
         ready, reason = self._local_ready()
+        # Change detection deliberately excludes ``plan_set_version``: the
+        # peer already receives every plan version through the ``sizing_plans``
+        # batches, so carrying it here only turns each sizing rebuild into an
+        # extra readiness send.  ``needs_human_reason`` *is* included: without
+        # it a change of the human-intervention detail while ``reason`` stays
+        # at its static "operator intervention is required" would never resend.
         snapshot = (
             ready,
             reason,
-            self._plan_set_version,
             None if self._policy is None else self._policy.hash,
             self._policy_accepted,
             self._broker_verified_empty(),
@@ -5253,6 +5316,7 @@ class PairExecutionCell:
             self._route_state,
             self.universe_generation(),
             self.quarantined_products(),
+            self._needs_human,
         )
         if snapshot == self._last_published_readiness:
             return
@@ -5316,7 +5380,14 @@ class PairExecutionCell:
         combined: list[object] = []
         for index in range(batch_count):
             combined.extend(batches[index])
-        if _hash(_canonical_json(combined))[:16] != version:
+        combined_plans = cast(list[dict[str, object]], combined)
+        if _plan_set_version_of(combined_plans) != version and (
+            _hash(_canonical_json(combined))[:16] != version
+        ):
+            # Neither the current margin-insensitive identity nor the legacy
+            # margin-inclusive one matches: the batches do not form the named
+            # set.  The legacy fallback keeps a rolling upgrade working while
+            # one side still hashes the old way; it fails closed afterwards.
             self._peer_plan_batches.pop(version, None)
             return
         parsed: dict[tuple[str, Direction], SizingPlan] = {}
