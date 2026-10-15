@@ -128,6 +128,19 @@ _SIZING_REFRESH_SECONDS = 3600.0
 # has never priced is still admitted without delay -- delaying it would
 # hold back entries on a genuinely new product for the whole window.
 _MIN_PLAN_REBUILD_SECONDS = 30.0
+# Minimum spacing between sizing-plan batch publications whose membership
+# is unchanged.  Version-only churn (lots ping-pong across volume steps on
+# a stable membership) is throttled here; a changed product set, or a
+# re-seed that wiped the caches, still publishes immediately.  The delay
+# uses cell time so tests that jump the clock are unaffected.  Retained
+# versions keep an in-flight attempt valid across the delay, and both sides
+# size a new attempt from the same named versions, so the staleness is only
+# a slightly older step grid, never a mismatch.
+_MIN_PLAN_PUBLISH_SECONDS = 120.0
+# Suspend reason for a product that has never been quoted: nothing was ever
+# attempted for it, so it must never count as "tried and failed" when
+# deciding whether a missing product is a genuine newcomer.
+_NO_QUOTE_SUSPEND_REASON = "no current local quote exists for this product"
 _MAXIMUM_HOLDING_SECONDS = 7 * 24 * 60 * 60
 # The bounded relay-handling window: the maximum time the design allows between
 # a leader's dispatch and the follower's admission decision on it.  Superseded
@@ -2495,6 +2508,12 @@ class PairExecutionCell:
         self._plans_refreshed_at: datetime | None = None
         self._last_plan_quote_set: frozenset[str] = frozenset()
         self._suspended_products: dict[str, str] = {}
+        # When each product last failed to build a plan.  A quoted product
+        # that was tried and suspended within the rebuild window is a proven
+        # failure, not a newcomer: retrying it every second (e.g. BTCUSD,
+        # whose margin calc never succeeds but whose ticks keep it quoted)
+        # would re-sweep every MT5 margin read ~1/s forever.
+        self._last_suspend_noted: dict[str, datetime] = {}
         # Policy hash the installed plans were built under.  A rebuild under
         # the same hash may retain prior plans across transient quote/facts
         # gaps; a policy change forces a full rebuild without retention.
@@ -2571,6 +2590,8 @@ class PairExecutionCell:
         self._last_timing: dict[str, object] = {}
         self._last_published_readiness: tuple[object, ...] | None = None
         self._last_published_plan_version: str | None = None
+        self._last_published_plan_keys: frozenset[tuple[str, Direction]] | None = None
+        self._last_plan_publish_at: datetime | None = None
         self._last_published_catalog_hash: str | None = None
         self._load_persisted_state()
         self._publisher_epoch = self._next_publisher_epoch()
@@ -4126,6 +4147,7 @@ class PairExecutionCell:
         self._plans_refreshed_at = None
         self._last_plan_quote_set = frozenset()
         self._suspended_products = {}
+        self._last_suspend_noted = {}
         self._plans_policy_hash = None
         self._decided_quotes = {}
         self._local_quotes = {
@@ -4543,11 +4565,24 @@ class PairExecutionCell:
         missing = quoted - {product_id for product_id, _ in self._plans}
         if missing and quoted != self._last_plan_quote_set:
             known = {plan.product_id for plan in self._plan_index.values()}
-            if set(missing) <= known:
-                # Oscillation among previously priced products only: wait out
-                # the debounce instead of re-sweeping every MT5 margin read
-                # each second.  A newcomer this Worker has never priced skips
-                # the wait so entries on it are never held back.
+            # A missing product this Worker has neither priced nor recently
+            # failed is a genuine newcomer: rebuild without delay so entries
+            # on it are never held back.  Anything else -- a known product
+            # oscillating, or a product tried and suspended within the window
+            # -- waits out the debounce instead of re-sweeping every MT5
+            # margin read each second.
+            cutoff = self._now - timedelta(seconds=_MIN_PLAN_REBUILD_SECONDS)
+            fresh = []
+            for product_id in missing:
+                if product_id in known:
+                    continue
+                noted = self._last_suspend_noted.get(product_id)
+                # Never tried (no entry at all), or tried long ago: a
+                # genuine newcomer.  Tried-and-suspended within the window
+                # is a proven failure, not news.
+                if noted is None or noted < cutoff:
+                    fresh.append(product_id)
+            if not fresh:
                 if (
                     self._plans_refreshed_at is not None
                     and (self._now - self._plans_refreshed_at).total_seconds() < _MIN_PLAN_REBUILD_SECONDS
@@ -4626,7 +4661,7 @@ class PairExecutionCell:
                 # under the same policy instead of flapping suspend/re-add.
                 if retain_prior and self._retain_prior_product_plans(product_id, plans):
                     continue
-                suspended[product_id] = "no current local quote exists for this product"
+                suspended[product_id] = _NO_QUOTE_SUSPEND_REASON
                 continue
             # A stale quote still prices margin and carries live facts: plans
             # are slow-moving economics, so rebuild from the last known quote
@@ -4703,6 +4738,12 @@ class PairExecutionCell:
                 directions_built += 1
             if directions_built == 0:
                 suspended[product_id] = "no direction has a valid positive sizing plan"
+        for product_id, reason in suspended.items():
+            # Only a product we actually attempted to price counts as tried.
+            # A never-quoted product was suspended sight unseen; its first
+            # quote must still admit it immediately as a newcomer.
+            if reason != _NO_QUOTE_SUSPEND_REASON:
+                self._last_suspend_noted[product_id] = self._now
         quoted = self._quoted_products()
         previously_planned = {product_id for product_id, _ in self._plans}
         if self._plans_refreshed_at is None:
@@ -5321,8 +5362,17 @@ class PairExecutionCell:
         self._publish_catalog_summary()
         self._publish_remaining_allowance()
         if self._plan_set_version != self._last_published_plan_version:
-            self._last_published_plan_version = self._plan_set_version
-            self._publish_plan_batches()
+            keys = frozenset(self._plans.keys())
+            if (
+                self._last_published_plan_version is None
+                or keys != self._last_published_plan_keys
+                or self._last_plan_publish_at is None
+                or (self._now - self._last_plan_publish_at).total_seconds() >= _MIN_PLAN_PUBLISH_SECONDS
+            ):
+                self._last_published_plan_version = self._plan_set_version
+                self._last_published_plan_keys = keys
+                self._last_plan_publish_at = self._now
+                self._publish_plan_batches()
         ready, reason = self._local_ready()
         # Change detection deliberately excludes ``plan_set_version``: the
         # peer already receives every plan version through the ``sizing_plans``
